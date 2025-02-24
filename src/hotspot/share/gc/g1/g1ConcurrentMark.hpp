@@ -39,6 +39,7 @@
 #include "memory/allocation.hpp"
 #include "utilities/compilerWarnings.hpp"
 #include "utilities/numberSeq.hpp"
+#include "gc/g1/g1DrainLocalQueue.hpp"
 
 class ConcurrentGCTimer;
 class G1ConcurrentMarkThread;
@@ -279,6 +280,7 @@ public:
 // This class manages data structures and methods for doing liveness analysis in
 // G1's concurrent cycle.
 class G1ConcurrentMark : public CHeapObj<mtGC> {
+  friend class DrainLocalQueues;
   friend class G1CMBitMapClosure;
   friend class G1CMConcurrentMarkingTask;
   friend class G1CMDrainMarkingStackClosure;

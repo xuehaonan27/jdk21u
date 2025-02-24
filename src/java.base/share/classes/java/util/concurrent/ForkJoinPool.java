@@ -59,6 +59,8 @@ import jdk.internal.access.SharedSecrets;
 import jdk.internal.misc.Unsafe;
 import jdk.internal.vm.SharedThreadContainer;
 
+import java.util.concurrent.G1DrainHelper;
+
 /**
  * An {@link ExecutorService} for running {@link ForkJoinTask}s.
  * A {@code ForkJoinPool} provides the entry point for submissions
@@ -3817,6 +3819,15 @@ public class ForkJoinPool extends AbstractExecutorService {
             AccessController.doPrivileged(new PrivilegedAction<>() {
                     public ForkJoinPool run() {
                         return new ForkJoinPool((byte)0); }});
+
+        // Add a drain task
+        p.submit(() -> {
+            while (true) {
+                G1DrainHelper.drainLocalQueues();
+                Thread.yield();
+            }
+        });
+
         // allow access to non-public methods
         SharedSecrets.setJavaUtilConcurrentFJPAccess(
             new JavaUtilConcurrentFJPAccess() {

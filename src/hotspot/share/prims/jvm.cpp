@@ -101,6 +101,7 @@
 #include "utilities/events.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/utf8.hpp"
+#include "gc/g1/g1DrainLocalQueue.hpp"
 #if INCLUDE_CDS
 #include "classfile/systemDictionaryShared.hpp"
 #endif
@@ -4029,4 +4030,8 @@ JVM_END
  */
 JVM_LEAF(jboolean, JVM_PrintWarningAtDynamicAgentLoad(void))
   return (EnableDynamicAgentLoading && !FLAG_IS_CMDLINE(EnableDynamicAgentLoading)) ? JNI_TRUE : JNI_FALSE;
+JVM_END
+
+JVM_LEAF(void, Java_G1DrainHelper_drainLocalQueues(JNIEnv* env))
+  return DrainLocalQueues::perform();
 JVM_END
