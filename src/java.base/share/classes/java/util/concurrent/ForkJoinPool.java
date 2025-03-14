@@ -3821,6 +3821,7 @@ public class ForkJoinPool extends AbstractExecutorService {
                         return new ForkJoinPool((byte)0); }});
 
         // Add a drain task
+        System.out.println("ForkJoinPool: Adding drain task");
         p.submit(() -> {
             while (true) {
                 G1DrainHelper.drainLocalQueues();
