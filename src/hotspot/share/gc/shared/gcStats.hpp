@@ -39,4 +39,22 @@ class GCStats : public CHeapObj<mtGC> {
   AdaptivePaddedNoZeroDevAverage*  avg_promoted() const { return _avg_promoted; }
 };
 
+#ifdef XHN_THREAD_MAJFLT
+// [xhn:thread-majflt]
+// Class used to profile and save gc majflt and cputime stats
+class GCMajfltStats {
+  long _stt_majflt;
+  long _stt_minflt;
+  long _stt_user_ms;
+  long _stt_sys_ms;
+
+public:
+  GCMajfltStats();
+  ~GCMajfltStats();
+
+  void start();
+  void end_and_log(const char* cause);
+};
+#endif // XHN_THREAD_MAJFLT
+
 #endif // SHARE_GC_SHARED_GCSTATS_HPP

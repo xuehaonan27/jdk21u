@@ -37,6 +37,9 @@
 #include "gc/g1/heapRegionManager.inline.hpp"
 #include "gc/g1/heapRegionRemSet.hpp"
 #include "gc/g1/heapRegionSet.inline.hpp"
+#ifdef XHN_THREAD_MAJFLT
+#include "gc/shared/gcStats.hpp"
+#endif // XHN_THREAD_MAJFLT
 #include "gc/shared/markBitMap.inline.hpp"
 #include "gc/shared/taskqueue.inline.hpp"
 #include "oops/stackChunkOop.hpp"

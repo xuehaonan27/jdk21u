@@ -28,3 +28,24 @@
 #include "gc/shared/gc_globals.hpp"
 
 GCStats::GCStats() : _avg_promoted(new AdaptivePaddedNoZeroDevAverage(AdaptiveSizePolicyWeight, PromotedPadding)) {}
+
+#ifdef XHN_THREAD_MAJFLT
+// [xhn:thread-majflt]
+GCMajfltStats::GCMajfltStats() : _stt_majflt(0), _stt_minflt(0), _stt_user_ms(0), _stt_sys_ms(0) {
+}
+
+GCMajfltStats::~GCMajfltStats() {
+}
+
+void GCMajfltStats::start() {
+  os::get_accum_majflt_minflt_and_cputime(&_stt_majflt, &_stt_minflt, &_stt_user_ms, &_stt_sys_ms);
+}
+
+void GCMajfltStats::end_and_log(const char* cause) {
+  long _end_majflt, _end_minflt, _end_user_ms, _end_sys_ms;
+  os::get_accum_majflt_minflt_and_cputime(&_end_majflt, &_end_minflt, &_end_user_ms, &_end_sys_ms);
+  log_info(gc)("Majflt(%s)=%ld (%ld -> %ld)", cause, _end_majflt - _stt_majflt , _stt_majflt, _end_majflt);
+  log_info(gc)("Minflt(%s)=%ld (%ld -> %ld)", cause, _end_minflt - _stt_minflt , _stt_minflt, _end_minflt);
+  log_info(gc)("PausePhase cputime(%s): user %ldms, sys %ldms", cause, _end_user_ms - _stt_user_ms, _end_sys_ms - _stt_sys_ms);
+}
+#endif // XHN_THREAD_MAJFLT

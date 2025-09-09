@@ -924,6 +924,12 @@ bool G1CollectedHeap::do_full_collection(bool clear_all_soft_refs,
     return false;
   }
 
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  GCMajfltStats gc_majflt_stats;
+  gc_majflt_stats.start();
+#endif // XHN_THREAD_MAJFLT
+
   const bool do_clear_all_soft_refs = clear_all_soft_refs ||
       soft_ref_policy()->should_clear_all_soft_refs();
 
@@ -934,6 +940,11 @@ bool G1CollectedHeap::do_full_collection(bool clear_all_soft_refs,
   collector.prepare_collection();
   collector.collect();
   collector.complete_collection();
+
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  gc_majflt_stats.end_and_log("full");
+#endif // XHN_THREAD_MAJFLT
 
   // Full collection was successfully completed.
   return true;
@@ -1545,10 +1556,22 @@ void G1CollectedHeap::stop() {
 
 void G1CollectedHeap::safepoint_synchronize_begin() {
   SuspendibleThreadSet::synchronize();
+  
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  Thread* cur = Thread::current();
+  log_info(gc)("Thread %s stop the world enter", cur->name());
+#endif // XHN_THREAD_MAJFLT
 }
 
 void G1CollectedHeap::safepoint_synchronize_end() {
   SuspendibleThreadSet::desynchronize();
+
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  Thread* cur = Thread::current();
+  log_info(gc)("Thread %s stop the world end", cur->name());
+#endif // XHN_THREAD_MAJFLT
 }
 
 void G1CollectedHeap::post_initialize() {
@@ -2574,9 +2597,20 @@ void G1CollectedHeap::do_collection_pause_at_safepoint_helper() {
   // been reset for the next pause.
   bool should_start_concurrent_mark_operation = collector_state()->in_concurrent_start_gc();
 
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  GCMajfltStats gc_majflt_stats;
+  gc_majflt_stats.start();
+#endif // XHN_THREAD_MAJFLT
+
   // Perform the collection.
   G1YoungCollector collector(gc_cause());
   collector.collect();
+
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  gc_majflt_stats.end_and_log("young");
+#endif // XHN_THREAD_MAJFLT
 
   // It should now be safe to tell the concurrent mark thread to start
   // without its logging output interfering with the logging output

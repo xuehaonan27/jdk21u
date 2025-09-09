@@ -122,6 +122,10 @@ void G1ConcurrentMarkThread::run_service() {
     FormatBuffer<128> title("Concurrent %s Cycle", _state == FullMark ? "Mark" : "Undo");
     GCTraceConcTime(Info, gc) tt(title);
 
+#ifdef XHN_THREAD_MAJFLT
+    // [xhn:thread-majflt]
+    os::dump_accum_thread_majflt_minflt_and_cputime("beforeConcCycle");
+#endif // XHN_THREAD_MAJFLT
     concurrent_cycle_start();
 
     if (_state == FullMark) {
@@ -132,6 +136,11 @@ void G1ConcurrentMarkThread::run_service() {
     }
 
     concurrent_cycle_end(_state == FullMark && !_cm->has_aborted());
+
+#ifdef XHN_THREAD_MAJFLT
+    // [xhn:thread-majflt]
+    os::dump_accum_thread_majflt_minflt_and_cputime("afterConcCycle");
+#endif // XHN_THREAD_MAJFLT
 
     _vtime_accum = (os::elapsedVTime() - _vtime_start);
   }
@@ -189,7 +198,18 @@ bool G1ConcurrentMarkThread::phase_mark_loop() {
     if (subphase_delay_to_keep_mmu_before_remark()) return true;
 
     // Subphase 4: Remark pause
+#ifdef XHN_THREAD_MAJFLT
+    // [xhn:thread_majflt]
+    GCMajfltStats gc_majflt_stats;
+    gc_majflt_stats.start();
+#endif // XHN_THREAD_MAJFLT
+
     if (subphase_remark()) return true;
+
+#ifdef XHN_THREAD_MAJFLT
+    // [xhn:thread_majflt]
+    gc_majflt_stats.end_and_log("remark");
+#endif // XHN_THREAD_MAJFLT
 
     // Check if we need to restart the marking loop.
     if (!mark_loop_needs_restart()) break;
@@ -297,7 +317,19 @@ void G1ConcurrentMarkThread::concurrent_mark_cycle_do() {
   if (phase_delay_to_keep_mmu_before_cleanup()) return;
 
   // Phase 5: Cleanup pause
+
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  GCMajfltStats gc_majflt_stats;
+  gc_majflt_stats.start();
+#endif //XHN_THREAD_MAJFLT
+  
   if (phase_cleanup()) return;
+
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  gc_majflt_stats.end_and_log("cleanup");
+#endif // XHN_THREAD_MAJFLT
 
   // Phase 6: Clear CLD claimed marks.
   if (phase_clear_cld_claimed_marks()) return;

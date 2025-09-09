@@ -1402,6 +1402,199 @@ void os::Linux::capture_initial_stack(size_t max_size) {
   }
 }
 
+#ifdef XHN_THREAD_MAJFLT
+////////////////////////////////////////////////////////////////////////////////
+// [xhn:thread-majflt]
+static inline unsigned long proc_majflt(const char* fname) {
+  // Get the majflt field from /proc/<pid>/<tid>/stat
+  char *s;
+  char stat[2048];
+  int statlen;
+  int count;
+  long majflt;
+  char cdummy;
+  int idummy;
+  long ldummy;
+  FILE *fp;
+  fp = os::fopen(fname, "r");
+  if (fp == nullptr) return 0ul;
+  statlen = fread(stat, 1, 2047, fp);
+  stat[statlen] = '\0';
+  fclose(fp);
+
+  // Skip pid and the command string. Note that we could be dealing with
+  // weird command names, e.g. user could decide to rename java launcher
+  // to "java 1.4.2 :)", then the stat file would look like
+  //                1234 (java 1.4.2 :)) R ... ...
+  // We don't really need to know the command string, just find the last
+  // occurrence of ")" and then start parsing from there. See bug 4726580.
+  s = strrchr(stat, ')');
+  if (s == nullptr) return 0ul;
+  // Skip blank chars
+  do { s++; } while (s && isspace(*s));
+  count = sscanf(s,"%c %d %d %d %d %d %lu %lu %lu %lu",
+                &cdummy, &idummy, &idummy, &idummy, &idummy, &idummy,
+                &ldummy, &ldummy, &ldummy, &majflt);
+  if (count == 12 - 2) {
+    return majflt;
+  } else {
+    return 0ul;
+  }
+}
+
+// Return 0 on error
+static inline int proc_majflt_and_minflt(const char* fname, long* majflt, long* minflt) {
+  // Get the majflt field from /proc/<pid>/<tid>/stat
+  char *s;
+  char stat[2048];
+  int statlen;
+  int count;
+  char cdummy;
+  int idummy;
+  long ldummy;
+  FILE *fp;
+
+  fp = os::fopen(fname, "r");
+  if (fp == nullptr) return 0ul;
+  statlen = fread(stat, 1, 2047, fp);
+  stat[statlen] = '\0';
+  fclose(fp);
+
+  // Skip pid and the command string. Note that we could be dealing with
+  // weird command names, e.g. user could decide to rename java launcher
+  // to "java 1.4.2 :)", then the stat file would look like
+  //                1234 (java 1.4.2 :)) R ... ...
+  // We don't really need to know the command string, just find the last
+  // occurrence of ")" and then start parsing from there. See bug 4726580.
+  s = strrchr(stat, ')');
+  if (s == nullptr) return 0ul;
+
+  // Skip blank chars
+  do { s++; } while (s && isspace(*s));
+
+  count = sscanf(s,"%c %d %d %d %d %d %lu %lu %lu %lu",
+                 &cdummy, &idummy, &idummy, &idummy, &idummy, &idummy,
+                 &ldummy, minflt, &ldummy, majflt);
+  if (count == 10) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+static inline void proc_majflt_minflt_and_cputime(const char* fname, long* majflt, long* minflt, long* user_time, long* sys_time) {
+  // Get the majflt, user and sys time field from /proc/<pid>/<tid>/stat
+  char *s;
+  char stat[2048];
+  int statlen;
+  int count;
+  char cdummy;
+  int idummy;
+  long ldummy;
+  FILE *fp;
+
+  *majflt = *sys_time = *user_time = 0;
+
+  fp = os::fopen(fname, "r");
+  if (fp == nullptr) return ;
+  statlen = fread(stat, 1, 2047, fp);
+  stat[statlen] = '\0';
+  fclose(fp);
+
+  // Skip pid and the command string. Note that we could be dealing with
+  // weird command names, e.g. user could decide to rename java launcher
+  // to "java 1.4.2 :)", then the stat file would look like
+  //                1234 (java 1.4.2 :)) R ... ...
+  // We don't really need to know the command string, just find the last
+  // occurrence of ")" and then start parsing from there. See bug 4726580.
+  s = strrchr(stat, ')');
+  if (s == nullptr) return ;
+
+  // Skip blank chars
+  do { s++; } while (s && isspace(*s));
+
+  count = sscanf(s,"%c %d %d %d %d %d %lu %lu %lu %lu %lu %lu %lu",
+                 &cdummy, &idummy, &idummy, &idummy, &idummy, &idummy,
+                 &ldummy, minflt, &ldummy, majflt, &ldummy,
+                 user_time, sys_time);
+  if (count != 15 - 2) return ;
+  *user_time = *user_time * (1000 / clock_tics_per_sec);
+  *sys_time = *sys_time * (1000 / clock_tics_per_sec);
+}
+
+// Error will return 0
+void os::get_accum_majflt_minflt(long* majflt, long* minflt) {
+  if (proc_majflt_and_minflt("/proc/self/stat", majflt, minflt) == 0) {
+    *majflt = 0;
+    *minflt = 0;
+  }
+}
+
+void os::get_accum_majflt_minflt_and_cputime(long* majflt, long* minflt, long* user_time, long* sys_time) {
+  proc_majflt_minflt_and_cputime("/proc/self/stat", majflt, minflt, user_time, sys_time);
+}
+
+void os::current_thread_majflt_minflt_and_cputime(long* majflt, long* minflt, long* user_time, long* sys_time) {
+  char proc_name[64];
+  snprintf(proc_name, 64, "/proc/self/task/%d/stat", Thread::current()->osthread()->thread_id());
+  proc_majflt_minflt_and_cputime(proc_name, majflt, minflt, user_time, sys_time);
+}
+
+void os::dump_current_thread_majflt_minflt_and_cputime(const char *prefix) {
+  pid_t tid;
+  char proc_name[64];
+  long majflt, minflt, user_time, sys_time;
+
+  for (JavaThreadIteratorWithHandle jtiwh; JavaThread *jt = jtiwh.next(); ) {
+    tid = jt->osthread()->thread_id();
+    snprintf(proc_name, 64, "/proc/self/task/%d/stat", tid);
+    proc_majflt_minflt_and_cputime(proc_name, &majflt, &minflt, &user_time, &sys_time);
+    log_info(gc, thread)("%sJavaThread %s(tid=%d), Majflt=%ld, Minflt=%ld, user=%ldms, sys=%ldms",
+      prefix, jt->name(), tid, majflt, minflt, user_time, sys_time);
+  }
+
+  for (NonJavaThread::Iterator njti; !njti.end(); njti.step()) {
+    NonJavaThread* njt = njti.current();
+    tid = njt->osthread()->thread_id();
+    snprintf(proc_name, 64, "/proc/self/task/%d/stat", tid);
+    proc_majflt_minflt_and_cputime(proc_name, &majflt, &minflt, &user_time, &sys_time);
+    log_info(gc, thread)("%sNonJavaThread %s(tid=%d), Majflt=%ld, Minflt=%ld, user=%ldms, sys=%ldms",
+      prefix, njt->name(), tid, majflt, minflt, user_time, sys_time);
+  }
+}
+
+void os::dump_accum_thread_majflt_minflt_and_cputime(const char *prefix) {
+  pid_t tid;
+  char proc_name[64];
+  long majflt, minflt, user_time, sys_time;
+  long proc_majflt, proc_minflt, proc_user_time, proc_sys_time;
+  long njt_majflt, njt_minflt, njt_user_time, njt_sys_time;
+
+  // Get non-jthread stats
+  njt_majflt = njt_minflt = njt_user_time = njt_sys_time = 0;
+  for (NonJavaThread::Iterator njti; !njti.end(); njti.step()) {
+    NonJavaThread* njt = njti.current();
+    tid = njt->osthread()->thread_id();
+    snprintf(proc_name, 64, "/proc/self/task/%d/stat", tid);
+    proc_majflt_minflt_and_cputime(proc_name, &majflt, &minflt, &user_time, &sys_time);
+    njt_majflt += majflt;
+    njt_minflt += minflt;
+    njt_user_time += user_time;
+    njt_sys_time += sys_time;
+  }
+
+  // Get process stats
+  proc_majflt_minflt_and_cputime("/proc/self/stat", &proc_majflt, &proc_minflt, &proc_user_time, &proc_sys_time);
+
+  // Get jthread stats by process - non-jthread since some mutator thread
+  // may create or exit.
+  log_info(gc)("%s JavaThread(Majflt=%ld, Minflt=%ld, user=%ldms, sys=%ldms), NonJavaThread(Majflt=%ld, Minflt=%ld, user=%ldms, sys=%ldms)",
+    prefix,
+    proc_majflt-njt_majflt, proc_minflt-njt_minflt, proc_user_time-njt_user_time, proc_sys_time-njt_sys_time,
+    njt_majflt, njt_minflt, njt_user_time, njt_sys_time);
+}
+#endif // XHN_THREAD_MAJFLT
+
 ////////////////////////////////////////////////////////////////////////////////
 // time support
 double os::elapsedVTime() {

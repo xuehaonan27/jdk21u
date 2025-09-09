@@ -454,6 +454,11 @@ void before_exit(JavaThread* thread, bool halt) {
 
   // Actual shutdown logic begins here.
 
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  os::dump_current_thread_majflt_minflt_and_cputime("");
+#endif // XHN_THREAD_MAJFLT
+
 #if INCLUDE_JVMCI
   if (EnableJVMCI) {
     JVMCI::shutdown(thread);
@@ -485,6 +490,15 @@ void before_exit(JavaThread* thread, bool halt) {
 
   // Stop concurrent GC threads
   Universe::heap()->stop();
+
+#ifdef XHN_THREAD_MAJFLT
+  // [xhn:thread-majflt]
+  long majflt, minflt;
+  os::get_accum_majflt_minflt(&majflt, &minflt);
+  log_info(gc)("Majflt(exit jvm)=%ld", majflt);
+  log_info(gc)("Minflt(exit jvm)=%ld", minflt);
+  os::dump_accum_thread_majflt_minflt_and_cputime("Exit jvm");
+#endif // XHN_THREAD_MAJFLT
 
   // Print GC/heap related information.
   Log(gc, heap, exit) log;
