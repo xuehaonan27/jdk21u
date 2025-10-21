@@ -65,6 +65,22 @@ inline bool G1CMSubjectToDiscoveryClosure::do_object_b(oop obj) {
   return _g1h->heap_region_containing(obj)->is_old_or_humongous();
 }
 
+#ifdef XHN_REBUILD_RC
+inline bool G1ConcurrentMark::par_rc_record(oop const obj) {
+  bool is_unique_marked = _unique_ref_bitmap.is_marked(cast_from_oop<HeapWord*>(obj));
+
+  bool success;
+  if (is_unique_marked) {
+    // A new reference to this obj, promote to shared
+    success = _shared_ref_bitmap.par_mark(obj);
+  } else {
+    success = _unique_ref_bitmap.par_mark(obj);
+  }
+
+  return success;
+}
+#endif // XHN_REBUILD_RC
+
 inline bool G1ConcurrentMark::mark_in_bitmap(uint const worker_id, oop const obj) {
   HeapRegion* const hr = _g1h->heap_region_containing(obj);
 
@@ -77,6 +93,11 @@ inline bool G1ConcurrentMark::mark_in_bitmap(uint const worker_id, oop const obj
   assert(!hr->is_continues_humongous(), "Should not try to mark object " PTR_FORMAT " in Humongous continues region %u above TAMS " PTR_FORMAT, p2i(obj), hr->hrm_index(), p2i(hr->top_at_mark_start()));
 
   bool success = _mark_bitmap.par_mark(obj);
+#ifdef XHN_REBUILD_RC
+  // [xhn:rebuild-rc] do RC logs here!
+  success = success && par_rc_record(obj);
+#endif // XHN_REBUILD_RC
+
   if (success) {
     add_to_liveness(worker_id, obj, obj->size());
   }
@@ -158,6 +179,7 @@ inline bool G1CMTask::is_below_finger(oop obj, HeapWord* global_finger) const {
   return objAddr < global_finger;
 }
 
+// [xhn:rebuild-rc] all grayed oops are further processed here
 template<bool scan>
 inline void G1CMTask::process_grey_task_entry(G1TaskQueueEntry task_entry) {
   assert(scan || (task_entry.is_oop() && task_entry.obj()->is_typeArray()), "Skipping scan of grey non-typeArray");
@@ -217,6 +239,7 @@ inline void G1CMTask::abort_marking_if_regular_check_fail() {
   }
 }
 
+// [xhn:rebuild-rc] reference is made grey here
 inline bool G1CMTask::make_reference_grey(oop obj) {
   if (!_cm->mark_in_bitmap(_worker_id, obj)) {
     return false;

@@ -57,7 +57,22 @@ void G1RootProcessor::evacuate_roots(G1ParScanThreadState* pss, uint worker_id) 
 
   G1EvacPhaseTimesTracker timer(phase_times, pss, G1GCPhaseTimes::ExtRootScan, worker_id);
 
+  // [xhn:evac-rc] whether or not in concurrent start gc phase
+  // ```
+  // G1EvacuationRootClosures* res = nullptr;
+  // if (g1h->collector_state()->in_concurrent_start_gc()) {
+  //   if (ClassUnloadingWithConcurrentMark) {
+  //     res = new G1ConcurrentStartMarkClosures<false>(g1h, pss);
+  //   } else {
+  //     res = new G1ConcurrentStartMarkClosures<true>(g1h, pss);
+  //   }
+  // } else {
+  //   res = new G1EvacuationClosures(g1h, pss, process_only_dirty_klasses);
+  // }
+  // return res;
+  // ```
   G1EvacuationRootClosures* closures = pss->closures();
+  // [xhn:evac-rc] Objects referenced by Roots in Java codes (stack, static, etc...)
   process_java_roots(closures, phase_times, worker_id);
 
   process_vm_roots(closures, phase_times, worker_id);

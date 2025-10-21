@@ -98,6 +98,11 @@ public:
   void clear()                         { do_clear(_covered, true); }
   void clear_range(MemRegion mr)       { do_clear(mr, false);      }
   void clear_range_large(MemRegion mr) { do_clear(mr, true);       }
+
+#ifdef XHN_REBUILD_RC
+  // [xhn:rebuild-rc]
+  size_t count_one_bits() { return _bm.count_one_bits(); }
+#endif // XHN_REBUILD_RC
 };
 
 #endif // SHARE_GC_SHARED_MARKBITMAP_HPP

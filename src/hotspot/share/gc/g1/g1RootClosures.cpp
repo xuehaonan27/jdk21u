@@ -69,6 +69,8 @@ public:
   CodeBlobClosure* weak_codeblobs()        { return &_weak._codeblobs; }
 };
 
+// [xhn:evac-rc] when evacuation starts, first scan collection set with these closures
+// G1ConcurrentStartMarkClosures and G1EvacuationClosures are both inherited from G1EvacuationRootClosures
 G1EvacuationRootClosures* G1EvacuationRootClosures::create_root_closures(G1CollectedHeap* g1h,
                                                                          G1ParScanThreadState* pss,
                                                                          bool process_only_dirty_klasses) {

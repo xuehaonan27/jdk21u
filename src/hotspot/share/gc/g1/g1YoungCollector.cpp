@@ -627,12 +627,15 @@ public:
     _num_workers(num_workers)
   { }
 
+  // [xhn:rebuild-rc] Evacuation each region start here
   void work(uint worker_id) {
     start_work(worker_id);
 
     {
       ResourceMark rm;
 
+      // [xhn:rebuild-rc] pss is created here dynamically everytime, with closures decided by
+      // GC phases to be Concurrent Mark or Evacuation
       G1ParScanThreadState* pss = _per_thread_states->state_for_worker(worker_id);
       pss->set_ref_discoverer(_g1h->ref_processor_stw());
 
@@ -644,13 +647,18 @@ public:
   }
 };
 
+// [xhn:rebuild-rc] When G1 has decided which region to collect, then this:
 class G1EvacuateRegionsTask : public G1EvacuateRegionsBaseTask {
   G1RootProcessor* _root_processor;
   bool _has_optional_evacuation_work;
 
   void scan_roots(G1ParScanThreadState* pss, uint worker_id) {
+    // [xhn:rebuild-rc] Apply correct closures from pss to the strongly and weakly reachable roots in the system
+    // in a single pass. Record and report timing measurements for sub phases using worker_id.
     _root_processor->evacuate_roots(pss, worker_id);
+    // [xhn:rebuild-rc] Scan all cards in the non-collection set regions that potentially contain references into the current whole collection set.
     _g1h->rem_set()->scan_heap_roots(pss, worker_id, G1GCPhaseTimes::ScanHR, G1GCPhaseTimes::ObjCopy, _has_optional_evacuation_work);
+    // [xhn:rebuild-rc] Do work for regions in the current increment of the collection set, scanning non-card based (heap) roots.
     _g1h->rem_set()->scan_collection_set_code_roots(pss, worker_id, G1GCPhaseTimes::CodeRoots, G1GCPhaseTimes::ObjCopy);
     // There are no optional roots to scan right now.
 #ifdef ASSERT
@@ -1019,6 +1027,7 @@ G1YoungCollector::G1YoungCollector(GCCause::Cause gc_cause) :
 {
 }
 
+// [xhn:rebuild-rc] G1 Collect / Evacuation
 void G1YoungCollector::collect() {
   // Do timing/tracing/statistics/pre- and post-logging/verification work not
   // directly related to the collection. They should not be accounted for in
@@ -1083,5 +1092,6 @@ void G1YoungCollector::collect() {
 
     policy()->record_young_collection_end(_concurrent_operation_is_full_mark, evacuation_failed());
   }
+  // [xhn:evac-rc] clear Bitmaps here.
   TASKQUEUE_STATS_ONLY(_g1h->task_queues()->print_and_reset_taskqueue_stats("Oop Queue");)
 }

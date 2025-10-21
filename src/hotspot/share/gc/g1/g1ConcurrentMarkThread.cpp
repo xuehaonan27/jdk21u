@@ -274,6 +274,16 @@ bool G1ConcurrentMarkThread::phase_cleanup() {
 
 bool G1ConcurrentMarkThread::phase_clear_bitmap_for_next_mark() {
   ConcurrentGCBreakpoints::at("AFTER CLEANUP STARTED");
+
+#ifdef XHN_REBUILD_RC
+  // [xhn:rebuild-rc]
+  size_t unique_bits = _cm->unique_ref_bitmap()->count_one_bits();
+  size_t shared_bits = _cm->shared_ref_bitmap()->count_one_bits();
+  // Some are upgraded to shared
+  log_info(gc, marking)("Concurrent Mark Unique Ref %lu", unique_bits - shared_bits);
+  log_info(gc, marking)("Concurrent Mark Shared Ref %lu", shared_bits);
+#endif // XHN_REBUILD_RC
+
   G1ConcPhaseTimer p(_cm, "Concurrent Cleanup for Next Mark");
   _cm->cleanup_for_next_mark();
   return _cm->has_aborted();

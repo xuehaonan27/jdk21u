@@ -182,6 +182,8 @@ void G1ParScanThreadState::verify_task(ScannerTask task) const {
 }
 #endif // ASSERT
 
+// [xhn:evac-rc] Evacuation here
+// [xhn:evac-rc] evacuate live objects here
 template <class T>
 MAYBE_INLINE_EVACUATION
 void G1ParScanThreadState::do_oop_evac(T* p) {
@@ -200,17 +202,21 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
          "Obj " PTR_FORMAT " should not refer to humongous region %u from " PTR_FORMAT,
          p2i(obj), _g1h->addr_to_region(obj), p2i(p));
 
+  // [xhn:evac-rc] if the region is not in cset, then somebody must have done scanning this obj,
+  // [xhn:evac-rc] then in this case must assert that RC is >= 1
   if (!region_attr.is_in_cset()) {
     // In this case somebody else already did all the work.
     return;
   }
 
+  // [xhn:evac-rc] decide how this should be evacuated according to its EVAC-RC
   markWord m = obj->mark();
   if (m.is_marked()) {
     obj = cast_to_oop(m.decode_pointer());
   } else {
     obj = do_copy_to_survivor_space(region_attr, obj, m);
   }
+  // [xhn:evac-rc] maybe changes to `UniqueAccess` or `SharedAccess` here
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);
 
   write_ref_field_post(p, obj);
@@ -444,6 +450,9 @@ void G1ParScanThreadState::update_bot_after_copying(oop obj, size_t word_sz) {
 
 // Private inline function, for direct internal use and providing the
 // implementation of the public not-inline function.
+// [xhn:evac-rc] Copy to survivor space, whether S or Old, decided by age.
+// [xhn:evac-rc] This is used by evacuating roots and evacuating objs.
+// [xhn:evac-rc] `old` is not marked in markWord here.
 MAYBE_INLINE_EVACUATION
 oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const region_attr,
                                                     oop const old,

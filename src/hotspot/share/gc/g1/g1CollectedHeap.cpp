@@ -1441,7 +1441,17 @@ jint G1CollectedHeap::initialize() {
   G1RegionToSpaceMapper* bitmap_storage =
     create_aux_memory_mapper("Mark Bitmap", bitmap_size, G1CMBitMap::heap_map_factor());
 
+#ifdef XHN_REBUILD_RC
+  G1RegionToSpaceMapper* unique_ref_bitmap_storage =
+    create_aux_memory_mapper("Unique Ref Bitmap", bitmap_size, G1CMBitMap::heap_map_factor());
+  G1RegionToSpaceMapper* shared_ref_bitmap_storage =
+    create_aux_memory_mapper("Shared Ref Bitmap", bitmap_size, G1CMBitMap::heap_map_factor());
+#endif // XHN_REBUILD_RC
+#ifdef XHN_REBUILD_RC
+  _hrm.initialize(heap_storage, bitmap_storage, unique_ref_bitmap_storage, shared_ref_bitmap_storage, bot_storage, cardtable_storage);
+#else
   _hrm.initialize(heap_storage, bitmap_storage, bot_storage, cardtable_storage);
+#endif // XHN_REBUILD_RC
   _card_table->initialize(cardtable_storage);
 
   // 6843694 - ensure that the maximum region index can fit
@@ -1484,7 +1494,11 @@ jint G1CollectedHeap::initialize() {
 
   // Create the G1ConcurrentMark data structure and thread.
   // (Must do this late, so that "max_[reserved_]regions" is defined.)
+#ifdef XHN_REBUILD_RC
+  _cm = new G1ConcurrentMark(this, bitmap_storage, unique_ref_bitmap_storage, shared_ref_bitmap_storage);
+#else
   _cm = new G1ConcurrentMark(this, bitmap_storage);
+#endif // XHN_REBUILD_RC
   _cm_thread = _cm->cm_thread();
 
   // Now expand into the initial heap size.
@@ -2513,6 +2527,7 @@ void G1CollectedHeap::expand_heap_after_young_collection(){
   }
 }
 
+// [xhn:rebuild-rc] Evacuation here
 bool G1CollectedHeap::do_collection_pause_at_safepoint() {
   assert_at_safepoint_on_vm_thread();
   guarantee(!is_stw_gc_active(), "collection is not reentrant");

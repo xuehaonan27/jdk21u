@@ -67,6 +67,7 @@ class G1CodeBlobClosure : public CodeBlobClosure {
     void do_oop(narrowOop* o);
   };
 
+  // [xhn:evac-rc] Code Blob closures here.
   HeapRegionGatheringOopClosure _oc;
   MarkingOopClosure _marking_oc;
 

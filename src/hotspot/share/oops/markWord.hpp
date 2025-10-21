@@ -68,6 +68,7 @@ class ObjectMonitor;
 class JavaThread;
 class outputStream;
 
+// [xhn:evac-rc] modify markWord
 class markWord {
  private:
   uintptr_t _value;
@@ -130,6 +131,14 @@ class markWord {
 
   static const uint max_age                       = age_mask;
 
+#ifdef XHN_EVAC_RC
+  // [xhn:evac-rc] Only consider 64 bits platform
+  // static const int rc_bits                        = 8; // Used in objs in CSet during evacuation
+  // static const int rc_shift                       = hash_shift + hash_bits;
+  // static const uintptr_t rc_mask                  = right_n_bits(rc_bits);
+  // static const uintptr_t rc_mask_in_place         = rc_mask << rc_shift;
+  // static const uint max_rc                        = rc_mask;
+#endif // XHN_EVAC_RC
   // Creates a markWord with all bits set to zero.
   static markWord zero() { return markWord(uintptr_t(0)); }
 
@@ -246,6 +255,15 @@ class markWord {
   bool has_no_hash() const {
     return hash() == no_hash;
   }
+#ifdef XHN_EVAC_RC
+  // [xhn:evac-rc] rc operations
+  // uint     rc() const { return mask_bits(value() >> rc_shift, rc_mask); }
+  // markWord set_rc(uint v) const {
+  //   assert((v & ~rc_mask) == 0, "shouldn't overflow rc field");
+  //   return markWord((value() & ~rc_mask_in_place) | ((v & rc_mask) << rc_shift));
+  // }
+  // markWord incr_rc()      const { return rc() == max_rc ? markWord(_value) : set_rc(rc() + 1); }
+#endif // XHN_EVAC_RC
 
   // Prototype mark for initialization
   static markWord prototype() {

@@ -69,6 +69,7 @@ inline void G1ScanClosureBase::handle_non_cset_obj_common(G1HeapRegionAttr const
   if (region_attr.is_humongous_candidate()) {
     _g1h->set_humongous_is_live(obj);
   } else if (region_attr.is_optional()) {
+    // [xhn:evac-rc] in old region
     _par_scan_state->remember_reference_into_optional_region(p);
   }
 }
@@ -77,6 +78,7 @@ inline void G1ScanClosureBase::trim_queue_partially() {
   _par_scan_state->trim_queue_partially();
 }
 
+// [xhn:evac-rc] scan child objs
 template <class T>
 inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
   T heap_oop = RawAccess<>::oop_load(p);
@@ -103,6 +105,7 @@ inline void G1CMOopClosure::do_oop_work(T* p) {
   _task->deal_with_reference(p);
 }
 
+// [xhn:rebuild-rc] ConcMark when scanning each root region, each oop in the region is processed here
 template <class T>
 inline void G1RootRegionScanClosure::do_oop_work(T* p) {
   T heap_oop = RawAccess<MO_RELAXED>::oop_load(p);
@@ -110,6 +113,8 @@ inline void G1RootRegionScanClosure::do_oop_work(T* p) {
     return;
   }
   oop obj = CompressedOops::decode_not_null(heap_oop);
+  // [xhn:rebuild-rc] ConcMark will mark the root region oop as alive here
+  // maybe doing RC rebuild could be done here as well
   _cm->mark_in_bitmap(_worker_id, obj);
 }
 
@@ -154,6 +159,7 @@ inline void G1ConcurrentRefineOopClosure::do_oop_work(T* p) {
   }
 }
 
+// [xhn:evac-rc] scan oop here, pushing the oop onto evacuation stack
 template <class T>
 inline void G1ScanCardClosure::do_oop_work(T* p) {
   T o = RawAccess<>::oop_load(p);
@@ -162,6 +168,7 @@ inline void G1ScanCardClosure::do_oop_work(T* p) {
   }
   oop obj = CompressedOops::decode_not_null(o);
 
+  // [xhn:evac-rc] an empty function here
   check_obj_during_refinement(p, obj);
 
   assert(!_g1h->is_in_cset((HeapWord*)p),
@@ -172,9 +179,14 @@ inline void G1ScanCardClosure::do_oop_work(T* p) {
   if (region_attr.is_in_cset()) {
     // Since the source is always from outside the collection set, here we implicitly know
     // that this is a cross-region reference too.
+    // [xhn:evac-rc] If o is in CSet, then counting its RC is meaningful, otherwise not.
+    // [xhn:evac-rc] the problem is: where to put this RC.
     prefetch_and_push(p, obj);
     _heap_roots_found++;
   } else if (!HeapRegion::is_in_same_region(p, obj)) {
+    // [xhn:evac-rc] is_in_same_region
+    // [xhn:evac-rc] Returns whether a field is in the same region as the obj it points to.
+    // [xhn:evac-rc] if is not in the same region, then 
     handle_non_cset_obj_common(region_attr, p, obj);
     _par_scan_state->enqueue_card_if_tracked(region_attr, p, obj);
   }
@@ -210,6 +222,8 @@ void G1ParCopyHelper::trim_queue_partially() {
   _par_scan_state->trim_queue_partially();
 }
 
+// [xhn:evac-rc] G1 parallel copy object
+// [xhn:evac-rc] evacuate roots here
 template <G1Barrier barrier, bool should_mark>
 template <class T>
 void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
@@ -224,6 +238,7 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
   assert(_worker_id == _par_scan_state->worker_id(), "sanity");
 
   const G1HeapRegionAttr state = _g1h->region_attr(obj);
+  // [xhn:rebuild-rc] Check in Old Region / Humongous Region / Young Region
   if (state.is_in_cset()) {
     oop forwardee;
     markWord m = obj->mark();

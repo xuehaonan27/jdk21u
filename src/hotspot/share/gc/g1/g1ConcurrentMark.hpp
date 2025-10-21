@@ -295,6 +295,12 @@ class G1ConcurrentMark : public CHeapObj<mtGC> {
   // Concurrent marking support structures
   G1CMBitMap              _mark_bitmap;
 
+#ifdef XHN_REBUILD_RC
+  // [xhn:rebuild-rc]
+  G1CMBitMap              _unique_ref_bitmap;
+  G1CMBitMap              _shared_ref_bitmap;
+#endif // XHN_REBUILD_RC
+
   // Heap bounds
   MemRegion const         _heap;
 
@@ -518,14 +524,29 @@ public:
 
   // Attempts to steal an object from the task queues of other tasks
   bool try_stealing(uint worker_id, G1TaskQueueEntry& task_entry);
+#ifdef XHN_REBUILD_RC
+  G1ConcurrentMark(G1CollectedHeap* g1h,
+                   G1RegionToSpaceMapper* bitmap_storage,
+                   G1RegionToSpaceMapper* unique_ref_bitmap_storage,
+                   G1RegionToSpaceMapper* shared_ref_bitmap_storage
+                  );
+#else
 
   G1ConcurrentMark(G1CollectedHeap* g1h,
                    G1RegionToSpaceMapper* bitmap_storage);
+#endif // XHN_REBUILD_RC
   ~G1ConcurrentMark();
 
   G1ConcurrentMarkThread* cm_thread() { return _cm_thread; }
 
   G1CMBitMap* mark_bitmap() const { return (G1CMBitMap*)&_mark_bitmap; }
+
+#ifdef XHN_REBUILD_RC
+  // [xhn:rebuild-rc]
+  inline bool par_rc_record(oop const obj);
+  G1CMBitMap* unique_ref_bitmap() const { return (G1CMBitMap*)&_unique_ref_bitmap; }
+  G1CMBitMap* shared_ref_bitmap() const { return (G1CMBitMap*)&_shared_ref_bitmap; }
+#endif // XHN_REBUILD_RC
 
   // Calculates the number of concurrent GC threads to be used in the marking phase.
   uint calc_active_marking_workers();

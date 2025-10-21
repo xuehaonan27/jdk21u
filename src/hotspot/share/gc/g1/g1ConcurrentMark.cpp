@@ -359,12 +359,26 @@ bool G1CMRootMemRegions::wait_until_scan_finished() {
   return true;
 }
 
+#ifdef XHN_REBUILD_RC
+G1ConcurrentMark::G1ConcurrentMark(G1CollectedHeap* g1h,
+                                   G1RegionToSpaceMapper* bitmap_storage,
+                                   G1RegionToSpaceMapper* unique_ref_bitmap_storage,
+                                   G1RegionToSpaceMapper* shared_ref_bitmap_storage
+                                  ) :
+#else
 G1ConcurrentMark::G1ConcurrentMark(G1CollectedHeap* g1h,
                                    G1RegionToSpaceMapper* bitmap_storage) :
+#endif // XHN_REBUILD_RC
   // _cm_thread set inside the constructor
   _g1h(g1h),
 
   _mark_bitmap(),
+
+#ifdef XHN_REBUILD_RC
+  // [xhn:rebuild-rc]
+  _unique_ref_bitmap(),
+  _shared_ref_bitmap(),
+#endif // XHN_REBUILD_RC
 
   _heap(_g1h->reserved()),
 
@@ -415,6 +429,10 @@ G1ConcurrentMark::G1ConcurrentMark(G1CollectedHeap* g1h,
   assert(CGC_lock != nullptr, "CGC_lock must be initialized");
 
   _mark_bitmap.initialize(g1h->reserved(), bitmap_storage);
+#ifdef XHN_REBUILD_RC
+  _unique_ref_bitmap.initialize(g1h->reserved(), unique_ref_bitmap_storage);
+  _shared_ref_bitmap.initialize(g1h->reserved(), shared_ref_bitmap_storage);
+#endif // XHN_REBUILD_RC
 
   // Create & start ConcurrentMark thread.
   _cm_thread = new G1ConcurrentMarkThread(this);
@@ -571,6 +589,13 @@ private:
   private:
     G1ConcurrentMark* _cm;
     G1CMBitMap* _bitmap;
+
+#ifdef XHN_REBUILD_RC
+    // [xhn:rebuild-rc]
+    G1CMBitMap* _bitmap_unique;
+    G1CMBitMap* _bitmap_shared;
+#endif // XHN_REBUILD_RC
+
     bool _suspendible; // If suspendible, do yield checks.
 
     bool suspendible() {
@@ -610,6 +635,11 @@ private:
       HeapRegionClosure(),
       _cm(cm),
       _bitmap(cm->mark_bitmap()),
+#ifdef XHN_REBUILD_RC
+      // [xhn:rebuild-rc]
+      _bitmap_unique(cm->unique_ref_bitmap()),
+      _bitmap_shared(cm->shared_ref_bitmap()),
+#endif // XHN_REBUILD_RC
       _suspendible(suspendible)
     { }
 
@@ -627,6 +657,11 @@ private:
 
         MemRegion mr(cur, MIN2(cur + chunk_size_in_words, end));
         _bitmap->clear_range(mr);
+#ifdef XHN_REBUILD_RC
+        // [xhn:rebuild-rc]
+        _bitmap_unique->clear_range(mr);
+        _bitmap_shared->clear_range(mr);
+#endif // XHN_REBUILD_RC
 
         cur += chunk_size_in_words;
 
@@ -918,6 +953,7 @@ uint G1ConcurrentMark::calc_active_marking_workers() {
   return result;
 }
 
+// [xhn:rebuild-rc] ConcMark will scan each root region here
 void G1ConcurrentMark::scan_root_region(const MemRegion* region, uint worker_id) {
 #ifdef ASSERT
   HeapWord* last = region->last();
@@ -1824,6 +1860,10 @@ void G1ConcurrentMark::flush_all_task_caches() {
 void G1ConcurrentMark::clear_bitmap_for_region(HeapRegion* hr) {
   assert_at_safepoint();
   _mark_bitmap.clear_range(MemRegion(hr->bottom(), hr->end()));
+#ifdef XHN_REBUILD_RC
+  _unique_ref_bitmap.clear_range(MemRegion(hr->bottom(), hr->end()));
+  _shared_ref_bitmap.clear_range(MemRegion(hr->bottom(), hr->end()));
+#endif // XHN_REBUILD_RC
 }
 
 HeapRegion* G1ConcurrentMark::claim_region(uint worker_id) {
@@ -2045,6 +2085,15 @@ void G1ConcurrentMark::threads_do(ThreadClosure* tc) const {
 void G1ConcurrentMark::print_on_error(outputStream* st) const {
   st->print_cr("Marking Bits: (CMBitMap*) " PTR_FORMAT, p2i(mark_bitmap()));
   _mark_bitmap.print_on_error(st, " Bits: ");
+
+#ifdef XHN_REBUILD_RC
+  // [xhn:rebuild-rc]
+  st->print_cr("UniqueRef Bits: (CMBitMap*) " PTR_FORMAT, p2i(unique_ref_bitmap()));
+  _unique_ref_bitmap.print_on_error(st, " Bits: ");
+
+  st->print_cr("SharedRef Bits: (CMBitMap*) " PTR_FORMAT, p2i(shared_ref_bitmap()));
+  _shared_ref_bitmap.print_on_error(st, " Bits: ");
+#endif // XHN_REBUILD_RC
 }
 
 static ReferenceProcessor* get_cm_oop_closure_ref_processor(G1CollectedHeap* g1h) {
@@ -2431,6 +2480,7 @@ bool G1ConcurrentMark::try_stealing(uint worker_id, G1TaskQueueEntry& task_entry
       visited by a task in the future, or whether it needs to be also
       pushed on a stack).
 
+      // [xhn:rebuild-rc] How to put task back to an IO-waiting Queue!
       (2) Local Queue. The local queue of the task which is accessed
       reasonably efficiently by the task. Other tasks can steal from
       it when they run out of work. Throughout the marking phase, a
@@ -2450,6 +2500,7 @@ bool G1ConcurrentMark::try_stealing(uint worker_id, G1TaskQueueEntry& task_entry
       popping by other tasks. Only when there is no more work, tasks
       will totally drain the global mark stack.
 
+      // [xhn:rebuild-rc] remember that new objs allocated in SATB section is considered root unconditionally.
       (4) SATB Buffer Queue. This is where completed SATB buffers are
       made available. Buffers are regularly removed from this queue
       and scanned for roots, so that the queue doesn't get too
@@ -2552,6 +2603,7 @@ void G1CMTask::do_marking_step(double time_target_ms,
   // eventually called from this method, so it is OK to allocate these
   // statically.
   G1CMBitMapClosure bitmap_closure(this, _cm);
+  // [xhn:rebuild-rc] this cm_oop_closure is key
   G1CMOopClosure cm_oop_closure(_g1h, this);
   set_cm_oop_closure(&cm_oop_closure);
 
