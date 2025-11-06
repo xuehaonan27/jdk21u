@@ -288,6 +288,31 @@ oop oopDesc::forward_to_atomic(oop p, markWord compare, atomic_memory_order orde
   }
 }
 
+#ifdef XHN_EVAC_RC
+oop oopDesc::forward_to_atomic_old(oop p, markWord compare, atomic_memory_order order) {
+  markWord tmp = markWord::encode_pointer_as_mark(p);
+  markWord m = tmp.set_rc(compare.rc());
+  assert(m.decode_pointer() == p, "encoding must be reversible");
+  markWord old_mark = cas_set_mark(m, compare, order);
+  if (old_mark == compare) {
+    return nullptr;
+  } else {
+    return cast_to_oop(old_mark.decode_pointer());
+  }
+}
+
+void oopDesc::incr_rc_atomic(atomic_memory_order order) {
+  while (true) {
+    markWord old_mark = mark();
+    markWord incred_mark = old_mark.incr_rc();
+    markWord current_mark = cas_set_mark(incred_mark, old_mark, order);
+    if (current_mark == old_mark) {
+      return;
+    } // else try once again
+  }
+}
+#endif // XHN_EVAC_RC
+
 // Note that the forwardee is not the same thing as the displaced_mark.
 // The forwardee is used when copying during scavenge and mark-sweep.
 // It does need to clear the low two locking- and GC-related bits.

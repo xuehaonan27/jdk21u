@@ -221,14 +221,17 @@ bool CollectedHeap::supports_concurrent_gc_breakpoints() const {
 
 bool CollectedHeap::is_oop(oop object) const {
   if (!is_object_aligned(object)) {
+    printf("[xhn:evac-rc] object not aligned: %p\n", (void *)object);
     return false;
   }
 
   if (!is_in(object)) {
+    printf("[xhn:evac-rc] object not in heap: %p\n", (void *)object);
     return false;
   }
 
   if (!Metaspace::contains(object->klass_raw())) {
+    printf("[xhn:evac-rc] metaspace no contains object klass raw: %p\n", object->klass_raw());
     return false;
   }
 

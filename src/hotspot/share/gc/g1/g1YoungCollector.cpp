@@ -218,6 +218,12 @@ G1ScannerTasksQueueSet* G1YoungCollector::task_queues() const {
   return _g1h->task_queues();
 }
 
+#ifdef XHN_EVAC_RC
+G1ScannerTasksQueueSet* G1YoungCollector::old_task_queues() const {
+  return _g1h->old_task_queues();
+}
+#endif // XHN_EVAC_RC
+
 G1SurvivorRegions* G1YoungCollector::survivor_regions() const {
   return _g1h->survivor();
 }
@@ -565,6 +571,20 @@ public:
     } while (!offer_termination());
   }
 
+#ifdef XHN_EVAC_RC
+  void old_do_void() {
+    EventGCPhaseParallel event;
+    G1ParScanThreadState* const pss = par_scan_state();
+    pss->trim_old_queue();
+    event.commit(GCId::current(), pss->worker_id(), G1GCPhaseTimes::phase_name(_phase));
+    do {
+      EventGCPhaseParallel event;
+      pss->steal_and_trim_old_queue(queues());
+      event.commit(GCId::current(), pss->worker_id(), G1GCPhaseTimes::phase_name(_phase));
+    } while (!offer_termination());
+  }
+#endif // XHN_EVAC_RC
+
   double term_time() const { return _term_time; }
   size_t term_attempts() const { return _term_attempts; }
 };
@@ -576,6 +596,11 @@ protected:
 
   G1ScannerTasksQueueSet* _task_queues;
   TaskTerminator _terminator;
+
+#ifdef XHN_EVAC_RC
+  G1ScannerTasksQueueSet* _old_task_queues;
+  TaskTerminator _old_terminator;
+#endif // XHN_EVAC_RC
 
   uint _num_workers;
 
@@ -590,6 +615,15 @@ protected:
     cl.do_void();
 
     assert(pss->queue_is_empty(), "should be empty");
+
+#ifdef XHN_EVAC_RC
+    log_info(gc,task)("[xhn:evac-rc] entering old iteration");
+    G1ParEvacuateFollowersClosure cl_old(_g1h, pss, _old_task_queues, &_old_terminator, objcopy_phase);
+    cl_old.old_do_void();
+
+    assert(pss->queue_is_empty(), "should be empty");
+    assert(pss->old_queue_is_empty(), "old queue should be empty");
+#endif // XHN_EVAC_RC
 
     Tickspan evac_time = (Ticks::now() - start);
     p->record_or_add_time_secs(objcopy_phase, worker_id, evac_time.seconds() - cl.term_time());
@@ -618,12 +652,19 @@ public:
   G1EvacuateRegionsBaseTask(const char* name,
                             G1ParScanThreadStateSet* per_thread_states,
                             G1ScannerTasksQueueSet* task_queues,
+#ifdef XHN_EVAC_RC
+                            G1ScannerTasksQueueSet* old_task_queues,
+#endif // XHN_EVAC_RC
                             uint num_workers) :
     WorkerTask(name),
     _g1h(G1CollectedHeap::heap()),
     _per_thread_states(per_thread_states),
     _task_queues(task_queues),
     _terminator(num_workers, _task_queues),
+#ifdef XHN_EVAC_RC
+    _old_task_queues(old_task_queues),
+    _old_terminator(num_workers, _old_task_queues),
+#endif // XHN_EVAC_RC
     _num_workers(num_workers)
   { }
 
@@ -693,10 +734,17 @@ public:
   G1EvacuateRegionsTask(G1CollectedHeap* g1h,
                         G1ParScanThreadStateSet* per_thread_states,
                         G1ScannerTasksQueueSet* task_queues,
+#ifdef XHN_EVAC_RC
+                        G1ScannerTasksQueueSet* old_task_queues,
+#endif // XHN_EVAC_RC
                         G1RootProcessor* root_processor,
                         uint num_workers,
                         bool has_optional_evacuation_work) :
+#ifdef XHN_EVAC_RC
+    G1EvacuateRegionsBaseTask("G1 Evacuate Regions", per_thread_states, task_queues, old_task_queues, num_workers),
+#else
     G1EvacuateRegionsBaseTask("G1 Evacuate Regions", per_thread_states, task_queues, num_workers),
+#endif // XHN_EVAC_RC
     _root_processor(root_processor),
     _has_optional_evacuation_work(has_optional_evacuation_work)
   { }
@@ -721,6 +769,9 @@ void G1YoungCollector::evacuate_initial_collection_set(G1ParScanThreadStateSet* 
     G1EvacuateRegionsTask g1_par_task(_g1h,
                                       per_thread_states,
                                       task_queues(),
+#ifdef XHN_EVAC_RC
+                                      old_task_queues(),
+#endif // XHN_EVAC_RC
                                       &root_processor,
                                       num_workers,
                                       has_optional_evacuation_work);
@@ -754,8 +805,15 @@ class G1EvacuateOptionalRegionsTask : public G1EvacuateRegionsBaseTask {
 public:
   G1EvacuateOptionalRegionsTask(G1ParScanThreadStateSet* per_thread_states,
                                 G1ScannerTasksQueueSet* queues,
+#ifdef XHN_EVAC_RC
+                                G1ScannerTasksQueueSet* old_queues,
+#endif // XHN_EVAC_RC
                                 uint num_workers) :
+#ifdef XHN_EVAC_RC
+    G1EvacuateRegionsBaseTask("G1 Evacuate Optional Regions", per_thread_states, queues, old_queues, num_workers) {
+#else
     G1EvacuateRegionsBaseTask("G1 Evacuate Optional Regions", per_thread_states, queues, num_workers) {
+#endif // XHN_EVAC_RC
   }
 };
 
@@ -768,7 +826,11 @@ void G1YoungCollector::evacuate_next_optional_regions(G1ParScanThreadStateSet* p
   Ticks start_processing = Ticks::now();
   {
     G1MarkScope code_mark_scope;
+#ifdef XHN_EVAC_RC
+    G1EvacuateOptionalRegionsTask task(per_thread_states, task_queues(), old_task_queues(), workers()->active_workers());
+#else
     G1EvacuateOptionalRegionsTask task(per_thread_states, task_queues(), workers()->active_workers());
+#endif // XHN_EVAC_RC
     task_time = run_task_timed(&task);
     // See comment in evacuate_initial_collection_set() for the reason of the scope.
   }

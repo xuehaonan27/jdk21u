@@ -51,6 +51,11 @@ protected:
   template <class T>
   inline void prefetch_and_push(T* p, oop const obj);
 
+#ifdef XHN_EVAC_RC
+  template <class T>
+  inline void prefetch_and_push_old(T* p, oop const obj);
+#endif // XHN_EVAC_RC
+
   template <class T>
   inline void handle_non_cset_obj_common(G1HeapRegionAttr const region_attr, T* p, oop const obj);
 public:

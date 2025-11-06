@@ -268,6 +268,12 @@ class oopDesc {
   // value of the forwarding pointer returned and does not modify "this".
   inline oop forward_to_atomic(oop p, markWord compare, atomic_memory_order order = memory_order_conservative);
 
+#ifdef XHN_EVAC_RC
+  inline oop forward_to_atomic_old(oop p, markWord compare, atomic_memory_order order = memory_order_conservative);
+  // Atomically increment RC by 1, but every thread calling this should succeed incrementing the RC field.
+  inline void incr_rc_atomic(atomic_memory_order order);
+#endif // XHN_EVAC_RC
+
   inline oop forwardee() const;
 
   // Age of object during scavenge

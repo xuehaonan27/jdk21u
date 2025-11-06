@@ -803,6 +803,11 @@ public:
   // The parallel task queues
   G1ScannerTasksQueueSet *_task_queues;
 
+#ifdef XHN_EVAC_RC
+  // The parallel old task queues
+  G1ScannerTasksQueueSet *_old_task_queues;
+#endif // XHN_EVAC_RC
+
   // ("Weak") Reference processing support.
   //
   // G1 has 2 instances of the reference processor class.
@@ -866,6 +871,11 @@ public:
 
   G1ScannerTasksQueueSet* task_queues() const;
   G1ScannerTasksQueue* task_queue(uint i) const;
+
+#ifdef XHN_EVAC_RC
+  G1ScannerTasksQueueSet* old_task_queues() const;
+  G1ScannerTasksQueue* old_task_queue(uint i) const;
+#endif // XHN_EVAC_RC
 
   // Create a G1CollectedHeap.
   // Must call the initialize method afterwards.

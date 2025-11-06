@@ -54,6 +54,9 @@ class outputStream;
 class G1ParScanThreadState : public CHeapObj<mtGC> {
   G1CollectedHeap* _g1h;
   G1ScannerTasksQueue* _task_queue;
+#ifdef XHN_EVAC_RC
+  G1ScannerTasksQueue* _old_task_queue;
+#endif // XHN_EVAC_RC
   G1RedirtyCardsLocalQueueSet _rdc_local_qset;
   G1CardTable* _ct;
   G1EvacuationRootClosures* _closures;
@@ -64,6 +67,9 @@ class G1ParScanThreadState : public CHeapObj<mtGC> {
   // Local tenuring threshold.
   uint _tenuring_threshold;
   G1ScanEvacuatedObjClosure _scanner;
+#ifdef XHN_EVAC_RC
+  G1ScanEvacuatedObjClosure _old_scanner;
+#endif // XHN_EVAC_RC
 
   uint _worker_id;
 
@@ -126,6 +132,9 @@ public:
 
 #ifdef ASSERT
   bool queue_is_empty() const { return _task_queue->is_empty(); }
+#ifdef XHN_EVAC_RC
+  bool old_queue_is_empty() const { return _old_task_queue->is_empty(); }
+#endif // XHN_EVAC_RC
 #endif
 
   void verify_task(narrowOop* task) const NOT_DEBUG_RETURN;
@@ -134,6 +143,9 @@ public:
   void verify_task(ScannerTask task) const NOT_DEBUG_RETURN;
 
   void push_on_queue(ScannerTask task);
+#ifdef XHN_EVAC_RC
+  void push_on_old_queue(ScannerTask task);
+#endif // XHN_EVAC_RC
 
   // Apply the post barrier to the given reference field. Enqueues the card of p
   // if the barrier does not filter out the reference for some reason (e.g.
@@ -181,6 +193,15 @@ private:
   template <class T> void do_oop_evac(T* p);
 
   void dispatch_task(ScannerTask task);
+#ifdef XHN_EVAC_RC
+  template <class T> void do_old_oop_evac(T* p);
+  void do_old_partial_array(PartialArrayScanTask task);
+  void start_old_partial_objarray(G1HeapRegionAttr dest_dir, oop from, oop to);
+  void dispatch_old_task(ScannerTask task);
+  oop do_copy_to_old_space(G1HeapRegionAttr region_attr,
+                           oop obj,
+                           markWord old_mark);
+#endif // XHN_EVAC_RC
 
   // Tries to allocate word_sz in the PLAB of the next "generation" after trying to
   // allocate into dest. Previous_plab_refill_failed indicates whether previous
@@ -203,6 +224,12 @@ private:
 
   inline bool needs_partial_trimming() const;
 
+#ifdef XHN_EVAC_RC
+  void trim_old_queue_to_threshold(uint threshold);
+
+  inline bool old_needs_partial_trimming() const;
+#endif // XHN_EVAC_RC
+
   // NUMA statistics related methods.
   void initialize_numa_stats();
   void flush_numa_stats();
@@ -215,11 +242,20 @@ public:
   inline void trim_queue_partially();
   void steal_and_trim_queue(G1ScannerTasksQueueSet *task_queues);
 
+#ifdef XHN_EVAC_RC
+  inline void trim_old_queue();
+  inline void trim_old_queue_partially();
+  void steal_and_trim_old_queue(G1ScannerTasksQueueSet *old_task_queues);
+#endif // XHN_EVAC_RC
+
   Tickspan trim_ticks() const;
   void reset_trim_ticks();
 
   // An attempt to evacuate "obj" has failed; take necessary steps.
   oop handle_evacuation_failure_par(oop obj, markWord m, size_t word_sz);
+#ifdef XHN_EVAC_RC
+  oop handle_evacuation_failure_par_old(oop old, markWord m, size_t word_sz);
+#endif // XHN_EVAC_RC
 
   template <typename T>
   inline void remember_root_into_optional_region(T* p);

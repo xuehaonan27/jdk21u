@@ -64,6 +64,29 @@ inline void G1ScanClosureBase::prefetch_and_push(T* p, const oop obj) {
   _par_scan_state->push_on_queue(ScannerTask(p));
 }
 
+#ifdef XHN_EVAC_RC
+template <class T>
+inline void G1ScanClosureBase::prefetch_and_push_old(T* p, const oop obj) {
+  // We're not going to even bother checking whether the object is
+  // already forwarded or not, as this usually causes an immediate
+  // stall. We'll try to prefetch the object (for write, given that
+  // we might need to install the forwarding reference) and we'll
+  // get back to it when pop it from the queue
+  Prefetch::write(obj->mark_addr(), 0);
+  Prefetch::read(obj->mark_addr(), (HeapWordSize*2));
+
+  // slightly paranoid test; I'm trying to catch potential
+  // problems before we go into push_on_queue to know where the
+  // problem is coming from
+  assert((obj == RawAccess<>::oop_load(p)) ||
+         (obj->is_forwarded() &&
+         obj->forwardee() == RawAccess<>::oop_load(p)),
+         "p should still be pointing to obj or to its forwardee");
+
+  _par_scan_state->push_on_old_queue(ScannerTask(p));
+}
+#endif // XHN_EVAC_RC
+
 template <class T>
 inline void G1ScanClosureBase::handle_non_cset_obj_common(G1HeapRegionAttr const region_attr, T* p, oop const obj) {
   if (region_attr.is_humongous_candidate()) {
@@ -89,6 +112,17 @@ inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
   oop obj = CompressedOops::decode_not_null(heap_oop);
   const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
   if (region_attr.is_in_cset()) {
+#ifdef XHN_EVAC_RC
+    // For FirstIteration, an object that's to be copied to old regions is set with RC = 1
+    // So when there's no RC, it must should be:
+    // 1. To be copied to old regions object, but hasn't gone through FirstIteration yet.
+    // 2. To be copied to survivor regions object
+    // In both the cases the task should be added to normal task queue.
+    // For OldIteration, all objects we meet should with a RC field
+    if (obj->mark().rc() != 0) {
+      prefetch_and_push_old(p, obj);
+    } else
+#endif // XHN_EVAC_RC 
     prefetch_and_push(p, obj);
   } else if (!HeapRegion::is_in_same_region(p, obj)) {
     handle_non_cset_obj_common(region_attr, p, obj);
