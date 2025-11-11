@@ -75,6 +75,9 @@ class G1YoungCollector {
   G1Policy* policy() const;
   G1RemSet* rem_set() const;
   G1ScannerTasksQueueSet* task_queues() const;
+#ifdef XHN_EVAC_RC
+  G1ScannerTasksQueueSet* old_task_queues() const;
+#endif // XHN_EVAC_RC
   G1SurvivorRegions* survivor_regions() const;
   ReferenceProcessor* ref_processor_stw() const;
   WorkerThreads* workers() const;

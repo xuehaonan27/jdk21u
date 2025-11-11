@@ -530,9 +530,13 @@ protected:
   bool is_subclass_of(const Klass* k) const;
   // subtype check: true if is_subclass_of, or if k is interface and receiver implements it
   bool is_subtype_of(Klass* k) const {
+    // printf("[xhn:evac-rc] calling super_check_offset\n");
     juint    off = k->super_check_offset();
+    // printf("[xhn:evac-rc] this=%p off=%d deref=%p\n", (address)this, off, (address)this + off);
     Klass* sup = *(Klass**)( (address)this + off );
+    // printf("[xhn:evac-rc] sup = %p\n", sup);
     const juint secondary_offset = in_bytes(secondary_super_cache_offset());
+    // printf("[xhn:evac-rc] called secondary_super_cache_offset\n");
     if (sup == k) {
       return true;
     } else if (off != secondary_offset) {

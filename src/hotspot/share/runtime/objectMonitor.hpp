@@ -240,6 +240,9 @@ private:
   markWord           header() const;
   volatile markWord* header_addr();
   void               set_header(markWord hdr);
+#ifdef XHN_EVAC_RC
+  markWord           cas_set_header(markWord new_hdr, markWord old_hdr, atomic_memory_order order);
+#endif // XHN_EVAC_RC
 
   bool is_busy() const {
     // TODO-FIXME: assert _owner == null implies _recursions = 0

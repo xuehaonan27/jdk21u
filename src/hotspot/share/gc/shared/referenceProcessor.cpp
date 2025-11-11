@@ -179,6 +179,7 @@ void ReferenceProcessor::verify_total_count_zero(DiscoveredList lists[], const c
 }
 #endif
 
+// [xhn:evac-rc] References processed here
 ReferenceProcessorStats ReferenceProcessor::process_discovered_references(RefProcProxyTask& proxy_task,
                                                                           ReferenceProcessorPhaseTimes& phase_times) {
 
@@ -493,7 +494,12 @@ public:
                BoolObjectClosure* is_alive,
                OopClosure* keep_alive,
                EnqueueDiscoveredFieldClosure* enqueue,
+#ifdef XHN_EVAC_RC
+               VoidClosure* complete_gc,
+               VoidClosure* old_complete_gc) override {
+#else
                VoidClosure* complete_gc) override {
+#endif // XHN_EVAC_RC
     RefProcWorkerTimeTracker t(_phase_times->soft_weak_final_refs_phase_worker_time_sec(), tracker_id(worker_id));
 
     process_discovered_list(worker_id, REF_SOFT, is_alive, keep_alive, enqueue);
@@ -505,6 +511,9 @@ public:
     // Close the reachable set; needed for collectors which keep_alive_closure do
     // not immediately complete their work.
     complete_gc->do_void();
+#ifdef XHN_EVAC_RC
+    // old_complete_gc->old_do_void();
+#endif // XHN_EVAC_RC
   }
 };
 
@@ -519,11 +528,19 @@ public:
                BoolObjectClosure* is_alive,
                OopClosure* keep_alive,
                EnqueueDiscoveredFieldClosure* enqueue,
+#ifdef XHN_EVAC_RC
+               VoidClosure* complete_gc,
+               VoidClosure* old_complete_gc) override {
+#else
                VoidClosure* complete_gc) override {
+#endif // XHN_EVAC_RC
     RefProcSubPhasesWorkerTimeTracker tt(ReferenceProcessor::KeepAliveFinalRefsSubPhase, _phase_times, tracker_id(worker_id));
     _ref_processor.process_final_keep_alive_work(_ref_processor._discoveredFinalRefs[worker_id], keep_alive, enqueue);
     // Close the reachable set
     complete_gc->do_void();
+#ifdef XHN_EVAC_RC
+    // old_complete_gc->old_do_void();
+#endif // XHN_EVAC_RC
   }
 };
 
@@ -538,12 +555,20 @@ public:
                BoolObjectClosure* is_alive,
                OopClosure* keep_alive,
                EnqueueDiscoveredFieldClosure* enqueue,
+#ifdef XHN_EVAC_RC
+               VoidClosure* complete_gc,
+               VoidClosure* old_complete_gc) override {
+#else
                VoidClosure* complete_gc) override {
+#endif // XHN_EVAC_RC
     process_discovered_list(worker_id, REF_PHANTOM, is_alive, keep_alive, enqueue);
 
     // Close the reachable set; needed for collectors which keep_alive_closure do
     // not immediately complete their work.
     complete_gc->do_void();
+#ifdef XHN_EVAC_RC
+    // old_complete_gc->old_do_void();
+#endif // XHN_EVAC_RC
   }
 };
 

@@ -309,6 +309,9 @@ class MonitorClosure : public StackObj {
 class VoidClosure : public StackObj {
  public:
   virtual void do_void() = 0;
+#ifdef XHN_EVAC_RC
+  // void old_do_void() {}
+#endif // XHN_EVAC_RC
 };
 
 

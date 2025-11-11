@@ -34,6 +34,7 @@
 #include "oops/compressedOops.inline.hpp"
 #include "oops/oop.inline.hpp"
 
+// [xhn:evac-rc] for each ref p in methods
 template <typename T>
 void G1CodeBlobClosure::HeapRegionGatheringOopClosure::do_oop_work(T* p) {
   _work->do_oop(p);

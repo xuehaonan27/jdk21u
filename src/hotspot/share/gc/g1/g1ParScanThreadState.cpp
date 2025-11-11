@@ -63,6 +63,9 @@ G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
                                            G1EvacFailureRegions* evac_failure_regions)
   : _g1h(g1h),
     _task_queue(g1h->task_queue(worker_id)),
+#ifdef XHN_EVAC_RC
+    _old_task_queue(g1h->old_task_queue(worker_id)),
+#endif // XHN_EVAC_RC
     _rdc_local_qset(rdcqs),
     _ct(g1h->card_table()),
     _closures(nullptr),
@@ -70,6 +73,9 @@ G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
     _age_table(false),
     _tenuring_threshold(g1h->policy()->tenuring_threshold()),
     _scanner(g1h, this),
+#ifdef XHN_EVAC_RC
+    _old_scanner(g1h, this),
+#endif // XHN_EVAC_RC
     _worker_id(worker_id),
     _last_enqueued_card(SIZE_MAX),
     _stack_trim_upper_threshold(GCDrainStackTargetSize * 2 + 1),
@@ -190,6 +196,10 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   // Reference should not be null here as such are never pushed to the task queue.
   oop obj = RawAccess<IS_NOT_NULL>::oop_load(p);
 
+#ifdef XHN_EVAC_RC
+  // printf("[xhn:evac-rc] FI do_oop_evac p=%p obj=%p\n", p, cast_from_oop<void *>(obj));
+#endif // XHN_EVAC_RC
+
   // Although we never intentionally push references outside of the collection
   // set, due to (benign) races in the claim mechanism during RSet scanning more
   // than one thread might claim the same card. So the same card may be
@@ -211,11 +221,54 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
 
   // [xhn:evac-rc] decide how this should be evacuated according to its EVAC-RC
   markWord m = obj->mark();
+#ifdef XHN_EVAC_RC
+  // XHN_TODO: jump old object processing
+  uint dummy_age = 0;
+  G1HeapRegionAttr dest_attr = next_region_attr(region_attr, m, dummy_age);
+  if (!dest_attr.is_young()) {
+    // To be copied to old region
+    if (!m.is_marked()) {
+      // Object not marked
+      // Atomically add RC field by 1
+      // XHN_TODO: enable this
+      obj->incr_rc_atomic(memory_order_relaxed);
+      // [xhn:evac-rc] push the _POINTER_ (I'm not saying object here) to old task queue,
+      // [xhn:evac-rc] regardless of whether it is already FI marked or not. Because `p`
+      // [xhn:evac-rc] needs update (oop store) anyway.
+      push_on_old_queue(ScannerTask(p));
+
+      // XHN_TODO: go over old objects here?
+
+      if (!m.fi_marked() && obj->set_fi_marked_atomic(memory_order_relaxed)) {
+        // [xhn:evac-rc] this worker successfully set the object as FI marked
+        Klass* klass = obj->klass();
+        assert(dest_attr.is_young() == _g1h->heap_region_containing(obj)->is_survivor(), "must be");
+        // G1OldIterationSkipCardEnqueueSetter x(&_old_scanner, dest_attr.is_young());
+        // obj->oop_iterate_backwards(&_old_scanner, klass);
+        G1SkipCardEnqueueSetter x(&_scanner, dest_attr.is_young());
+        obj->oop_iterate_backwards(&_scanner, klass);
+      }
+      return;
+    } else {
+      if (obj->rc() != 0) {
+        fatal("[xhn:evac-rc] p=%p obj=%p rc=%d root old objs should have RC=0\n", p, cast_from_oop<void*>(obj), obj->rc());
+      }
+    }
+  }
+#endif // XHN_EVAC_RC
+
   if (m.is_marked()) {
     obj = cast_to_oop(m.decode_pointer());
   } else {
     obj = do_copy_to_survivor_space(region_attr, obj, m);
   }
+
+#ifdef XHN_EVAC_RC
+  if (!Universe::is_in_heap((void *)obj)) {
+    printf("[xhn:evac-rc] obj not in heap: %p old mark=%lx new mark=%lx\n", (void *)obj, m.value(), obj->mark().value());
+  }
+#endif // XHN_EVAC_RC
+
   // [xhn:evac-rc] maybe changes to `UniqueAccess` or `SharedAccess` here
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);
 
@@ -225,6 +278,10 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
 MAYBE_INLINE_EVACUATION
 void G1ParScanThreadState::do_partial_array(PartialArrayScanTask task) {
   oop from_obj = task.to_source_array();
+
+#ifdef XHN_EVAC_RC
+  // printf("[xhn:evac-rc] FI do_partial_array obj=%p\n", cast_from_oop<void *>(from_obj));
+#endif // XHN_EVAC_RC
 
   assert(_g1h->is_in_reserved(from_obj), "must be in heap.");
   assert(from_obj->is_objArray(), "must be obj array");
@@ -264,6 +321,10 @@ void G1ParScanThreadState::start_partial_objarray(G1HeapRegionAttr dest_attr,
   assert(to_obj->is_objArray(), "precondition");
 
   objArrayOop to_array = objArrayOop(to_obj);
+
+#ifdef XHN_EVAC_RC
+  // printf("[xhn:evac-rc] FI start_partial_objarray from_obj=%p to_obj=%p\n", cast_from_oop<void *>(from_obj), cast_from_oop<void *>(to_obj));
+#endif // XHN_EVAC_RC
 
   PartialArrayTaskStepper::Step step
     = _partial_array_stepper.start(objArrayOop(from_obj),
@@ -329,6 +390,312 @@ void G1ParScanThreadState::steal_and_trim_queue(G1ScannerTasksQueueSet* task_que
   }
 }
 
+#ifdef XHN_EVAC_RC
+
+MAYBE_INLINE_EVACUATION
+void G1ParScanThreadState::dispatch_old_task(ScannerTask task) {
+  verify_task(task);
+  if (task.is_narrow_oop_ptr()) {
+    do_old_oop_evac(task.to_narrow_oop_ptr());
+  } else if (task.is_oop_ptr()) {
+    do_old_oop_evac(task.to_oop_ptr());
+  } else {
+    do_old_partial_array(task.to_partial_array_task());
+  }
+}
+
+// Process tasks until overflow queue is empty and local queue
+// contains no more than threshold entries.  NOINLINE to prevent
+// inlining into steal_and_trim_queue.
+ATTRIBUTE_FLATTEN NOINLINE
+void G1ParScanThreadState::trim_old_queue_to_threshold(uint threshold) {
+  ScannerTask task;
+  do {
+    while (_old_task_queue->pop_overflow(task)) {
+      if (!_old_task_queue->try_push_to_taskqueue(task)) {
+        dispatch_old_task(task);
+      }
+    }
+    while (_old_task_queue->pop_local(task, threshold)) {
+      dispatch_old_task(task);
+    }
+  } while ( !_old_task_queue->overflow_empty() );
+}
+
+ATTRIBUTE_FLATTEN
+void G1ParScanThreadState::steal_and_trim_old_queue(G1ScannerTasksQueueSet* old_task_queues) {
+  ScannerTask stolen_task;
+  while (old_task_queues->steal(_worker_id, stolen_task)) {
+    dispatch_old_task(stolen_task);
+    // Processing stolen task may have added tasks to our queue.
+    trim_old_queue();
+  }
+}
+
+template <class T>
+MAYBE_INLINE_EVACUATION
+void G1ParScanThreadState::do_old_oop_evac(T* p) {
+  // Reference should not be null here as such are never pushed to the task queue.
+  oop obj = RawAccess<IS_NOT_NULL>::oop_load(p);
+
+#ifdef XHN_EVAC_RC
+  // printf("[xhn:evac-rc] OI do_old_oop_evac p=%p obj=%p\n", p, cast_from_oop<void*>(obj));
+#endif // XHN_EVAC_RC
+
+  // Although we never intentionally push references outside of the collection
+  // set, due to (benign) races in the claim mechanism during RSet scanning more
+  // than one thread might claim the same card. So the same card may be
+  // processed multiple times, and so we might get references into old gen here.
+  // So we need to redo this check.
+  const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
+  // References pushed onto the work stack should never point to a humongous region
+  // as they are not added to the collection set due to above precondition.
+  assert(!region_attr.is_humongous_candidate(),
+         "Obj " PTR_FORMAT " should not refer to humongous region %u from " PTR_FORMAT,
+         p2i(obj), _g1h->addr_to_region(obj), p2i(p));
+
+  // [xhn:evac-rc] if the region is not in cset, then somebody must have done scanning this obj,
+  // [xhn:evac-rc] then in this case must assert that RC is >= 1
+  if (!region_attr.is_in_cset()) {
+    // In this case somebody else already did all the work.
+    return;
+  }
+
+  // [xhn:evac-rc] m is with RC field here
+  markWord m = obj->mark();
+
+  // [xhn:evac-rc] check m is FI marked and clear it
+  if (!m.fi_marked()) {
+    fatal("[xhn:evac-rc] not FI marked p=%p obj=%p\n", p, cast_from_oop<void*>(obj));
+  }
+  m.clear_fi_marked();
+
+  if (m.is_marked()) {
+    obj = cast_to_oop(m.decode_pointer());
+  } else {
+    // [xhn:evac-rc] object will be marked here
+    // [xhn:evac-rc] markWord m is with RC field here, but will be cleared in do_copy_to_old_space
+    obj = do_copy_to_old_space(region_attr, obj, m);
+  }
+
+#ifdef XHN_EVAC_RC
+  if (!Universe::is_in_heap(cast_from_oop<void *>(obj))) {
+    printf("[xhn:evac-rc] obj not in heap: %p old mark=%lx new mark=%lx\n", (void *)obj, m.value(), obj->mark().value());
+  }
+#endif // XHN_EVAC_RC
+
+  RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+
+  write_ref_field_post(p, obj);
+}
+
+
+MAYBE_INLINE_EVACUATION
+void G1ParScanThreadState::do_old_partial_array(PartialArrayScanTask task) {
+  oop from_obj = task.to_source_array();
+
+#ifdef XHN_EVAC_RC
+  // printf("[xhn:evac-rc] OI do_old_partial_array obj=%p\n", cast_from_oop<void *>(from_obj));
+#endif // XHN_EVAC_RC
+
+  assert(_g1h->is_in_reserved(from_obj), "must be in heap.");
+  assert(from_obj->is_objArray(), "must be obj array");
+  assert(from_obj->is_forwarded(), "must be forwarded");
+
+  oop to_obj = from_obj->forwardee();
+  assert(from_obj != to_obj, "should not be chunking self-forwarded objects");
+  assert(to_obj->is_objArray(), "must be obj array");
+  objArrayOop to_array = objArrayOop(to_obj);
+
+  PartialArrayTaskStepper::Step step
+    = _partial_array_stepper.next(objArrayOop(from_obj),
+                                  to_array,
+                                  _partial_objarray_chunk_size);
+  for (uint i = 0; i < step._ncreate; ++i) {
+    // Push onto old queue instead of queue
+    push_on_old_queue(ScannerTask(PartialArrayScanTask(from_obj)));
+  }
+
+  G1HeapRegionAttr dest_attr = _g1h->region_attr(to_array);
+  assert(!dest_attr.is_young(), "Should have copied duing FirstIteration");
+  G1OldIterationSkipCardEnqueueSetter x(&_old_scanner, dest_attr.is_new_survivor());
+  // Process claimed task.  The length of to_array is not correct, but
+  // fortunately the iteration ignores the length field and just relies
+  // on start/end.
+  to_array->oop_iterate_range(&_old_scanner,
+                              step._index,
+                              step._index + _partial_objarray_chunk_size);
+}
+
+MAYBE_INLINE_EVACUATION
+void G1ParScanThreadState::start_old_partial_objarray(G1HeapRegionAttr dest_attr,
+                                                  oop from_obj,
+                                                  oop to_obj) {
+  assert(from_obj->is_objArray(), "precondition");
+  assert(from_obj->is_forwarded(), "precondition");
+  assert(from_obj->forwardee() == to_obj, "precondition");
+  assert(from_obj != to_obj, "should not be scanning self-forwarded objects");
+  assert(to_obj->is_objArray(), "precondition");
+
+  objArrayOop to_array = objArrayOop(to_obj);
+
+#ifdef XHN_EVAC_RC
+  // printf("[xhn:evac-rc] OI start_old_partial_objarray from_obj=%p to_obj=%p\n", cast_from_oop<void *>(from_obj), cast_from_oop<void *>(to_obj));
+#endif // XHN_EVAC_RC
+
+  PartialArrayTaskStepper::Step step
+    = _partial_array_stepper.start(objArrayOop(from_obj),
+                                   to_array,
+                                   _partial_objarray_chunk_size);
+
+  // Push any needed partial scan tasks.  Pushed before processing the
+  // initial chunk to allow other workers to steal while we're processing.
+  for (uint i = 0; i < step._ncreate; ++i) {
+    push_on_old_queue(ScannerTask(PartialArrayScanTask(from_obj)));
+  }
+
+  // Skip the card enqueue iff the object (to_array) is in survivor region.
+  // However, HeapRegion::is_survivor() is too expensive here.
+  // Instead, we use dest_attr.is_young() because the two values are always
+  // equal: successfully allocated young regions must be survivor regions.
+  assert(dest_attr.is_young() == _g1h->heap_region_containing(to_array)->is_survivor(), "must be");
+  // XHN_TODO: because scan followers (fields) push all fields onto old queue, including possible young objects,...
+  // XHN_TODO: so assert dest_attr is young is not reasonable here.
+  // assert(!dest_attr.is_young(), "Should have copied during FirstIteration");
+  G1OldIterationSkipCardEnqueueSetter x(&_old_scanner, dest_attr.is_young());
+  // Process the initial chunk.  No need to process the type in the
+  // klass, as it will already be handled by processing the built-in
+  // module. The length of to_array is not correct, but fortunately
+  // the iteration ignores that length field and relies on start/end.
+  to_array->oop_iterate_range(&_old_scanner, 0, step._index);
+}
+
+MAYBE_INLINE_EVACUATION
+oop G1ParScanThreadState::do_copy_to_old_space(G1HeapRegionAttr const region_attr,
+                                                    oop const old,
+                                                    markWord const old_mark) {
+  // [xhn:evac-rc] note that old_mark is with RC field !
+  assert(region_attr.is_in_cset(),
+         "Unexpected region attr type: %s", region_attr.get_type_str());
+
+  // Get the klass once.  We'll need it again later, and this avoids
+  // re-decoding when it's compressed.
+  Klass* klass = old->klass();
+  const size_t word_sz = old->size_given_klass(klass);
+
+  uint age = 0;
+  G1HeapRegionAttr dest_attr = next_region_attr(region_attr, old_mark, age);
+  // XHN_TODO: because scan followers (fields) push all fields onto old queue, including possible young objects,...
+  // XHN_TODO: so assert dest_attr is young is not reasonable here.
+  // assert(!dest_attr.is_young(), "Should have been copied during FirstIteration");
+  HeapRegion* const from_region = _g1h->heap_region_containing(old);
+  uint node_index = from_region->node_index();
+
+  HeapWord* obj_ptr = _plab_allocator->plab_allocate(dest_attr, word_sz, node_index);
+
+  // PLAB allocations should succeed most of the time, so we'll
+  // normally check against null once and that's it.
+  if (obj_ptr == nullptr) {
+    obj_ptr = allocate_copy_slow(&dest_attr, old, word_sz, age, node_index);
+    if (obj_ptr == nullptr) {
+      // This will either forward-to-self, or detect that someone else has
+      // installed a forwarding pointer.
+      return handle_evacuation_failure_par_old(old, old_mark, word_sz);
+    }
+  }
+
+  assert(obj_ptr != nullptr, "when we get here, allocation should have succeeded");
+  assert(_g1h->is_in_reserved(obj_ptr), "Allocated memory should be in the heap");
+
+  // Should this evacuation fail?
+  if (inject_evacuation_failure(from_region->hrm_index())) {
+    // Doing this after all the allocation attempts also tests the
+    // undo_allocation() method too.
+    undo_allocation(dest_attr, obj_ptr, word_sz, node_index);
+    return handle_evacuation_failure_par_old(old, old_mark, word_sz);
+  }
+
+  // We're going to allocate linearly, so might as well prefetch ahead.
+  Prefetch::write(obj_ptr, PrefetchCopyIntervalInBytes);
+  Copy::aligned_disjoint_words(cast_from_oop<HeapWord*>(old), obj_ptr, word_sz);
+
+  const oop obj = cast_to_oop(obj_ptr);
+  // [xhn:evac-rc] markWord clear in obj
+  obj->clear_rc();
+
+  // Because the forwarding is done with memory_order_relaxed there is no
+  // ordering with the above copy.  Clients that get the forwardee must not
+  // examine its contents without other synchronization, since the contents
+  // may not be up to date for them.
+
+  // [xhn:evac-rc] the forwarded pointer should have a markWord with RC set
+  const oop forward_ptr = old->forward_to_atomic_old(obj, old_mark, memory_order_relaxed);
+  if (forward_ptr == nullptr) {
+
+    {
+      const uint young_index = from_region->young_index_in_cset();
+      assert((from_region->is_young() && young_index >  0) ||
+             (!from_region->is_young() && young_index == 0), "invariant" );
+      _surviving_young_words[young_index] += word_sz;
+    }
+
+    if (dest_attr.is_young()) {
+      if (age < markWord::max_age) {
+        age++;
+        obj->incr_age();
+      }
+      _age_table.add(age, word_sz);
+    } else {
+      update_bot_after_copying(obj, word_sz);
+    }
+    // Asserted to be not young region
+    // XHN_TODO: asserted to be not young region
+    // update_bot_after_copying(obj, word_sz);
+
+    // Most objects are not arrays, so do one array check rather than
+    // checking for each array category for each object.
+    if (klass->is_array_klass()) {
+      if (klass->is_objArray_klass()) {
+        start_old_partial_objarray(dest_attr, old, obj);
+      } else {
+        // Nothing needs to be done for typeArrays.  Body doesn't contain
+        // any oops to scan, and the type in the klass will already be handled
+        // by processing the built-in module.
+        assert(klass->is_typeArray_klass(), "invariant");
+      }
+      return obj;
+    }
+
+    ContinuationGCSupport::transform_stack_chunk(obj);
+
+    // Check for deduplicating young Strings.
+    if (G1StringDedup::is_candidate_from_evacuation(klass,
+                                                    region_attr,
+                                                    dest_attr,
+                                                    age)) {
+      // Record old; request adds a new weak reference, which reference
+      // processing expects to refer to a from-space object.
+      _string_dedup_requests.add(old);
+    }
+
+    // Skip the card enqueue iff the object (obj) is in survivor region.
+    // However, HeapRegion::is_survivor() is too expensive here.
+    // Instead, we use dest_attr.is_young() because the two values are always
+    // equal: successfully allocated young regions must be survivor regions.
+
+    // [xhn:evac-rc] XHN_TODO: if all scanned during first iteration then this should not be scanned!
+    // assert(dest_attr.is_young() == _g1h->heap_region_containing(obj)->is_survivor(), "must be");
+    // G1OldIterationSkipCardEnqueueSetter x(&_old_scanner, dest_attr.is_young());
+    // obj->oop_iterate_backwards(&_old_scanner, klass);
+    return obj;
+  } else {
+    _plab_allocator->undo_allocation(dest_attr, obj_ptr, word_sz, node_index);
+    return forward_ptr;
+  }
+}
+
+#endif // XHN_EVAC_RC
+
 HeapWord* G1ParScanThreadState::allocate_in_next_plab(G1HeapRegionAttr* dest,
                                                       size_t word_sz,
                                                       bool previous_plab_refill_failed,
@@ -382,6 +749,12 @@ G1HeapRegionAttr G1ParScanThreadState::next_region_attr(G1HeapRegionAttr const r
   // young-to-old (promotion) or old-to-old; destination is old in both cases.
   return G1HeapRegionAttr::Old;
 }
+
+#ifdef XHN_EVAC_RC
+G1HeapRegionAttr G1ParScanThreadState::pub_next_region_attr(G1HeapRegionAttr const region_attr, markWord const m, uint& age) {
+  return next_region_attr(region_attr, m, age);
+}
+#endif // XHN_EVAC_RC
 
 void G1ParScanThreadState::report_promotion_event(G1HeapRegionAttr const dest_attr,
                                                   oop const old, size_t word_sz, uint age,
@@ -499,6 +872,15 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
   Copy::aligned_disjoint_words(cast_from_oop<HeapWord*>(old), obj_ptr, word_sz);
 
   const oop obj = cast_to_oop(obj_ptr);
+
+#ifdef XHN_EVAC_RC
+  // assert(obj->rc() == 0, "Should not have RC here");
+  if (obj->rc() != 0 &&
+    (_evacuation_stage != EvacuationStage::RootObj && _evacuation_stage != EvacuationStage::OptRootObj && _evacuation_stage != EvacuationStage::Unknown)) {
+    fatal("[xhn:evac-rc] Should not have RC here: obj=%p mark=%lx, rc=%d stage=%d\n", cast_from_oop<void*>(obj), obj->mark().value(), obj->rc(), _evacuation_stage);
+  }
+#endif // XHN_EVAC_RC
+
   // Because the forwarding is done with memory_order_relaxed there is no
   // ordering with the above copy.  Clients that get the forwardee must not
   // examine its contents without other synchronization, since the contents
@@ -627,6 +1009,9 @@ void G1ParScanThreadStateSet::record_unused_optional_region(HeapRegion* hr) {
 
 NOINLINE
 oop G1ParScanThreadState::handle_evacuation_failure_par(oop old, markWord m, size_t word_sz) {
+#ifdef XHN_EVAC_RC
+  printf("[xhn:evac-rc]: handle_evacuation_failure_par\n");
+#endif // XHN_EVAC_RC
   assert(_g1h->is_in_cset(old), "Object " PTR_FORMAT " should be in the CSet", p2i(old));
 
   oop forward_ptr = old->forward_to_atomic(old, m, memory_order_relaxed);
@@ -670,6 +1055,56 @@ oop G1ParScanThreadState::handle_evacuation_failure_par(oop old, markWord m, siz
     return forward_ptr;
   }
 }
+
+#ifdef XHN_EVAC_RC
+NOINLINE
+oop G1ParScanThreadState::handle_evacuation_failure_par_old(oop old, markWord m, size_t word_sz) {
+  // [xhn:evac-rc] note that markWord m is with RC field
+  printf("[xhn:evac-rc]: handle_evacuation_failure_par_old\n");
+  assert(_g1h->is_in_cset(old), "Object " PTR_FORMAT " should be in the CSet", p2i(old));
+
+  oop forward_ptr = old->forward_to_atomic_old(old, m, memory_order_relaxed);
+  if (forward_ptr == nullptr) {
+    // Forward-to-self succeeded. We are the "owner" of the object.
+    HeapRegion* r = _g1h->heap_region_containing(old);
+
+    if (_evac_failure_regions->record(r->hrm_index())) {
+      _g1h->hr_printer()->evac_failure(r);
+    }
+
+    // Mark the failing object in the marking bitmap and later use the bitmap to handle
+    // evacuation failure recovery.
+    _g1h->mark_evac_failure_object(_worker_id, old, word_sz);
+
+    _preserved_marks->push_if_necessary(old, m);
+
+    ContinuationGCSupport::transform_stack_chunk(old);
+
+    _evacuation_failed_info.register_copy_failure(word_sz);
+
+    // For iterating objects that failed evacuation currently we can reuse the
+    // existing closure to scan evacuated objects because:
+    // - for objects referring into the collection set we do not need to gather
+    // cards at this time. The regions they are in will be unconditionally turned
+    // to old regions without remembered sets.
+    // - since we are iterating from a collection set region (i.e. never a Survivor
+    // region), we always need to gather cards for this case.
+    G1OldIterationSkipCardEnqueueSetter x(&_old_scanner, false /* skip_card_enqueue */);
+    old->oop_iterate_backwards(&_old_scanner);
+
+    return old;
+  } else {
+    // Forward-to-self failed. Either someone else managed to allocate
+    // space for this object (old != forward_ptr) or they beat us in
+    // self-forwarding it (old == forward_ptr).
+    assert(old == forward_ptr || !_g1h->is_in_cset(forward_ptr),
+           "Object " PTR_FORMAT " forwarded to: " PTR_FORMAT " "
+           "should not be in the CSet",
+           p2i(old), p2i(forward_ptr));
+    return forward_ptr;
+  }
+}
+#endif // XHN_EVAC_RC
 
 void G1ParScanThreadState::initialize_numa_stats() {
   if (_numa->is_enabled()) {

@@ -54,6 +54,7 @@ class oopDesc {
   friend class JVMCIVMStructs;
  private:
   volatile markWord _mark;
+  // [xhn:evac-rc] our modification somehow got these NULL?
   union _metadata {
     Klass*      _klass;
     narrowKlass _compressed_klass;
@@ -268,6 +269,20 @@ class oopDesc {
   // value of the forwarding pointer returned and does not modify "this".
   inline oop forward_to_atomic(oop p, markWord compare, atomic_memory_order order = memory_order_conservative);
 
+#ifdef XHN_EVAC_RC
+  inline oop forward_to_atomic_old(oop p, markWord compare, atomic_memory_order order = memory_order_conservative);
+  inline void clear_rc();
+  inline uint rc() const;
+  inline void incr_rc();
+  // inline void set_rc_atomic(uint rc, atomic_memory_order order);
+  // Atomically increment RC by 1, but every thread calling this should succeed incrementing the RC field.
+  inline void incr_rc_atomic(atomic_memory_order order);
+
+  // inline bool fi_marked() const;
+  inline bool set_fi_marked_atomic(atomic_memory_order order);
+  // inline void clear_fi_marked();
+#endif // XHN_EVAC_RC
+
   inline oop forwardee() const;
 
   // Age of object during scavenge
@@ -303,6 +318,9 @@ class oopDesc {
   inline bool     has_displaced_mark() const;
   inline markWord displaced_mark() const;
   inline void     set_displaced_mark(markWord m);
+#ifdef XHN_EVAC_RC
+  inline markWord cas_set_displaced_mark(markWord new_mark, markWord old_mark, atomic_memory_order order);
+#endif // XHN_EVAC_RC
 
   // Checks if the mark word needs to be preserved
   inline bool mark_must_be_preserved() const;

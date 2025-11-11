@@ -51,6 +51,11 @@ protected:
   template <class T>
   inline void prefetch_and_push(T* p, oop const obj);
 
+#ifdef XHN_EVAC_RC
+  template <class T>
+  inline void prefetch_and_push_old(T* p, oop const obj);
+#endif // XHN_EVAC_RC
+
   template <class T>
   inline void handle_non_cset_obj_common(G1HeapRegionAttr const region_attr, T* p, oop const obj);
 public:
@@ -113,6 +118,35 @@ public:
   }
 };
 
+#ifdef XHN_EVAC_RC
+class G1ScanEvacuatedToOldRegionObjClosure : public G1ScanClosureBase {
+  friend class G1OldIterationSkipCardEnqueueSetter;
+
+  enum SkipCardEnqueueTristate {
+    False = 0,
+    True,
+    Uninitialized
+  };
+
+  SkipCardEnqueueTristate _skip_card_enqueue;
+
+public:
+  G1ScanEvacuatedToOldRegionObjClosure(G1CollectedHeap* g1h, G1ParScanThreadState* par_scan_state) :
+    G1ScanClosureBase(g1h, par_scan_state), _skip_card_enqueue(Uninitialized) { }
+
+  template <class T> void do_oop_work(T* p);
+  virtual void do_oop(oop* p)          { do_oop_work(p); }
+  virtual void do_oop(narrowOop* p)    { do_oop_work(p); }
+
+  // We need to do reference discovery while processing evacuated objects.
+  virtual ReferenceIterationMode reference_iteration_mode() { return DO_DISCOVERED_AND_DISCOVERY; }
+
+  void set_ref_discoverer(ReferenceDiscoverer* rd) {
+    set_ref_discoverer_internal(rd);
+  }
+};
+#endif // XHN_EVAC_RC
+
 // RAII object to properly set the _skip_card_enqueue field in G1ScanEvacuatedObjClosure.
 class G1SkipCardEnqueueSetter : public StackObj {
   G1ScanEvacuatedObjClosure* _closure;
@@ -127,6 +161,23 @@ public:
     DEBUG_ONLY(_closure->_skip_card_enqueue = G1ScanEvacuatedObjClosure::Uninitialized;)
   }
 };
+
+#ifdef XHN_EVAC_RC
+// RAII object to properly set the _skip_card_enqueue field in G1ScanEvacuatedToOldRegionObjClosure.
+class G1OldIterationSkipCardEnqueueSetter : public StackObj {
+  G1ScanEvacuatedToOldRegionObjClosure* _closure;
+
+public:
+  G1OldIterationSkipCardEnqueueSetter(G1ScanEvacuatedToOldRegionObjClosure* closure, bool skip_card_enqueue) : _closure(closure) {
+    assert(_closure->_skip_card_enqueue == G1ScanEvacuatedToOldRegionObjClosure::Uninitialized, "Must not be set");
+    _closure->_skip_card_enqueue = skip_card_enqueue ? G1ScanEvacuatedToOldRegionObjClosure::True : G1ScanEvacuatedToOldRegionObjClosure::False;
+  }
+
+  ~G1OldIterationSkipCardEnqueueSetter() {
+    DEBUG_ONLY(_closure->_skip_card_enqueue = G1ScanEvacuatedToOldRegionObjClosure::Uninitialized;)
+  }
+};
+#endif // XHN_EVAC_RC
 
 // Add back base class for metadata
 class G1ParCopyHelper : public OopClosure {

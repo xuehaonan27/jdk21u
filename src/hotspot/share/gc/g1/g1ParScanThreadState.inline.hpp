@@ -35,6 +35,21 @@
 #include "oops/oop.inline.hpp"
 
 inline void G1ParScanThreadState::push_on_queue(ScannerTask task) {
+#ifdef XHN_EVAC_RC
+  if (_evacuation_stage == EvacuationStage::OldIteration) {
+    fatal("[xhn:evac-rc] old iteration called push_on_queue\n");
+  }
+  // if (task.is_narrow_oop_ptr()) {
+  //   narrowOop* p = task.to_narrow_oop_ptr();
+  //   printf("[xhn:evac-rc] push_on_queue narrowOop* p = %p\n", p);
+  // } else if (task.is_oop_ptr()) {
+  //   oop* p = task.to_oop_ptr();
+  //   printf("[xhn:evac-rc] push_on_queue oop* p = %p\n", p);
+  // } else {
+  //   oop src_array = task.to_partial_array_task().to_source_array();
+  //   printf("[xhn:evac-rc] push_on_queue oop src_array = %p\n", cast_from_oop<void *>(src_array));
+  // }
+#endif // XHN_EVAC_RC
   verify_task(task);
   _task_queue->push(task);
 }
@@ -61,6 +76,48 @@ void G1ParScanThreadState::trim_queue() {
   assert(_task_queue->overflow_empty(), "invariant");
   assert(_task_queue->taskqueue_empty(), "invariant");
 }
+
+#ifdef XHN_EVAC_RC
+inline void G1ParScanThreadState::push_on_old_queue(ScannerTask task) {
+  // print debug info
+  // if (task.is_narrow_oop_ptr()) {
+  //   narrowOop* p = task.to_narrow_oop_ptr();
+  //   printf("[xhn:evac-rc] push_on_old_queue narrowOop* p = %p\n", p);
+  // } else if (task.is_oop_ptr()) {
+  //   oop* p = task.to_oop_ptr();
+  //   printf("[xhn:evac-rc] push_on_old_queue oop* p = %p\n", p);
+  // } else {
+  //   oop src_array = task.to_partial_array_task().to_source_array();
+  //   printf("[xhn:evac-rc] push_on_old_queue oop src_array = %p\n", cast_from_oop<void *>(src_array));
+  // }
+
+  verify_task(task);
+  _old_task_queue->push(task);
+}
+
+bool G1ParScanThreadState::old_needs_partial_trimming() const {
+  return !_old_task_queue->overflow_empty() ||
+         (_old_task_queue->size() > _stack_trim_upper_threshold);
+}
+
+void G1ParScanThreadState::trim_old_queue_partially() {
+  if (!old_needs_partial_trimming()) {
+    return;
+  }
+
+  const Ticks start = Ticks::now();
+  trim_old_queue_to_threshold(_stack_trim_lower_threshold);
+  assert(_old_task_queue->overflow_empty(), "invariant");
+  assert(_old_task_queue->size() <= _stack_trim_lower_threshold, "invariant");
+  _trim_ticks += Ticks::now() - start;
+}
+
+void G1ParScanThreadState::trim_old_queue() {
+  trim_old_queue_to_threshold(0);
+  assert(_old_task_queue->overflow_empty(), "invariant");
+  assert(_old_task_queue->taskqueue_empty(), "invariant");
+}
+#endif // XHN_EVAC_RC
 
 inline Tickspan G1ParScanThreadState::trim_ticks() const {
   return _trim_ticks;

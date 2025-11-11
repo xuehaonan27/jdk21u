@@ -328,6 +328,9 @@ class Universe: AllStatic {
 
   DEBUG_ONLY(static bool is_stw_gc_active();)
   DEBUG_ONLY(static bool is_in_heap(const void* p);)
+#ifdef XHN_EVAC_RC
+  NOT_DEBUG(static bool is_in_heap(const void* p);)
+#endif // XHN_EVAC_RC
   DEBUG_ONLY(static bool is_in_heap_or_null(const void* p) { return p == nullptr || is_in_heap(p); })
 
   // Reserve Java heap and determine CompressedOops mode

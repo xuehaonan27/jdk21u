@@ -218,6 +218,12 @@ G1ScannerTasksQueueSet* G1YoungCollector::task_queues() const {
   return _g1h->task_queues();
 }
 
+#ifdef XHN_EVAC_RC
+G1ScannerTasksQueueSet* G1YoungCollector::old_task_queues() const {
+  return _g1h->old_task_queues();
+}
+#endif // XHN_EVAC_RC
+
 G1SurvivorRegions* G1YoungCollector::survivor_regions() const {
   return _g1h->survivor();
 }
@@ -565,6 +571,21 @@ public:
     } while (!offer_termination());
   }
 
+#ifdef XHN_EVAC_RC
+  void old_do_void() {
+    printf("[xhn:evac-rc] old_do_void\n");
+    EventGCPhaseParallel event;
+    G1ParScanThreadState* const pss = par_scan_state();
+    pss->trim_old_queue();
+    event.commit(GCId::current(), pss->worker_id(), G1GCPhaseTimes::phase_name(_phase));
+    do {
+      EventGCPhaseParallel event;
+      pss->steal_and_trim_old_queue(queues());
+      event.commit(GCId::current(), pss->worker_id(), G1GCPhaseTimes::phase_name(_phase));
+    } while (!offer_termination());
+  }
+#endif // XHN_EVAC_RC
+
   double term_time() const { return _term_time; }
   size_t term_attempts() const { return _term_attempts; }
 };
@@ -577,6 +598,11 @@ protected:
   G1ScannerTasksQueueSet* _task_queues;
   TaskTerminator _terminator;
 
+#ifdef XHN_EVAC_RC
+  G1ScannerTasksQueueSet* _old_task_queues;
+  TaskTerminator _old_terminator;
+#endif // XHN_EVAC_RC
+
   uint _num_workers;
 
   void evacuate_live_objects(G1ParScanThreadState* pss,
@@ -585,11 +611,47 @@ protected:
                              G1GCPhaseTimes::GCParPhases termination_phase) {
     G1GCPhaseTimes* p = _g1h->phase_times();
 
+#ifdef XHN_EVAC_RC
+    if (pss->_evacuation_stage == G1ParScanThreadState::EvacuationStage::RootObj) {
+      pss->_evacuation_stage = G1ParScanThreadState::EvacuationStage::FirstIteration;
+    } else {
+      pss->_evacuation_stage = G1ParScanThreadState::EvacuationStage::OptFirstIteration;
+    }
+#endif // XHN_EVAC_RC
+
     Ticks start = Ticks::now();
     G1ParEvacuateFollowersClosure cl(_g1h, pss, _task_queues, &_terminator, objcopy_phase);
     cl.do_void();
 
     assert(pss->queue_is_empty(), "should be empty");
+
+#ifdef XHN_EVAC_RC
+    if (!pss->queue_is_empty()) {
+      fatal("[xhn-evac-rc] not sane!\n");
+    }
+
+    if (pss->_evacuation_stage == G1ParScanThreadState::EvacuationStage::RootObj) {
+      pss->_evacuation_stage = G1ParScanThreadState::EvacuationStage::OldIteration;
+    } else {
+      pss->_evacuation_stage = G1ParScanThreadState::EvacuationStage::OptOldIteration;
+    }
+
+    log_info(gc,task)("[xhn:evac-rc] entering old iteration");
+    printf("[xhn:evac-rc] debug entering old iteration\n");
+    G1ParEvacuateFollowersClosure cl_old(_g1h, pss, _old_task_queues, &_old_terminator, objcopy_phase);
+    cl_old.old_do_void();
+
+    assert(pss->queue_is_empty(), "should be empty");
+    if (!pss->queue_is_empty()) {
+      fatal("[xhn:evac-rc] pss task queue is not empty\n");
+    }
+    assert(pss->old_queue_is_empty(), "old queue should be empty");
+    if (!pss->old_queue_is_empty()) {
+      fatal("[xhn:evac-rc] pss old task queue is not empty\n");
+    }
+
+    pss->_evacuation_stage = G1ParScanThreadState::EvacuationStage::Unknown;
+#endif // XHN_EVAC_RC
 
     Tickspan evac_time = (Ticks::now() - start);
     p->record_or_add_time_secs(objcopy_phase, worker_id, evac_time.seconds() - cl.term_time());
@@ -618,12 +680,19 @@ public:
   G1EvacuateRegionsBaseTask(const char* name,
                             G1ParScanThreadStateSet* per_thread_states,
                             G1ScannerTasksQueueSet* task_queues,
+#ifdef XHN_EVAC_RC
+                            G1ScannerTasksQueueSet* old_task_queues,
+#endif // XHN_EVAC_RC
                             uint num_workers) :
     WorkerTask(name),
     _g1h(G1CollectedHeap::heap()),
     _per_thread_states(per_thread_states),
     _task_queues(task_queues),
     _terminator(num_workers, _task_queues),
+#ifdef XHN_EVAC_RC
+    _old_task_queues(old_task_queues),
+    _old_terminator(num_workers, _old_task_queues),
+#endif // XHN_EVAC_RC
     _num_workers(num_workers)
   { }
 
@@ -653,6 +722,9 @@ class G1EvacuateRegionsTask : public G1EvacuateRegionsBaseTask {
   bool _has_optional_evacuation_work;
 
   void scan_roots(G1ParScanThreadState* pss, uint worker_id) {
+#ifdef XHN_EVAC_RC
+    pss->_evacuation_stage = G1ParScanThreadState::EvacuationStage::RootObj;
+#endif // XHN_EVAC_RC
     // [xhn:rebuild-rc] Apply correct closures from pss to the strongly and weakly reachable roots in the system
     // in a single pass. Record and report timing measurements for sub phases using worker_id.
     _root_processor->evacuate_roots(pss, worker_id);
@@ -693,10 +765,17 @@ public:
   G1EvacuateRegionsTask(G1CollectedHeap* g1h,
                         G1ParScanThreadStateSet* per_thread_states,
                         G1ScannerTasksQueueSet* task_queues,
+#ifdef XHN_EVAC_RC
+                        G1ScannerTasksQueueSet* old_task_queues,
+#endif // XHN_EVAC_RC
                         G1RootProcessor* root_processor,
                         uint num_workers,
                         bool has_optional_evacuation_work) :
+#ifdef XHN_EVAC_RC
+    G1EvacuateRegionsBaseTask("G1 Evacuate Regions", per_thread_states, task_queues, old_task_queues, num_workers),
+#else
     G1EvacuateRegionsBaseTask("G1 Evacuate Regions", per_thread_states, task_queues, num_workers),
+#endif // XHN_EVAC_RC
     _root_processor(root_processor),
     _has_optional_evacuation_work(has_optional_evacuation_work)
   { }
@@ -721,6 +800,9 @@ void G1YoungCollector::evacuate_initial_collection_set(G1ParScanThreadStateSet* 
     G1EvacuateRegionsTask g1_par_task(_g1h,
                                       per_thread_states,
                                       task_queues(),
+#ifdef XHN_EVAC_RC
+                                      old_task_queues(),
+#endif // XHN_EVAC_RC
                                       &root_processor,
                                       num_workers,
                                       has_optional_evacuation_work);
@@ -742,6 +824,9 @@ void G1YoungCollector::evacuate_initial_collection_set(G1ParScanThreadStateSet* 
 class G1EvacuateOptionalRegionsTask : public G1EvacuateRegionsBaseTask {
 
   void scan_roots(G1ParScanThreadState* pss, uint worker_id) {
+#ifdef XHN_EVAC_RC
+    pss->_evacuation_stage = G1ParScanThreadState::EvacuationStage::OptRootObj;
+#endif // XHN_EVAC_RC
     _g1h->rem_set()->scan_heap_roots(pss, worker_id, G1GCPhaseTimes::OptScanHR, G1GCPhaseTimes::OptObjCopy, true /* remember_already_scanned_cards */);
     _g1h->rem_set()->scan_collection_set_code_roots(pss, worker_id, G1GCPhaseTimes::OptCodeRoots, G1GCPhaseTimes::OptObjCopy);
     _g1h->rem_set()->scan_collection_set_optional_roots(pss, worker_id, G1GCPhaseTimes::OptScanHR, G1GCPhaseTimes::ObjCopy);
@@ -754,8 +839,15 @@ class G1EvacuateOptionalRegionsTask : public G1EvacuateRegionsBaseTask {
 public:
   G1EvacuateOptionalRegionsTask(G1ParScanThreadStateSet* per_thread_states,
                                 G1ScannerTasksQueueSet* queues,
+#ifdef XHN_EVAC_RC
+                                G1ScannerTasksQueueSet* old_queues,
+#endif // XHN_EVAC_RC
                                 uint num_workers) :
+#ifdef XHN_EVAC_RC
+    G1EvacuateRegionsBaseTask("G1 Evacuate Optional Regions", per_thread_states, queues, old_queues, num_workers) {
+#else
     G1EvacuateRegionsBaseTask("G1 Evacuate Optional Regions", per_thread_states, queues, num_workers) {
+#endif // XHN_EVAC_RC
   }
 };
 
@@ -768,7 +860,11 @@ void G1YoungCollector::evacuate_next_optional_regions(G1ParScanThreadStateSet* p
   Ticks start_processing = Ticks::now();
   {
     G1MarkScope code_mark_scope;
+#ifdef XHN_EVAC_RC
+    G1EvacuateOptionalRegionsTask task(per_thread_states, task_queues(), old_task_queues(), workers()->active_workers());
+#else
     G1EvacuateOptionalRegionsTask task(per_thread_states, task_queues(), workers()->active_workers());
+#endif // XHN_EVAC_RC
     task_time = run_task_timed(&task);
     // See comment in evacuate_initial_collection_set() for the reason of the scope.
   }
@@ -871,6 +967,22 @@ public:
       // When the queue is drained (after each phase of reference processing)
       // the object and it's followers will be copied, the reference field set
       // to point to the new location, and the RSet updated.
+      
+      // [xhn:evac-rc] push on queue
+      // XHN_TODO: here
+// #ifdef XHN_EVAC_RC
+//       const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
+//       uint dummy_age = 0;
+//       markWord m = obj->mark();
+//       G1HeapRegionAttr dest_attr = _par_scan_state->pub_next_region_attr(region_attr, m, dummy_age);
+//       printf("");
+//       if (!dest_attr.is_young()) {
+//         if (!m.is_marked()) {
+//           obj->incr_rc_atomic(memory_order_relaxed);
+//           _par_scan_state->push_on_old_queue(ScannerTask(p));
+//         }
+//       } else
+// #endif // XHN_EVAC_RC
       _par_scan_state->push_on_queue(ScannerTask(p));
     }
   }
@@ -881,6 +993,10 @@ class G1STWRefProcProxyTask : public RefProcProxyTask {
   G1ParScanThreadStateSet& _pss;
   TaskTerminator _terminator;
   G1ScannerTasksQueueSet& _task_queues;
+#ifdef XHN_EVAC_RC
+  TaskTerminator _old_terminator;
+  G1ScannerTasksQueueSet& _old_task_queues;
+#endif // XHN_EVAC_RC
 
   // Special closure for enqueuing discovered fields: during enqueue the card table
   // may not be in shape to properly handle normal barrier calls (e.g. card marks
@@ -908,12 +1024,22 @@ class G1STWRefProcProxyTask : public RefProcProxyTask {
   };
 
 public:
+#ifdef XHN_EVAC_RC
+  G1STWRefProcProxyTask(uint max_workers, G1CollectedHeap& g1h, G1ParScanThreadStateSet& pss, G1ScannerTasksQueueSet& task_queues, G1ScannerTasksQueueSet& old_task_queues)
+#else
   G1STWRefProcProxyTask(uint max_workers, G1CollectedHeap& g1h, G1ParScanThreadStateSet& pss, G1ScannerTasksQueueSet& task_queues)
+#endif // XHN_EVAC_RC
     : RefProcProxyTask("G1STWRefProcProxyTask", max_workers),
       _g1h(g1h),
       _pss(pss),
       _terminator(max_workers, &task_queues),
+#ifdef XHN_EVAC_RC
+      _task_queues(task_queues),
+      _old_terminator(max_workers, &old_task_queues),
+      _old_task_queues(old_task_queues) {}
+#else
       _task_queues(task_queues) {}
+#endif // XHN_EVAC_RC
 
   void work(uint worker_id) override {
     assert(worker_id < _max_workers, "sanity");
@@ -926,7 +1052,12 @@ public:
     G1CopyingKeepAliveClosure keep_alive(&_g1h, pss);
     G1EnqueueDiscoveredFieldClosure enqueue(&_g1h, pss);
     G1ParEvacuateFollowersClosure complete_gc(&_g1h, pss, &_task_queues, _tm == RefProcThreadModel::Single ? nullptr : &_terminator, G1GCPhaseTimes::ObjCopy);
+#ifdef XHN_EVAC_RC
+    G1ParEvacuateFollowersClosure old_complete_gc(&_g1h, pss, &_old_task_queues, _tm == RefProcThreadModel::Single ? nullptr : &_terminator, G1GCPhaseTimes::ObjCopy);
+    _rp_task->rp_work(worker_id, &is_alive, &keep_alive, &enqueue, &complete_gc, &old_complete_gc);
+#else
     _rp_task->rp_work(worker_id, &is_alive, &keep_alive, &enqueue, &complete_gc);
+#endif // XHN_EVAC_RC
 
     // We have completed copying any necessary live referent objects.
     assert(pss->queue_is_empty(), "both queue and overflow should be empty");
@@ -946,7 +1077,11 @@ void G1YoungCollector::process_discovered_references(G1ParScanThreadStateSet* pe
   uint no_of_gc_workers = workers()->active_workers();
   rp->set_active_mt_degree(no_of_gc_workers);
 
+#ifdef XHN_EVAC_RC
+  G1STWRefProcProxyTask task(rp->max_num_queues(), *_g1h, *per_thread_states, *task_queues(), *old_task_queues());
+#else
   G1STWRefProcProxyTask task(rp->max_num_queues(), *_g1h, *per_thread_states, *task_queues());
+#endif // XHN_EVAC_RC
   ReferenceProcessorPhaseTimes& pt = *phase_times()->ref_phase_times();
   ReferenceProcessorStats stats = rp->process_discovered_references(task, pt);
 

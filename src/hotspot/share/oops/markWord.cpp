@@ -61,6 +61,24 @@ void markWord::set_displaced_mark_helper(markWord m) const {
   fatal("bad header=" INTPTR_FORMAT, value());
 }
 
+// #ifdef XHN_EVAC_RC
+// XHN_TODO: modify here!
+markWord markWord::cas_set_displaced_mark_helper(markWord new_mark, markWord old_mark, atomic_memory_order order) {
+  assert(has_displaced_mark_helper(), "check");
+  if (has_monitor()) {
+    // Has an inflated monitor. Must be checked before has_locker().
+    ObjectMonitor* monitor = this->monitor();
+    return monitor->cas_set_header(new_mark, old_mark, order);
+  }
+  if (has_locker()) {  // has a stack lock
+    BasicLock* locker = this->locker();
+    return locker->cas_set_displaced_header(new_mark, old_mark, order);
+  }
+  // This should never happen:
+  fatal("bad header=" INTPTR_FORMAT, value());
+}
+// #endif // XHN_EVAC_RC
+
 void markWord::print_on(outputStream* st, bool print_monitor_info) const {
   if (is_marked()) {  // last bits = 11
     st->print(" marked(" INTPTR_FORMAT ")", value());

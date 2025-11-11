@@ -1318,3 +1318,11 @@ bool Universe::is_in_heap(const void* p) {
 }
 
 #endif // ASSERT
+
+#ifndef ASSERT
+#ifdef XHN_EVAC_RC
+bool Universe::is_in_heap(const void* p) {
+  return heap()->is_in(p);
+}
+#endif
+#endif

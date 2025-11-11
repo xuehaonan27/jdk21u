@@ -540,7 +540,12 @@ public:
                        BoolObjectClosure* is_alive,
                        OopClosure* keep_alive,
                        EnqueueDiscoveredFieldClosure* enqueue,
-                       VoidClosure* complete_gc) = 0;
+#ifdef XHN_EVAC_RC
+                       VoidClosure* complete_gc,
+                       VoidClosure* old_complete_gc = nullptr) = 0;    
+#else
+                       VoidClosure* complete_gc) = 0;        
+#endif // XHN_EVAC_RC
 };
 
 /*

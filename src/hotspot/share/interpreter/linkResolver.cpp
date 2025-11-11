@@ -1429,6 +1429,7 @@ void LinkResolver::resolve_interface_call(CallInfo& result, Handle recv, Klass* 
   // throws linktime exceptions
   Method* resolved_method = linktime_resolve_interface_method(link_info, CHECK);
   methodHandle mh(THREAD, resolved_method);
+  // [xhn:evac-rc] recv_klass might be NULL here?
   runtime_resolve_interface_method(result, mh, link_info.resolved_klass(),
                                    recv, recv_klass, check_null_and_abstract, CHECK);
 }
@@ -1444,20 +1445,24 @@ Method* LinkResolver::linktime_resolve_interface_method(const LinkInfo& link_inf
 }
 
 // throws runtime exceptions
-void LinkResolver::runtime_resolve_interface_method(CallInfo& result,
-                                                    const methodHandle& resolved_method,
-                                                    Klass* resolved_klass,
-                                                    Handle recv,
-                                                    Klass* recv_klass,
-                                                    bool check_null_and_abstract, TRAPS) {
+void LinkResolver::runtime_resolve_interface_method(CallInfo& result, // %rdi
+                                                    const methodHandle& resolved_method, // %rsi                                                    
+                                                    Klass* resolved_klass, // %rdx
+                                                    Handle recv, // %rcx
+                                                    Klass* recv_klass, // %r8
+                                                    bool check_null_and_abstract, TRAPS) { // %r9
 
+  // printf("[xhn:evac-rc] enter runtime_resolve_interface_method\n");
   // check if receiver exists
   if (check_null_and_abstract && recv.is_null()) {
     THROW(vmSymbols::java_lang_NullPointerException());
   }
 
+  // printf("[xhn:evac-rc] checkpoint 1\n");
   // check if receiver klass implements the resolved interface
   if (!recv_klass->is_subtype_of(resolved_klass)) {
+    // [xhn:evac-rc] SIGSEGV here
+    // printf("[xhn:evac-rc] check subtype done\n");
     ResourceMark rm(THREAD);
     char buf[200];
     jio_snprintf(buf, sizeof(buf), "Class %s does not implement the requested interface %s",
@@ -1466,10 +1471,12 @@ void LinkResolver::runtime_resolve_interface_method(CallInfo& result,
     THROW_MSG(vmSymbols::java_lang_IncompatibleClassChangeError(), buf);
   }
 
+  // printf("[xhn:evac-rc] checkpoint 2\n");
   methodHandle selected_method = resolved_method;
 
   // resolve the method in the receiver class, unless it is private
   if (!resolved_method()->is_private()) {
+    // printf("[xhn:evac-rc] checkpoint 3\n");
     // do lookup based on receiver klass
     // This search must match the linktime preparation search for itable initialization
     // to correctly enforce loader constraints for interface method inheritance.
@@ -1479,6 +1486,7 @@ void LinkResolver::runtime_resolve_interface_method(CallInfo& result,
                                                        resolved_method->signature(),
                                                        Klass::PrivateLookupMode::skip);
     selected_method = methodHandle(THREAD, method);
+    // printf("[xhn:evac-rc] checkpoint 4\n");
 
     if (selected_method.is_null() && !check_null_and_abstract) {
       // In theory this is a harmless placeholder value, but
@@ -1486,11 +1494,13 @@ void LinkResolver::runtime_resolve_interface_method(CallInfo& result,
       // This needs further study.
       selected_method = resolved_method;
     }
+    // printf("[xhn:evac-rc] checkpoint 5\n");
     // check if method exists
     if (selected_method.is_null()) {
       // Pass arguments for generating a verbose error message.
       throw_abstract_method_error(resolved_method, recv_klass, CHECK);
     }
+    // printf("[xhn:evac-rc] checkpoint 6\n");
     // check access
     // Throw Illegal Access Error if selected_method is not public.
     if (!selected_method->is_public()) {
@@ -1501,27 +1511,34 @@ void LinkResolver::runtime_resolve_interface_method(CallInfo& result,
       ss.print("'");
       THROW_MSG(vmSymbols::java_lang_IllegalAccessError(), ss.as_string());
     }
+    // printf("[xhn:evac-rc] checkpoint 7\n");
     // check if abstract
     if (check_null_and_abstract && selected_method->is_abstract()) {
       throw_abstract_method_error(resolved_method, selected_method, recv_klass, CHECK);
     }
+    // printf("[xhn:evac-rc] checkpoint 8\n");
   }
 
+  // printf("[xhn:evac-rc] checkpoint 9\n");
   if (log_develop_is_enabled(Trace, itables)) {
     trace_method_resolution("invokeinterface selected method: receiver-class:",
                             recv_klass, resolved_klass, selected_method(), true);
   }
+  // printf("[xhn:evac-rc] checkpoint 10\n");
   // setup result
   if (resolved_method->has_vtable_index()) {
+    // printf("[xhn:evac-rc] checkpoint 11\n");
     int vtable_index = resolved_method->vtable_index();
     log_develop_trace(itables)("  -- vtable index: %d", vtable_index);
     assert(vtable_index == selected_method->vtable_index(), "sanity check");
     result.set_virtual(resolved_klass, resolved_method, selected_method, vtable_index, CHECK);
   } else if (resolved_method->has_itable_index()) {
+    // printf("[xhn:evac-rc] checkpoint 12\n");
     int itable_index = resolved_method()->itable_index();
     log_develop_trace(itables)("  -- itable index: %d", itable_index);
     result.set_interface(resolved_klass, resolved_method, selected_method, itable_index, CHECK);
   } else {
+    // printf("[xhn:evac-rc] checkpoint 13\n");
     int index = resolved_method->vtable_index();
     log_develop_trace(itables)("  -- non itable/vtable index: %d", index);
     assert(index == Method::nonvirtual_vtable_index, "Oops hit another case!");
@@ -1532,6 +1549,7 @@ void LinkResolver::runtime_resolve_interface_method(CallInfo& result,
     // This sets up the nonvirtual form of "virtual" call (as needed for final and private methods)
     result.set_virtual(resolved_klass, resolved_method, resolved_method, index, CHECK);
   }
+  // printf("[xhn:evac-rc] checkpoint 14\n");
   JFR_ONLY(Jfr::on_resolution(result, CHECK);)
 }
 
@@ -1652,6 +1670,7 @@ void LinkResolver::resolve_invoke(CallInfo& result, Handle& recv,
                            /*check_null_and_abstract=*/true, CHECK);
       break;
     case Bytecodes::_invokeinterface:
+      // [xhn:evac-rc] recv->klass() == NULL here!
       resolve_interface_call(result, recv, recv->klass(), link_info,
                              /*check_null_and_abstract=*/true, CHECK);
       break;

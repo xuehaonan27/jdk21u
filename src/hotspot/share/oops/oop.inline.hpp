@@ -86,10 +86,20 @@ void oopDesc::init_mark() {
   set_mark(markWord::prototype());
 }
 
+// [xhn:evac-rc] returning NULL here?
+// [xhn:evac-rc] 0x656d6f68
+// 0x 00000000, 00000000, 00000000, 00000000, 01100101, 01101101, 01101111, 01101000
 Klass* oopDesc::klass() const {
   if (UseCompressedClassPointers) {
+    // printf("[xhn:evac-rc] UC _metadata._compressed_klass=%d\n", _metadata._compressed_klass);
+    // if (_metadata._compressed_klass < 8193) {
+    //   printf("[xhn:evac-rc] Checking the oopDesc\n");
+    //   printf("[xhn:evac-rc] Oop is at %p\n", this);
+    //   printf("[xhn:evac-rc] markWord _mark = 0x%lx\n", mark().value());
+    // }
     return CompressedKlassPointers::decode_not_null(_metadata._compressed_klass);
   } else {
+    // printf("[xhn:evac-rc] _metadata._klass=%p\n", _metadata._klass);
     return _metadata._klass;
   }
 }
@@ -287,6 +297,90 @@ oop oopDesc::forward_to_atomic(oop p, markWord compare, atomic_memory_order orde
     return cast_to_oop(old_mark.decode_pointer());
   }
 }
+
+#ifdef XHN_EVAC_RC
+markWord oopDesc::cas_set_displaced_mark(markWord new_mark, markWord old_mark, atomic_memory_order order) {
+  return mark().cas_set_displaced_mark_helper(new_mark, old_mark, order);
+}
+
+oop oopDesc::forward_to_atomic_old(oop p, markWord compare, atomic_memory_order order) {
+  // XHN_TODO: fallback to young forward
+  markWord tmp = markWord::encode_pointer_as_mark(p);
+  // markWord m = tmp.set_rc(compare.rc());
+  // XHN_TODO: should the RC be got from oop?
+  markWord m = tmp.set_rc(p->rc()).set_fi_marked();
+  assert(m.decode_pointer() == p, "encoding must be reversible");
+  markWord old_mark = cas_set_mark(m, compare, order);
+  if (old_mark == compare) {
+    return nullptr;
+  } else {
+    return cast_to_oop(old_mark.decode_pointer());
+  }
+
+  // return forward_to_atomic(p, compare, order);
+}
+
+void oopDesc::clear_rc() {
+  // assert(!mark().is_marked(), "Attempt to clear rc of forwarded mark");
+  if (has_displaced_mark()) {
+    set_displaced_mark(displaced_mark().clear_rc());
+  } else {
+    set_mark(mark().clear_rc());
+  }
+}
+
+uint oopDesc::rc() const {
+  // assert(!mark().is_marked(), "Attempt to read rc from forwarded mark");
+  if (has_displaced_mark()) {
+    return displaced_mark().rc();
+  } else {
+    return mark().rc();
+  }
+}
+
+void oopDesc::incr_rc() {
+  // assert(!mark().is_marked(), "Attempt to increment rc of forwarded mark");
+  if (has_displaced_mark()) {
+    set_displaced_mark(displaced_mark().incr_rc());
+  } else {
+    set_mark(mark().incr_rc());
+  }
+}
+
+void oopDesc::incr_rc_atomic(atomic_memory_order order) {
+  // assert(!mark().is_marked(), "Attempt to increment rc of forwarded mark");
+  if (has_displaced_mark()) {
+    while (true) {
+      markWord old_mark = displaced_mark();
+      markWord incred_mark = old_mark.incr_rc();
+      markWord current_mark = cas_set_displaced_mark(incred_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return; // else try once again
+      }
+    }
+  } else {
+    while (true) {
+      markWord old_mark = mark();
+      markWord incred_mark = old_mark.incr_rc();
+      markWord current_mark = cas_set_mark(incred_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return;
+      } // else try once again
+    }
+  }
+}
+
+// [xhn:evac-rc] there should only be one worker successfully set the object
+// as FI marked, who receives true from this function
+bool oopDesc::set_fi_marked_atomic(atomic_memory_order order) {
+  markWord old_mark = mark();
+  markWord modified_mark = old_mark.set_fi_marked();
+  markWord current_mark = cas_set_mark(modified_mark, old_mark, order);
+  return current_mark == old_mark;
+  // [xhn:evac-rc] if equals, then we succeed, return true
+}
+
+#endif // XHN_EVAC_RC
 
 // Note that the forwardee is not the same thing as the displaced_mark.
 // The forwardee is used when copying during scavenge and mark-sweep.
