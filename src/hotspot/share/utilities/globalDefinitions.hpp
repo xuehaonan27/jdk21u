@@ -1091,8 +1091,12 @@ const int      badCodeHeapFreeVal = 0xDD;                   // value used to zap
 #define       badAddress        ((address)::badAddressVal)
 #define       badHeapWord       (::badHeapWordVal)
 
+// #ifndef XHN_EVAC_RC
 // Default TaskQueue size is 16K (32-bit) or 128K (64-bit)
 #define TASKQUEUE_SIZE (NOT_LP64(1<<14) LP64_ONLY(1<<17))
+// #else
+// #define TASKQUEUE_SIZE (NOT_LP64(1<<17) LP64_ONLY(1<<20))
+// #endif // XHN_EVAC_RC
 
 //----------------------------------------------------------------------------------------------------
 // Utility functions for bitfield manipulations

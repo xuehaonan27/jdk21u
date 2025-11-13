@@ -397,4 +397,86 @@ bool oopDesc::mark_must_be_preserved(markWord m) const {
   return m.must_be_preserved(this);
 }
 
+#ifdef XHN_EVAC_RC
+markWord oopDesc::cas_set_displaced_mark(markWord new_mark, markWord old_mark, atomic_memory_order order) {
+  return mark().cas_set_displaced_mark_helper(new_mark, old_mark, order);
+}
+
+uint oopDesc::rc() const {
+  // assert(!mark().is_marked(), "Attempt to read rc from forwarded mark");
+  if (has_displaced_mark()) {
+    return displaced_mark().rc();
+  } else {
+    return mark().rc();
+  }
+}
+
+// void oopDesc::incr_rc() {
+//   assert(!mark().is_marked(), "Attempt to increment rc of forwarded mark");
+//   if (has_displaced_mark()) {
+//     set_displaced_mark(displaced_mark().incr_rc());
+//   } else {
+//     set_mark(mark().incr_rc());
+//   }
+// }
+
+bool oopDesc::incr_rc_atomic(atomic_memory_order order) {
+  // assert(!mark().is_marked(), "Attempt to increment rc of forwarded mark");
+  if (has_displaced_mark()) {
+    while (true) {
+      markWord old_mark = displaced_mark();
+      markWord incred_mark = old_mark.incr_rc();
+      if (incred_mark == old_mark) {
+        return false;
+      }
+      markWord current_mark = cas_set_displaced_mark(incred_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return true; // else try once again
+      }
+    }
+  } else {
+    while (true) {
+      markWord old_mark = mark();
+      markWord incred_mark = old_mark.incr_rc();
+      if (incred_mark == old_mark) {
+        return false;
+      }
+      markWord current_mark = cas_set_mark(incred_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return true;
+      } // else try once again
+    }
+  }
+}
+
+bool oopDesc::decr_rc_atomic(atomic_memory_order order) {
+  // assert(!mark().is_marked(), "Attempt to increment rc of forwarded mark");
+  if (has_displaced_mark()) {
+    while (true) {
+      markWord old_mark = displaced_mark();
+      markWord incred_mark = old_mark.decr_rc();
+      if (incred_mark == old_mark) {
+        return false;
+      }
+      markWord current_mark = cas_set_displaced_mark(incred_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return true; // else try once again
+      }
+    }
+  } else {
+    while (true) {
+      markWord old_mark = mark();
+      markWord incred_mark = old_mark.decr_rc();
+      if (incred_mark == old_mark) {
+        return false;
+      }
+      markWord current_mark = cas_set_mark(incred_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return true;
+      } // else try once again
+    }
+  }
+}
+#endif // XHN_EVAC_RC
+
 #endif // SHARE_OOPS_OOP_INLINE_HPP

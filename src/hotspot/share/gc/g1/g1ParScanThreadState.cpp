@@ -63,6 +63,9 @@ G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
                                            G1EvacFailureRegions* evac_failure_regions)
   : _g1h(g1h),
     _task_queue(g1h->task_queue(worker_id)),
+#ifdef XHN_EVAC_RC
+    _srdrc_task_queue(g1h->srdrc_task_queue(worker_id)),
+#endif // XHN_EVAC_RC
     _rdc_local_qset(rdcqs),
     _ct(g1h->card_table()),
     _closures(nullptr),
@@ -180,6 +183,25 @@ void G1ParScanThreadState::verify_task(ScannerTask task) const {
     ShouldNotReachHere();
   }
 }
+
+#ifdef XHN_EVAC_RC
+void G1ParScanThreadState::verify_task(StoreRefDecRcTask task) const {
+  if (task.is_narrow_oop_ptr()) {
+    narrowOop* p = task.get_narrow_oop_ptr();
+    oop obj = task.get_forwardee();
+    assert(_g1h->is_in_reserved(obj),
+         "task=" PTR_FORMAT " p=" PTR_FORMAT, p2i(p), p2i(obj));
+  } else if (task.is_oop_ptr()) {
+    oop* p =  task.get_oop_ptr();
+    oop obj = task.get_forwardee();
+    assert(_g1h->is_in_reserved(obj),
+         "task=" PTR_FORMAT " p=" PTR_FORMAT, p2i(p), p2i(obj));
+  } else {
+    ShouldNotReachHere();
+  }
+}
+#endif // XHN_EVAC_RC
+
 #endif // ASSERT
 
 // [xhn:evac-rc] Evacuation here
@@ -216,11 +238,42 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   } else {
     obj = do_copy_to_survivor_space(region_attr, obj, m);
   }
-  // [xhn:evac-rc] maybe changes to `UniqueAccess` or `SharedAccess` here
+
+#ifdef XHN_EVAC_RC
+  uint dummy_age = 0;
+  G1HeapRegionAttr dest_attr = next_region_attr(region_attr, m, dummy_age);
+  // if (dest_attr.is_young()) // If is not a promotion, then just do normal
+#endif // XHN_EVAC_RC
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+#ifdef XHN_EVAC_RC
+  if (!dest_attr.is_young()) {
+  // else { // If is a promotion or old-to-old copy
+    // Atomically add RC of obj, must succeed.
+    bool inc_result = obj->incr_rc_atomic(memory_order_relaxed);
+    // guarantee(inc_result, "[xhn:evac-rc] incrementing RC overflow p=%p, obj=%p\n", p, cast_from_oop<void*>(obj));
+    // printf("[xhn:evac-rc] %u\n", srdrc_queue_size());
+    // report_srdrc_status();
+    push_on_srdrc_queue(StoreRefDecRcTask(p, obj));
+  }
+#endif // XHN_EVAC_RC
 
   write_ref_field_post(p, obj);
 }
+
+#ifdef XHN_EVAC_RC
+template <class T>
+MAYBE_INLINE_EVACUATION
+void G1ParScanThreadState::do_oop_ref_store_dec_rc(T* p, oop obj) {
+  // [xhn:evac-rc] There should be 2 situations.
+  // 1. This is a young-to-old promotion. Then just give it a new special reference.
+  // 2. This is a old-to-old copy. Then we must consider unique reference promoting to shared reference.
+  
+  bool dec_result = obj->decr_rc_atomic(memory_order_relaxed);
+  // guarantee(dec_result, "[xhn:evac-rc] decrementing RC below 0 p=%p, obj=%p\n", p, cast_from_oop<void*>(obj));
+  // [xhn:evac-rc] TODO: unique / shared here
+  RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+}
+#endif // XHN_EVAC_RC
 
 MAYBE_INLINE_EVACUATION
 void G1ParScanThreadState::do_partial_array(PartialArrayScanTask task) {
@@ -301,6 +354,19 @@ void G1ParScanThreadState::dispatch_task(ScannerTask task) {
   }
 }
 
+#ifdef XHN_EVAC_RC
+void G1ParScanThreadState::dispatch_srdrc_task(StoreRefDecRcTask task) {
+  verify_task(task);
+  if (task.is_narrow_oop_ptr()) {
+    do_oop_ref_store_dec_rc(task.get_narrow_oop_ptr(), task.get_forwardee());
+  } else if (task.is_oop_ptr()) {
+    do_oop_ref_store_dec_rc(task.get_oop_ptr(), task.get_forwardee());
+  } else {
+    fatal("[xhn:evac-rc] Insane\n");
+  }
+}
+#endif // XHN_EVAC_RC
+
 // Process tasks until overflow queue is empty and local queue
 // contains no more than threshold entries.  NOINLINE to prevent
 // inlining into steal_and_trim_queue.
@@ -319,6 +385,23 @@ void G1ParScanThreadState::trim_queue_to_threshold(uint threshold) {
   } while (!_task_queue->overflow_empty());
 }
 
+#ifdef XHN_EVAC_RC
+ATTRIBUTE_FLATTEN NOINLINE
+void G1ParScanThreadState::trim_srdrc_queue_to_threshold(uint threshold) {
+  StoreRefDecRcTask task;
+  do {
+    while (_srdrc_task_queue->pop_overflow(task)) {
+      if (!_srdrc_task_queue->try_push_to_taskqueue(task)) {
+        dispatch_srdrc_task(task);
+      }
+    }
+    while (_srdrc_task_queue->pop_local(task, threshold)) {
+      dispatch_srdrc_task(task);
+    }
+  } while (!_srdrc_task_queue->overflow_empty());
+}
+#endif // XHN_EVAC_RC
+
 ATTRIBUTE_FLATTEN
 void G1ParScanThreadState::steal_and_trim_queue(G1ScannerTasksQueueSet* task_queues) {
   ScannerTask stolen_task;
@@ -328,6 +411,18 @@ void G1ParScanThreadState::steal_and_trim_queue(G1ScannerTasksQueueSet* task_que
     trim_queue();
   }
 }
+
+#ifdef XHN_EVAC_RC
+ATTRIBUTE_FLATTEN
+void G1ParScanThreadState::steal_and_trim_srdrc_queue(G1StoreRefDecRcTasksQueueSet* srdrc_task_queues) {
+  StoreRefDecRcTask stolen_task;
+  while (srdrc_task_queues->steal(_worker_id, stolen_task)) {
+    dispatch_srdrc_task(stolen_task);
+    // Processing stolen task may have added tasks to our queue.
+    trim_srdrc_queue();
+  }
+}
+#endif // XHN_EVAC_RC
 
 HeapWord* G1ParScanThreadState::allocate_in_next_plab(G1HeapRegionAttr* dest,
                                                       size_t word_sz,
@@ -382,6 +477,28 @@ G1HeapRegionAttr G1ParScanThreadState::next_region_attr(G1HeapRegionAttr const r
   // young-to-old (promotion) or old-to-old; destination is old in both cases.
   return G1HeapRegionAttr::Old;
 }
+
+#ifdef XHN_EVAC_RC
+G1HeapRegionAttr G1ParScanThreadState::pub_next_region_attr(G1HeapRegionAttr const region_attr, markWord const m, uint& age) {
+  return next_region_attr(region_attr, m, age);
+}
+
+uint G1ParScanThreadState::srdrc_queue_size() const {
+  uint queue_size = _srdrc_task_queue->size();
+  uint overflow_size = _srdrc_task_queue->overflow_stack()->size();
+  return queue_size + overflow_size;
+}
+
+void G1ParScanThreadState::report_srdrc_status() {
+#define REPORT_THRESHOLD_ADD (1 << 8)
+  uint queue_size = _srdrc_task_queue->size();
+  uint overflow_size = _srdrc_task_queue->overflow_stack()->size();
+  if (queue_size + overflow_size >= _report_threshold) {
+    _report_threshold += REPORT_THRESHOLD_ADD;
+    printf("[xhn:evac-rc] srdrc queue size=%u overflow size=%u\n", queue_size, overflow_size);
+  }
+}
+#endif // XHN_EVAC_RC
 
 void G1ParScanThreadState::report_promotion_event(G1HeapRegionAttr const dest_attr,
                                                   oop const old, size_t word_sz, uint age,

@@ -66,6 +66,10 @@ class G1GCPhaseTimes : public CHeapObj<mtGC> {
     OptCodeRoots,
     ObjCopy,
     OptObjCopy,
+#ifdef XHN_EVAC_RC
+    StoreRefDecRc,
+    OptStoreRefDecRc,
+#endif // XHN_EVAC_RC
     Termination,
     OptTermination,
     Other,

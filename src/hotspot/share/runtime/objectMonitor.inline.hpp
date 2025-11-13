@@ -61,6 +61,12 @@ inline void ObjectMonitor::set_header(markWord hdr) {
   Atomic::store(&_header, hdr);
 }
 
+#ifdef XHN_EVAC_RC
+inline markWord ObjectMonitor::cas_set_header(markWord new_hdr, markWord old_hdr, atomic_memory_order order) {
+  return Atomic::cmpxchg(&_header, old_hdr, new_hdr, order);
+}
+#endif // XHN_EVAC_RC
+
 inline int ObjectMonitor::waiters() const {
   return _waiters;
 }

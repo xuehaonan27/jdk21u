@@ -28,6 +28,9 @@
 #include "metaprogramming/primitiveConversions.hpp"
 #include "oops/oopsHierarchy.hpp"
 #include "runtime/globals.hpp"
+#ifdef XHN_EVAC_RC
+#include "runtime/atomic.hpp"
+#endif // XHN_EVAC_RC
 
 #include <type_traits>
 
@@ -133,11 +136,11 @@ class markWord {
 
 #ifdef XHN_EVAC_RC
   // [xhn:evac-rc] Only consider 64 bits platform
-  // static const int rc_bits                        = 8; // Used in objs in CSet during evacuation
-  // static const int rc_shift                       = hash_shift + hash_bits;
-  // static const uintptr_t rc_mask                  = right_n_bits(rc_bits);
-  // static const uintptr_t rc_mask_in_place         = rc_mask << rc_shift;
-  // static const uint max_rc                        = rc_mask;
+  static const int rc_bits                        = 8; // Used in objs in CSet during evacuation
+  static const int rc_shift                       = hash_shift + hash_bits + 1 + 16;
+  static const uintptr_t rc_mask                  = right_n_bits(rc_bits);
+  static const uintptr_t rc_mask_in_place         = rc_mask << rc_shift;
+  static const uint max_rc                        = rc_mask;
 #endif // XHN_EVAC_RC
   // Creates a markWord with all bits set to zero.
   static markWord zero() { return markWord(uintptr_t(0)); }
@@ -213,6 +216,9 @@ class markWord {
   }
   markWord displaced_mark_helper() const;
   void set_displaced_mark_helper(markWord m) const;
+#ifdef XHN_EVAC_RC
+  markWord cas_set_displaced_mark_helper(markWord new_mark, markWord old_mark, atomic_memory_order order);
+#endif // XHN_EVAC_RC
   markWord copy_set_hash(intptr_t hash) const {
     uintptr_t tmp = value() & (~hash_mask_in_place);
     tmp |= ((hash & hash_mask) << hash_shift);
@@ -257,12 +263,14 @@ class markWord {
   }
 #ifdef XHN_EVAC_RC
   // [xhn:evac-rc] rc operations
-  // uint     rc() const { return mask_bits(value() >> rc_shift, rc_mask); }
-  // markWord set_rc(uint v) const {
-  //   assert((v & ~rc_mask) == 0, "shouldn't overflow rc field");
-  //   return markWord((value() & ~rc_mask_in_place) | ((v & rc_mask) << rc_shift));
-  // }
-  // markWord incr_rc()      const { return rc() == max_rc ? markWord(_value) : set_rc(rc() + 1); }
+  uint     rc() const { return mask_bits(value() >> rc_shift, rc_mask); }
+  markWord set_rc(uint v) const {
+    assert((v & ~rc_mask) == 0, "shouldn't overflow rc field");
+    return markWord((value() & ~rc_mask_in_place) | ((v & rc_mask) << rc_shift));
+  }
+  markWord incr_rc()      const { return rc() == max_rc ? markWord(_value) : set_rc(rc() + 1); }
+  markWord decr_rc()      const { return rc() == 0      ? markWord(_value) : set_rc(rc() - 1); }
+  markWord clear_rc()     const { return markWord(value() & ~rc_mask_in_place); }
 #endif // XHN_EVAC_RC
 
   // Prototype mark for initialization
@@ -277,7 +285,11 @@ class markWord {
   inline static markWord encode_pointer_as_mark(void* p) { return from_pointer(p).set_marked(); }
 
   // Recover address of oop from encoded form used in mark
+#ifndef XHN_EVAC_RC
   inline void* decode_pointer() { return (void*)clear_lock_bits().value(); }
+#else
+  inline void* decode_pointer() { return (void*)clear_lock_bits().clear_rc().value(); }
+#endif // XHN_EVAC_RC
 };
 
 // Support atomic operations.

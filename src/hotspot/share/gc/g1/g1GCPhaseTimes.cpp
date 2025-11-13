@@ -91,6 +91,10 @@ G1GCPhaseTimes::G1GCPhaseTimes(STWGCTimer* gc_timer, uint max_gc_threads) :
   _gc_par_phases[OptCodeRoots] = new WorkerDataArray<double>("OptCodeRoots", "Optional Code Root Scan (ms):", max_gc_threads);
   _gc_par_phases[ObjCopy] = new WorkerDataArray<double>("ObjCopy", "Object Copy (ms):", max_gc_threads);
   _gc_par_phases[OptObjCopy] = new WorkerDataArray<double>("OptObjCopy", "Optional Object Copy (ms):", max_gc_threads);
+#ifdef XHN_EVAC_RC
+  _gc_par_phases[StoreRefDecRc] = new WorkerDataArray<double>("StoreRefDecRc", "Store Reference and Decrement RC (ms):", max_gc_threads);
+  _gc_par_phases[OptStoreRefDecRc] = new WorkerDataArray<double>("OptStoreRefDecRc", "Optional Store Reference and Decrement RC (ms):", max_gc_threads);
+#endif // XHN_EVAC_RC
   _gc_par_phases[Termination] = new WorkerDataArray<double>("Termination", "Termination (ms):", max_gc_threads);
   _gc_par_phases[OptTermination] = new WorkerDataArray<double>("OptTermination", "Optional Termination (ms):", max_gc_threads);
   _gc_par_phases[GCWorkerTotal] = new WorkerDataArray<double>("GCWorkerTotal", "GC Worker Total (ms):", max_gc_threads);
@@ -236,6 +240,9 @@ void G1GCPhaseTimes::record_gc_pause_end() {
                                  worker_time(ScanHR, i) +
                                  worker_time(CodeRoots, i) +
                                  worker_time(ObjCopy, i) +
+#ifdef XHN_EVAC_RC
+                                 worker_time(StoreRefDecRc, i) +
+#endif // XHN_EVAC_RC
                                  worker_time(Termination, i);
 
       record_time_secs(Other, i, total_worker_time - worker_known_time);
@@ -252,6 +259,10 @@ void G1GCPhaseTimes::record_gc_pause_end() {
       ASSERT_PHASE_UNINITIALIZED(OptCodeRoots);
       ASSERT_PHASE_UNINITIALIZED(ObjCopy);
       ASSERT_PHASE_UNINITIALIZED(OptObjCopy);
+#ifdef XHN_EVAC_RC
+      ASSERT_PHASE_UNINITIALIZED(StoreRefDecRc);
+      ASSERT_PHASE_UNINITIALIZED(OptStoreRefDecRc);
+#endif // XHN_EVAC_RC
       ASSERT_PHASE_UNINITIALIZED(Termination);
     }
   }
@@ -445,6 +456,9 @@ double G1GCPhaseTimes::print_evacuate_optional_collection_set() const {
     info_time("Evacuate Optional Collection Set", _cur_optional_evac_time_ms);
     debug_phase(_gc_par_phases[OptScanHR]);
     debug_phase(_gc_par_phases[OptObjCopy]);
+#ifdef XHN_EVAC_RC
+    debug_phase(_gc_par_phases[OptStoreRefDecRc]);
+#endif // XHN_EVAC_RC
     debug_phase(_gc_par_phases[OptCodeRoots]);
     debug_phase(_gc_par_phases[OptTermination]);
   }
@@ -469,6 +483,9 @@ double G1GCPhaseTimes::print_evacuate_initial_collection_set() const {
   debug_phase(_gc_par_phases[ScanHR]);
   debug_phase(_gc_par_phases[CodeRoots]);
   debug_phase(_gc_par_phases[ObjCopy]);
+#ifdef XHN_EVAC_RC
+  debug_phase(_gc_par_phases[StoreRefDecRc]);
+#endif // XHN_EVAC_RC
   debug_phase(_gc_par_phases[Termination]);
   debug_phase(_gc_par_phases[Other]);
   debug_phase(_gc_par_phases[GCWorkerTotal]);

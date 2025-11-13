@@ -54,6 +54,9 @@ class outputStream;
 class G1ParScanThreadState : public CHeapObj<mtGC> {
   G1CollectedHeap* _g1h;
   G1ScannerTasksQueue* _task_queue;
+#ifdef XHN_EVAC_RC
+  G1StoreRefDecRcTasksQueue* _srdrc_task_queue;
+#endif // XHN_EVAC_RC
   G1RedirtyCardsLocalQueueSet _rdc_local_qset;
   G1CardTable* _ct;
   G1EvacuationRootClosures* _closures;
@@ -127,6 +130,12 @@ public:
 #ifdef ASSERT
   bool queue_is_empty() const { return _task_queue->is_empty(); }
 #endif
+#ifdef XHN_EVAC_RC
+#ifndef ASSERT
+  bool queue_is_empty() const { return _task_queue->is_empty(); }
+#endif
+  bool srdrc_queue_is_empty() const { return _srdrc_task_queue->is_empty(); }
+#endif // XHN_EVAC_RC
 
   void verify_task(narrowOop* task) const NOT_DEBUG_RETURN;
   void verify_task(oop* task) const NOT_DEBUG_RETURN;
@@ -134,6 +143,13 @@ public:
   void verify_task(ScannerTask task) const NOT_DEBUG_RETURN;
 
   void push_on_queue(ScannerTask task);
+#ifdef XHN_EVAC_RC
+  void push_on_srdrc_queue(StoreRefDecRcTask task);
+  uint _report_threshold = 0;
+  uint srdrc_queue_size() const;
+  void report_srdrc_status();
+  void verify_task(StoreRefDecRcTask task) const NOT_DEBUG_RETURN;
+#endif // XHN_EVAC_RC
 
   // Apply the post barrier to the given reference field. Enqueues the card of p
   // if the barrier does not filter out the reference for some reason (e.g.
@@ -182,6 +198,12 @@ private:
 
   void dispatch_task(ScannerTask task);
 
+#ifdef XHN_EVAC_RC
+  template <class T> void do_oop_ref_store_dec_rc(T* p, oop obj);
+
+  void dispatch_srdrc_task(StoreRefDecRcTask task);
+#endif // XHN_EVAC_RC
+
   // Tries to allocate word_sz in the PLAB of the next "generation" after trying to
   // allocate into dest. Previous_plab_refill_failed indicates whether previous
   // PLAB refill for the original (source) object failed.
@@ -203,6 +225,12 @@ private:
 
   inline bool needs_partial_trimming() const;
 
+#ifdef XHN_EVAC_RC
+  void trim_srdrc_queue_to_threshold(uint threshold);
+
+  inline bool srdrc_needs_partial_trimming() const;
+#endif // XHN_EVAC_RC
+
   // NUMA statistics related methods.
   void initialize_numa_stats();
   void flush_numa_stats();
@@ -214,6 +242,13 @@ public:
   inline void trim_queue();
   inline void trim_queue_partially();
   void steal_and_trim_queue(G1ScannerTasksQueueSet *task_queues);
+
+#ifdef XHN_EVAC_RC
+  G1HeapRegionAttr pub_next_region_attr(G1HeapRegionAttr const region_attr, markWord const m, uint& age);
+  inline void trim_srdrc_queue();
+  inline void trim_srdrc_queue_partially();
+  void steal_and_trim_srdrc_queue(G1StoreRefDecRcTasksQueueSet *srdrc_task_queues);
+#endif // XHN_EVAC_RC
 
   Tickspan trim_ticks() const;
   void reset_trim_ticks();

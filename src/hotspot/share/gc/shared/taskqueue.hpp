@@ -586,6 +586,71 @@ public:
   oop to_source_array() const { return _src; }
 };
 
+#ifdef XHN_EVAC_RC
+class StoreRefDecRcTask {
+  void* _p;
+  oop _forwardee;
+
+  static const uintptr_t OopTag = 0;
+  static const uintptr_t NarrowOopTag = (uintptr_t)1 << (sizeof(void*) * 8 - 1);
+  // static const uintptr_t PartialArrayTag = 2;
+  // static const uintptr_t TagSize = 1;
+  // static const uintptr_t TagAlignment = 1 << TagSize;
+  // static const uintptr_t TagMask = TagAlignment - 1;
+  static const uintptr_t TagMask = (uintptr_t)1 << (sizeof(void*) * 8 - 1);
+
+  static void* encode(void* p, uintptr_t tag) {
+    // assert(is_aligned(p, TagAlignment), "misaligned: " PTR_FORMAT, p2i(p));
+    return (void*)((uintptr_t)p | tag);
+  }
+
+  uintptr_t raw_value() const {
+    return reinterpret_cast<uintptr_t>(_p);
+  }
+
+  bool has_tag(uintptr_t tag) const {
+    return (raw_value() & TagMask) == tag;
+  }
+
+  void* decode(uintptr_t tag) const {
+    // assert(has_tag(tag), "precondition");
+    assert(has_tag(tag), "precondition raw_value=%lx tag=%ld", raw_value(), tag);
+    return (void*)((uintptr_t)_p & (~tag));
+  }
+
+public:
+  StoreRefDecRcTask() : _p(nullptr), _forwardee(cast_to_oop(nullptr)) {}
+
+  explicit StoreRefDecRcTask(oop* p, oop forwardee) : _p(encode(p, OopTag)), _forwardee(forwardee) {}
+
+  explicit StoreRefDecRcTask(narrowOop* p, oop forwardee) : _p(encode(p, NarrowOopTag)), _forwardee(forwardee) {}
+
+  // Trivially copyable.
+
+  // Predicate implementations assume OopTag == 0, others are powers of 2.
+
+  bool is_oop_ptr() const {
+    return (raw_value() & NarrowOopTag) == 0;
+  }
+
+  bool is_narrow_oop_ptr() const {
+    return (raw_value() & NarrowOopTag) != 0;
+  }
+
+  oop* get_oop_ptr() const {
+    return static_cast<oop*>(decode(OopTag));
+  }
+
+  narrowOop* get_narrow_oop_ptr() const {
+    return static_cast<narrowOop*>(decode(NarrowOopTag));
+  }
+
+  oop get_forwardee() const {
+    return _forwardee;
+  }
+};
+#endif // XHN_EVAC_RC
+
 // Discriminated union over oop*, narrowOop*, and PartialArrayScanTask.
 // Uses a low tag in the associated pointer to identify the category.
 // Used as a task queue element type.

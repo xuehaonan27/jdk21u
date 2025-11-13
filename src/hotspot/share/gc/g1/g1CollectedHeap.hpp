@@ -89,6 +89,10 @@ class WorkerThreads;
 
 typedef OverflowTaskQueue<ScannerTask, mtGC>           G1ScannerTasksQueue;
 typedef GenericTaskQueueSet<G1ScannerTasksQueue, mtGC> G1ScannerTasksQueueSet;
+#ifdef XHN_EVAC_RC
+typedef OverflowTaskQueue<StoreRefDecRcTask, mtGC>           G1StoreRefDecRcTasksQueue;
+typedef GenericTaskQueueSet<G1StoreRefDecRcTasksQueue, mtGC> G1StoreRefDecRcTasksQueueSet;
+#endif // XHN_EVAC_RC
 
 typedef int RegionIdx_t;   // needs to hold [ 0..max_reserved_regions() )
 typedef int CardIdx_t;     // needs to hold [ 0..CardsPerRegion )
@@ -803,6 +807,10 @@ public:
   // The parallel task queues
   G1ScannerTasksQueueSet *_task_queues;
 
+#ifdef XHN_EVAC_RC
+  G1StoreRefDecRcTasksQueueSet *_srdrc_task_queues;
+#endif // XHN_EVAC_RC
+
   // ("Weak") Reference processing support.
   //
   // G1 has 2 instances of the reference processor class.
@@ -866,6 +874,10 @@ public:
 
   G1ScannerTasksQueueSet* task_queues() const;
   G1ScannerTasksQueue* task_queue(uint i) const;
+#ifdef XHN_EVAC_RC
+  G1StoreRefDecRcTasksQueueSet* srdrc_task_queues() const;
+  G1StoreRefDecRcTasksQueue* srdrc_task_queue(uint i) const;
+#endif // XHN_EVAC_RC
 
   // Create a G1CollectedHeap.
   // Must call the initialize method afterwards.

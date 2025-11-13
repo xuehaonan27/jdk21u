@@ -274,6 +274,15 @@ class oopDesc {
   inline uint age() const;
   inline void incr_age();
 
+#ifdef XHN_EVAC_RC
+  inline uint rc() const;
+  // inline void incr_rc();
+  // Atomically increment RC by 1, but every thread calling this should succeed incrementing the RC field.
+  inline bool incr_rc_atomic(atomic_memory_order order);
+  // Atomically decrement RC by 1, but every thread calling this should succeed decrementing the RC field.
+  inline bool decr_rc_atomic(atomic_memory_order order);
+#endif // XHN_EVAC_RC
+
   template <typename OopClosureType>
   inline void oop_iterate(OopClosureType* cl);
 
@@ -303,6 +312,9 @@ class oopDesc {
   inline bool     has_displaced_mark() const;
   inline markWord displaced_mark() const;
   inline void     set_displaced_mark(markWord m);
+#ifdef XHN_EVAC_RC
+  inline markWord cas_set_displaced_mark(markWord new_mark, markWord old_mark, atomic_memory_order order);
+#endif // XHN_EVAC_RC
 
   // Checks if the mark word needs to be preserved
   inline bool mark_must_be_preserved() const;

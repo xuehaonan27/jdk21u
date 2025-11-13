@@ -44,6 +44,12 @@ class BasicLock {
     Atomic::store(&_displaced_header, header);
   }
 
+#ifdef XHN_EVAC_RC
+  markWord cas_set_displaced_header(markWord new_header, markWord old_header, atomic_memory_order order) {
+    return Atomic::cmpxchg(&_displaced_header, old_header, new_header, order);
+  }
+#endif // XHN_EVAC_RC
+
   void print_on(outputStream* st, oop owner) const;
 
   // move a basic lock (used during deoptimization

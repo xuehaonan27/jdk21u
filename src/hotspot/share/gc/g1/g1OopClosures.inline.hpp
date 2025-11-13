@@ -248,7 +248,23 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
       forwardee = _par_scan_state->copy_to_survivor_space(state, obj, m);
     }
     assert(forwardee != nullptr, "forwardee should not be null");
+
+#ifdef XHN_EVAC_RC
+    uint dummy_age = 0;
+    G1HeapRegionAttr dest_attr = _par_scan_state->pub_next_region_attr(state, m, dummy_age);
+    // if (dest_attr.is_young()) // If is not a promotion, then just do normal
+#endif // XHN_EVAC_RC
     RawAccess<IS_NOT_NULL>::oop_store(p, forwardee);
+#ifdef XHN_EVAC_RC
+    if (!dest_attr.is_young()) {
+    // else { // If is a promotion or old-to-old copy
+      bool inc_result = forwardee->incr_rc_atomic(memory_order_relaxed);
+      // guarantee(inc_result, "[xhn:evac-rc] incrementing RC overflow p=%p, obj=%p\n", p, cast_from_oop<void*>(forwardee));
+      // printf("[xhn:evac-rc] %u\n", _par_scan_state->srdrc_queue_size());
+      // _par_scan_state->report_srdrc_status();
+      _par_scan_state->push_on_srdrc_queue(StoreRefDecRcTask(p, forwardee));
+    }
+#endif // XHN_EVAC_RC
 
     if (barrier == G1BarrierCLD) {
       do_cld_barrier(forwardee);
