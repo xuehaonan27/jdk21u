@@ -45,6 +45,9 @@
 #include "runtime/prefetch.inline.hpp"
 #include "utilities/globalDefinitions.hpp"
 #include "utilities/macros.hpp"
+#ifdef XHN_COUNT_RC
+#include "logging/log.hpp"
+#endif // XHN_COUNT_RC
 
 // In fastdebug builds the code size can get out of hand, potentially
 // tripping over compiler limits (which may be bugs, but nevertheless
@@ -66,6 +69,9 @@ G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
 #ifdef XHN_EVAC_RC
     _srdrc_task_queue(g1h->srdrc_task_queue(worker_id)),
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+    _cntrc_task_queue(g1h->cntrc_task_queue(worker_id)),
+#endif // XHN_COUNT_RC
     _rdc_local_qset(rdcqs),
     _ct(g1h->card_table()),
     _closures(nullptr),
@@ -201,6 +207,23 @@ void G1ParScanThreadState::verify_task(StoreRefDecRcTask task) const {
   }
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+void G1ParScanThreadState::verify_task(CountRcTask task) const {
+  if (task.is_narrow_oop_ptr()) {
+    narrowOop* p = task.get_narrow_oop_ptr();
+    oop obj = task.get_forwardee();
+    assert(_g1h->is_in_reserved(obj),
+         "task=" PTR_FORMAT " p=" PTR_FORMAT, p2i(p), p2i(obj));
+  } else if (task.is_oop_ptr()) {
+    oop* p =  task.get_oop_ptr();
+    oop obj = task.get_forwardee();
+    assert(_g1h->is_in_reserved(obj),
+         "task=" PTR_FORMAT " p=" PTR_FORMAT, p2i(p), p2i(obj));
+  } else {
+    ShouldNotReachHere();
+  }
+}
+#endif // XHN_COUNT_RC
 
 #endif // ASSERT
 
@@ -253,6 +276,9 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
     // guarantee(inc_result, "[xhn:evac-rc] incrementing RC overflow p=%p, obj=%p\n", p, cast_from_oop<void*>(obj));
     // printf("[xhn:evac-rc] %u\n", srdrc_queue_size());
     // report_srdrc_status();
+#ifdef XHN_COUNT_RC
+    push_on_cntrc_queue(CountRcTask(p, obj));
+#endif // XHN_COUNT_RC
     push_on_srdrc_queue(StoreRefDecRcTask(p, obj));
   }
 #endif // XHN_EVAC_RC
@@ -268,12 +294,40 @@ void G1ParScanThreadState::do_oop_ref_store_dec_rc(T* p, oop obj) {
   // 1. This is a young-to-old promotion. Then just give it a new special reference.
   // 2. This is a old-to-old copy. Then we must consider unique reference promoting to shared reference.
   
+#ifdef XHN_COUNT_RC
+  // Clear cntrc bit, CAS because other workers may modifying with decr_rc_atomic now
+  if (obj->cntrc_bit())
+    obj->clear_cntrc_bit_atomic(memory_order_relaxed); // Don't care who won
+#endif // XHN_COUNT_RC
   bool dec_result = obj->decr_rc_atomic(memory_order_relaxed);
   // guarantee(dec_result, "[xhn:evac-rc] decrementing RC below 0 p=%p, obj=%p\n", p, cast_from_oop<void*>(obj));
   // [xhn:evac-rc] TODO: unique / shared here
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+template <class T>
+MAYBE_INLINE_EVACUATION
+void G1ParScanThreadState::do_oop_count_rc(T* p, oop obj) {
+  // [xhn:evac-rc] count RC
+  // RC won't change here, just load it
+  uint rc = obj->rc();
+  if (rc == 1) {
+    _unique_ref_cnt += 1;
+  } else {
+    _shared_ref_cnt += 1;
+  }
+  
+  if (!obj->cntrc_bit() && obj->set_cntrc_bit_atomic(memory_order_relaxed)) {
+    // we won the competition of setting cntrc bit to 1
+    if (rc == 1) {
+      _unique_obj_cnt += 1;
+    } else {
+      _shared_obj_cnt += 1;
+    }
+  }
+}
+#endif // XHN_COUNT_RC
 
 MAYBE_INLINE_EVACUATION
 void G1ParScanThreadState::do_partial_array(PartialArrayScanTask task) {
@@ -366,6 +420,18 @@ void G1ParScanThreadState::dispatch_srdrc_task(StoreRefDecRcTask task) {
   }
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+void G1ParScanThreadState::dispatch_cntrc_task(CountRcTask task) {
+  verify_task(task);
+  if (task.is_narrow_oop_ptr()) {
+    do_oop_count_rc(task.get_narrow_oop_ptr(), task.get_forwardee());
+  } else if (task.is_oop_ptr()) {
+    do_oop_count_rc(task.get_oop_ptr(), task.get_forwardee());
+  } else {
+    fatal("[xhn:count-rc] Insane\n");
+  }
+}
+#endif // XHN_COUNT_RC
 
 // Process tasks until overflow queue is empty and local queue
 // contains no more than threshold entries.  NOINLINE to prevent
@@ -401,6 +467,22 @@ void G1ParScanThreadState::trim_srdrc_queue_to_threshold(uint threshold) {
   } while (!_srdrc_task_queue->overflow_empty());
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+ATTRIBUTE_FLATTEN NOINLINE
+void G1ParScanThreadState::trim_cntrc_queue_to_threshold(uint threshold) {
+  CountRcTask task;
+  do {
+    while (_cntrc_task_queue->pop_overflow(task)) {
+      if (!_cntrc_task_queue->try_push_to_taskqueue(task)) {
+        dispatch_cntrc_task(task);
+      }
+    }
+    while (_cntrc_task_queue->pop_local(task, threshold)) {
+      dispatch_cntrc_task(task);
+    }
+  } while (!_cntrc_task_queue->overflow_empty());
+}
+#endif // XHN_COUNT_RC
 
 ATTRIBUTE_FLATTEN
 void G1ParScanThreadState::steal_and_trim_queue(G1ScannerTasksQueueSet* task_queues) {
@@ -423,6 +505,17 @@ void G1ParScanThreadState::steal_and_trim_srdrc_queue(G1StoreRefDecRcTasksQueueS
   }
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+ATTRIBUTE_FLATTEN
+void G1ParScanThreadState::steal_and_trim_cntrc_queue(G1CountRcTasksQueueSet* cntrc_task_queues) {
+  CountRcTask stolen_task;
+  while (cntrc_task_queues->steal(_worker_id, stolen_task)) {
+    dispatch_cntrc_task(stolen_task);
+    // Processing stolen task may have added tasks to our queue.
+    trim_cntrc_queue();
+  }
+}
+#endif // XHN_COUNT_RC
 
 HeapWord* G1ParScanThreadState::allocate_in_next_plab(G1HeapRegionAttr* dest,
                                                       size_t word_sz,
@@ -722,6 +815,15 @@ void G1ParScanThreadStateSet::flush_stats() {
     size_t lab_undo_waste_bytes = pss->lab_undo_waste_words() * HeapWordSize;
     size_t copied_bytes = pss->flush_stats(_surviving_young_words_total, _num_workers) * HeapWordSize;
 
+#ifdef XHN_COUNT_RC
+    // [xhn:evac-rc] because merge pss is serial (see comment of G1PostEvacuateCollectionSetCleanupTask1)
+    // there's no need for synchronizing or atomic operation, just add
+    _unique_ref_cnt += pss->_unique_ref_cnt;
+    _shared_ref_cnt += pss->_shared_ref_cnt;
+    _unique_obj_cnt += pss->_unique_obj_cnt;
+    _shared_obj_cnt += pss->_shared_obj_cnt;
+#endif // XHN_COUNT_RC
+
     p->record_or_add_thread_work_item(G1GCPhaseTimes::MergePSS, worker_id, copied_bytes, G1GCPhaseTimes::MergePSSCopiedBytes);
     p->record_or_add_thread_work_item(G1GCPhaseTimes::MergePSS, worker_id, lab_waste_bytes, G1GCPhaseTimes::MergePSSLABWasteBytes);
     p->record_or_add_thread_work_item(G1GCPhaseTimes::MergePSS, worker_id, lab_undo_waste_bytes, G1GCPhaseTimes::MergePSSLABUndoWasteBytes);
@@ -729,6 +831,12 @@ void G1ParScanThreadStateSet::flush_stats() {
     delete pss;
     _states[worker_id] = nullptr;
   }
+#ifdef XHN_COUNT_RC
+  log_info(gc, task)("[xhn:evac-rc] Unique reference count = %u", _unique_ref_cnt);
+  log_info(gc, task)("[xhn:evac-rc] Shared reference count = %u", _shared_ref_cnt);
+  log_info(gc, task)("[xhn:evac-rc] Unique objects   count = %u", _unique_obj_cnt);
+  log_info(gc, task)("[xhn:evac-rc] Shared objects   count = %u", _shared_obj_cnt);
+#endif // XHN_COUNT_RC
   _flushed = true;
 }
 

@@ -45,6 +45,12 @@ inline void G1ParScanThreadState::push_on_srdrc_queue(StoreRefDecRcTask task) {
   _srdrc_task_queue->push(task);
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+inline void G1ParScanThreadState::push_on_cntrc_queue(CountRcTask task) {
+  verify_task(task);
+  _cntrc_task_queue->push(task);
+}
+#endif // XHN_COUNT_RC
 
 bool G1ParScanThreadState::needs_partial_trimming() const {
   return !_task_queue->overflow_empty() ||
@@ -57,6 +63,12 @@ bool G1ParScanThreadState::srdrc_needs_partial_trimming() const {
          (_srdrc_task_queue->size() > _stack_trim_upper_threshold);
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+bool G1ParScanThreadState::cntrc_needs_partial_trimming() const {
+  return !_cntrc_task_queue->overflow_empty() ||
+         (_cntrc_task_queue->size() > _stack_trim_upper_threshold);
+}
+#endif // XHN_COUNT_RC
 
 void G1ParScanThreadState::trim_queue_partially() {
   if (!needs_partial_trimming()) {
@@ -95,6 +107,25 @@ void G1ParScanThreadState::trim_srdrc_queue() {
   assert(_srdrc_task_queue->taskqueue_empty(), "invariant");
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+void G1ParScanThreadState::trim_cntrc_queue_partially() {
+  if (!cntrc_needs_partial_trimming()) {
+    return;
+  }
+
+  const Ticks start = Ticks::now();
+  trim_cntrc_queue_to_threshold(_stack_trim_lower_threshold);
+  assert(_cntrc_task_queue->overflow_empty(), "invariant");
+  assert(_cntrc_task_queue->size() <= _stack_trim_lower_threshold, "invariant");
+  _trim_ticks += Ticks::now() - start;
+}
+
+void G1ParScanThreadState::trim_cntrc_queue() {
+  trim_cntrc_queue_to_threshold(0);
+  assert(_cntrc_task_queue->overflow_empty(), "invariant");
+  assert(_cntrc_task_queue->taskqueue_empty(), "invariant");
+}
+#endif // XHN_COUNT_RC
 
 inline Tickspan G1ParScanThreadState::trim_ticks() const {
   return _trim_ticks;

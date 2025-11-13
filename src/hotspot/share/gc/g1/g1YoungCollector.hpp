@@ -78,6 +78,9 @@ class G1YoungCollector {
 #ifdef XHN_EVAC_RC
   G1StoreRefDecRcTasksQueueSet* srdrc_task_queues() const;
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  G1CountRcTasksQueueSet* cntrc_task_queues() const;
+#endif // XHN_COUNT_RC
   G1SurvivorRegions* survivor_regions() const;
   ReferenceProcessor* ref_processor_stw() const;
   WorkerThreads* workers() const;

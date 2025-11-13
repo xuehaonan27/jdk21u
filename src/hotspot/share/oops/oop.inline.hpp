@@ -478,5 +478,68 @@ bool oopDesc::decr_rc_atomic(atomic_memory_order order) {
   }
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+bool oopDesc::cntrc_bit() const {
+    if (has_displaced_mark()) {
+    return displaced_mark().cntrc();
+  } else {
+    return mark().cntrc();
+  }
+}
+
+bool oopDesc::set_cntrc_bit_atomic(atomic_memory_order order) {
+  if (has_displaced_mark()) {
+    while (true) {
+      markWord old_mark = displaced_mark();
+      if (old_mark.cntrc()) return false;
+      markWord cleared_mark = old_mark.set_cntrc();
+      markWord current_mark = cas_set_displaced_mark(cleared_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return true;
+      }
+      // If failed, 2 situations:
+      // 1. probably someone else modified other fields like RC
+      // 2. someone else beated us in cas set cntrc
+      // anyway, go back loop again and check which situation.
+      // If 1 then give it another try;
+      // If 2 someone else done it, just return false, we failed in competition.
+    }
+  } else {
+    while (true) {
+      markWord old_mark = mark();
+      if (old_mark.cntrc()) return false;
+      markWord cleared_mark = old_mark.set_cntrc();
+      markWord current_mark = cas_set_mark(cleared_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return true;
+      }
+    }
+  }
+}
+
+bool oopDesc::clear_cntrc_bit_atomic(atomic_memory_order order) {
+  if (has_displaced_mark()) {
+    while (true) {
+      markWord old_mark = displaced_mark();
+      if (!old_mark.cntrc()) return false;
+      markWord cleared_mark = old_mark.clear_cntrc();
+      markWord current_mark = cas_set_displaced_mark(cleared_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return true;
+      }
+    }
+  } else {
+    while (true) {
+      markWord old_mark = mark();
+      if (!old_mark.cntrc()) return false;
+      markWord cleared_mark = old_mark.clear_cntrc();
+      markWord current_mark = cas_set_mark(cleared_mark, old_mark, order);
+      if (current_mark == old_mark) {
+        return true;
+      }
+    }
+  }
+}
+#endif // XHN_COUNT_RC
 
 #endif // SHARE_OOPS_OOP_INLINE_HPP

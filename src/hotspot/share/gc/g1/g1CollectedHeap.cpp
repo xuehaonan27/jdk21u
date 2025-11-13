@@ -1278,6 +1278,9 @@ G1CollectedHeap::G1CollectedHeap() :
 #ifdef XHN_EVAC_RC
   _srdrc_task_queues(nullptr),
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  _cntrc_task_queues(nullptr),
+#endif // XHN_COUNT_RC
   _ref_processor_stw(nullptr),
   _is_alive_closure_stw(this),
   _is_subject_to_discovery_stw(this),
@@ -1318,12 +1321,24 @@ G1CollectedHeap::G1CollectedHeap() :
   }
 #endif // XHN_EVAC_RC
 
+#ifdef XHN_COUNT_RC
+  _cntrc_task_queues = new G1CountRcTasksQueueSet(n_queues);
+
+  for (uint i = 0; i < n_queues; i++) {
+    G1CountRcTasksQueue* q = new G1CountRcTasksQueue();
+    _cntrc_task_queues->register_queue(i, q);
+  }
+#endif // XHN_COUNT_RC
+
   _gc_tracer_stw->initialize();
 
   guarantee(_task_queues != nullptr, "task_queues allocation failure.");
 #ifdef XHN_EVAC_RC
   guarantee(_srdrc_task_queues != nullptr, "srdrc_task_queues allocation failure.");
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  guarantee(_cntrc_task_queues != nullptr, "cntrc_task_queues allocation failure.");
+#endif // XHN_COUNT_RC
 }
 
 G1RegionToSpaceMapper* G1CollectedHeap::create_aux_memory_mapper(const char* description,

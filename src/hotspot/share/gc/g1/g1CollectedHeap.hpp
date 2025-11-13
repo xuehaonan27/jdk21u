@@ -93,6 +93,10 @@ typedef GenericTaskQueueSet<G1ScannerTasksQueue, mtGC> G1ScannerTasksQueueSet;
 typedef OverflowTaskQueue<StoreRefDecRcTask, mtGC>           G1StoreRefDecRcTasksQueue;
 typedef GenericTaskQueueSet<G1StoreRefDecRcTasksQueue, mtGC> G1StoreRefDecRcTasksQueueSet;
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+typedef OverflowTaskQueue<CountRcTask, mtGC>           G1CountRcTasksQueue;
+typedef GenericTaskQueueSet<G1CountRcTasksQueue, mtGC> G1CountRcTasksQueueSet;
+#endif // XHN_COUNT_RC
 
 typedef int RegionIdx_t;   // needs to hold [ 0..max_reserved_regions() )
 typedef int CardIdx_t;     // needs to hold [ 0..CardsPerRegion )
@@ -810,6 +814,9 @@ public:
 #ifdef XHN_EVAC_RC
   G1StoreRefDecRcTasksQueueSet *_srdrc_task_queues;
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  G1CountRcTasksQueueSet *_cntrc_task_queues;
+#endif // XHN_COUNT_RC
 
   // ("Weak") Reference processing support.
   //
@@ -878,6 +885,10 @@ public:
   G1StoreRefDecRcTasksQueueSet* srdrc_task_queues() const;
   G1StoreRefDecRcTasksQueue* srdrc_task_queue(uint i) const;
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  G1CountRcTasksQueueSet* cntrc_task_queues() const;
+  G1CountRcTasksQueue* cntrc_task_queue(uint i) const;
+#endif // XHN_COUNT_RC
 
   // Create a G1CollectedHeap.
   // Must call the initialize method afterwards.

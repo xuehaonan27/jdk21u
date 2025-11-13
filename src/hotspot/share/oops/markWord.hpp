@@ -134,10 +134,21 @@ class markWord {
 
   static const uint max_age                       = age_mask;
 
+#ifdef XHN_COUNT_RC
+  static const int cntrc_bits                     = 1;
+  static const int cntrc_shift                    = hash_shift + hash_bits + 16;
+  static const uintptr_t cntrc_mask               = right_n_bits(cntrc_bits);
+  static const uintptr_t cntrc_mask_in_place      = cntrc_mask << cntrc_shift;
+#endif // XHN_COUNT_RC
+
 #ifdef XHN_EVAC_RC
   // [xhn:evac-rc] Only consider 64 bits platform
   static const int rc_bits                        = 8; // Used in objs in CSet during evacuation
+#ifdef XHN_COUNT_RC
+  static const int rc_shift                       = cntrc_shift + cntrc_bits;
+#else
   static const int rc_shift                       = hash_shift + hash_bits + 1 + 16;
+#endif // XHN_COUNT_RC
   static const uintptr_t rc_mask                  = right_n_bits(rc_bits);
   static const uintptr_t rc_mask_in_place         = rc_mask << rc_shift;
   static const uint max_rc                        = rc_mask;
@@ -261,6 +272,11 @@ class markWord {
   bool has_no_hash() const {
     return hash() == no_hash;
   }
+#ifdef XHN_COUNT_RC
+  bool     cntrc() const { return mask_bits(value(), cntrc_mask_in_place) != 0; }
+  markWord set_cntrc() const { return markWord(value() | cntrc_mask_in_place); }
+  markWord clear_cntrc() const { return markWord(value() & ~cntrc_mask_in_place); }
+#endif // XHN_COUNT_RC
 #ifdef XHN_EVAC_RC
   // [xhn:evac-rc] rc operations
   uint     rc() const { return mask_bits(value() >> rc_shift, rc_mask); }
@@ -288,7 +304,11 @@ class markWord {
 #ifndef XHN_EVAC_RC
   inline void* decode_pointer() { return (void*)clear_lock_bits().value(); }
 #else
+#ifndef XHN_COUNT_RC
   inline void* decode_pointer() { return (void*)clear_lock_bits().clear_rc().value(); }
+#else
+  inline void* decode_pointer() { return (void*)clear_lock_bits().clear_rc().clear_cntrc().value(); }
+#endif // XHN_COUNT_RC
 #endif // XHN_EVAC_RC
 };
 

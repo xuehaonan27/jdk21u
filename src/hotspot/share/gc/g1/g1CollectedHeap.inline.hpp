@@ -192,6 +192,15 @@ inline G1StoreRefDecRcTasksQueue* G1CollectedHeap::srdrc_task_queue(uint i) cons
   return _srdrc_task_queues->queue(i);
 }
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+inline G1CountRcTasksQueueSet* G1CollectedHeap::cntrc_task_queues() const {
+  return _cntrc_task_queues;
+}
+
+inline G1CountRcTasksQueue* G1CollectedHeap::cntrc_task_queue(uint i) const {
+  return _cntrc_task_queues->queue(i);
+}
+#endif // XHN_COUNT_RC
 
 inline bool G1CollectedHeap::is_marked(oop obj) const {
   return _cm->mark_bitmap()->is_marked(obj);

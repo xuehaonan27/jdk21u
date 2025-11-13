@@ -282,6 +282,11 @@ class oopDesc {
   // Atomically decrement RC by 1, but every thread calling this should succeed decrementing the RC field.
   inline bool decr_rc_atomic(atomic_memory_order order);
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  inline bool cntrc_bit() const;
+  inline bool set_cntrc_bit_atomic(atomic_memory_order order);
+  inline bool clear_cntrc_bit_atomic(atomic_memory_order order);
+#endif // XHN_COUNT_RC
 
   template <typename OopClosureType>
   inline void oop_iterate(OopClosureType* cl);

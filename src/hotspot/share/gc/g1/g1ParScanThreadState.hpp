@@ -57,6 +57,9 @@ class G1ParScanThreadState : public CHeapObj<mtGC> {
 #ifdef XHN_EVAC_RC
   G1StoreRefDecRcTasksQueue* _srdrc_task_queue;
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  G1CountRcTasksQueue* _cntrc_task_queue;
+#endif // XHN_COUNT_RC
   G1RedirtyCardsLocalQueueSet _rdc_local_qset;
   G1CardTable* _ct;
   G1EvacuationRootClosures* _closures;
@@ -116,6 +119,12 @@ class G1ParScanThreadState : public CHeapObj<mtGC> {
   bool inject_evacuation_failure(uint region_idx) EVAC_FAILURE_INJECTOR_RETURN_( return false; );
 
 public:
+#ifdef XHN_COUNT_RC
+  uint _unique_ref_cnt = 0;
+  uint _shared_ref_cnt = 0;
+  uint _unique_obj_cnt = 0;
+  uint _shared_obj_cnt = 0;
+#endif // XHN_COUNT_RC
   G1ParScanThreadState(G1CollectedHeap* g1h,
                        G1RedirtyCardsQueueSet* rdcqs,
                        PreservedMarks* preserved_marks,
@@ -135,6 +144,9 @@ public:
   bool queue_is_empty() const { return _task_queue->is_empty(); }
 #endif
   bool srdrc_queue_is_empty() const { return _srdrc_task_queue->is_empty(); }
+#ifdef XHN_COUNT_RC
+  bool cntrc_queue_is_empty() const { return _cntrc_task_queue->is_empty(); }
+#endif // XHN_COUNT_RC
 #endif // XHN_EVAC_RC
 
   void verify_task(narrowOop* task) const NOT_DEBUG_RETURN;
@@ -150,6 +162,10 @@ public:
   void report_srdrc_status();
   void verify_task(StoreRefDecRcTask task) const NOT_DEBUG_RETURN;
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  void push_on_cntrc_queue(CountRcTask task);
+  void verify_task(CountRcTask task) const NOT_DEBUG_RETURN;
+#endif // XHN_COUNT_RC
 
   // Apply the post barrier to the given reference field. Enqueues the card of p
   // if the barrier does not filter out the reference for some reason (e.g.
@@ -203,6 +219,11 @@ private:
 
   void dispatch_srdrc_task(StoreRefDecRcTask task);
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  template <class T> void do_oop_count_rc(T* p, oop obj);
+
+  void dispatch_cntrc_task(CountRcTask task);
+#endif // XHN_COUNT_RC
 
   // Tries to allocate word_sz in the PLAB of the next "generation" after trying to
   // allocate into dest. Previous_plab_refill_failed indicates whether previous
@@ -230,6 +251,11 @@ private:
 
   inline bool srdrc_needs_partial_trimming() const;
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  void trim_cntrc_queue_to_threshold(uint threshold);
+
+  inline bool cntrc_needs_partial_trimming() const;
+#endif // XHN_COUNT_RC
 
   // NUMA statistics related methods.
   void initialize_numa_stats();
@@ -249,6 +275,11 @@ public:
   inline void trim_srdrc_queue_partially();
   void steal_and_trim_srdrc_queue(G1StoreRefDecRcTasksQueueSet *srdrc_task_queues);
 #endif // XHN_EVAC_RC
+#ifdef XHN_COUNT_RC
+  inline void trim_cntrc_queue();
+  inline void trim_cntrc_queue_partially();
+  void steal_and_trim_cntrc_queue(G1CountRcTasksQueueSet *srdrc_task_queues);
+#endif // XHN_COUNT_RC
 
   Tickspan trim_ticks() const;
   void reset_trim_ticks();
@@ -270,6 +301,12 @@ class G1ParScanThreadStateSet : public StackObj {
   G1RedirtyCardsQueueSet _rdcqs;
   PreservedMarksSet _preserved_marks_set;
   G1ParScanThreadState** _states;
+#ifdef XHN_COUNT_RC
+  uint _unique_ref_cnt = 0;
+  uint _shared_ref_cnt = 0;
+  uint _unique_obj_cnt = 0;
+  uint _shared_obj_cnt = 0;
+#endif // XHN_COUNT_RC
   size_t* _surviving_young_words_total;
   uint _num_workers;
   bool _flushed;
