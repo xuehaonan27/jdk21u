@@ -215,6 +215,8 @@ const DecoratorSet ARRAYCOPY_DECORATOR_MASK       = ARRAYCOPY_CHECKCAST | ARRAYC
 const DecoratorSet ACCESS_READ                    = UCONST64(1) << 29;
 const DecoratorSet ACCESS_WRITE                   = UCONST64(1) << 30;
 
+// [xhn:barrier] add barriers and modify `DECORATOR_LAST`
+
 // Keep track of the last decorator.
 const DecoratorSet DECORATOR_LAST = UCONST64(1) << 30;
 

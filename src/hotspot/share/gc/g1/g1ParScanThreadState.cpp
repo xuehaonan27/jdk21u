@@ -299,7 +299,7 @@ void G1ParScanThreadState::do_oop_ref_store_dec_rc(T* p, oop obj) {
   if (obj->cntrc_bit())
     obj->clear_cntrc_bit_atomic(memory_order_relaxed); // Don't care who won
 #endif // XHN_COUNT_RC
-  bool dec_result = obj->decr_rc_atomic(memory_order_relaxed);
+  // bool dec_result = obj->decr_rc_atomic(memory_order_relaxed);
   // guarantee(dec_result, "[xhn:evac-rc] decrementing RC below 0 p=%p, obj=%p\n", p, cast_from_oop<void*>(obj));
   // [xhn:evac-rc] TODO: unique / shared here
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);

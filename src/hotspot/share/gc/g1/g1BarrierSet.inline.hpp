@@ -112,6 +112,7 @@ oop_load_not_in_heap(T* addr) {
   return value;
 }
 
+// [xhn:barrier] non-raw access oop load here
 template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::

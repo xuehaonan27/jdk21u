@@ -75,6 +75,7 @@ inline void RawAccessBarrier<decorators>::oop_store_at(oop base, ptrdiff_t offse
   oop_store(field_addr(base, offset), value);
 }
 
+// [xhn:barrier] Raw access OOP load here
 template <DecoratorSet decorators>
 template <typename T>
 inline T RawAccessBarrier<decorators>::oop_load(void* addr) {

@@ -317,6 +317,7 @@ public:
 
   template <typename T>
   static inline T load(void* addr) {
+    // [xhn:barrier] RawAccess loading OOP here
     return load_internal<decorators, T>(addr);
   }
 

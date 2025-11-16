@@ -245,6 +245,8 @@ public:
     // Heap oop accesses. These accessors get resolved when
     // IN_HEAP is set (e.g. when using the HeapAccess API), it is
     // an oop_* overload, and the barrier strength is AS_NORMAL.
+    // [xhn:barrier] G1 bs oop_load_in_heap proxy to ModRef::oop_load_in_heap
+    // [xhn:barrier] but ModRef doesn't override oop_load_in_heap, so proxy directly to this base method
     template <typename T>
     static oop oop_load_in_heap(T* addr) {
       return Raw::template oop_load<oop>(addr);
