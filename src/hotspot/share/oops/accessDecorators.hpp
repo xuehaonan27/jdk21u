@@ -215,10 +215,17 @@ const DecoratorSet ARRAYCOPY_DECORATOR_MASK       = ARRAYCOPY_CHECKCAST | ARRAYC
 const DecoratorSet ACCESS_READ                    = UCONST64(1) << 29;
 const DecoratorSet ACCESS_WRITE                   = UCONST64(1) << 30;
 
+#ifdef XHN_BARRIER
 // [xhn:barrier] add barriers and modify `DECORATOR_LAST`
+// [xhn:barrier] This marks whether access is by Mutator.
+const DecoratorSet IS_MUTATOR_ACCESS              = UCONST64(1) << 31;
+// Keep track of the last decorator.
+const DecoratorSet DECORATOR_LAST = UCONST64(1) << 31;
+#else
 
 // Keep track of the last decorator.
 const DecoratorSet DECORATOR_LAST = UCONST64(1) << 30;
+#endif  // XHN_BARRIER
 
 namespace AccessInternal {
   // This class adds implied decorators that follow according to decorator rules.

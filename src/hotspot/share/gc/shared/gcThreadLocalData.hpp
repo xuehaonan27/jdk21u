@@ -40,6 +40,10 @@
 // should consider placing frequently accessed fields first in
 // T, so that field offsets relative to Thread are small, which
 // often allows for a more compact instruction encoding.
+#ifndef XHN_BARRIER
 typedef uint64_t GCThreadLocalData[43]; // 344 bytes
+#else
+typedef uint64_t GCThreadLocalData[100];
+#endif // XHN_BARRIER
 
 #endif // SHARE_GC_SHARED_GCTHREADLOCALDATA_HPP

@@ -31,7 +31,9 @@
 #include "oops/oopsHierarchy.hpp"
 #include "utilities/debug.hpp"
 #include "utilities/globalDefinitions.hpp"
-
+#ifdef XHN_EVAC_RC
+  #include "oops/compressedOops.hpp"
+#endif // XHN_EVAC_RC
 
 // = GENERAL =
 // Access is an API for performing accesses with declarative semantics. Each access can have a number of "decorators".
@@ -249,6 +251,9 @@ public:
     verify_oop_decorators<store_mo_decorators>();
     typedef typename AccessInternal::OopOrNarrowOop<T>::type OopType;
     OopType oop_value = value;
+#ifdef XHN_EVAC_RC
+    // printf("[oop_store] addr=%p value=%p\n", addr, cast_from_oop<void*>(CompressedOops::decode(value)));
+#endif // XHN_EVAC_RC
     AccessInternal::store<decorators | INTERNAL_VALUE_IS_OOP>(addr, oop_value);
   }
 

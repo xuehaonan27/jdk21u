@@ -265,8 +265,13 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
 #ifdef XHN_EVAC_RC
   uint dummy_age = 0;
   G1HeapRegionAttr dest_attr = next_region_attr(region_attr, m, dummy_age);
+  // XHN_TODO
   // if (dest_attr.is_young()) // If is not a promotion, then just do normal
 #endif // XHN_EVAC_RC
+  if (cast_from_oop<void*>(obj) == nullptr) {
+    // printf("[check null] p=%p obj=null\n", p);
+    guarantee(false, "[check null] p=%p obj=null\n", p);
+  }
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);
 #ifdef XHN_EVAC_RC
   if (!dest_attr.is_young()) {
@@ -276,10 +281,12 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
     // guarantee(inc_result, "[xhn:evac-rc] incrementing RC overflow p=%p, obj=%p\n", p, cast_from_oop<void*>(obj));
     // printf("[xhn:evac-rc] %u\n", srdrc_queue_size());
     // report_srdrc_status();
+    Klass* klass = obj->klass();
 #ifdef XHN_COUNT_RC
-    push_on_cntrc_queue(CountRcTask(p, obj));
+    push_on_cntrc_queue(CountRcTask(p, obj, klass));
 #endif // XHN_COUNT_RC
-    push_on_srdrc_queue(StoreRefDecRcTask(p, obj));
+    // printf("[xhn:evac-rc] srdrc p=%p obj=%p\n", p, cast_from_oop<void*>(obj));
+    push_on_srdrc_queue(StoreRefDecRcTask(p, obj, klass));
   }
 #endif // XHN_EVAC_RC
 
@@ -289,7 +296,7 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
 #ifdef XHN_EVAC_RC
 template <class T>
 MAYBE_INLINE_EVACUATION
-void G1ParScanThreadState::do_oop_ref_store_dec_rc(T* p, oop obj) {
+void G1ParScanThreadState::do_oop_ref_store_dec_rc(T* p, oop obj, Klass* klass) {
   // [xhn:evac-rc] There should be 2 situations.
   // 1. This is a young-to-old promotion. Then just give it a new special reference.
   // 2. This is a old-to-old copy. Then we must consider unique reference promoting to shared reference.
@@ -302,13 +309,90 @@ void G1ParScanThreadState::do_oop_ref_store_dec_rc(T* p, oop obj) {
   // bool dec_result = obj->decr_rc_atomic(memory_order_relaxed);
   // guarantee(dec_result, "[xhn:evac-rc] decrementing RC below 0 p=%p, obj=%p\n", p, cast_from_oop<void*>(obj));
   // [xhn:evac-rc] TODO: unique / shared here
-  RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+
+  // printf("[xhn:evac-rc] loading p=%p obj=%p\n", p, cast_from_oop<void*>(obj));
+  uint32_t narrowOop_uint32 = *((uint32_t*)p);
+  if (narrowOop_uint32 == 0) {
+    // check words before and after this
+    printf("[check klass] klass signature name = %s\n", klass->signature_name());
+    printf("[check klass] is InstanceKlass? %s\n", klass->is_instance_klass() ? "yes" : "no");
+    printf("[check klass] is other InstanceKlass? %s\n", klass->is_other_instance_klass() ? "yes" : "no");
+    printf("[check klass] is InstanceRefKlass? %s\n", klass->is_reference_instance_klass() ? "yes" : "no");
+    printf("[check klass] is InstanceMirrorKlass? %s\n", klass->is_mirror_instance_klass() ? "yes" : "no");
+    printf("[check klass] is InstanceClassLoaderKlass? %s\n", klass->is_class_loader_instance_klass() ? "yes" : "no");
+    printf("[check klass] is ArrayKlass? %s\n", klass->is_array_klass() ? "yes" : "no");
+    printf("[check klass] is InstanceStackChunkKlass? %s\n", klass->is_stack_chunk_instance_klass() ? "yes" : "no");
+    printf("[check klass] is ObjArrayKlassKind? %s\n", klass->is_objArray_klass() ? "yes" : "no");
+    printf("[check klass] is TypeArrayKlassKind? %s\n", klass->is_typeArray_klass() ? "yes" : "no");
+    uint64_t* here = (uint64_t*)p;
+    uint64_t* here_plus_1 = (uint64_t*)here + 1;
+    uint64_t* here_plus_2 = (uint64_t*)here + 2;
+    uint64_t* here_plus_3 = (uint64_t*)here + 3;
+    uint64_t* here_minus_1 = (uint64_t*)here - 1;
+    uint64_t* here_minus_2 = (uint64_t*)here - 2;
+    uint64_t* here_minus_3 = (uint64_t*)here - 3;
+#define XHN_PRINT_CHECK(ptr) \
+  do { \
+    printf("[check null] pointer=%p val=%lx\n", ptr, *ptr); \
+  } while (0)
+
+    XHN_PRINT_CHECK(here_minus_1);
+    XHN_PRINT_CHECK(here_minus_2);
+    XHN_PRINT_CHECK(here_minus_3);
+    XHN_PRINT_CHECK(here);
+    XHN_PRINT_CHECK(here_plus_1);
+    XHN_PRINT_CHECK(here_plus_2);
+    XHN_PRINT_CHECK(here_plus_3);
+#undef XHN_PRINT_CHECK
+    // guarantee(false, "check exit");
+  }
+  // guarantee(narrowOop_uint32 != 0, "[xhn:evac-rc] narrowOop p=%p obj=%p but p would load 0\n", p, cast_from_oop<void*>(obj));
+  // oop assert_oop = RawAccess<IS_NOT_NULL>::oop_load(p);
+  // oop assert_oop = RawAccess<>::oop_load(p);
+  // oop assert_oop = *((oop*)p);
+  // guarantee(assert_oop == obj, "[xhn:evac-rc] Insane p=%p obj=%p but load p failed: assert_oop=%p!", p, cast_from_oop<void*>(obj), cast_from_oop<void*>(assert_oop));
+  // RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+  RawAccess<>::oop_store(p, obj);
 }
 #endif // XHN_EVAC_RC
 #ifdef XHN_COUNT_RC
 template <class T>
 MAYBE_INLINE_EVACUATION
-void G1ParScanThreadState::do_oop_count_rc(T* p, oop obj) {
+void G1ParScanThreadState::do_oop_count_rc(T* p, oop obj, Klass* klass) {
+   uint32_t narrowOop_uint32 = *((uint32_t*)p);
+  if (narrowOop_uint32 == 0) {
+    // check words before and after this
+    printf("[cntrc] klass signature name = %s\n", klass->signature_name());
+    printf("[cntrc] is InstanceKlass? %s\n", klass->is_instance_klass() ? "yes" : "no");
+    printf("[cntrc] is other InstanceKlass? %s\n", klass->is_other_instance_klass() ? "yes" : "no");
+    printf("[cntrc] is InstanceRefKlass? %s\n", klass->is_reference_instance_klass() ? "yes" : "no");
+    printf("[cntrc] is InstanceMirrorKlass? %s\n", klass->is_mirror_instance_klass() ? "yes" : "no");
+    printf("[cntrc] is InstanceClassLoaderKlass? %s\n", klass->is_class_loader_instance_klass() ? "yes" : "no");
+    printf("[cntrc] is ArrayKlass? %s\n", klass->is_array_klass() ? "yes" : "no");
+    printf("[cntrc] is InstanceStackChunkKlass? %s\n", klass->is_stack_chunk_instance_klass() ? "yes" : "no");
+    printf("[cntrc] is ObjArrayKlassKind? %s\n", klass->is_objArray_klass() ? "yes" : "no");
+    printf("[cntrc] is TypeArrayKlassKind? %s\n", klass->is_typeArray_klass() ? "yes" : "no");
+    uint64_t* here = (uint64_t*)p;
+    uint64_t* here_plus_1 = (uint64_t*)here + 1;
+    uint64_t* here_plus_2 = (uint64_t*)here + 2;
+    uint64_t* here_plus_3 = (uint64_t*)here + 3;
+    uint64_t* here_minus_1 = (uint64_t*)here - 1;
+    uint64_t* here_minus_2 = (uint64_t*)here - 2;
+    uint64_t* here_minus_3 = (uint64_t*)here - 3;
+#define XHN_PRINT_CHECK(ptr) \
+  do { \
+    printf("[check null] pointer=%p val=%lx\n", ptr, *ptr); \
+  } while (0)
+
+    XHN_PRINT_CHECK(here_minus_1);
+    XHN_PRINT_CHECK(here_minus_2);
+    XHN_PRINT_CHECK(here_minus_3);
+    XHN_PRINT_CHECK(here);
+    XHN_PRINT_CHECK(here_plus_1);
+    XHN_PRINT_CHECK(here_plus_2);
+    XHN_PRINT_CHECK(here_plus_3);
+#undef XHN_PRINT_CHECK
+  }
   // [xhn:evac-rc] count RC
   // RC won't change here, just load it
   uint rc = obj->rc();
@@ -412,9 +496,9 @@ void G1ParScanThreadState::dispatch_task(ScannerTask task) {
 void G1ParScanThreadState::dispatch_srdrc_task(StoreRefDecRcTask task) {
   verify_task(task);
   if (task.is_narrow_oop_ptr()) {
-    do_oop_ref_store_dec_rc(task.get_narrow_oop_ptr(), task.get_forwardee());
+    do_oop_ref_store_dec_rc(task.get_narrow_oop_ptr(), task.get_forwardee(), task.get_klass());
   } else if (task.is_oop_ptr()) {
-    do_oop_ref_store_dec_rc(task.get_oop_ptr(), task.get_forwardee());
+    do_oop_ref_store_dec_rc(task.get_oop_ptr(), task.get_forwardee(), task.get_klass());
   } else {
     fatal("[xhn:evac-rc] Insane\n");
   }
@@ -424,9 +508,9 @@ void G1ParScanThreadState::dispatch_srdrc_task(StoreRefDecRcTask task) {
 void G1ParScanThreadState::dispatch_cntrc_task(CountRcTask task) {
   verify_task(task);
   if (task.is_narrow_oop_ptr()) {
-    do_oop_count_rc(task.get_narrow_oop_ptr(), task.get_forwardee());
+    do_oop_count_rc(task.get_narrow_oop_ptr(), task.get_forwardee(), task.get_klass());
   } else if (task.is_oop_ptr()) {
-    do_oop_count_rc(task.get_oop_ptr(), task.get_forwardee());
+    do_oop_count_rc(task.get_oop_ptr(), task.get_forwardee(), task.get_klass());
   } else {
     fatal("[xhn:count-rc] Insane\n");
   }

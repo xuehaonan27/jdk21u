@@ -42,6 +42,9 @@
 #include "runtime/java.hpp"
 #include "runtime/nonJavaThread.hpp"
 #include "utilities/globalDefinitions.hpp"
+#ifdef XHN_EVAC_RC
+#include "string.h"
+#endif // XHN_EVAC_RC
 
 ReferencePolicy* ReferenceProcessor::_always_clear_soft_ref_policy = nullptr;
 ReferencePolicy* ReferenceProcessor::_default_soft_ref_policy      = nullptr;
@@ -248,6 +251,15 @@ void DiscoveredListIterator::load_ptrs(DEBUG_ONLY(bool allow_null_referent)) {
 
 void DiscoveredListIterator::remove() {
   assert(oopDesc::is_oop(_current_discovered), "Dropping a bad reference");
+#ifdef XHN_EVAC_RC
+  // Check the oop
+  // Klass* klass = _current_discovered->klass();
+  // const char* klass_signature_name = klass->signature_name();
+  // if (strcmp(klass_signature_name, "Lsun/nio/ch/FileChannelImpl;") == 0) {
+  //   printf("Lsun/nio/ch/FileChannelImpl; STORING NULLPTR INTO IT");
+  // }
+  // printf("[DiscoveredListIterator::remove] oop_store(%p, nullptr), _current_discovered->klass()=%s\n", _current_discovered_addr, _current_discovered->klass()->signature_name());
+#endif // XHN_EVAC_RC
   RawAccess<>::oop_store(_current_discovered_addr, oop(nullptr));
 
   // First _prev_next ref actually points into DiscoveredList (gross).

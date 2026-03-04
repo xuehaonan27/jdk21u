@@ -590,6 +590,7 @@ public:
 class StoreRefDecRcTask {
   void* _p;
   oop _forwardee;
+  Klass* _klass;
 
   static const uintptr_t OopTag = 0;
   static const uintptr_t NarrowOopTag = (uintptr_t)1 << (sizeof(void*) * 8 - 1);
@@ -621,9 +622,9 @@ class StoreRefDecRcTask {
 public:
   StoreRefDecRcTask() : _p(nullptr), _forwardee(cast_to_oop(nullptr)) {}
 
-  explicit StoreRefDecRcTask(oop* p, oop forwardee) : _p(encode(p, OopTag)), _forwardee(forwardee) {}
+  explicit StoreRefDecRcTask(oop* p, oop forwardee, Klass* klass) : _p(encode(p, OopTag)), _forwardee(forwardee), _klass(klass) {}
 
-  explicit StoreRefDecRcTask(narrowOop* p, oop forwardee) : _p(encode(p, NarrowOopTag)), _forwardee(forwardee) {}
+  explicit StoreRefDecRcTask(narrowOop* p, oop forwardee, Klass* klass) : _p(encode(p, NarrowOopTag)), _forwardee(forwardee), _klass(klass) {}
 
   // Trivially copyable.
 
@@ -648,12 +649,17 @@ public:
   oop get_forwardee() const {
     return _forwardee;
   }
+
+  Klass* get_klass() const {
+    return _klass;
+  }
 };
 #endif // XHN_EVAC_RC
 #ifdef XHN_COUNT_RC
 class CountRcTask {
   void* _p;
   oop _forwardee;
+  Klass* _klass;
 
   static const uintptr_t OopTag = 0;
   static const uintptr_t NarrowOopTag = (uintptr_t)1 << (sizeof(void*) * 8 - 1);
@@ -683,11 +689,11 @@ class CountRcTask {
   }
 
 public:
-  CountRcTask() : _p(nullptr), _forwardee(cast_to_oop(nullptr)) {}
+  CountRcTask() : _p(nullptr), _forwardee(cast_to_oop(nullptr)), _klass(nullptr) {}
 
-  explicit CountRcTask(oop* p, oop forwardee) : _p(encode(p, OopTag)), _forwardee(forwardee) {}
+  explicit CountRcTask(oop* p, oop forwardee, Klass* klass) : _p(encode(p, OopTag)), _forwardee(forwardee), _klass(klass)  {}
 
-  explicit CountRcTask(narrowOop* p, oop forwardee) : _p(encode(p, NarrowOopTag)), _forwardee(forwardee) {}
+  explicit CountRcTask(narrowOop* p, oop forwardee, Klass* klass) : _p(encode(p, NarrowOopTag)), _forwardee(forwardee), _klass(klass)  {}
 
   // Trivially copyable.
 
@@ -711,6 +717,10 @@ public:
 
   oop get_forwardee() const {
     return _forwardee;
+  }
+
+  Klass* get_klass() const {
+    return _klass;
   }
 };
 #endif // XHN_COUNT_RC

@@ -341,6 +341,9 @@ public:
   template <typename T>
   static void oop_store_at(oop base, ptrdiff_t offset, T value);
 
+// #ifdef XHN_BARRIER
+//   static oop oop_load(void *addr);
+// #endif // XHN_BARRIER
   template <typename T>
   static T oop_load(void* addr);
   template <typename T>

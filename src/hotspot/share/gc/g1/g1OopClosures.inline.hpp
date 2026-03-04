@@ -252,8 +252,13 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
 #ifdef XHN_EVAC_RC
     uint dummy_age = 0;
     G1HeapRegionAttr dest_attr = _par_scan_state->pub_next_region_attr(state, m, dummy_age);
+    // XHN_TODO
     // if (dest_attr.is_young()) // If is not a promotion, then just do normal
 #endif // XHN_EVAC_RC
+    if (cast_from_oop<void*>(forwardee) == nullptr) {
+      // printf("[check null] p=%p obj=null\n", p);
+      guarantee(false, "[check null] p=%p forwardee=null\n", p);
+    }
     RawAccess<IS_NOT_NULL>::oop_store(p, forwardee);
 #ifdef XHN_EVAC_RC
     if (!dest_attr.is_young()) {
@@ -262,7 +267,12 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
       // guarantee(inc_result, "[xhn:evac-rc] incrementing RC overflow p=%p, obj=%p\n", p, cast_from_oop<void*>(forwardee));
       // printf("[xhn:evac-rc] %u\n", _par_scan_state->srdrc_queue_size());
       // _par_scan_state->report_srdrc_status();
-      _par_scan_state->push_on_srdrc_queue(StoreRefDecRcTask(p, forwardee));
+      Klass* klass = forwardee->klass();
+#ifdef XHN_COUNT_RC
+      _par_scan_state->push_on_cntrc_queue(CountRcTask(p, forwardee, klass));
+#endif // XHN_COUNT_RC
+      // printf("[xhn:evac-rc] srdrc p=%p fwd=%p\n", p, cast_from_oop<void*>(forwardee));
+      _par_scan_state->push_on_srdrc_queue(StoreRefDecRcTask(p, forwardee, klass));
     }
 #endif // XHN_EVAC_RC
 

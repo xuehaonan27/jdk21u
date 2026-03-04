@@ -122,6 +122,10 @@ class StringDedup::Processor::ProcessRequest final : public OopClosure {
 
   void release_ref(oop* ref) {
     assert(_release_index < ARRAY_SIZE(_bulk_release), "invariant");
+#ifdef XHN_EVAC_RC
+    oop ref_oop = RawAccess<>::oop_load(ref);
+    // printf("[StringDedup::Processor::ProcessRequest::release_ref] oop_store(%p, nullptr), ref->klass()=%s\n", ref, ref_oop->klass()->signature_name());
+#endif // XHN_EVAC_RC
     NativeAccess<ON_PHANTOM_OOP_REF>::oop_store(ref, nullptr);
     _bulk_release[_release_index++] = ref;
     if (_release_index == ARRAY_SIZE(_bulk_release)) {

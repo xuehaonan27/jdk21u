@@ -215,12 +215,12 @@ private:
   void dispatch_task(ScannerTask task);
 
 #ifdef XHN_EVAC_RC
-  template <class T> void do_oop_ref_store_dec_rc(T* p, oop obj);
+  template <class T> void do_oop_ref_store_dec_rc(T* p, oop obj, Klass* klass);
 
   void dispatch_srdrc_task(StoreRefDecRcTask task);
 #endif // XHN_EVAC_RC
 #ifdef XHN_COUNT_RC
-  template <class T> void do_oop_count_rc(T* p, oop obj);
+  template <class T> void do_oop_count_rc(T* p, oop obj, Klass* klass);
 
   void dispatch_cntrc_task(CountRcTask task);
 #endif // XHN_COUNT_RC

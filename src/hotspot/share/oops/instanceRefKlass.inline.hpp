@@ -118,6 +118,7 @@ void InstanceRefKlass::oop_oop_iterate_ref_processing(oop obj, OopClosureType* c
       trace_reference_gc<T>("do_discovery", obj);
       oop_oop_iterate_discovery<T>(obj, reference_type(), closure, contains);
       break;
+    // [xhn:evac-rc] G1ScanEvacuatedObjClosure will set to DO_DISCOVERED_AND_DISCOVERY here.
     case OopIterateClosure::DO_DISCOVERED_AND_DISCOVERY:
       trace_reference_gc<T>("do_discovered_and_discovery", obj);
       oop_oop_iterate_discovered_and_discovery<T>(obj, reference_type(), closure, contains);

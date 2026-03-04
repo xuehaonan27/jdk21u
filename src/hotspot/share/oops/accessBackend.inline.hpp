@@ -33,6 +33,9 @@
 #include "oops/oopsHierarchy.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/orderAccess.hpp"
+// #ifdef XHN_BARRIER
+// #include "oops/distributedOop.hpp"
+// #endif // XHN_BARRIER
 
 #include <type_traits>
 
@@ -74,6 +77,22 @@ template <typename T>
 inline void RawAccessBarrier<decorators>::oop_store_at(oop base, ptrdiff_t offset, T value) {
   oop_store(field_addr(base, offset), value);
 }
+
+// #ifdef XHN_BARRIER
+// // [xhn:barrier] Raw access OOP load here
+// // [xhn:barrier] Any loading of [T=oop] will be statically dispatched to here by compiler
+// // [xhn:barrier] because this matches best.
+// template <DecoratorSet decorators>
+// inline oop RawAccessBarrier<decorators>::oop_load(void* addr) {
+//   oop encoded = load<oop>(reinterpret_cast<oop*>(addr));
+//   // [xhn:barrier] must hook here, in case raw accessing a remoted oop.
+//   // [xhn:barrier] before any memory access happens to this `encoded` oop,
+//   // [xhn:barrier] we must check whether it is a distributedOop.
+//   return DistributedOop(encoded).is_distributed() ? // is this address distributed?
+//     DistributedOopPostProcessor::handle_oop_load(addr, encoded) :
+//     encoded;
+// }
+// #endif // XHN_BARRIER
 
 // [xhn:barrier] Raw access OOP load here
 template <DecoratorSet decorators>

@@ -47,6 +47,9 @@ inline void G1ParScanThreadState::push_on_srdrc_queue(StoreRefDecRcTask task) {
 #endif // XHN_EVAC_RC
 #ifdef XHN_COUNT_RC
 inline void G1ParScanThreadState::push_on_cntrc_queue(CountRcTask task) {
+  if (strcmp(task.get_klass().signature_name(), "Lsun/nio/ch/FileChannelImpl") == 0) {
+    uint32_t narrowOop_uint32 = *((uint32_t*)task.get_pointer());
+  }
   verify_task(task);
   _cntrc_task_queue->push(task);
 }

@@ -732,12 +732,12 @@ protected:
     Ticks srdrc_start = Ticks::now();
 
 #ifdef XHN_COUNT_RC
-    log_info(gc)("[xhn:evac-rc] entering cntrc");
+    // log_info(gc)("[xhn:evac-rc] entering cntrc");
     G1ParCountRcClosure cntrc_cl(_g1h, pss, _cntrc_task_queues, &_cntrc_terminator, srdrc_phase);
     cntrc_cl.do_void();
 #endif // XHN_COUNT_RC
-
-    log_info(gc)("[xhn:evac-rc] entering srdrc");
+    // printf("[xhn:evac-rc] #######################################################################################\n");
+    // log_info(gc)("[xhn:evac-rc] entering srdrc");
     G1ParStoreRefDecRcClosure srdrc_cl(_g1h, pss, _srdrc_task_queues, &_srdrc_terminator, srdrc_phase);
     srdrc_cl.do_void();
 
@@ -1133,6 +1133,9 @@ class G1STWRefProcProxyTask : public RefProcProxyTask {
 // #ifdef XHN_EVAC_RC
 //       if (value == nullptr)
 // #endif // XHN_EVAC_RC
+#ifdef XHN_EVAC_RC
+      // printf("[xhn:evac-rc] d=%p val=%p\n", discovered_field_addr, cast_from_oop<void*>(value));
+#endif // XHN_EVAC_RC
       RawAccess<>::oop_store(discovered_field_addr, value);
 // #ifdef XHN_EVAC_RC
 //       else {
