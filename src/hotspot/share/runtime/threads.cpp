@@ -998,8 +998,10 @@ void Threads::destroy_vm() {
   exit_globals();
 
 #ifdef USE_LIBAPTH
-  apth_detach_self();
-  apth_drop();
+  // TODO: Both apth_detach_self() and apth_drop() crash during JVM
+  // shutdown. Skip both — process exits anyway, OS reclaims resources.
+  // apth_detach_self();
+  // apth_drop();
 #endif
 
   // Deleting the shutdown thread here is safe. See comment on
