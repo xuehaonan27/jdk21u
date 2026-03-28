@@ -1829,11 +1829,10 @@ int SR_initialize() {
 }
 
 static int sr_notify(OSThread* osthread) {
-#ifdef USE_LIBAPTH
-  int status = apth_kill(osthread->apth_id(), PosixSignals::SR_signum);
-#else
+  // USE_LIBAPTH: Use pthread_kill with the worker pthread TID for ALL
+  // thread types. For M:N threads, pthread_id() is the scheduler worker;
+  // for DEDICATED, it's the backing pthread. Both are real kernel threads.
   int status = pthread_kill(osthread->pthread_id(), PosixSignals::SR_signum);
-#endif
   assert_status(status == 0, status, "pthread_kill");
   return status;
 }
@@ -1841,56 +1840,12 @@ static int sr_notify(OSThread* osthread) {
 // returns true on success and false on error - really an error is fatal
 // but this seems the normal response to library errors
 bool PosixSignals::do_suspend(OSThread* osthread) {
-#ifdef USE_LIBAPTH
-  {
-    struct apth_thread_stats stats;
-    apth_t apth_id = osthread->apth_id();
-    if (apth_get_thread_stats(apth_id, &stats) == 0 &&
-        stats.thread_class != APTH_CLASS_DEDICATED) {
-      // M:N thread: scheduler-based suspend (no SIGUSR2)
-      if (osthread->sr.request_suspend() != SuspendResume::SR_SUSPEND_REQUEST) {
-        ShouldNotReachHere();
-        return false;
-      }
-      apth_prevent_dispatch(apth_id);
-
-      // Wait for thread to stop running (preemption will force within 5ms)
-      int spin = 0;
-      while (apth_getstate(apth_id) == APTH_THREAD_STATE_RUNNING) {
-        if (++spin > 1000) { os::naked_yield(); spin = 0; }
-      }
-
-      // Capture register context from LIBAPTH saved state
-      void *saved_sp = NULL;
-      apth_get_saved_sp(apth_id, &saved_sp);
-      if (saved_sp != NULL) {
-        ucontext_t *uc = osthread->apth_ucontext();
-        memset(uc, 0, sizeof(*uc));
-        intptr_t *sp = (intptr_t*)saved_sp;
-#if defined(AMD64)
-        // x86-64 LIBAPTH assembly context layout (apth_ctx_x86_64.S):
-        // [sp+0]=R15 [sp+8]=R14 [sp+16]=R13 [sp+24]=R12
-        // [sp+32]=RBX [sp+40]=RBP [sp+48]=return address
-        uc->uc_mcontext.gregs[REG_R15] = sp[0];
-        uc->uc_mcontext.gregs[REG_R14] = sp[1];
-        uc->uc_mcontext.gregs[REG_R13] = sp[2];
-        uc->uc_mcontext.gregs[REG_R12] = sp[3];
-        uc->uc_mcontext.gregs[REG_RBX] = sp[4];
-        uc->uc_mcontext.gregs[REG_RBP] = sp[5];
-        uc->uc_mcontext.gregs[REG_RIP] = sp[6];
-        uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(sp + 7);
-#else
-#error "LIBAPTH M:N suspend/resume only supported on x86-64"
-#endif
-        osthread->set_ucontext(uc);
-      }
-
-      osthread->sr.suspended();
-      sr_semaphore.signal();
-      return true;
-    }
-  }
-#endif
+  // Note: For USE_LIBAPTH, both M:N and DEDICATED threads use the
+  // standard SIGUSR2 suspend path. M:N threads run on worker pthreads
+  // and can receive signals via pthread_kill (the worker's TID is
+  // stored in osthread->pthread_id(), set in thread_native_entry).
+  // The M:N scheduler-based suspend was removed because it requires
+  // preemption to force running threads off the CPU.
   assert(osthread->sr.is_running(), "thread should be running");
   assert(!sr_semaphore.trywait(), "semaphore has invalid state");
 
@@ -1930,20 +1885,7 @@ bool PosixSignals::do_suspend(OSThread* osthread) {
 }
 
 void PosixSignals::do_resume(OSThread* osthread) {
-#ifdef USE_LIBAPTH
-  {
-    struct apth_thread_stats stats;
-    apth_t apth_id = osthread->apth_id();
-    if (apth_get_thread_stats(apth_id, &stats) == 0 &&
-        stats.thread_class != APTH_CLASS_DEDICATED) {
-      osthread->sr.request_wakeup();
-      apth_allow_dispatch(apth_id);
-      osthread->sr.running();
-      sr_semaphore.signal();
-      return;
-    }
-  }
-#endif
+  // USE_LIBAPTH: standard SIGUSR2 resume for both M:N and DEDICATED.
   assert(osthread->sr.is_suspended(), "thread should be suspended");
   assert(!sr_semaphore.trywait(), "invalid semaphore state");
 

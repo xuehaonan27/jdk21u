@@ -737,7 +737,11 @@ bool os::Linux::manually_expand_stack(JavaThread * t, address addr) {
 // Thread start routine for all newly created threads
 static void *thread_native_entry(Thread *thread) {
 
+#ifdef USE_LIBAPTH
+#endif
   thread->record_stack_base_and_size();
+#ifdef USE_LIBAPTH
+#endif
 
 #ifndef __GLIBC__
   // Try to randomize the cache line index of hot stack frames.
@@ -790,9 +794,13 @@ static void *thread_native_entry(Thread *thread) {
     sync->notify_all();
 
     // wait until os::start_thread()
+#ifdef USE_LIBAPTH
+#endif
     while (osthread->get_state() == INITIALIZED) {
       sync->wait_without_safepoint_check();
     }
+#ifdef USE_LIBAPTH
+#endif
   }
 
   log_info(os, thread)("Thread is alive (tid: " UINTX_FORMAT ", pthread id: " UINTX_FORMAT ").",
@@ -812,6 +820,8 @@ static void *thread_native_entry(Thread *thread) {
     os::naked_short_sleep(100);
   }
 
+#ifdef USE_LIBAPTH
+#endif
   // call one more level start routine
   thread->call_run();
 
@@ -930,9 +940,12 @@ static void init_adjust_stacksize_for_guard_pages() {
 
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
-  // All threads DEDICATED for now. M:N requires cooperative yielding
-  // (I/O hooks or preemption) which is not yet in the core build.
-  // TODO: Enable M:N after adding preemption support to core build.
+  // All threads DEDICATED. M:N requires HotSpot-integrated yield
+  // checkpoints (interpreter backedge, safepoint poll calling
+  // apth_yield_optional) which is Phase 3 work.
+  // The M:N scheduler cannot preempt running threads without either
+  // I/O hooks or SIGPROF-based preemption, and a safepoint-waiting
+  // VM thread will deadlock if the Java thread never yields.
   (void)thr_type;
   return APTH_CLASS_DEDICATED;
 }
