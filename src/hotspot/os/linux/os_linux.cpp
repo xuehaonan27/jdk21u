@@ -930,16 +930,14 @@ static void init_adjust_stacksize_for_guard_pages() {
 
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
-  switch (thr_type) {
-  case os::java_thread:     return APTH_CLASS_IO_BOUND;
-  case os::gc_thread:       return APTH_CLASS_DISTRIBUTED;
-  case os::vm_thread:       return APTH_CLASS_CPU_BOUND;
-  case os::compiler_thread: return APTH_CLASS_DEDICATED;
-  case os::watcher_thread:  return APTH_CLASS_DEDICATED;
-  case os::asynclog_thread: return APTH_CLASS_DEDICATED;
-  case os::os_thread:       return APTH_CLASS_DEDICATED;
-  default:                  return APTH_CLASS_DEFAULT;
-  }
+  // Phase 1 bootstrap: ALL threads are DEDICATED (1:1 pthread).
+  // This validates basic LIBAPTH infrastructure without M:N scheduler.
+  // TODO: re-enable M:N classes incrementally after first-green:
+  //   java_thread → APTH_CLASS_IO_BOUND
+  //   gc_thread   → APTH_CLASS_DISTRIBUTED
+  //   vm_thread   → APTH_CLASS_CPU_BOUND
+  (void)thr_type;
+  return APTH_CLASS_DEDICATED;
 }
 #endif
 
