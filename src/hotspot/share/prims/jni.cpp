@@ -102,6 +102,12 @@
 #include "jfr/jfr.hpp"
 #endif
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 static jint CurrentVersion = JNI_VERSION_21;
 
 #if defined(_WIN32) && !defined(USE_VECTORED_EXCEPTION_HANDLING)
@@ -3782,12 +3788,25 @@ static jint attach_current_thread(JavaVM *vm, void **penv, void *_args, bool dae
   // initializing the Java level thread object. Hence, the correct state must
   // be set in order for the Safepoint code to deal with it correctly.
   thread->set_thread_state(_thread_in_vm);
+#ifdef USE_LIBAPTH
+  {
+    apth_t attach_apth;
+    if (apth_attach_self_as_dedicated(&attach_apth) != 0) {
+      thread->smr_delete();
+      HOTSPOT_JNI_ATTACHCURRENTTHREAD_RETURN((uint32_t) JNI_ERR);
+      return JNI_ERR;
+    }
+  }
+#endif
   thread->record_stack_base_and_size();
   thread->register_thread_stack_with_NMT();
   thread->initialize_thread_current();
   MACOS_AARCH64_ONLY(thread->init_wx());
 
   if (!os::create_attached_thread(thread)) {
+#ifdef USE_LIBAPTH
+    apth_detach_self();
+#endif
     thread->unregister_thread_stack_with_NMT();
     thread->smr_delete();
     return JNI_ERR;
@@ -3929,6 +3948,9 @@ jint JNICALL jni_DetachCurrentThread(JavaVM *vm)  {
   // or hidden (e.g. it could probably be hidden in the same
   // (platform-dependent) methods where we do alternate stack
   // maintenance work?)
+#ifdef USE_LIBAPTH
+  apth_detach_self();
+#endif
   thread->exit(false, JavaThread::jni_detach);
   thread->unregister_thread_stack_with_NMT();
   thread->smr_delete();

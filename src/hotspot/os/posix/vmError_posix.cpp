@@ -49,19 +49,36 @@
 #endif
 
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 // Needed for cancelable steps.
+#ifdef USE_LIBAPTH
+static volatile apth_t reporter_apth_id;
+#else
 static volatile pthread_t reporter_thread_id;
+#endif
 
 void VMError::reporting_started() {
-  // record pthread id of reporter thread.
+#ifdef USE_LIBAPTH
+  reporter_apth_id = apth_self();
+#else
   reporter_thread_id = ::pthread_self();
+#endif
 }
 
 void VMError::interrupt_reporting_thread() {
   // We misuse SIGILL here, but it does not really matter. We need
   //  a signal which is handled by crash_handler and not likely to
   //  occur during error reporting itself.
+#ifdef USE_LIBAPTH
+  apth_kill(reporter_apth_id, SIGILL);
+#else
   ::pthread_kill(reporter_thread_id, SIGILL);
+#endif
 }
 
 static void crash_handler(int sig, siginfo_t* info, void* context) {

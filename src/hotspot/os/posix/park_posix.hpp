@@ -31,6 +31,12 @@
 
 #include <pthread.h>
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 /*
  * This is the platform-specific implementation underpinning
  * the ParkEvent class, which itself underpins Java-level monitor
@@ -43,8 +49,13 @@ class PlatformEvent : public CHeapObj<mtSynchronizer> {
   double cachePad[4];        // Increase odds that _mutex is sole occupant of cache line
   volatile int _event;       // Event count/permit: -1, 0 or 1
   volatile int _nParked;     // Indicates if associated thread is blocked: 0 or 1
+#ifdef USE_LIBAPTH
+  apth_mutex_t _mutex[1];
+  apth_cond_t  _cond[1];
+#else
   pthread_mutex_t _mutex[1]; // Native mutex for locking
   pthread_cond_t  _cond[1];  // Native condition variable for blocking
+#endif
   double postPad[2];
 
  protected:       // TODO-FIXME: make dtor private
@@ -83,8 +94,13 @@ class PlatformParker {
   };
   volatile int _counter;
   int _cur_index;  // which cond is in use: -1, 0, 1
+#ifdef USE_LIBAPTH
+  apth_mutex_t _mutex[1];
+  apth_cond_t  _cond[2];
+#else
   pthread_mutex_t _mutex[1];
   pthread_cond_t  _cond[2]; // one for relative times and one for absolute
+#endif
 
  public:
   PlatformParker();

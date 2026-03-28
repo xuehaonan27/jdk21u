@@ -34,6 +34,7 @@ m4_include([lib-hsdis.m4])
 m4_include([lib-std.m4])
 m4_include([lib-x11.m4])
 
+m4_include([lib-apth.m4])
 m4_include([lib-tests.m4])
 
 ################################################################################
@@ -126,6 +127,7 @@ AC_DEFUN_ONCE([LIB_SETUP_LIBRARIES],
   LIB_SETUP_LIBFFI
   LIB_SETUP_MISC_LIBS
   LIB_SETUP_X11
+  LIB_SETUP_LIBAPTH
 
   LIB_TESTS_SETUP_GTEST
 

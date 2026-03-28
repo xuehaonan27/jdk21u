@@ -122,6 +122,12 @@
 # include <malloc.h>
 #endif
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 #ifndef _GNU_SOURCE
   #define _GNU_SOURCE
   #include <sched.h>
@@ -711,9 +717,17 @@ bool os::Linux::manually_expand_stack(JavaThread * t, address addr) {
   if (t->is_in_usable_stack(addr)) {
     sigset_t mask_all, old_sigset;
     sigfillset(&mask_all);
+#ifdef USE_LIBAPTH
+    apth_sigmask(SIG_SETMASK, &mask_all, &old_sigset);
+#else
     pthread_sigmask(SIG_SETMASK, &mask_all, &old_sigset);
+#endif
     _expand_stack_to(addr);
+#ifdef USE_LIBAPTH
+    apth_sigmask(SIG_SETMASK, &old_sigset, nullptr);
+#else
     pthread_sigmask(SIG_SETMASK, &old_sigset, nullptr);
+#endif
     return true;
   }
   return false;
@@ -777,9 +791,17 @@ static void *thread_native_entry(Thread *thread) {
   }
 
   log_info(os, thread)("Thread is alive (tid: " UINTX_FORMAT ", pthread id: " UINTX_FORMAT ").",
+#ifdef USE_LIBAPTH
+    os::current_thread_id(), (uintx) apth_self());
+#else
     os::current_thread_id(), (uintx) pthread_self());
+#endif
 
+#ifdef USE_LIBAPTH
+  assert(osthread->apth_id() != nullptr, "apth_id was not set");
+#else
   assert(osthread->pthread_id() != 0, "pthread_id was not set as expected");
+#endif
 
   if (DelayThreadStartALot) {
     os::naked_short_sleep(100);
@@ -793,7 +815,11 @@ static void *thread_native_entry(Thread *thread) {
   thread = nullptr;
 
   log_info(os, thread)("Thread finished (tid: " UINTX_FORMAT ", pthread id: " UINTX_FORMAT ").",
+#ifdef USE_LIBAPTH
+    os::current_thread_id(), (uintx) apth_self());
+#else
     os::current_thread_id(), (uintx) pthread_self());
+#endif
 
   return 0;
 }
@@ -895,6 +921,21 @@ static void init_adjust_stacksize_for_guard_pages() {
 }
 #endif // GLIBC
 
+#ifdef USE_LIBAPTH
+int os::Linux::apth_class_for(os::ThreadType thr_type) {
+  switch (thr_type) {
+  case os::java_thread:     return APTH_CLASS_IO_BOUND;
+  case os::gc_thread:       return APTH_CLASS_DISTRIBUTED;
+  case os::vm_thread:       return APTH_CLASS_CPU_BOUND;
+  case os::compiler_thread: return APTH_CLASS_DEDICATED;
+  case os::watcher_thread:  return APTH_CLASS_DEDICATED;
+  case os::asynclog_thread: return APTH_CLASS_DEDICATED;
+  case os::os_thread:       return APTH_CLASS_DEDICATED;
+  default:                  return APTH_CLASS_DEFAULT;
+  }
+}
+#endif
+
 bool os::create_thread(Thread* thread, ThreadType thr_type,
                        size_t req_stack_size) {
   assert(thread->osthread() == nullptr, "caller responsible");
@@ -913,6 +954,48 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
 
   thread->set_osthread(osthread);
 
+#ifdef USE_LIBAPTH
+  {
+    // Calculate stack size if it's not specified by caller.
+    size_t stack_size = os::Posix::get_initial_stack_size(thr_type, req_stack_size);
+
+    apth_t tid;
+    apth_attr_t apth_attr;
+    apth_attr_init(&apth_attr);
+    apth_attr_setstacksize(&apth_attr, stack_size);
+    apth_attr_setclass_np(&apth_attr, apth_class_for(thr_type));
+    apth_attr_setdetachstate(&apth_attr, APTH_CREATE_DETACHED);
+
+    int ret = apth_create(&tid, &apth_attr, (void* (*)(void*)) thread_native_entry, thread);
+    apth_attr_destroy(&apth_attr);
+
+    if (ret != 0) {
+      log_warning(os, thread)("Failed to start thread - apth_create failed (%s)",
+                               os::errno_name(ret));
+      thread->set_osthread(nullptr);
+      delete osthread;
+      return false;
+    }
+
+    osthread->set_apth_id(tid);
+    // Also set pthread_id for compatibility (dedicated threads have a real pthread)
+    osthread->set_pthread_id(apth_func_raw(pthread_self)());
+
+    // Wait until child thread is either initialized or aborted
+    {
+      Monitor* sync_with_child = osthread->startThread_lock();
+      MutexLocker ml(sync_with_child, Mutex::_no_safepoint_check_flag);
+      while (osthread->get_state() == ALLOCATED) {
+        sync_with_child->wait_without_safepoint_check();
+      }
+    }
+
+    // The thread is returned suspended (in state INITIALIZED),
+    // and is started higher up in the call chain
+    assert(osthread->get_state() == INITIALIZED, "race condition");
+    return true;
+  }
+#else
   // init thread attributes
   pthread_attr_t attr;
   int rslt = pthread_attr_init(&attr);
@@ -1036,6 +1119,7 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
   // and is started higher up in the call chain
   assert(state == INITIALIZED, "race condition");
   return true;
+#endif // USE_LIBAPTH
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1062,6 +1146,9 @@ bool os::create_attached_thread(JavaThread* thread) {
   // Store pthread info into the OSThread
   osthread->set_thread_id(os::Linux::gettid());
   osthread->set_pthread_id(::pthread_self());
+#ifdef USE_LIBAPTH
+  osthread->set_apth_id(apth_self());
+#endif
 
   // initialize floating point control register
   os::Linux::init_thread_fpu_state();
@@ -1104,7 +1191,11 @@ bool os::create_attached_thread(JavaThread* thread) {
 
   log_info(os, thread)("Thread attached (tid: " UINTX_FORMAT ", pthread id: " UINTX_FORMAT
                        ", stack: " PTR_FORMAT " - " PTR_FORMAT " (" SIZE_FORMAT "K) ).",
+#ifdef USE_LIBAPTH
+                       os::current_thread_id(), (uintx) apth_self(),
+#else
                        os::current_thread_id(), (uintx) pthread_self(),
+#endif
                        p2i(thread->stack_base()), p2i(thread->stack_end()), thread->stack_size() / K);
 
   return true;
@@ -1130,13 +1221,21 @@ void os::free_thread(OSThread* osthread) {
 #ifdef ASSERT
   sigset_t current;
   sigemptyset(&current);
+#ifdef USE_LIBAPTH
+  apth_sigmask(SIG_SETMASK, nullptr, &current);
+#else
   pthread_sigmask(SIG_SETMASK, nullptr, &current);
+#endif
   assert(!sigismember(&current, PosixSignals::SR_signum), "SR signal should not be blocked!");
 #endif
 
   // Restore caller's signal mask
   sigset_t sigmask = osthread->caller_sigmask();
+#ifdef USE_LIBAPTH
+  apth_sigmask(SIG_SETMASK, &sigmask, nullptr);
+#else
   pthread_sigmask(SIG_SETMASK, &sigmask, nullptr);
+#endif
 
   delete osthread;
 }
@@ -5008,9 +5107,13 @@ void os::set_native_thread_name(const char *name) {
     char buf [16]; // according to glibc manpage, 16 chars incl. '/0'
     snprintf(buf, sizeof(buf), "%s", name);
     buf[sizeof(buf) - 1] = '\0';
+#ifdef USE_LIBAPTH
+    apth_setname_np(apth_self(), buf);
+#else
     const int rc = Linux::_pthread_setname_np(pthread_self(), buf);
     // ERANGE should not happen; all other errors should just be ignored.
     assert(rc != ERANGE, "pthread_setname_np failed");
+#endif
   }
 }
 
@@ -5213,6 +5316,18 @@ bool os::pd_unmap_memory(char* addr, size_t bytes) {
 static jlong slow_thread_cpu_time(Thread *thread, bool user_sys_cpu_time);
 
 static jlong fast_cpu_time(Thread *thread) {
+#ifdef USE_LIBAPTH
+  if (thread != NULL && thread->osthread() != NULL) {
+    apth_t aid = thread->osthread()->apth_id();
+    struct apth_thread_stats stats;
+    if (apth_get_thread_stats(aid, &stats) == 0 &&
+        stats.thread_class != APTH_CLASS_DEDICATED) {
+      // M:N thread: use LIBAPTH per-apth CPU time
+      return (jlong)(stats.cpu_time_sec * 1e9);
+    }
+  }
+  // Fall through for DEDICATED threads: use pthread_getcpuclockid
+#endif
     clockid_t clockid;
     int rc = os::Linux::pthread_getcpuclockid(thread->osthread()->pthread_id(),
                                               &clockid);
@@ -5492,6 +5607,18 @@ static void current_stack_region(address * bottom, size_t * size) {
     *bottom = os::Linux::initial_thread_stack_bottom();
     *size   = os::Linux::initial_thread_stack_size();
   } else {
+#ifdef USE_LIBAPTH
+    {
+      void *base;
+      size_t sz;
+      if (apth_get_stack_bounds(apth_self(), &base, &sz) == 0) {
+        *bottom = (address)base;
+        *size = sz;
+        return;
+      }
+      // Fall through for DEDICATED threads (ENOTSUP)
+    }
+#endif
     pthread_attr_t attr;
 
     int rslt = pthread_getattr_np(pthread_self(), &attr);

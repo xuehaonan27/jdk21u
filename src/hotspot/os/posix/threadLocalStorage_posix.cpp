@@ -26,7 +26,17 @@
 #include "utilities/debug.hpp"
 #include <pthread.h>
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
+#ifdef USE_LIBAPTH
+static apth_key_t _thread_key;
+#else
 static pthread_key_t _thread_key;
+#endif
 static bool _initialized = false;
 
 // Restore the thread pointer if the destructor is called. This is in case
@@ -41,7 +51,11 @@ extern "C" void restore_thread_pointer(void* p) {
 
 void ThreadLocalStorage::init() {
   assert(!_initialized, "initializing TLS more than once!");
+#ifdef USE_LIBAPTH
+  int rslt = apth_key_create(&_thread_key, restore_thread_pointer);
+#else
   int rslt = pthread_key_create(&_thread_key, restore_thread_pointer);
+#endif
   // If this assert fails we will get a recursive assertion failure
   // and not see the actual error message or get a hs_err file
   assert_status(rslt == 0, rslt, "pthread_key_create");
@@ -59,11 +73,19 @@ Thread* ThreadLocalStorage::thread() {
   // the initialization process, which is using Thread::current without
   // checking TLS is initialized - see java.cpp vm_exit
   assert(_initialized, "TLS not initialized yet!");
+#ifdef USE_LIBAPTH
+  return (Thread*) apth_getspecific(_thread_key);
+#else
   return (Thread*) pthread_getspecific(_thread_key); // may be null
+#endif
 }
 
 void ThreadLocalStorage::set_thread(Thread* current) {
   assert(_initialized, "TLS not initialized yet!");
+#ifdef USE_LIBAPTH
+  int rslt = apth_setspecific(_thread_key, current);
+#else
   int rslt = pthread_setspecific(_thread_key, current);
+#endif
   assert_status(rslt == 0, rslt, "pthread_setspecific");
 }

@@ -24,6 +24,13 @@
 
 #ifndef OS_LINUX_OSTHREAD_LINUX_HPP
 #define OS_LINUX_OSTHREAD_LINUX_HPP
+
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
  public:
   typedef pid_t thread_id_t;
 
@@ -42,6 +49,10 @@
   // _pthread_id is the pthread id, which is used by library calls
   // (e.g. pthread_kill).
   pthread_t _pthread_id;
+#ifdef USE_LIBAPTH
+  apth_t    _apth_id;
+  ucontext_t _apth_saved_ucontext;  // For M:N suspend register context
+#endif
 
   sigset_t _caller_sigmask; // Caller's signal mask
 
@@ -62,6 +73,11 @@
   void set_pthread_id(pthread_t tid) {
     _pthread_id = tid;
   }
+#ifdef USE_LIBAPTH
+  apth_t apth_id() const      { return _apth_id; }
+  void set_apth_id(apth_t id) { _apth_id = id; }
+  ucontext_t* apth_ucontext() { return &_apth_saved_ucontext; }
+#endif
 
   // ***************************************************************
   // suspension support.

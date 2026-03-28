@@ -30,9 +30,53 @@
 // put OS-includes here
 # include <pthread.h>
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 //
 // See threadCritical.hpp for details of this class.
 //
+
+#ifdef USE_LIBAPTH
+
+static apth_t         tc_owner;
+static apth_mutex_t   tc_mutex;
+static apth_once_t    tc_once = 0;
+static int            tc_count = 0;
+
+static void tc_init() {
+  apth_mutex_init(&tc_mutex, NULL);
+  tc_owner = NULL;
+}
+
+ThreadCritical::ThreadCritical() {
+  apth_once(&tc_once, tc_init);
+  apth_t self = apth_self();
+  if (!apth_equal(self, tc_owner)) {
+    int ret = apth_mutex_lock(&tc_mutex);
+    guarantee(ret == 0, "fatal error with apth_mutex_lock()");
+    assert(tc_count == 0, "Lock acquired with illegal reentry count.");
+    tc_owner = self;
+  }
+  tc_count++;
+}
+
+ThreadCritical::~ThreadCritical() {
+  assert(apth_equal(tc_owner, apth_self()), "must have correct owner");
+  assert(tc_count > 0, "must have correct count");
+
+  tc_count--;
+  if (tc_count == 0) {
+    tc_owner = NULL;
+    int ret = apth_mutex_unlock(&tc_mutex);
+    guarantee(ret == 0, "fatal error with apth_mutex_unlock()");
+  }
+}
+
+#else // !USE_LIBAPTH
 
 static pthread_t             tc_owner = 0;
 static pthread_mutex_t       tc_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -60,3 +104,5 @@ ThreadCritical::~ThreadCritical() {
     guarantee(ret == 0, "fatal error with pthread_mutex_unlock()");
   }
 }
+
+#endif // USE_LIBAPTH

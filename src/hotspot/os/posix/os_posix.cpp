@@ -81,6 +81,12 @@
   #include <crt_externs.h>
 #endif
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 #define ROOT_UID 0
 
 #ifndef MAP_ANONYMOUS
@@ -1202,15 +1208,34 @@ bool os::Posix::matches_effective_uid_and_gid_or_root(uid_t uid, gid_t gid) {
 // with CLOCK_MONOTONIC if available to avoid issues with time-of-day changes,
 // but otherwise whatever default is used by the platform - generally the
 // time-of-day clock.
+#ifdef USE_LIBAPTH
+static apth_condattr_t _condAttr[1];
+#else
 static pthread_condattr_t _condAttr[1];
+#endif
 
 // Shared mutexattr to explicitly set the type to PTHREAD_MUTEX_NORMAL as not
 // all systems (e.g. FreeBSD) map the default to "normal".
+#ifdef USE_LIBAPTH
+static apth_mutexattr_t _mutexAttr[1];
+#else
 static pthread_mutexattr_t _mutexAttr[1];
+#endif
 
 // common basic initialization that is always supported
 static void pthread_init_common(void) {
   int status;
+#ifdef USE_LIBAPTH
+  if ((status = apth_condattr_init(_condAttr)) != 0) {
+    fatal("apth_condattr_init: %s", os::strerror(status));
+  }
+  if ((status = apth_mutexattr_init(_mutexAttr)) != 0) {
+    fatal("apth_mutexattr_init: %s", os::strerror(status));
+  }
+  if ((status = apth_mutexattr_settype(_mutexAttr, APTH_MUTEX_NORMAL)) != 0) {
+    fatal("apth_mutexattr_settype: %s", os::strerror(status));
+  }
+#else
   if ((status = pthread_condattr_init(_condAttr)) != 0) {
     fatal("pthread_condattr_init: %s", os::strerror(status));
   }
@@ -1220,10 +1245,13 @@ static void pthread_init_common(void) {
   if ((status = pthread_mutexattr_settype(_mutexAttr, PTHREAD_MUTEX_NORMAL)) != 0) {
     fatal("pthread_mutexattr_settype: %s", os::strerror(status));
   }
+#endif
   PlatformMutex::init();
 }
 
+#ifndef USE_LIBAPTH
 static int (*_pthread_condattr_setclock)(pthread_condattr_t *, clockid_t) = nullptr;
+#endif
 
 static bool _use_clock_monotonic_condattr = false;
 
@@ -1240,6 +1268,9 @@ void os::Posix::init(void) {
 
   // Check for pthread_condattr_setclock support.
 
+#ifdef USE_LIBAPTH
+  // With LIBAPTH, use apth_condattr_setclock directly.
+#else
   // libpthread is already loaded.
   int (*condattr_setclock_func)(pthread_condattr_t*, clockid_t) =
     (int (*)(pthread_condattr_t*, clockid_t))dlsym(RTLD_DEFAULT,
@@ -1247,12 +1278,26 @@ void os::Posix::init(void) {
   if (condattr_setclock_func != nullptr) {
     _pthread_condattr_setclock = condattr_setclock_func;
   }
+#endif
 
   // Now do general initialization.
 
   pthread_init_common();
 
   int status;
+#ifdef USE_LIBAPTH
+  if ((status = apth_condattr_setclock(_condAttr, CLOCK_MONOTONIC)) != 0) {
+    if (status == EINVAL) {
+      _use_clock_monotonic_condattr = false;
+      warning("Unable to use monotonic clock with relative timed-waits" \
+              " - changes to the time-of-day clock may have adverse affects");
+    } else {
+      fatal("apth_condattr_setclock: %s", os::strerror(status));
+    }
+  } else {
+    _use_clock_monotonic_condattr = true;
+  }
+#else
   if (_pthread_condattr_setclock != nullptr) {
     if ((status = _pthread_condattr_setclock(_condAttr, CLOCK_MONOTONIC)) != 0) {
       if (status == EINVAL) {
@@ -1266,14 +1311,19 @@ void os::Posix::init(void) {
       _use_clock_monotonic_condattr = true;
     }
   }
+#endif
 
   initial_time_count = javaTimeNanos();
 }
 
 void os::Posix::init_2(void) {
   log_info(os)("Use of CLOCK_MONOTONIC is supported");
+#ifdef USE_LIBAPTH
+  log_info(os)("Use of apth_condattr_setclock is supported");
+#else
   log_info(os)("Use of pthread_condattr_setclock is%s supported",
                (_pthread_condattr_setclock != nullptr ? "" : " not"));
+#endif
   log_info(os)("Relative timed-wait using pthread_cond_timedwait is associated with %s",
                _use_clock_monotonic_condattr ? "CLOCK_MONOTONIC" : "the default clock");
 }
@@ -1503,9 +1553,17 @@ struct tm* os::localtime_pd(const time_t* clock, struct tm*  res) {
 //    comments on unpark().
 
 PlatformEvent::PlatformEvent() {
+#ifdef USE_LIBAPTH
+  int status = apth_cond_init(_cond, _condAttr);
+#else
   int status = pthread_cond_init(_cond, _condAttr);
+#endif
   assert_status(status == 0, status, "cond_init");
+#ifdef USE_LIBAPTH
+  status = apth_mutex_init(_mutex, _mutexAttr);
+#else
   status = pthread_mutex_init(_mutex, _mutexAttr);
+#endif
   assert_status(status == 0, status, "mutex_init");
   _event   = 0;
   _nParked = 0;
@@ -1531,20 +1589,32 @@ void PlatformEvent::park() {       // AKA "down()"
   guarantee(v >= 0, "invariant");
 
   if (v == 0) { // Do this the hard way by blocking ...
+#ifdef USE_LIBAPTH
+    int status = apth_mutex_lock(_mutex);
+#else
     int status = pthread_mutex_lock(_mutex);
+#endif
     assert_status(status == 0, status, "mutex_lock");
     guarantee(_nParked == 0, "invariant");
     ++_nParked;
     while (_event < 0) {
       // OS-level "spurious wakeups" are ignored
+#ifdef USE_LIBAPTH
+      status = apth_cond_wait(_cond, _mutex);
+#else
       status = pthread_cond_wait(_cond, _mutex);
+#endif
       assert_status(status == 0 MACOS_ONLY(|| status == ETIMEDOUT),
                     status, "cond_wait");
     }
     --_nParked;
 
     _event = 0;
+#ifdef USE_LIBAPTH
+    status = apth_mutex_unlock(_mutex);
+#else
     status = pthread_mutex_unlock(_mutex);
+#endif
     assert_status(status == 0, status, "mutex_unlock");
     // Paranoia to ensure our locked and lock-free paths interact
     // correctly with each other.
@@ -1582,13 +1652,21 @@ int PlatformEvent::park_nanos(jlong nanos) {
     to_abstime(&abst, nanos, false, false);
 
     int ret = OS_TIMEOUT;
+#ifdef USE_LIBAPTH
+    int status = apth_mutex_lock(_mutex);
+#else
     int status = pthread_mutex_lock(_mutex);
+#endif
     assert_status(status == 0, status, "mutex_lock");
     guarantee(_nParked == 0, "invariant");
     ++_nParked;
 
     while (_event < 0) {
+#ifdef USE_LIBAPTH
+      status = apth_cond_timedwait(_cond, _mutex, &abst);
+#else
       status = pthread_cond_timedwait(_cond, _mutex, &abst);
+#endif
       assert_status(status == 0 || status == ETIMEDOUT,
                     status, "cond_timedwait");
       // OS-level "spurious wakeups" are ignored
@@ -1601,7 +1679,11 @@ int PlatformEvent::park_nanos(jlong nanos) {
     }
 
     _event = 0;
+#ifdef USE_LIBAPTH
+    status = apth_mutex_unlock(_mutex);
+#else
     status = pthread_mutex_unlock(_mutex);
+#endif
     assert_status(status == 0, status, "mutex_unlock");
     // Paranoia to ensure our locked and lock-free paths interact
     // correctly with each other.
@@ -1631,11 +1713,19 @@ void PlatformEvent::unpark() {
 
   if (Atomic::xchg(&_event, 1) >= 0) return;
 
+#ifdef USE_LIBAPTH
+  int status = apth_mutex_lock(_mutex);
+#else
   int status = pthread_mutex_lock(_mutex);
+#endif
   assert_status(status == 0, status, "mutex_lock");
   int anyWaiters = _nParked;
   assert(anyWaiters == 0 || anyWaiters == 1, "invariant");
+#ifdef USE_LIBAPTH
+  status = apth_mutex_unlock(_mutex);
+#else
   status = pthread_mutex_unlock(_mutex);
+#endif
   assert_status(status == 0, status, "mutex_unlock");
 
   // Note that we signal() *after* dropping the lock for "immortal" Events.
@@ -1647,7 +1737,11 @@ void PlatformEvent::unpark() {
   // provide wait morphing.
 
   if (anyWaiters != 0) {
+#ifdef USE_LIBAPTH
+    status = apth_cond_signal(_cond);
+#else
     status = pthread_cond_signal(_cond);
+#endif
     assert_status(status == 0, status, "cond_signal");
   }
 }
@@ -1655,20 +1749,44 @@ void PlatformEvent::unpark() {
 // JSR166 support
 
  PlatformParker::PlatformParker() : _counter(0), _cur_index(-1) {
+#ifdef USE_LIBAPTH
+  int status = apth_cond_init(&_cond[REL_INDEX], _condAttr);
+#else
   int status = pthread_cond_init(&_cond[REL_INDEX], _condAttr);
+#endif
   assert_status(status == 0, status, "cond_init rel");
+#ifdef USE_LIBAPTH
+  status = apth_cond_init(&_cond[ABS_INDEX], nullptr);
+#else
   status = pthread_cond_init(&_cond[ABS_INDEX], nullptr);
+#endif
   assert_status(status == 0, status, "cond_init abs");
+#ifdef USE_LIBAPTH
+  status = apth_mutex_init(_mutex, _mutexAttr);
+#else
   status = pthread_mutex_init(_mutex, _mutexAttr);
+#endif
   assert_status(status == 0, status, "mutex_init");
 }
 
 PlatformParker::~PlatformParker() {
+#ifdef USE_LIBAPTH
+  int status = apth_cond_destroy(&_cond[REL_INDEX]);
+#else
   int status = pthread_cond_destroy(&_cond[REL_INDEX]);
+#endif
   assert_status(status == 0, status, "cond_destroy rel");
+#ifdef USE_LIBAPTH
+  status = apth_cond_destroy(&_cond[ABS_INDEX]);
+#else
   status = pthread_cond_destroy(&_cond[ABS_INDEX]);
+#endif
   assert_status(status == 0, status, "cond_destroy abs");
+#ifdef USE_LIBAPTH
+  status = apth_mutex_destroy(_mutex);
+#else
   status = pthread_mutex_destroy(_mutex);
+#endif
   assert_status(status == 0, status, "mutex_destroy");
 }
 
@@ -1716,14 +1834,22 @@ void Parker::park(bool isAbsolute, jlong time) {
 
   // Don't wait if cannot get lock since interference arises from
   // unparking.
+#ifdef USE_LIBAPTH
+  if (apth_mutex_trylock(_mutex) != 0) {
+#else
   if (pthread_mutex_trylock(_mutex) != 0) {
+#endif
     return;
   }
 
   int status;
   if (_counter > 0)  { // no wait needed
     _counter = 0;
+#ifdef USE_LIBAPTH
+    status = apth_mutex_unlock(_mutex);
+#else
     status = pthread_mutex_unlock(_mutex);
+#endif
     assert_status(status == 0, status, "invariant");
     // Paranoia to ensure our locked and lock-free paths interact
     // correctly with each other and Java-level accesses.
@@ -1736,20 +1862,32 @@ void Parker::park(bool isAbsolute, jlong time) {
   assert(_cur_index == -1, "invariant");
   if (time == 0) {
     _cur_index = REL_INDEX; // arbitrary choice when not timed
+#ifdef USE_LIBAPTH
+    status = apth_cond_wait(&_cond[_cur_index], _mutex);
+#else
     status = pthread_cond_wait(&_cond[_cur_index], _mutex);
+#endif
     assert_status(status == 0 MACOS_ONLY(|| status == ETIMEDOUT),
                   status, "cond_wait");
   }
   else {
     _cur_index = isAbsolute ? ABS_INDEX : REL_INDEX;
+#ifdef USE_LIBAPTH
+    status = apth_cond_timedwait(&_cond[_cur_index], _mutex, &absTime);
+#else
     status = pthread_cond_timedwait(&_cond[_cur_index], _mutex, &absTime);
+#endif
     assert_status(status == 0 || status == ETIMEDOUT,
                   status, "cond_timedwait");
   }
   _cur_index = -1;
 
   _counter = 0;
+#ifdef USE_LIBAPTH
+  status = apth_mutex_unlock(_mutex);
+#else
   status = pthread_mutex_unlock(_mutex);
+#endif
   assert_status(status == 0, status, "invariant");
   // Paranoia to ensure our locked and lock-free paths interact
   // correctly with each other and Java-level accesses.
@@ -1757,13 +1895,21 @@ void Parker::park(bool isAbsolute, jlong time) {
 }
 
 void Parker::unpark() {
+#ifdef USE_LIBAPTH
+  int status = apth_mutex_lock(_mutex);
+#else
   int status = pthread_mutex_lock(_mutex);
+#endif
   assert_status(status == 0, status, "invariant");
   const int s = _counter;
   _counter = 1;
   // must capture correct index before unlocking
   int index = _cur_index;
+#ifdef USE_LIBAPTH
+  status = apth_mutex_unlock(_mutex);
+#else
   status = pthread_mutex_unlock(_mutex);
+#endif
   assert_status(status == 0, status, "invariant");
 
   // Note that we signal() *after* dropping the lock for "immortal" Events.
@@ -1776,7 +1922,11 @@ void Parker::unpark() {
 
   if (s < 1 && index != -1) {
     // thread is definitely parked
+#ifdef USE_LIBAPTH
+    status = apth_cond_signal(&_cond[index]);
+#else
     status = pthread_cond_signal(&_cond[index]);
+#endif
     assert_status(status == 0, status, "invariant");
   }
 }
@@ -1870,22 +2020,38 @@ PlatformMonitor::~PlatformMonitor() {
 #else
 
 PlatformMutex::PlatformMutex() {
+#ifdef USE_LIBAPTH
+  int status = apth_mutex_init(&_mutex, _mutexAttr);
+#else
   int status = pthread_mutex_init(&_mutex, _mutexAttr);
+#endif
   assert_status(status == 0, status, "mutex_init");
 }
 
 PlatformMutex::~PlatformMutex() {
+#ifdef USE_LIBAPTH
+  int status = apth_mutex_destroy(&_mutex);
+#else
   int status = pthread_mutex_destroy(&_mutex);
+#endif
   assert_status(status == 0, status, "mutex_destroy");
 }
 
 PlatformMonitor::PlatformMonitor() {
+#ifdef USE_LIBAPTH
+  int status = apth_cond_init(&_cond, _condAttr);
+#else
   int status = pthread_cond_init(&_cond, _condAttr);
+#endif
   assert_status(status == 0, status, "cond_init");
 }
 
 PlatformMonitor::~PlatformMonitor() {
+#ifdef USE_LIBAPTH
+  int status = apth_cond_destroy(&_cond);
+#else
   int status = pthread_cond_destroy(&_cond);
+#endif
   assert_status(status == 0, status, "cond_destroy");
 }
 
@@ -1905,7 +2071,11 @@ int PlatformMonitor::wait(uint64_t millis) {
     to_abstime(&abst, millis_to_nanos(int64_t(millis)), false, false);
 
     int ret = OS_TIMEOUT;
+#ifdef USE_LIBAPTH
+    int status = apth_cond_timedwait(cond(), mutex(), &abst);
+#else
     int status = pthread_cond_timedwait(cond(), mutex(), &abst);
+#endif
     assert_status(status == 0 || status == ETIMEDOUT,
                   status, "cond_timedwait");
     if (status == 0) {
@@ -1913,7 +2083,11 @@ int PlatformMonitor::wait(uint64_t millis) {
     }
     return ret;
   } else {
+#ifdef USE_LIBAPTH
+    int status = apth_cond_wait(cond(), mutex());
+#else
     int status = pthread_cond_wait(cond(), mutex());
+#endif
     assert_status(status == 0 MACOS_ONLY(|| status == ETIMEDOUT),
                   status, "cond_wait");
     return OS_OK;

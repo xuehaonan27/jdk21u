@@ -35,9 +35,26 @@
 // For SafeFetch we need POSIX TLS and sigsetjmp/longjmp.
 #include <setjmp.h>
 #include <pthread.h>
-static pthread_key_t g_jmpbuf_key;
 
-struct InitTLSKey { InitTLSKey() { pthread_key_create(&g_jmpbuf_key, nullptr); } };
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
+#ifdef USE_LIBAPTH
+static apth_key_t g_jmpbuf_key;
+#else
+static pthread_key_t g_jmpbuf_key;
+#endif
+
+struct InitTLSKey { InitTLSKey() {
+#ifdef USE_LIBAPTH
+  apth_key_create(&g_jmpbuf_key, nullptr);
+#else
+  pthread_key_create(&g_jmpbuf_key, nullptr);
+#endif
+} };
 static InitTLSKey g_init_tly_key;
 
 // Handle safefetch, sigsetjmp style:
@@ -55,7 +72,11 @@ bool handle_safefetch(int sig, address ignored1, void* ignored2) {
     // Note signal safety: pthread_getspecific is not safe for signal handler
     // usage, but in practice it works and we have done this in the JVM for many
     // years (via Thread::current_or_null_safe()).
+#ifdef USE_LIBAPTH
+    sigjmp_buf* const jb = (sigjmp_buf*) apth_getspecific(g_jmpbuf_key);
+#else
     sigjmp_buf* const jb = (sigjmp_buf*) pthread_getspecific(g_jmpbuf_key);
+#endif
     if (jb) {
       siglongjmp(*jb, 1);
     }
@@ -74,20 +95,32 @@ ATTRIBUTE_NO_ASAN static bool _SafeFetchXX_internal(const T *adr, T* result) {
   sigjmp_buf jb;
   if (sigsetjmp(jb, 1) != 0) {
     // We faulted. Reset TLS slot, then return.
+#ifdef USE_LIBAPTH
+    apth_setspecific(g_jmpbuf_key, nullptr);
+#else
     pthread_setspecific(g_jmpbuf_key, nullptr);
+#endif
     *result = 0;
     return false;
   }
 
   // Anchor jump buffer in TLS
+#ifdef USE_LIBAPTH
+  apth_setspecific(g_jmpbuf_key, &jb);
+#else
   pthread_setspecific(g_jmpbuf_key, &jb);
+#endif
 
   // unsafe access
   n = *adr;
 
   // Still here... All went well, adr was valid.
   // Reset TLS slot, then return result.
+#ifdef USE_LIBAPTH
+  apth_setspecific(g_jmpbuf_key, nullptr);
+#else
   pthread_setspecific(g_jmpbuf_key, nullptr);
+#endif
   *result = n;
 
   return true;

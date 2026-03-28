@@ -27,6 +27,12 @@
 
 #include "runtime/os.hpp"
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 // os::Linux defines the interface to Linux operating systems
 
 class os::Linux {
@@ -53,6 +59,10 @@ class os::Linux {
 
   static julong _physical_memory;
   static pthread_t _main_thread;
+#ifdef USE_LIBAPTH
+  static apth_t _main_apth;
+  static int apth_class_for(os::ThreadType thr_type);
+#endif
 
   static julong available_memory();
   static julong free_memory();

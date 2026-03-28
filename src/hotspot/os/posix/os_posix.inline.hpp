@@ -34,34 +34,60 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 // Aix does not have NUMA support but need these for compilation.
 inline bool os::numa_has_group_homing()     { AIX_ONLY(ShouldNotReachHere();) return false;  }
 
 // Platform Mutex/Monitor implementation
 
 inline void PlatformMutex::lock() {
+#ifdef USE_LIBAPTH
+  int status = apth_mutex_lock(mutex());
+#else
   int status = pthread_mutex_lock(mutex());
+#endif
   assert_status(status == 0, status, "mutex_lock");
 }
 
 inline void PlatformMutex::unlock() {
+#ifdef USE_LIBAPTH
+  int status = apth_mutex_unlock(mutex());
+#else
   int status = pthread_mutex_unlock(mutex());
+#endif
   assert_status(status == 0, status, "mutex_unlock");
 }
 
 inline bool PlatformMutex::try_lock() {
+#ifdef USE_LIBAPTH
+  int status = apth_mutex_trylock(mutex());
+#else
   int status = pthread_mutex_trylock(mutex());
+#endif
   assert_status(status == 0 || status == EBUSY, status, "mutex_trylock");
   return status == 0;
 }
 
 inline void PlatformMonitor::notify() {
+#ifdef USE_LIBAPTH
+  int status = apth_cond_signal(cond());
+#else
   int status = pthread_cond_signal(cond());
+#endif
   assert_status(status == 0, status, "cond_signal");
 }
 
 inline void PlatformMonitor::notify_all() {
+#ifdef USE_LIBAPTH
+  int status = apth_cond_broadcast(cond());
+#else
   int status = pthread_cond_broadcast(cond());
+#endif
   assert_status(status == 0, status, "cond_broadcast");
 }
 

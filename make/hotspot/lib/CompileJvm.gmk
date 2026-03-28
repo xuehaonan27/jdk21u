@@ -142,6 +142,10 @@ $(call FillFindCache, $(JVM_SRC_DIRS))
 ################################################################################
 # Now set up the actual compilation of the main hotspot native library
 
+ifneq ($(LIBAPTH_LIBS), )
+  JVM_LIBS += $(LIBAPTH_LIBS)
+endif
+
 $(eval $(call SetupJdkLibrary, BUILD_LIBJVM, \
     NAME := jvm, \
     TOOLCHAIN := TOOLCHAIN_LINK_CXX, \

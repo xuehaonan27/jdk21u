@@ -273,3 +273,7 @@ ifeq ($(call check-jvm-feature, opt-size), true)
     BUILD_LIBJVM_systemDictionary.cpp_CXXFLAGS := -fno-optimize-sibling-calls
   endif
 endif
+
+ifneq ($(LIBAPTH_CFLAGS), )
+  JVM_CFLAGS_FEATURES += $(LIBAPTH_CFLAGS)
+endif

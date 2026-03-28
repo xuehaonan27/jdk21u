@@ -26,6 +26,12 @@
 #include "runtime/thread.hpp"
 #include "runtime/threadCrashProtection.hpp"
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 Thread* ThreadCrashProtection::_protected_thread = nullptr;
 ThreadCrashProtection* ThreadCrashProtection::_crash_protection = nullptr;
 
@@ -46,7 +52,11 @@ bool ThreadCrashProtection::call(CrashProtectionCallback& cb) {
   // we cannot rely on sigsetjmp/siglongjmp to save/restore the signal mask
   // since on at least some systems (OS X) siglongjmp will restore the mask
   // for the process, not the thread
+#ifdef USE_LIBAPTH
+  apth_sigmask(0, nullptr, &saved_sig_mask);
+#else
   pthread_sigmask(0, nullptr, &saved_sig_mask);
+#endif
   if (sigsetjmp(_jmpbuf, 0) == 0) {
     // make sure we can see in the signal handler that we have crash protection
     // installed
@@ -58,7 +68,11 @@ bool ThreadCrashProtection::call(CrashProtectionCallback& cb) {
     return true;
   }
   // this happens when we siglongjmp() back
+#ifdef USE_LIBAPTH
+  apth_sigmask(SIG_SETMASK, &saved_sig_mask, nullptr);
+#else
   pthread_sigmask(SIG_SETMASK, &saved_sig_mask, nullptr);
+#endif
   _crash_protection = nullptr;
   _protected_thread = nullptr;
   return false;

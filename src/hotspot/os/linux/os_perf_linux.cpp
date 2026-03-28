@@ -48,6 +48,12 @@
 #include <ifaddrs.h>
 #include <fcntl.h>
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 /**
    /proc/[number]/stat
               Status information about the process.  This is used by ps(1).  It is defined in /usr/src/linux/fs/proc/array.c.
@@ -429,8 +435,15 @@ static int get_boot_time(uint64_t* time) {
   return parse_stat("btime " UINT64_FORMAT "\n", time);
 }
 
+#ifdef USE_LIBAPTH
+static apth_mutex_t contextSwitchLock;
+static apth_once_t cslock_once = APTH_ONCE_INIT;
+static void cslock_init(void) { apth_mutex_init(&contextSwitchLock, NULL); }
+#else
+static pthread_mutex_t contextSwitchLock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 static int perf_context_switch_rate(double* rate) {
-  static pthread_mutex_t contextSwitchLock = PTHREAD_MUTEX_INITIALIZER;
   static uint64_t      bootTime;
   static uint64_t      lastTimeNanos;
   static uint64_t      lastSwitches;
@@ -450,7 +463,12 @@ static int perf_context_switch_rate(double* rate) {
 
   res = OS_OK;
 
+#ifdef USE_LIBAPTH
+  apth_once(&cslock_once, cslock_init);
+  apth_mutex_lock(&contextSwitchLock);
+#else
   pthread_mutex_lock(&contextSwitchLock);
+#endif
   {
 
     uint64_t sw;
@@ -492,7 +510,11 @@ static int perf_context_switch_rate(double* rate) {
       bootTime = bt;
     }
   }
+#ifdef USE_LIBAPTH
+  apth_mutex_unlock(&contextSwitchLock);
+#else
   pthread_mutex_unlock(&contextSwitchLock);
+#endif
 
   return res;
 }

@@ -25,6 +25,11 @@
  */
 
 #include "precompiled.hpp"
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
 #include "cds/metaspaceShared.hpp"
 #include "code/codeCache.hpp"
 #include "compiler/compileBroker.hpp"
@@ -2106,7 +2111,11 @@ static void ALWAYSINLINE crash_with_sigfpe() {
 #ifndef _WIN32
   // OSX implements raise(sig) incorrectly so we need to
   // explicitly target the current thread
+#ifdef USE_LIBAPTH
+  apth_kill(apth_self(), SIGFPE);
+#else
   pthread_kill(pthread_self(), SIGFPE);
+#endif
 #endif
 
 } // end: crash_with_sigfpe

@@ -31,6 +31,12 @@
 
 #include <pthread.h>
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 
 // Workaround for a bug in macOSX kernel's pthread support (fixed in Mojave?).
 // Avoid ever allocating a pthread_mutex_t at the same address as one of our
@@ -75,10 +81,15 @@ class PlatformMutex : public CHeapObj<mtSynchronizer> {
 
 #else
 
+#ifdef USE_LIBAPTH
+  apth_mutex_t _mutex;
+ protected:
+  apth_mutex_t* mutex() { return &_mutex; }
+#else
   pthread_mutex_t _mutex;
-
  protected:
   pthread_mutex_t* mutex() { return &_mutex; }
+#endif
 
  public:
   static void init() {}         // Nothing needed for the non-indirect case.
@@ -120,8 +131,13 @@ class PlatformMonitor : public PlatformMutex {
 
 #else
 
+#ifdef USE_LIBAPTH
+  apth_cond_t _cond;
+  apth_cond_t* cond() { return &_cond; }
+#else
   pthread_cond_t _cond;
   pthread_cond_t* cond() { return &_cond; }
+#endif
 
  public:
   PlatformMonitor();

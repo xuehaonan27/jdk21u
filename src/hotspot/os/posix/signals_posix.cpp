@@ -48,6 +48,12 @@
 
 #include <signal.h>
 
+#ifdef USE_LIBAPTH
+extern "C" {
+#include <apth.h>
+}
+#endif
+
 #define SEGV_BNDERR_value 3
 
 #if defined(SEGV_BNDERR)
@@ -430,7 +436,11 @@ static bool call_chained_handler(struct sigaction *actp, int sig,
     // try to honor the signal mask
     sigset_t oset;
     sigemptyset(&oset);
+#ifdef USE_LIBAPTH
+    apth_sigmask(SIG_SETMASK, &(actp->sa_mask), &oset);
+#else
     pthread_sigmask(SIG_SETMASK, &(actp->sa_mask), &oset);
+#endif
 
     // call into the chained handler
     if (siginfo_flag_set) {
@@ -440,7 +450,11 @@ static bool call_chained_handler(struct sigaction *actp, int sig,
     }
 
     // restore the signal mask
+#ifdef USE_LIBAPTH
+    apth_sigmask(SIG_SETMASK, &oset, nullptr);
+#else
     pthread_sigmask(SIG_SETMASK, &oset, nullptr);
+#endif
   }
   // Tell jvm's signal handler the signal is taken care of.
   return true;
@@ -505,7 +519,11 @@ void PosixSignals::unblock_error_signals() {
   sigset_t set;
   sigemptyset(&set);
   add_error_signals_to_set(&set);
+#ifdef USE_LIBAPTH
+  ::apth_sigmask(SIG_UNBLOCK, &set, nullptr);
+#else
   ::pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+#endif
 }
 
 class ErrnoPreserver: public StackObj {
@@ -1213,7 +1231,11 @@ void os::print_siginfo(outputStream* os, const void* si0) {
 bool os::signal_thread(Thread* thread, int sig, const char* reason) {
   OSThread* osthread = thread->osthread();
   if (osthread) {
+#ifdef USE_LIBAPTH
+    int status = apth_kill(osthread->apth_id(), sig);
+#else
     int status = pthread_kill(osthread->pthread_id(), sig);
+#endif
     if (status == 0) {
       Events::log(Thread::current(), "sent signal %d to Thread " INTPTR_FORMAT " because %s.",
                   sig, p2i(thread), reason);
@@ -1449,7 +1471,11 @@ void PosixSignals::print_signal_handler(outputStream* st, int sig,
   print_single_signal_handler(st, &current_act, buf, buflen);
 
   sigset_t thread_sig_mask;
+#ifdef USE_LIBAPTH
+  if (::apth_sigmask(/* ignored */ SIG_BLOCK, nullptr, &thread_sig_mask) == 0) {
+#else
   if (::pthread_sigmask(/* ignored */ SIG_BLOCK, nullptr, &thread_sig_mask) == 0) {
+#endif
     st->print(", %s", sigismember(&thread_sig_mask, sig) ? "blocked" : "unblocked");
   }
   st->cr();
@@ -1575,20 +1601,36 @@ void PosixSignals::hotspot_sigmask(Thread* thread) {
 
   //Save caller's signal mask before setting VM signal mask
   sigset_t caller_sigmask;
+#ifdef USE_LIBAPTH
+  apth_sigmask(SIG_BLOCK, nullptr, &caller_sigmask);
+#else
   pthread_sigmask(SIG_BLOCK, nullptr, &caller_sigmask);
+#endif
 
   OSThread* osthread = thread->osthread();
   osthread->set_caller_sigmask(caller_sigmask);
 
+#ifdef USE_LIBAPTH
+  apth_sigmask(SIG_UNBLOCK, unblocked_signals(), nullptr);
+#else
   pthread_sigmask(SIG_UNBLOCK, unblocked_signals(), nullptr);
+#endif
 
   if (!ReduceSignalUsage) {
     if (thread->is_VM_thread()) {
       // Only the VM thread handles BREAK_SIGNAL ...
+#ifdef USE_LIBAPTH
+      apth_sigmask(SIG_UNBLOCK, vm_signals(), nullptr);
+#else
       pthread_sigmask(SIG_UNBLOCK, vm_signals(), nullptr);
+#endif
     } else {
       // ... all other threads block BREAK_SIGNAL
+#ifdef USE_LIBAPTH
+      apth_sigmask(SIG_BLOCK, vm_signals(), nullptr);
+#else
       pthread_sigmask(SIG_BLOCK, vm_signals(), nullptr);
+#endif
     }
   }
 }
@@ -1694,7 +1736,11 @@ static void SR_handler(int sig, siginfo_t* siginfo, void* context) {
       sigemptyset(&suspend_set);
 
       // get current set of blocked signals and unblock resume signal
+#ifdef USE_LIBAPTH
+      apth_sigmask(SIG_BLOCK, nullptr, &suspend_set);
+#else
       pthread_sigmask(SIG_BLOCK, nullptr, &suspend_set);
+#endif
       sigdelset(&suspend_set, PosixSignals::SR_signum);
 
       sr_semaphore.signal();
@@ -1754,7 +1800,11 @@ int SR_initialize() {
   act.sa_sigaction = SR_handler;
 
   // SR_signum is blocked when the handler runs.
+#ifdef USE_LIBAPTH
+  apth_sigmask(SIG_BLOCK, nullptr, &act.sa_mask);
+#else
   pthread_sigmask(SIG_BLOCK, nullptr, &act.sa_mask);
+#endif
   remove_error_signals_from_set(&(act.sa_mask));
 
   if (sigaction(PosixSignals::SR_signum, &act, 0) == -1) {
@@ -1769,7 +1819,11 @@ int SR_initialize() {
 }
 
 static int sr_notify(OSThread* osthread) {
+#ifdef USE_LIBAPTH
+  int status = apth_kill(osthread->apth_id(), PosixSignals::SR_signum);
+#else
   int status = pthread_kill(osthread->pthread_id(), PosixSignals::SR_signum);
+#endif
   assert_status(status == 0, status, "pthread_kill");
   return status;
 }
@@ -1777,6 +1831,49 @@ static int sr_notify(OSThread* osthread) {
 // returns true on success and false on error - really an error is fatal
 // but this seems the normal response to library errors
 bool PosixSignals::do_suspend(OSThread* osthread) {
+#ifdef USE_LIBAPTH
+  {
+    struct apth_thread_stats stats;
+    apth_t apth_id = osthread->apth_id();
+    if (apth_get_thread_stats(apth_id, &stats) == 0 &&
+        stats.thread_class != APTH_CLASS_DEDICATED) {
+      // M:N thread: scheduler-based suspend (no SIGUSR2)
+      if (osthread->sr.request_suspend() != SuspendResume::SR_SUSPEND_REQUEST) {
+        ShouldNotReachHere();
+        return false;
+      }
+      apth_prevent_dispatch(apth_id);
+
+      // Wait for thread to stop running (preemption will force within 5ms)
+      int spin = 0;
+      while (apth_getstate(apth_id) == APTH_THREAD_STATE_RUNNING) {
+        if (++spin > 1000) { os::naked_yield(); spin = 0; }
+      }
+
+      // Capture register context from LIBAPTH saved state
+      void *saved_sp = NULL;
+      apth_get_saved_sp(apth_id, &saved_sp);
+      if (saved_sp != NULL) {
+        ucontext_t *uc = osthread->apth_ucontext();
+        memset(uc, 0, sizeof(*uc));
+        intptr_t *sp = (intptr_t*)saved_sp;
+        uc->uc_mcontext.gregs[REG_R15] = sp[0];
+        uc->uc_mcontext.gregs[REG_R14] = sp[1];
+        uc->uc_mcontext.gregs[REG_R13] = sp[2];
+        uc->uc_mcontext.gregs[REG_R12] = sp[3];
+        uc->uc_mcontext.gregs[REG_RBX] = sp[4];
+        uc->uc_mcontext.gregs[REG_RBP] = sp[5];
+        uc->uc_mcontext.gregs[REG_RIP] = sp[6];
+        uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(sp + 7);
+        osthread->set_ucontext(uc);
+      }
+
+      osthread->sr.suspended();
+      sr_semaphore.signal();
+      return true;
+    }
+  }
+#endif
   assert(osthread->sr.is_running(), "thread should be running");
   assert(!sr_semaphore.trywait(), "semaphore has invalid state");
 
@@ -1816,6 +1913,20 @@ bool PosixSignals::do_suspend(OSThread* osthread) {
 }
 
 void PosixSignals::do_resume(OSThread* osthread) {
+#ifdef USE_LIBAPTH
+  {
+    struct apth_thread_stats stats;
+    apth_t apth_id = osthread->apth_id();
+    if (apth_get_thread_stats(apth_id, &stats) == 0 &&
+        stats.thread_class != APTH_CLASS_DEDICATED) {
+      osthread->sr.request_wakeup();
+      apth_allow_dispatch(apth_id);
+      osthread->sr.running();
+      sr_semaphore.signal();
+      return;
+    }
+  }
+#endif
   assert(osthread->sr.is_suspended(), "thread should be suspended");
   assert(!sr_semaphore.trywait(), "invalid semaphore state");
 
