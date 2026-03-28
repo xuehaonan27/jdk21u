@@ -930,12 +930,9 @@ static void init_adjust_stacksize_for_guard_pages() {
 
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
-  // Phase 1 bootstrap: ALL threads are DEDICATED (1:1 pthread).
-  // This validates basic LIBAPTH infrastructure without M:N scheduler.
-  // TODO: re-enable M:N classes incrementally after first-green:
-  //   java_thread → APTH_CLASS_IO_BOUND
-  //   gc_thread   → APTH_CLASS_DISTRIBUTED
-  //   vm_thread   → APTH_CLASS_CPU_BOUND
+  // All threads DEDICATED for now. M:N requires cooperative yielding
+  // (I/O hooks or preemption) which is not yet in the core build.
+  // TODO: Enable M:N after adding preemption support to core build.
   (void)thr_type;
   return APTH_CLASS_DEDICATED;
 }
