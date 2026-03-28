@@ -26,9 +26,7 @@
 
 #include "precompiled.hpp"
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 #include "cds/metaspaceShared.hpp"
 #include "code/codeCache.hpp"

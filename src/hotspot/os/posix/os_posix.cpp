@@ -82,9 +82,7 @@
 #endif
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 
 #define ROOT_UID 0

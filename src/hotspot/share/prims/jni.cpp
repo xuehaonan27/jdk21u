@@ -103,9 +103,7 @@
 #endif
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 
 static jint CurrentVersion = JNI_VERSION_21;
@@ -3948,12 +3946,17 @@ jint JNICALL jni_DetachCurrentThread(JavaVM *vm)  {
   // or hidden (e.g. it could probably be hidden in the same
   // (platform-dependent) methods where we do alternate stack
   // maintenance work?)
-#ifdef USE_LIBAPTH
-  apth_detach_self();
-#endif
   thread->exit(false, JavaThread::jni_detach);
   thread->unregister_thread_stack_with_NMT();
   thread->smr_delete();
+
+#ifdef USE_LIBAPTH
+  // Detach AFTER all HotSpot exit logic completes.
+  // thread->exit() needs CUR_APTH for TLS (JavaThread::current()).
+  // smr_delete() frees the Thread object.
+  // apth_detach_self() only clears LIBAPTH state — no Thread* needed.
+  apth_detach_self();
+#endif
 
   // Go to the execute mode, the initial state of the thread on creation.
   // Use os interface as the thread is not a JavaThread anymore.

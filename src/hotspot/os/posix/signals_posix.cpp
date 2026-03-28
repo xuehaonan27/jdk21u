@@ -49,9 +49,7 @@
 #include <signal.h>
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 
 #define SEGV_BNDERR_value 3
@@ -1633,6 +1631,18 @@ void PosixSignals::hotspot_sigmask(Thread* thread) {
 #endif
     }
   }
+
+#ifdef USE_LIBAPTH
+  // LIBAPTH owns SIGPROF for preemption timers. DEDICATED threads must
+  // keep SIGPROF blocked. hotspot_sigmask may have unblocked it above
+  // via unblocked_signals(). Re-block it here.
+  {
+    sigset_t sigprof_set;
+    sigemptyset(&sigprof_set);
+    sigaddset(&sigprof_set, SIGPROF);
+    apth_sigmask(SIG_BLOCK, &sigprof_set, nullptr);
+  }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1857,6 +1867,10 @@ bool PosixSignals::do_suspend(OSThread* osthread) {
         ucontext_t *uc = osthread->apth_ucontext();
         memset(uc, 0, sizeof(*uc));
         intptr_t *sp = (intptr_t*)saved_sp;
+#if defined(AMD64)
+        // x86-64 LIBAPTH assembly context layout (apth_ctx_x86_64.S):
+        // [sp+0]=R15 [sp+8]=R14 [sp+16]=R13 [sp+24]=R12
+        // [sp+32]=RBX [sp+40]=RBP [sp+48]=return address
         uc->uc_mcontext.gregs[REG_R15] = sp[0];
         uc->uc_mcontext.gregs[REG_R14] = sp[1];
         uc->uc_mcontext.gregs[REG_R13] = sp[2];
@@ -1865,6 +1879,9 @@ bool PosixSignals::do_suspend(OSThread* osthread) {
         uc->uc_mcontext.gregs[REG_RBP] = sp[5];
         uc->uc_mcontext.gregs[REG_RIP] = sp[6];
         uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(sp + 7);
+#else
+#error "LIBAPTH M:N suspend/resume only supported on x86-64"
+#endif
         osthread->set_ucontext(uc);
       }
 

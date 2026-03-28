@@ -11,7 +11,7 @@ AC_DEFUN_ONCE([LIB_SETUP_LIBAPTH],
 
   if test "x$with_libapth" != "x" -a "x$with_libapth" != "xno"; then
     LIBAPTH_CFLAGS="-I${with_libapth}/src -DUSE_LIBAPTH -DUSE_LIBRARY_BASED_TLS_ONLY"
-    LIBAPTH_LIBS="-L${with_libapth}/build/lib -lapth -ldl"
+    LIBAPTH_LIBS="-L${with_libapth}/build/lib -Wl,-rpath,${with_libapth}/build/lib -lapth -ldl"
     AC_MSG_NOTICE([Using libapth from $with_libapth])
   fi
 

@@ -28,9 +28,7 @@
 #include "runtime/os.hpp"
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 
 // os::Linux defines the interface to Linux operating systems

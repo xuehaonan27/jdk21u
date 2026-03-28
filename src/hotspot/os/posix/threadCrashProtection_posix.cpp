@@ -27,9 +27,7 @@
 #include "runtime/threadCrashProtection.hpp"
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 
 Thread* ThreadCrashProtection::_protected_thread = nullptr;

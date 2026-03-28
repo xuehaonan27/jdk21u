@@ -123,9 +123,7 @@
 #endif
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 
 #ifndef _GNU_SOURCE
@@ -764,6 +762,13 @@ static void *thread_native_entry(Thread *thread) {
 
   osthread->set_thread_id(os::current_thread_id());
 
+#ifdef USE_LIBAPTH
+  // Set pthread_id from inside the child thread (not the parent).
+  // For DEDICATED threads, this is the real backing pthread.
+  // For M:N threads, this is the worker pthread (shared, used for logging only).
+  osthread->set_pthread_id(apth_func_raw(pthread_self)());
+#endif
+
   if (UseNUMA) {
     int lgrp_id = os::numa_get_group_id();
     if (lgrp_id != -1) {
@@ -847,6 +852,7 @@ GetMinStack _get_minstack_func = nullptr;  // Initialized via os::init_2()
 // Returns the size of the static TLS area glibc puts on thread stacks.
 // The value is cached on first use, which occurs when the first thread
 // is created during VM initialization.
+#ifndef USE_LIBAPTH  // Only used in pthread path
 static size_t get_static_tls_area_size(const pthread_attr_t *attr) {
   size_t tls_size = 0;
   if (_get_minstack_func != nullptr) {
@@ -884,6 +890,7 @@ static size_t get_static_tls_area_size(const pthread_attr_t *attr) {
                        tls_size);
   return tls_size;
 }
+#endif // !USE_LIBAPTH
 
 // In glibc versions prior to 2.27 the guard size mechanism
 // was not implemented properly. The POSIX standard requires adding
@@ -963,7 +970,7 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
     apth_attr_t apth_attr;
     apth_attr_init(&apth_attr);
     apth_attr_setstacksize(&apth_attr, stack_size);
-    apth_attr_setclass_np(&apth_attr, apth_class_for(thr_type));
+    apth_attr_setclass_np(&apth_attr, os::Linux::apth_class_for(thr_type));
     apth_attr_setdetachstate(&apth_attr, APTH_CREATE_DETACHED);
 
     int ret = apth_create(&tid, &apth_attr, (void* (*)(void*)) thread_native_entry, thread);
@@ -978,8 +985,8 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
     }
 
     osthread->set_apth_id(tid);
-    // Also set pthread_id for compatibility (dedicated threads have a real pthread)
-    osthread->set_pthread_id(apth_func_raw(pthread_self)());
+    // pthread_id is set from inside the child thread (thread_native_entry),
+    // not here in the parent, so it reflects the correct backing pthread.
 
     // Wait until child thread is either initialized or aborted
     {
@@ -4823,6 +4830,12 @@ jint os::init_2(void) {
   if (PosixSignals::init() == JNI_ERR) {
     return JNI_ERR;
   }
+
+#ifdef USE_LIBAPTH
+  log_info(os)("LIBAPTH active: SIGPROF owned by LIBAPTH preemption timer. "
+               "External profilers using SIGPROF (e.g. async-profiler) may conflict. "
+               "Use apth_set_preempt_hook() for CPU sampling instead.");
+#endif
 
   // Check and sets minimum stack sizes against command line options
   if (set_minimum_stack_sizes() == JNI_ERR) {

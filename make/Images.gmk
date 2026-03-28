@@ -164,7 +164,16 @@ define CreateCDSArchive
   JRE_TARGETS += $$($1_$2_gen_cds_archive_jre)
 endef
 
+# Skip CDS archive generation when LIBAPTH is enabled: the target JVM
+# uses LIBAPTH which cannot run during build (needs runtime env).
+# CDS archives can be generated post-build: java -Xshare:dump
 ifeq ($(BUILD_CDS_ARCHIVE), true)
+ifneq ($(LIBAPTH_CFLAGS), )
+  BUILD_CDS_ARCHIVE_LIBAPTH_SKIP := true
+endif
+endif
+ifeq ($(BUILD_CDS_ARCHIVE), true)
+ifeq ($(BUILD_CDS_ARCHIVE_LIBAPTH_SKIP), )
   $(foreach v, $(JVM_VARIANTS), \
     $(eval $(call CreateCDSArchive,$v,)) \
   )
@@ -174,7 +183,8 @@ ifeq ($(BUILD_CDS_ARCHIVE), true)
       $(eval $(call CreateCDSArchive,$v,_nocoops)) \
     )
   endif
-endif
+endif # BUILD_CDS_ARCHIVE_LIBAPTH_SKIP
+endif # BUILD_CDS_ARCHIVE
 
 ################################################################################
 # src.zip

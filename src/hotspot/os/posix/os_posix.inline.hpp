@@ -35,9 +35,7 @@
 #include <netdb.h>
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 
 // Aix does not have NUMA support but need these for compilation.

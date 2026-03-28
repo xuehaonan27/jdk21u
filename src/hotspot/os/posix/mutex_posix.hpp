@@ -32,9 +32,7 @@
 #include <pthread.h>
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #endif
 
 

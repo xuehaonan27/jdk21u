@@ -26,9 +26,7 @@
 #include "precompiled.hpp"
 
 #ifdef USE_LIBAPTH
-extern "C" {
 #include <apth.h>
-}
 #include <unistd.h>  // sysconf
 #endif
 
@@ -487,6 +485,20 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   // Note: this internally calls os::init_container_support()
   jint parse_result = Arguments::parse(args);
   if (parse_result != JNI_OK) return parse_result;
+
+#ifdef USE_LIBAPTH
+  // LIBAPTH does not support fork()/vfork() after init.
+  // Only posix_spawn is safe. Reject any other launch mechanism.
+  {
+    const char* launch_mech = Arguments::PropertyList_get_value(
+        Arguments::system_properties(), "jdk.lang.Process.launchMechanism");
+    if (launch_mech != nullptr && strcasecmp(launch_mech, "posix_spawn") != 0) {
+      vm_exit_during_initialization(
+        "LIBAPTH requires posix_spawn for process creation. "
+        "Remove -Djdk.lang.Process.launchMechanism or set it to posix_spawn.");
+    }
+  }
+#endif
 
   // Initialize NMT right after argument parsing to keep the pre-NMT-init window small.
   MemTracker::initialize();
