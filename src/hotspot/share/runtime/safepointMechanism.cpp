@@ -33,6 +33,9 @@
 #include "runtime/stackWatermarkSet.hpp"
 #include "services/memTracker.hpp"
 #include "utilities/globalDefinitions.hpp"
+#ifdef USE_LIBAPTH
+#include <apth.h>
+#endif
 
 uintptr_t SafepointMechanism::_poll_word_armed_value;
 uintptr_t SafepointMechanism::_poll_word_disarmed_value;
@@ -158,6 +161,20 @@ void SafepointMechanism::process(JavaThread *thread, bool allow_suspend, bool ch
 
     need_rechecking = thread->handshake_state()->has_operation() && thread->handshake_state()->process_by_self(allow_suspend, check_async_exception);
   } while (need_rechecking);
+
+#ifdef USE_LIBAPTH
+  // M:N cooperative yield: if the scheduler requested a reschedule,
+  // transition to _thread_blocked, yield to the scheduler, then resume.
+  // This gives sibling apths on the same worker a chance to run.
+  if (thread->poll_data()->_need_resched) {
+    thread->poll_data()->_need_resched = false;
+    // Temporarily transition to blocked so safepoints see us as safe.
+    JavaThreadState saved = thread->thread_state();
+    thread->set_thread_state(_thread_blocked);
+    apth_yield();
+    thread->set_thread_state(saved);
+  }
+#endif
 
   update_poll_values(thread);
   assert(sp_before == thread->last_Java_sp(), "Anchor has changed");
