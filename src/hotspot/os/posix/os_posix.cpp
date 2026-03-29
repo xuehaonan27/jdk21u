@@ -849,6 +849,16 @@ bool os::dont_yield() {
 }
 
 void os::naked_yield() {
+#ifdef USE_LIBAPTH
+  // For M:N threads, yield the current apth to the scheduler so sibling
+  // threads on the same worker get a chance to run.  apth_self() returns
+  // NULL when no apth is dispatched (scheduler context / shutdown).
+  // For DEDICATED threads apth_yield is a no-op, so always safe to call.
+  if (apth_self() != nullptr) {
+    apth_yield();
+    return;
+  }
+#endif
   sched_yield();
 }
 
