@@ -35,6 +35,23 @@
 #include "utilities/events.hpp"
 #include "utilities/macros.hpp"
 
+#ifdef USE_LIBAPTH
+#include <apth.h>
+// Helper: returns true if the current thread is an M:N JavaThread that
+// would cooperatively yield (via apth_cond_wait/apth_mutex_lock) when
+// blocking.  Such threads must transition to _thread_blocked before the
+// LIBAPTH blocking primitive, otherwise SafepointSynchronize::begin()
+// will spin waiting for a thread that is sitting in a scheduler queue.
+static bool is_mn_java_thread(Thread* self) {
+  if (!self->is_Java_thread()) return false;
+  apth_t a = apth_self();
+  if (a == nullptr) return false;
+  struct apth_thread_stats st;
+  return apth_get_thread_stats(a, &st) == 0 &&
+         st.thread_class != APTH_CLASS_DEDICATED;
+}
+#endif
+
 class InFlightMutexRelease {
  private:
   Mutex* _in_flight_mutex;
@@ -144,7 +161,22 @@ void Mutex::lock_without_safepoint_check(Thread * self) {
   check_no_safepoint_state(self);
   check_rank(self);
 
-  _lock.lock();
+#ifdef USE_LIBAPTH
+  // M:N JavaThreads: transition to _thread_blocked before the LIBAPTH
+  // mutex lock, which may yield to the scheduler.  Without this,
+  // SafepointSynchronize::begin() would spin waiting for a thread that
+  // is sitting in a scheduler queue in _thread_in_vm state.
+  if (is_mn_java_thread(self)) {
+    JavaThread* jt = JavaThread::cast(self);
+    JavaThreadState saved = jt->thread_state();
+    jt->set_thread_state(_thread_blocked);
+    _lock.lock();
+    jt->set_thread_state(saved);
+  } else
+#endif
+  {
+    _lock.lock();
+  }
   assert_owner(nullptr);
   set_owner(self);
 }
@@ -223,7 +255,23 @@ bool Monitor::wait_without_safepoint_check(uint64_t timeout) {
   // Check safepoint state after resetting owner and possible NSV.
   check_no_safepoint_state(self);
 
-  int wait_status = _lock.wait(timeout);
+  int wait_status;
+#ifdef USE_LIBAPTH
+  // M:N JavaThreads: transition to _thread_blocked before the LIBAPTH
+  // cond wait, which yields to the scheduler.  Without this,
+  // SafepointSynchronize::begin() would spin waiting for a thread that
+  // is sitting in a scheduler queue in _thread_in_vm state.
+  if (is_mn_java_thread(self)) {
+    JavaThread* jt = JavaThread::cast(self);
+    JavaThreadState saved = jt->thread_state();
+    jt->set_thread_state(_thread_blocked);
+    wait_status = _lock.wait(timeout);
+    jt->set_thread_state(saved);
+  } else
+#endif
+  {
+    wait_status = _lock.wait(timeout);
+  }
   set_owner(self);
   return wait_status != 0;          // return true IFF timeout
 }
