@@ -28,10 +28,18 @@
 #include "memory/allocation.hpp"
 #include "utilities/globalDefinitions.hpp"
 
+#ifdef USE_LIBAPTH
+#include <apth.h>
+#else
 #include <semaphore.h>
+#endif
 
 class PosixSemaphore : public CHeapObj<mtInternal> {
+#ifdef USE_LIBAPTH
+  apth_sem_t _semaphore;
+#else
   sem_t _semaphore;
+#endif
 
   NONCOPYABLE(PosixSemaphore);
 

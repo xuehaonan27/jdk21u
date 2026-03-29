@@ -41,25 +41,41 @@
 #define guarantee_with_errno(cond, msg) check_with_errno(guarantee, cond, msg)
 
 PosixSemaphore::PosixSemaphore(uint value) {
+#ifdef USE_LIBAPTH
+  int ret = apth_sem_init(&_semaphore, 0, value);
+#else
   int ret = sem_init(&_semaphore, 0, value);
+#endif
 
   guarantee_with_errno(ret == 0, "Failed to initialize semaphore");
 }
 
 PosixSemaphore::~PosixSemaphore() {
+#ifdef USE_LIBAPTH
+  int ret = apth_sem_destroy(&_semaphore);
+#else
   int ret = sem_destroy(&_semaphore);
+#endif
   assert_with_errno(ret == 0, "sem_destroy failed");
 }
 
 void PosixSemaphore::signal(uint count) {
   for (uint i = 0; i < count; i++) {
+#ifdef USE_LIBAPTH
+    int ret = apth_sem_post(&_semaphore);
+#else
     int ret = sem_post(&_semaphore);
+#endif
 
     assert_with_errno(ret == 0, "sem_post failed");
   }
 }
 
 void PosixSemaphore::wait() {
+#ifdef USE_LIBAPTH
+  int ret = apth_sem_wait(&_semaphore);
+  assert_with_errno(ret == 0, "sem_wait failed");
+#else
   int ret;
 
   do {
@@ -67,9 +83,15 @@ void PosixSemaphore::wait() {
   } while (ret != 0 && errno == EINTR);
 
   assert_with_errno(ret == 0, "sem_wait failed");
+#endif
 }
 
 bool PosixSemaphore::trywait() {
+#ifdef USE_LIBAPTH
+  int ret = apth_sem_trywait(&_semaphore);
+  assert_with_errno(ret == 0 || ret == EAGAIN, "trywait failed");
+  return ret == 0;
+#else
   int ret;
 
   do {
@@ -79,6 +101,7 @@ bool PosixSemaphore::trywait() {
   assert_with_errno(ret == 0 || errno == EAGAIN, "trywait failed");
 
   return ret == 0;
+#endif
 }
 
 bool PosixSemaphore::timedwait(int64_t millis) {
@@ -88,6 +111,18 @@ bool PosixSemaphore::timedwait(int64_t millis) {
 }
 
 bool PosixSemaphore::timedwait(struct timespec ts) {
+#ifdef USE_LIBAPTH
+  int result = apth_sem_timedwait(&_semaphore, &ts);
+  if (result == 0) {
+    return true;
+  } else if (result == ETIMEDOUT) {
+    return false;
+  } else {
+    errno = result;
+    assert_with_errno(false, "timedwait failed");
+    return false;
+  }
+#else
   while (true) {
     int result = sem_timedwait(&_semaphore, &ts);
     if (result == 0) {
@@ -101,6 +136,7 @@ bool PosixSemaphore::timedwait(struct timespec ts) {
       return false;
     }
   }
+#endif
 }
 #endif // __APPLE__
 
