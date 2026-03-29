@@ -68,6 +68,9 @@ class SafepointMechanism : public AllStatic {
   struct ThreadData {
     volatile uintptr_t _polling_word;
     volatile uintptr_t _polling_page;
+#ifdef USE_LIBAPTH
+    volatile bool _need_resched;  // LIBAPTH: M:N thread should yield at next poll
+#endif
 
     inline void set_polling_word(uintptr_t poll_value);
     inline uintptr_t get_polling_word();

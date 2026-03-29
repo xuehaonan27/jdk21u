@@ -67,6 +67,13 @@ bool SafepointMechanism::should_process(JavaThread* thread, bool allow_suspend) 
     return true;
   }
 
+#ifdef USE_LIBAPTH
+  // M:N yield request — treated as a reason to process
+  if (thread->poll_data()->_need_resched) {
+    return true;
+  }
+#endif
+
   // It has boiled down to two possibilities:
   // 1: We have nothing to process, this just a disarm poll.
   // 2: We have a suspend or async exception handshake, which cannot be processed.

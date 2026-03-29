@@ -940,14 +940,10 @@ static void init_adjust_stacksize_for_guard_pages() {
 
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
-  // All threads DEDICATED. M:N requires HotSpot-integrated yield
-  // checkpoints (interpreter backedge, safepoint poll calling
-  // apth_yield_optional) which is Phase 3 work.
-  // The M:N scheduler cannot preempt running threads without either
-  // I/O hooks or SIGPROF-based preemption, and a safepoint-waiting
-  // VM thread will deadlock if the Java thread never yields.
-  (void)thr_type;
-  return APTH_CLASS_DEDICATED;
+  switch (thr_type) {
+  case os::java_thread:     return APTH_CLASS_IO_BOUND;
+  default:                  return APTH_CLASS_DEDICATED;
+  }
 }
 #endif
 
