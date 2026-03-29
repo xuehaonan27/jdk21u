@@ -49,7 +49,6 @@
   pthread_t _pthread_id;
 #ifdef USE_LIBAPTH
   apth_t    _apth_id;
-  ucontext_t _apth_saved_ucontext;  // For M:N suspend register context
 #endif
 
   sigset_t _caller_sigmask; // Caller's signal mask
@@ -74,7 +73,6 @@
 #ifdef USE_LIBAPTH
   apth_t apth_id() const      { return _apth_id; }
   void set_apth_id(apth_t id) { _apth_id = id; }
-  ucontext_t* apth_ucontext() { return &_apth_saved_ucontext; }
 #endif
 
   // ***************************************************************

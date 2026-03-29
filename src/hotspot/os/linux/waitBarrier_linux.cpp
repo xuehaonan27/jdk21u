@@ -78,14 +78,22 @@ void LinuxWaitBarrier::wait(int barrier_tag) {
 #ifdef USE_LIBAPTH
   // For M:N threads, a raw futex wait would block the scheduler worker and
   // starve sibling apths.  Use a yield loop instead — safepoints are brief
-  // so this is acceptable.  DEDICATED threads use the normal futex path.
-  // apth_self() returns non-NULL when an apth is dispatched.
-  // apth_yield() is safe for both M:N and DEDICATED (no-op for DEDICATED).
-  if (apth_self() != nullptr) {
-    while (barrier_tag == _futex_barrier) {
-      apth_yield();
+  // so this is acceptable.  DEDICATED threads use the normal futex path
+  // (apth_yield is sched_yield for DEDICATED — would busy-loop the CPU).
+  // Check thread_class via apth_get_thread_stats to distinguish M:N from
+  // DEDICATED without accessing the opaque apth_t struct.
+  {
+    apth_t self = apth_self();
+    if (self != nullptr) {
+      struct apth_thread_stats st;
+      if (apth_get_thread_stats(self, &st) == 0 &&
+          st.thread_class != APTH_CLASS_DEDICATED) {
+        while (barrier_tag == _futex_barrier) {
+          apth_yield();
+        }
+        return;
+      }
     }
-    return;
   }
 #endif
   do {
