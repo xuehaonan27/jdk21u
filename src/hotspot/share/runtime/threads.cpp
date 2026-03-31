@@ -440,10 +440,9 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   // Initialize LIBAPTH before TLS init — apth_key_create needs LIBAPTH.
   {
     static apth_t _main_apth_handle;
-    int apth_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (apth_workers > 2) apth_workers -= 2;
-    if (apth_workers < 1) apth_workers = 1;
-    if (apth_init_library(apth_workers) != 0) return JNI_ERR;
+    // 0 = auto-detect: uses sched_getaffinity to get available CPUs
+    // (respects cgroup cpuset), then reserves 2 for DEDICATED threads.
+    if (apth_init_library(0) != 0) return JNI_ERR;
     if (apth_attach_self_as_dedicated(&_main_apth_handle) != 0) {
       apth_drop();
       return JNI_ERR;
