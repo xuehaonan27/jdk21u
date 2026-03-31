@@ -11,8 +11,17 @@ AC_DEFUN_ONCE([LIB_SETUP_LIBAPTH],
 
   if test "x$with_libapth" != "x" -a "x$with_libapth" != "xno"; then
     LIBAPTH_CFLAGS="-I${with_libapth}/src -DUSE_LIBAPTH -DUSE_LIBRARY_BASED_TLS_ONLY"
-    LIBAPTH_LIBS="${with_libapth}/build/lib/libapth_core.a -lpthread -ldl"
-    AC_MSG_NOTICE([Using libapth from $with_libapth])
+    # Link the JVM-specific shared library dynamically.  libapth_jvm.so
+    # includes I/O hooks (read/write/poll/epoll_wait/accept/connect/recv/send)
+    # that interpose libc for M:N cooperative scheduling, but EXCLUDES signal
+    # hooks (sigaction/signal) since HotSpot manages its own signal handlers.
+    # Resolve to absolute path for reliable linking and rpath
+    LIBAPTH_ABS_LIB=$(cd "${with_libapth}/build/lib" 2>/dev/null && pwd)
+    if test -z "$LIBAPTH_ABS_LIB"; then
+      AC_MSG_ERROR([libapth build/lib directory not found. Run 'make jvm' in libapth first.])
+    fi
+    LIBAPTH_LIBS="-L${LIBAPTH_ABS_LIB} -lapth_jvm -Wl,-rpath,${LIBAPTH_ABS_LIB} -lpthread -ldl"
+    AC_MSG_NOTICE([Using libapth (JVM shared library) from $with_libapth])
   fi
 
   AC_SUBST(LIBAPTH_CFLAGS)
