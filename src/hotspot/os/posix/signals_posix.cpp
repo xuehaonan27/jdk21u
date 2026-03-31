@@ -920,7 +920,16 @@ int PosixSignals::install_sigaction_signal_handler(struct sigaction* sigAct,
     sigAct->sa_flags |= SA_ONSTACK;
   }
 #endif
-  return sigaction(sig, sigAct, oldSigAct);
+  int ret = sigaction(sig, sigAct, oldSigAct);
+#ifdef USE_LIBAPTH
+  // Mirror this handler into LIBAPTH's software signal dispatch table.
+  // Without this, apth_kill() for M:N threads would use LIBAPTH's table
+  // (which defaults to SIG_DFL) instead of HotSpot's actual handler.
+  if (ret == 0) {
+    apth_register_sigaction(sig, sigAct);
+  }
+#endif
+  return ret;
 }
 
 // Will be modified when max signal is changed to be dynamic
@@ -1820,6 +1829,11 @@ int SR_initialize() {
   if (sigaction(PosixSignals::SR_signum, &act, 0) == -1) {
     return -1;
   }
+#ifdef USE_LIBAPTH
+  // Mirror SR handler into LIBAPTH's software dispatch table so
+  // apth_kill(apth_id, SR_signum) delivers it to the correct M:N thread.
+  apth_register_sigaction(PosixSignals::SR_signum, &act);
+#endif
 
   // Save signal setup information for later checking.
   vm_handlers.set(PosixSignals::SR_signum, &act);
@@ -1829,10 +1843,15 @@ int SR_initialize() {
 }
 
 static int sr_notify(OSThread* osthread) {
-  // USE_LIBAPTH: Use pthread_kill with the worker pthread TID for ALL
-  // thread types. For M:N threads, pthread_id() is the scheduler worker;
-  // for DEDICATED, it's the backing pthread. Both are real kernel threads.
+#ifdef USE_LIBAPTH
+  // For M:N threads, use apth_kill to target the specific apth via
+  // LIBAPTH's software signal dispatch.  pthread_kill would hit the
+  // shared worker pthread, which may be running a different apth.
+  // For DEDICATED threads, apth_kill routes to pthread_kill internally.
+  int status = apth_kill(osthread->apth_id(), PosixSignals::SR_signum);
+#else
   int status = pthread_kill(osthread->pthread_id(), PosixSignals::SR_signum);
+#endif
   assert_status(status == 0, status, "pthread_kill");
   return status;
 }
