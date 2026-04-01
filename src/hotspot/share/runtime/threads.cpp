@@ -996,16 +996,19 @@ void Threads::destroy_vm() {
   // exit_globals() will delete tty
   exit_globals();
 
-#ifdef USE_LIBAPTH
-  // TODO: Both apth_detach_self() and apth_drop() crash during JVM
-  // shutdown. Skip both — process exits anyway, OS reclaims resources.
-  // apth_detach_self();
-  // apth_drop();
-#endif
-
   // Deleting the shutdown thread here is safe. See comment on
   // wait_until_not_protected() above.
   delete thread;
+
+#ifdef USE_LIBAPTH
+  // Clean LIBAPTH shutdown. Must happen AFTER delete thread because
+  // HotSpot TLS is backed by apth_key_* (threadLocalStorage_posix.cpp).
+  // By this point: all non-daemon JavaThreads are dead, VMThread is
+  // destroyed, VM_Exit::set_vm_exited() has been called.
+  // apth_drop() has its own reentrancy guard and init check.
+  apth_detach_self();
+  apth_drop();
+#endif
 
 #if INCLUDE_JVMCI
   if (JVMCICounterSize > 0) {

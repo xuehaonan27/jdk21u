@@ -73,12 +73,47 @@ Java_sun_nio_ch_NativeThread_init(JNIEnv *env, jclass cl)
 JNIEXPORT jlong JNICALL
 Java_sun_nio_ch_NativeThread_current0(JNIEnv *env, jclass cl)
 {
+#ifdef USE_LIBAPTH
+    /* For LIBAPTH M:N threads, return a sentinel (-2) instead of the
+     * worker pthread_t.  This sentinel:
+     * - Is treated as "native thread" by NativeThread.isNativeThread()
+     *   (not 0, not -1), so preClose/dup2 interruption still works.
+     * - Is skipped by signal0() to avoid sending pthread_kill to the
+     *   wrong worker.  M:N threads don't need signals to interrupt I/O
+     *   because LIBAPTH's hooks convert blocking I/O to cooperative
+     *   yield; fd invalidation via preClose0/dup2 is sufficient.
+     *
+     * Check: apth_self() != NULL means LIBAPTH is initialized.
+     * Dedicated threads (apth_self()->is_dedicated via apth_get_thread_stats)
+     * fall through to the normal pthread_self() path.
+     */
+    {
+        extern void *apth_self(void);
+        extern int apth_get_thread_stats(void *, void *);
+        void *self = apth_self();
+        if (self != NULL) {
+            struct { int dispatches; double cpu, wall; int thread_class, state; } st;
+            if (apth_get_thread_stats(self, &st) == 0 && st.thread_class != 3/*DEDICATED*/) {
+                return (jlong)-2;
+            }
+        }
+    }
+#endif
     return (jlong)pthread_self();
 }
+
+/* Sentinel value for LIBAPTH M:N threads (matches NativeThread.java) */
+#define LIBAPTH_MN_THREAD_ID ((jlong)-2)
 
 JNIEXPORT void JNICALL
 Java_sun_nio_ch_NativeThread_signal0(JNIEnv *env, jclass cl, jlong thread)
 {
+#ifdef USE_LIBAPTH
+    /* M:N threads don't need signal-based interruption: LIBAPTH hooks
+     * handle I/O cooperatively, and fd invalidation via preClose0/dup2
+     * is sufficient to interrupt blocked operations. */
+    if (thread == LIBAPTH_MN_THREAD_ID) return;
+#endif
     int ret;
     ret = pthread_kill((pthread_t)thread, INTERRUPT_SIGNAL);
 #ifdef MACOSX

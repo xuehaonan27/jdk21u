@@ -67,6 +67,18 @@ find "$JDK_IMAGE" "$LIBAPTH_DIR" -type f \( -name "java" -o -name "javac" -o -na
   fi
 done
 
+# === CDS Archive Generation ===
+# CDS is skipped during build (LIBAPTH JVM needs LD_PRELOAD at runtime).
+# Generate the default shared archive post-build so -Xshare:off is not needed.
+echo ""
+echo "=== Generating CDS archive ==="
+LD_PRELOAD=/home/xuehaonan/libapth/build/lib/libapth.so \
+  "$JDK_IMAGE/bin/java" -Xshare:dump \
+    -Xmx128M -Xms128M \
+    -XX:SharedArchiveFile="$JDK_IMAGE/lib/server/classes.jsa" \
+  && echo "CDS archive created successfully" \
+  || echo "WARNING: CDS archive generation failed (non-fatal)"
+
 echo ""
 echo "=== Verification ==="
 echo ""
