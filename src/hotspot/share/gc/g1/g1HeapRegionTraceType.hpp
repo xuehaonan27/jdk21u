@@ -37,6 +37,7 @@ class G1HeapRegionTraceType : AllStatic {
     StartsHumongous,
     ContinuesHumongous,
     Old,
+    FetchCache,
     G1HeapRegionTypeEndSentinel
   };
 
@@ -48,6 +49,7 @@ class G1HeapRegionTraceType : AllStatic {
       case StartsHumongous:    return "Starts Humongous";
       case ContinuesHumongous: return "Continues Humongous";
       case Old:                return "Old";
+      case FetchCache:         return "Fetch Cache";
       default: ShouldNotReachHere(); return nullptr;
     }
   }

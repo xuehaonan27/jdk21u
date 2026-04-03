@@ -70,7 +70,13 @@ private:
     ContinuesHumongousTag = HumongousMask + 1,
 
     OldMask               = 8,
-    OldTag                = OldMask
+    OldTag                = OldMask,
+
+    // Fetch Cache Region: sub-type of Old (OldMask | 1 = 9).
+    // is_old() returns true for FCR (bit 3 is set), so existing code
+    // that checks is_old() handles FCR automatically.
+    // is_fetch_cache() distinguishes FCR from plain Old.
+    FetchCacheTag         = OldMask + 1
   } Tag;
 
   volatile Tag _tag;
@@ -120,6 +126,10 @@ public:
 
   bool is_old_or_humongous() const { return (get() & (OldMask | HumongousMask)) != 0; }
 
+  // Fetch Cache Region: for cached copies of remote objects.
+  // is_old() returns true for FCR (it's an Old sub-type).
+  bool is_fetch_cache() const { return get() == FetchCacheTag; }
+
   // Setters
 
   void set_free() { set(FreeTag); }
@@ -132,6 +142,8 @@ public:
   void set_continues_humongous() { set_from(ContinuesHumongousTag, FreeTag); }
 
   void set_old() { set(OldTag); }
+
+  void set_fetch_cache() { set_from(FetchCacheTag, FreeTag); }
 
   // Change the current region type to be of an old region type if not already done so.
   // Returns whether the region type has been changed or not.

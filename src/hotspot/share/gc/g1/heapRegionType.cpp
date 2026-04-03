@@ -39,6 +39,7 @@ bool HeapRegionType::is_valid(Tag tag) {
     case StartsHumongousTag:
     case ContinuesHumongousTag:
     case OldTag:
+    case FetchCacheTag:
       return true;
     default:
       return false;
@@ -54,6 +55,7 @@ const char* HeapRegionType::get_str() const {
     case StartsHumongousTag:    return "HUMS";
     case ContinuesHumongousTag: return "HUMC";
     case OldTag:                return "OLD";
+    case FetchCacheTag:         return "FCR";
     default:
       ShouldNotReachHere();
       return nullptr; // keep some compilers happy
@@ -69,6 +71,7 @@ const char* HeapRegionType::get_short_str() const {
     case StartsHumongousTag:    return "HS";
     case ContinuesHumongousTag: return "HC";
     case OldTag:                return "O";
+    case FetchCacheTag:         return "FC";
     default:
       ShouldNotReachHere();
       return nullptr; // keep some compilers happy
@@ -84,6 +87,7 @@ G1HeapRegionTraceType::Type HeapRegionType::get_trace_type() {
     case StartsHumongousTag:    return G1HeapRegionTraceType::StartsHumongous;
     case ContinuesHumongousTag: return G1HeapRegionTraceType::ContinuesHumongous;
     case OldTag:                return G1HeapRegionTraceType::Old;
+    case FetchCacheTag:         return G1HeapRegionTraceType::FetchCache;
     default:
       ShouldNotReachHere();
       return G1HeapRegionTraceType::Free; // keep some compilers happy
