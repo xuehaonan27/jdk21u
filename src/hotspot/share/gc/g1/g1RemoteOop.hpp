@@ -124,7 +124,7 @@ const uintptr_t G1_MW_REMOTE_METADATA_MASK =
 
 inline oop resolve_oop_raw(oop tagged) {
   uintptr_t v = cast_from_oop<uintptr_t>(tagged);
-  if (LIKELY((v & G1_OOP_TAG_MASK) == 0)) {
+  if ((v & G1_OOP_TAG_MASK) == 0) {
     return tagged;  // Ordinary (fast path -- no tags)
   }
   // For now (Phase 1a): just strip tags.
