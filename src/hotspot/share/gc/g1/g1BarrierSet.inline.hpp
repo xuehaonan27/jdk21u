@@ -192,28 +192,24 @@ oop_store_not_in_heap(T* addr, oop new_value) {
 // the Handle, maintaining coherence for remote eviction.
 // ============================================================
 
+// Phase 2b: Write barrier with region-bitmap-based classification.
+// Checks per-region bitmap to determine if target is managed (Unique or Shared).
+// For Shared targets: encodes store as Shared OOP pointing to Handle.
+// For Unique targets: upgrades to Shared (allocate Handle, update bitmap).
+// For untracked: no special handling (standard store).
+//
+// Fast negative path: most regions have no bitmap → one null-pointer check.
+
 template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap(T* addr, oop new_value) {
   oop store_value = new_value;
 
-  // Check if the target object is managed (registered in the remote memory manager).
-  // If so and it's Shared, encode the reference as a Shared OOP pointing to its Handle.
-  // Uses SIDE TABLE lookup (not mark word bits) to avoid interfering with
-  // MethodHandle generated code that does full 64-bit mark word CAS operations.
   if (new_value != nullptr && Universe::heap() != nullptr) {
-    G1CollectedHeap* g1h = G1CollectedHeap::heap();
-    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-    if (rmm != nullptr) {
-      RemoteHandle* h = rmm->handle_for(new_value);
-      if (h != nullptr) {
-        store_value = g1_make_shared_oop((void*)h);
-      }
-    }
+    store_value = G1BarrierSet::resolve_managed_store(new_value);
   }
 
-  // Standard ModRef store with SATB pre-barrier and card marking post-barrier.
   ModRef::oop_store_in_heap(addr, store_value);
 }
 
@@ -223,14 +219,7 @@ oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
   oop store_value = new_value;
 
   if (new_value != nullptr && Universe::heap() != nullptr) {
-    G1CollectedHeap* g1h = G1CollectedHeap::heap();
-    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-    if (rmm != nullptr) {
-      RemoteHandle* h = rmm->handle_for(new_value);
-      if (h != nullptr) {
-        store_value = g1_make_shared_oop((void*)h);
-      }
-    }
+    store_value = G1BarrierSet::resolve_managed_store(new_value);
   }
 
   ModRef::oop_store_in_heap_at(base, offset, store_value);
