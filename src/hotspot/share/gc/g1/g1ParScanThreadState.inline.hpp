@@ -90,6 +90,14 @@ inline void G1ParScanThreadState::remember_reference_into_optional_region(T* p) 
   verify_task(p);
 }
 
+void G1ParScanThreadState::record_rc_ref_site(oop new_copy, void* ref_site, bool is_narrow) {
+  rc_buffer_ensure_capacity();
+  _rc_buffer[_rc_buffer_size]._new_copy = new_copy;
+  _rc_buffer[_rc_buffer_size]._ref_site = ref_site;
+  _rc_buffer[_rc_buffer_size]._is_narrow = is_narrow;
+  _rc_buffer_size++;
+}
+
 G1OopStarChunkedList* G1ParScanThreadState::oops_into_optional_region(const HeapRegion* hr) {
   assert(hr->index_in_opt_cset() < _max_num_optional_regions,
          "Trying to access optional region idx %u beyond " SIZE_FORMAT " " HR_FORMAT,

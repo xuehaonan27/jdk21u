@@ -110,6 +110,32 @@ class G1ParScanThreadState : public CHeapObj<mtGC> {
   EvacuationFailedInfo _evacuation_failed_info;
   G1EvacFailureRegions* _evac_failure_regions;
 
+public:
+  // ============================================================
+  // Phase 2: RC recording for Unique/Shared OOP classification
+  // ============================================================
+  // Records (new_copy_addr, ref_site_addr) pairs during evacuation.
+  // After evacuation, flush_stats() processes these to classify
+  // promoted Old objects as Unique (RC=1) or Shared (RC>1).
+
+  struct RCRefSite {
+    oop     _new_copy;     // New copy address (after forwarding)
+    void*   _ref_site;     // Address of the reference slot (oop* or narrowOop*)
+    bool    _is_narrow;    // true if narrowOop*, false if oop*
+  };
+
+private:
+  static const size_t RC_BUFFER_INITIAL_CAPACITY = 1024;
+  RCRefSite*  _rc_buffer;         // Growable buffer of ref-site records
+  size_t      _rc_buffer_size;    // Current number of entries
+  size_t      _rc_buffer_capacity; // Allocated capacity
+
+  void rc_buffer_ensure_capacity();
+
+public:
+  // Record a reference site for RC counting.
+  inline void record_rc_ref_site(oop new_copy, void* ref_site, bool is_narrow);
+
   bool inject_evacuation_failure(uint region_idx) EVAC_FAILURE_INJECTOR_RETURN_( return false; );
 
 public:
@@ -227,6 +253,10 @@ public:
   inline void remember_reference_into_optional_region(T* p);
 
   inline G1OopStarChunkedList* oops_into_optional_region(const HeapRegion* hr);
+
+  // Phase 2: RC buffer accessors (used by flush_stats fixup)
+  RCRefSite* rc_buffer() const { return _rc_buffer; }
+  size_t rc_buffer_size() const { return _rc_buffer_size; }
 };
 
 class G1ParScanThreadStateSet : public StackObj {
@@ -251,6 +281,7 @@ class G1ParScanThreadStateSet : public StackObj {
   PreservedMarksSet* preserved_marks_set() { return &_preserved_marks_set; }
 
   void flush_stats();
+  void process_oop_classification_fixup();  // Phase 2: classify promoted Old objects
   void record_unused_optional_region(HeapRegion* hr);
 
   G1ParScanThreadState* state_for_worker(uint worker_id);

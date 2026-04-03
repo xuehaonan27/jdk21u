@@ -89,7 +89,10 @@ G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
     EVAC_FAILURE_INJECTOR_ONLY(_evac_failure_inject_counter(0) COMMA)
     _preserved_marks(preserved_marks),
     _evacuation_failed_info(),
-    _evac_failure_regions(evac_failure_regions)
+    _evac_failure_regions(evac_failure_regions),
+    _rc_buffer(nullptr),
+    _rc_buffer_size(0),
+    _rc_buffer_capacity(0)
 {
   // We allocate number of young gen regions in the collection set plus one
   // entries, since entry 0 keeps track of surviving bytes for non-young regions.
@@ -138,6 +141,22 @@ G1ParScanThreadState::~G1ParScanThreadState() {
   FREE_C_HEAP_ARRAY(size_t, _surviving_young_words_base);
   delete[] _oops_into_optional_regions;
   FREE_C_HEAP_ARRAY(size_t, _obj_alloc_stat);
+  if (_rc_buffer != nullptr) {
+    FREE_C_HEAP_ARRAY(RCRefSite, _rc_buffer);
+  }
+}
+
+void G1ParScanThreadState::rc_buffer_ensure_capacity() {
+  if (_rc_buffer_size >= _rc_buffer_capacity) {
+    size_t new_cap = (_rc_buffer_capacity == 0) ? RC_BUFFER_INITIAL_CAPACITY : _rc_buffer_capacity * 2;
+    RCRefSite* new_buf = NEW_C_HEAP_ARRAY(RCRefSite, new_cap, mtGC);
+    if (_rc_buffer != nullptr) {
+      memcpy(new_buf, _rc_buffer, _rc_buffer_size * sizeof(RCRefSite));
+      FREE_C_HEAP_ARRAY(RCRefSite, _rc_buffer);
+    }
+    _rc_buffer = new_buf;
+    _rc_buffer_capacity = new_cap;
+  }
 }
 
 size_t G1ParScanThreadState::lab_waste_words() const {
@@ -213,6 +232,14 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
     obj = do_copy_to_survivor_space(region_attr, obj, m);
   }
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+
+  // Phase 2: Record reference site for RC counting if target was promoted to Old.
+  {
+    HeapRegion* dest = _g1h->heap_region_containing(obj);
+    if (dest != nullptr && dest->is_old()) {
+      record_rc_ref_site(obj, (void*)p, sizeof(T) == sizeof(narrowOop));
+    }
+  }
 
   write_ref_field_post(p, obj);
 }
@@ -589,8 +616,170 @@ const size_t* G1ParScanThreadStateSet::surviving_young_words() const {
   return _surviving_young_words_total;
 }
 
+// Phase 2: Classify promoted Old objects as Unique or Shared.
+// This runs INSIDE flush_stats() BEFORE per-worker states are deleted.
+void G1ParScanThreadStateSet::process_oop_classification_fixup() {
+  G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+  if (rmm == nullptr) return;
+
+  // Step 1: Aggregate all per-worker RC records into a global map.
+  // Key: new_copy address. Value: reference count + list of ref sites.
+  struct ObjRCInfo {
+    int                              count;
+    G1ParScanThreadState::RCRefSite  first_site;    // First ref site (always stored)
+    G1ParScanThreadState::RCRefSite* extra_sites;   // Additional sites (if count > 1)
+    int                              extra_count;
+    int                              extra_capacity;
+  };
+
+  // Simple hash map: new_copy_addr -> ObjRCInfo
+  const size_t MAP_SIZE = 4096;
+  struct MapEntry {
+    uintptr_t key;
+    ObjRCInfo info;
+    MapEntry* next;
+  };
+  MapEntry* map[MAP_SIZE];
+  memset(map, 0, sizeof(map));
+
+  size_t total_sites = 0;
+  size_t unique_count = 0;
+  size_t shared_count = 0;
+
+  // Collect from all workers
+  for (uint wid = 0; wid < _num_workers; wid++) {
+    G1ParScanThreadState* pss = _states[wid];
+    if (pss == nullptr) continue;
+
+    for (size_t i = 0; i < pss->rc_buffer_size(); i++) {
+      G1ParScanThreadState::RCRefSite& site = pss->rc_buffer()[i];
+      uintptr_t key = cast_from_oop<uintptr_t>(site._new_copy);
+      size_t idx = (key >> 3) % MAP_SIZE;
+
+      // Find or create entry
+      MapEntry* e = map[idx];
+      while (e != nullptr && e->key != key) e = e->next;
+
+      if (e == nullptr) {
+        // New entry
+        e = NEW_C_HEAP_OBJ(MapEntry, mtGC);
+        e->key = key;
+        e->info.count = 1;
+        e->info.first_site = site;
+        e->info.extra_sites = nullptr;
+        e->info.extra_count = 0;
+        e->info.extra_capacity = 0;
+        e->next = map[idx];
+        map[idx] = e;
+      } else {
+        // Existing entry — increment RC
+        e->info.count++;
+        // Store extra site
+        if (e->info.extra_count >= e->info.extra_capacity) {
+          int new_cap = (e->info.extra_capacity == 0) ? 4 : e->info.extra_capacity * 2;
+          auto* new_arr = NEW_C_HEAP_ARRAY(G1ParScanThreadState::RCRefSite, new_cap, mtGC);
+          if (e->info.extra_sites != nullptr) {
+            memcpy(new_arr, e->info.extra_sites, e->info.extra_count * sizeof(G1ParScanThreadState::RCRefSite));
+            FREE_C_HEAP_ARRAY(G1ParScanThreadState::RCRefSite, e->info.extra_sites);
+          }
+          e->info.extra_sites = new_arr;
+          e->info.extra_capacity = new_cap;
+        }
+        e->info.extra_sites[e->info.extra_count++] = site;
+      }
+      total_sites++;
+    }
+  }
+
+  // Step 2: Classify and tag
+  RemoteHandleAllocBuffer hab;
+
+  for (size_t idx = 0; idx < MAP_SIZE; idx++) {
+    MapEntry* e = map[idx];
+    while (e != nullptr) {
+      oop obj = cast_to_oop(e->key);
+      ObjRCInfo& info = e->info;
+
+      // Only classify objects in Old regions (not survivor)
+      HeapRegion* dest = _g1h->heap_region_containing(obj);
+      if (dest == nullptr || !dest->is_old()) {
+        goto next_entry;
+      }
+
+      {
+        markWord mw = obj->mark();
+        // Skip already-managed objects (from previous GC cycles)
+        if (mw.has_remote_metadata()) {
+          goto next_entry;
+        }
+        // Skip locked/inflated objects
+        if (!mw.is_unlocked()) {
+          goto next_entry;
+        }
+
+        if (info.count == 1) {
+          // RC=1 -> Unique: set mark word, tag the single ref site
+          markWord new_mw = markWord(mw.value() | G1_MW_MANAGED_BIT);
+          obj->set_mark(new_mw);
+
+          // Tag the reference site as Unique OOP — but ONLY if it's in the heap.
+          // Stack/root references are read without the load barrier (interpreter
+          // accesses stack oops directly), so they must remain clean.
+          G1ParScanThreadState::RCRefSite& site = info.first_site;
+          if (!site._is_narrow && _g1h->is_in((void*)site._ref_site)) {
+            oop* slot = (oop*)site._ref_site;
+            *slot = g1_make_unique_oop(obj);
+          }
+          unique_count++;
+        } else {
+          // RC>1 -> Shared: allocate Handle, set mark word, tag all ref sites
+          RemoteHandle* h = rmm->create_handle_for(obj, &hab);
+
+          markWord new_mw = markWord(mw.value() | G1_MW_MANAGED_BIT | G1_MW_SHARED_BIT);
+          obj->set_mark(new_mw);
+
+          oop shared_oop = g1_make_shared_oop((void*)h);
+
+          // Tag heap reference sites only. Stack/root refs stay clean.
+          if (!info.first_site._is_narrow && _g1h->is_in((void*)info.first_site._ref_site)) {
+            oop* slot = (oop*)info.first_site._ref_site;
+            *slot = shared_oop;
+          }
+          for (int i = 0; i < info.extra_count; i++) {
+            if (!info.extra_sites[i]._is_narrow && _g1h->is_in((void*)info.extra_sites[i]._ref_site)) {
+              oop* slot = (oop*)info.extra_sites[i]._ref_site;
+              *slot = shared_oop;
+            }
+          }
+          shared_count++;
+        }
+      }
+
+    next_entry:
+      MapEntry* next = e->next;
+      if (e->info.extra_sites != nullptr) {
+        FREE_C_HEAP_ARRAY(G1ParScanThreadState::RCRefSite, e->info.extra_sites);
+      }
+      FREE_C_HEAP_OBJ(e);
+      e = next;
+    }
+    map[idx] = nullptr;
+  }
+
+  if (unique_count > 0 || shared_count > 0) {
+    log_info(gc)("OOP Classification: " SIZE_FORMAT " sites, " SIZE_FORMAT " Unique, "
+                 SIZE_FORMAT " Shared promoted Old objects",
+                 total_sites, unique_count, shared_count);
+  }
+}
+
 void G1ParScanThreadStateSet::flush_stats() {
   assert(!_flushed, "thread local state from the per thread states should be flushed once");
+
+  // Phase 2: OOP Classification Fixup — DISABLED pending crash investigation.
+  // The fixup tags heap OOP slots, but something downstream reads them without barrier.
+  // TODO: investigate which interpreter/runtime paths bypass oop_load_in_heap.
+  // process_oop_classification_fixup();
 
   for (uint worker_id = 0; worker_id < _num_workers; ++worker_id) {
     G1ParScanThreadState* pss = _states[worker_id];
