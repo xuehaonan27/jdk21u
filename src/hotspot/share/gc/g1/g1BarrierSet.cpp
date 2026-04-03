@@ -72,7 +72,11 @@ G1BarrierSet::write_ref_array_pre_work(T* dst, size_t count) {
   for (size_t i = 0; i < count; i++, elem_ptr++) {
     T heap_oop = RawAccess<>::oop_load(elem_ptr);
     if (!CompressedOops::is_null(heap_oop)) {
-      queue_set.enqueue_known_active(queue, CompressedOops::decode_not_null(heap_oop));
+      // Resolve tag bits before SATB enqueue (array pre-barrier path).
+      // SATB queue asserts valid heap pointers (g1SATBMarkQueueSet.cpp:83).
+      oop decoded = CompressedOops::decode_not_null(heap_oop);
+      oop resolved = resolve_oop_raw(decoded);
+      queue_set.enqueue_known_active(queue, resolved);
     }
   }
 }

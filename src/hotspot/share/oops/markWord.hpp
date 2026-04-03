@@ -166,7 +166,10 @@ class markWord {
   static const uintptr_t remote_metadata_mask = uintptr_t(0x3F) << 58;  // bits 58-63
 
   bool has_remote_metadata() const {
-    return (value() & remote_metadata_mask) != 0;
+    // Only check remote metadata bits when mark is in normal (unlocked) state.
+    // In locked/monitor/marked states, the mark word holds a pointer, and
+    // bits 58-63 may be part of that pointer's address value.
+    return is_unlocked() && (value() & remote_metadata_mask) != 0;
   }
 
   // Clear remote metadata bits (used in forward_to for safety).

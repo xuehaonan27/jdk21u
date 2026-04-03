@@ -116,6 +116,13 @@ class G1BarrierSet: public CardTableBarrierSet {
     // Defensive: will catch weak oops at addresses in heap
     template <typename T>
     static oop oop_load_in_heap(T* addr);
+
+    // Override store to encode Shared OOPs for managed objects.
+    // When storing a reference to a managed Old object, the stored value
+    // must be a Shared OOP pointing to the Handle (for coherence).
+    template <typename T>
+    static void oop_store_in_heap(T* addr, oop new_value);
+    static void oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value);
   };
 };
 

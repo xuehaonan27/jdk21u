@@ -28,9 +28,12 @@
 #include "gc/g1/g1BarrierSet.hpp"
 
 #include "gc/g1/g1CardTable.hpp"
+#include "gc/g1/g1CollectedHeap.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/shared/accessBarrierSupport.inline.hpp"
+#include "memory/universe.hpp"
 #include "oops/access.inline.hpp"
 #include "oops/compressedOops.inline.hpp"
 #include "oops/oop.hpp"
@@ -148,6 +151,69 @@ oop_store_not_in_heap(T* addr, oop new_value) {
   G1BarrierSet *bs = barrier_set_cast<G1BarrierSet>(BarrierSet::barrier_set());
   bs->write_ref_field_pre<decorators>(addr);
   Raw::oop_store(addr, new_value);
+}
+
+// ============================================================
+// Minimal write barrier for disaggregated memory (Phase 1).
+// When storing a reference to a managed Old object, encode
+// the stored value as a Shared OOP pointing to the Handle.
+// This ensures all references to managed objects go through
+// the Handle, maintaining coherence for remote eviction.
+// ============================================================
+
+template <DecoratorSet decorators, typename BarrierSetT>
+template <typename T>
+inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
+oop_store_in_heap(T* addr, oop new_value) {
+  oop store_value = new_value;
+
+  // Check if the target object is managed (has remote memory metadata).
+  // If so, encode the reference as a Shared OOP pointing to its Handle.
+  // This is the minimal Phase 1 write barrier — no Unique/Shared distinction,
+  // all managed objects are treated as Shared.
+  // Check if the target object is managed (has remote memory metadata).
+  // Only check when new_value is non-null and the mark word is in
+  // unlocked state (has_remote_metadata checks this internally).
+  // Guard against early bootstrap when G1CollectedHeap may not be ready.
+  if (new_value != nullptr && Universe::heap() != nullptr) {
+    markWord mw = new_value->mark();
+    if (mw.has_remote_metadata()) {
+      // Target is managed — find its Handle and encode as Shared OOP.
+      G1CollectedHeap* g1h = G1CollectedHeap::heap();
+      G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+      if (rmm != nullptr) {
+        RemoteHandle* h = rmm->handle_for(new_value);
+        if (h != nullptr) {
+          store_value = g1_make_shared_oop((void*)h);
+        }
+      }
+    }
+  }
+
+  // Standard ModRef store with SATB pre-barrier and card marking post-barrier.
+  ModRef::oop_store_in_heap(addr, store_value);
+}
+
+template <DecoratorSet decorators, typename BarrierSetT>
+inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
+oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
+  oop store_value = new_value;
+
+  if (new_value != nullptr && Universe::heap() != nullptr) {
+    markWord mw = new_value->mark();
+    if (mw.has_remote_metadata()) {
+      G1CollectedHeap* g1h = G1CollectedHeap::heap();
+      G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+      if (rmm != nullptr) {
+        RemoteHandle* h = rmm->handle_for(new_value);
+        if (h != nullptr) {
+          store_value = g1_make_shared_oop((void*)h);
+        }
+      }
+    }
+  }
+
+  ModRef::oop_store_in_heap_at(base, offset, store_value);
 }
 
 #endif // SHARE_GC_G1_G1BARRIERSET_INLINE_HPP
