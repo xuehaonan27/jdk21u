@@ -46,11 +46,12 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   // efficient structure if needed.
   struct HandleEntry : public CHeapObj<mtGC> {
     uintptr_t     _obj_addr;   // key: object address
-    RemoteHandle* _handle;     // value: Handle pointer
+    RemoteHandle* _handle;     // value: Handle pointer (nullptr for Unique)
+    bool          _is_shared;  // true = Shared (RC>1), false = Unique (RC=1)
     HandleEntry*  _next;       // chaining
 
-    HandleEntry(uintptr_t addr, RemoteHandle* h, HandleEntry* next)
-      : _obj_addr(addr), _handle(h), _next(next) {}
+    HandleEntry(uintptr_t addr, RemoteHandle* h, bool shared, HandleEntry* next)
+      : _obj_addr(addr), _handle(h), _is_shared(shared), _next(next) {}
   };
 
   // Simple hash table for object->Handle mapping.
@@ -74,9 +75,26 @@ public:
   // Handle management
   // ============================================================
 
-  // Create a Handle for an object and register it in the mapping.
-  // The Handle is initialized to LOCAL with the object's current address.
-  // Returns the allocated Handle.
+  // Register an object as managed (Unique, no Handle).
+  // Used by Phase 2 fixup for RC=1 objects.
+  HandleEntry* alloc_entry(uintptr_t addr, RemoteHandle* h, bool shared, HandleEntry* next) {
+    HandleEntry* e = (HandleEntry*)os::malloc(sizeof(HandleEntry), mtGC);
+    e->_obj_addr = addr;
+    e->_handle = h;
+    e->_is_shared = shared;
+    e->_next = next;
+    return e;
+  }
+
+  void register_unique(oop obj) {
+    uintptr_t addr = cast_from_oop<uintptr_t>(obj);
+    size_t idx = hash_obj(addr);
+
+    table_lock();
+    _table[idx] = alloc_entry(addr, nullptr, false, _table[idx]);
+    table_unlock();
+  }
+
   RemoteHandle* create_handle_for(oop obj, RemoteHandleAllocBuffer* hab) {
     RemoteHandle* h = _handle_allocator.allocate_handle(hab);
     h->initialize(cast_from_oop<void*>(obj));
@@ -85,7 +103,7 @@ public:
     size_t idx = hash_obj(addr);
 
     table_lock();
-    _table[idx] = new HandleEntry(addr, h, _table[idx]);
+    _table[idx] = alloc_entry(addr, h, true, _table[idx]);
     table_unlock();
 
     return h;

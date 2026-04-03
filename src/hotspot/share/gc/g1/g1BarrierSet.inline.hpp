@@ -198,25 +198,17 @@ inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap(T* addr, oop new_value) {
   oop store_value = new_value;
 
-  // Check if the target object is managed (has remote memory metadata).
-  // If so, encode the reference as a Shared OOP pointing to its Handle.
-  // This is the minimal Phase 1 write barrier — no Unique/Shared distinction,
-  // all managed objects are treated as Shared.
-  // Check if the target object is managed (has remote memory metadata).
-  // Only check when new_value is non-null and the mark word is in
-  // unlocked state (has_remote_metadata checks this internally).
-  // Guard against early bootstrap when G1CollectedHeap may not be ready.
+  // Check if the target object is managed (registered in the remote memory manager).
+  // If so and it's Shared, encode the reference as a Shared OOP pointing to its Handle.
+  // Uses SIDE TABLE lookup (not mark word bits) to avoid interfering with
+  // MethodHandle generated code that does full 64-bit mark word CAS operations.
   if (new_value != nullptr && Universe::heap() != nullptr) {
-    markWord mw = new_value->mark();
-    if (mw.has_remote_metadata()) {
-      // Target is managed — find its Handle and encode as Shared OOP.
-      G1CollectedHeap* g1h = G1CollectedHeap::heap();
-      G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-      if (rmm != nullptr) {
-        RemoteHandle* h = rmm->handle_for(new_value);
-        if (h != nullptr) {
-          store_value = g1_make_shared_oop((void*)h);
-        }
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      RemoteHandle* h = rmm->handle_for(new_value);
+      if (h != nullptr) {
+        store_value = g1_make_shared_oop((void*)h);
       }
     }
   }
@@ -231,15 +223,12 @@ oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
   oop store_value = new_value;
 
   if (new_value != nullptr && Universe::heap() != nullptr) {
-    markWord mw = new_value->mark();
-    if (mw.has_remote_metadata()) {
-      G1CollectedHeap* g1h = G1CollectedHeap::heap();
-      G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-      if (rmm != nullptr) {
-        RemoteHandle* h = rmm->handle_for(new_value);
-        if (h != nullptr) {
-          store_value = g1_make_shared_oop((void*)h);
-        }
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      RemoteHandle* h = rmm->handle_for(new_value);
+      if (h != nullptr) {
+        store_value = g1_make_shared_oop((void*)h);
       }
     }
   }

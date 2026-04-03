@@ -260,6 +260,13 @@ private:
   // NUMA node.
   uint _node_index;
 
+  // Remote memory classification bitmap (Phase 2).
+  // 2 bits per MinObjAlignmentInBytes slot: 00=untracked, 01=unique, 10=shared.
+  // Allocated lazily for Old regions during post-evacuation fixup.
+  // Freed on hr_clear(). Stored external to mark word to avoid CAS conflicts.
+  uint8_t* _remote_class_map;       // nullptr if no objects classified in this region
+  size_t   _remote_class_map_size;  // byte count of allocated map
+
   void report_region_type_change(G1HeapRegionTraceType::Type to);
 
   template <class Closure, bool in_gc_pause>
@@ -565,6 +572,23 @@ public:
 
   uint node_index() const { return _node_index; }
   void set_node_index(uint node_index) { _node_index = node_index; }
+
+  // Remote memory classification: per-region bitmap for Unique/Shared status.
+  // 2 bits per slot: 00=untracked, 01=unique, 10=shared.
+  static const uint8_t REMOTE_CLASS_UNTRACKED = 0;
+  static const uint8_t REMOTE_CLASS_UNIQUE    = 1;
+  static const uint8_t REMOTE_CLASS_SHARED    = 2;
+
+  // Ensure the classification map is allocated for this region.
+  void ensure_remote_class_map();
+  // Free the classification map.
+  void free_remote_class_map();
+  // Set classification for an object at the given address.
+  void set_remote_class(HeapWord* obj_addr, uint8_t cls);
+  // Get classification for an object at the given address.
+  uint8_t get_remote_class(HeapWord* obj_addr) const;
+  // Check if any object in this region is classified.
+  bool has_remote_class_map() const { return _remote_class_map != nullptr; }
 
   // Verify that the entries on the code root list for this
   // region are live and include at least one pointer into this region.

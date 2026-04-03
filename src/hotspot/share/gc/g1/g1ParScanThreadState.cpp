@@ -718,22 +718,18 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         }
 
         if (info.count == 1) {
-          // RC=1 -> Unique: set mark word ONLY. No Handle needed.
-          // Reference slots are NOT rewritten — they remain as clean oops.
-          // Tagging happens lazily via the write barrier when the application
-          // stores a new reference to this object.
-          // This avoids the need for interpreter load barrier support (Phase 4).
-          markWord new_mw = markWord(mw.value() | G1_MW_MANAGED_BIT);
-          obj->set_mark(new_mw);
+          // RC=1 -> Unique: set region bitmap only.
+          // No mark word modification (causes CAS crashes).
+          // No os::malloc (causes corruption during STW).
+          // Bitmap is pre-allocated lazily per region (ensure_remote_class_map).
+          dest->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_UNIQUE);
           unique_count++;
         } else {
-          // RC>1 -> Shared: allocate Handle, set mark word. No ref slot rewriting.
-          // The Handle is registered in the object->Handle map so the write
-          // barrier can find it when encoding future stores as Shared OOPs.
-          RemoteHandle* h = rmm->create_handle_for(obj, &hab);
-
-          markWord new_mw = markWord(mw.value() | G1_MW_MANAGED_BIT | G1_MW_SHARED_BIT);
-          obj->set_mark(new_mw);
+          // RC>1 -> Shared: set region bitmap.
+          // Handle allocation deferred to outside STW (eviction time).
+          // During STW we only record the classification; actual Handle
+          // creation happens when the object is about to be evicted.
+          dest->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_SHARED);
           shared_count++;
         }
       }
@@ -760,8 +756,8 @@ void G1ParScanThreadStateSet::flush_stats() {
   assert(!_flushed, "thread local state from the per thread states should be flushed once");
 
   // Phase 2: OOP Classification Fixup — classifies promoted Old objects.
-  // Sets mark word bits (oop_managed, oop_shared) and creates Handles for Shared objects.
-  // Does NOT rewrite reference slots — tagging is done lazily by the write barrier.
+  // Uses SIDE TABLE (G1RemoteMemoryManager hash table) instead of mark word bits
+  // because setting mark word bits causes crashes in MethodHandle generated code.
   process_oop_classification_fixup();
 
   for (uint worker_id = 0; worker_id < _num_workers; ++worker_id) {
