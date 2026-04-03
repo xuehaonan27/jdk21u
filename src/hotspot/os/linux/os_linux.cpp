@@ -932,6 +932,7 @@ static void init_adjust_stacksize_for_guard_pages() {
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
   switch (thr_type) {
   case os::java_thread:     return APTH_CLASS_IO_BOUND;
+  case os::gc_thread:       return APTH_CLASS_DISTRIBUTED;  // Phase 5: M:N GC workers
   default:                  return APTH_CLASS_DEDICATED;
   }
 }

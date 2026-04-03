@@ -26,6 +26,9 @@
 #define SHARE_GC_SHARED_WORKERTHREAD_HPP
 
 #include "gc/shared/gcId.hpp"
+#ifdef USE_LIBAPTH
+#include <apth.h>
+#endif
 #include "memory/allocation.hpp"
 #include "runtime/nonJavaThread.hpp"
 #include "runtime/semaphore.hpp"
@@ -127,14 +130,40 @@ class WorkerThread : public NamedThread {
   friend class WorkerTaskDispatcher;
 
 private:
+#ifdef USE_LIBAPTH
+  // M:N GC workers: worker_id follows the logical apth, not the backing pthread.
+  // Same pattern as Thread::current() with USE_LIBRARY_BASED_TLS_ONLY.
+  // Per-task assignment via Atomic::fetch_then_add is compatible with M:N.
+  static apth_key_t _worker_id_key;
+  static bool _worker_id_key_initialized;
+#else
   static THREAD_LOCAL uint _worker_id;
+#endif
 
   WorkerTaskDispatcher* const _dispatcher;
 
-  static void set_worker_id(uint worker_id) { _worker_id = worker_id; }
+  static void set_worker_id(uint worker_id) {
+#ifdef USE_LIBAPTH
+    if (!_worker_id_key_initialized) {
+      apth_key_create(&_worker_id_key, nullptr);
+      _worker_id_key_initialized = true;
+    }
+    apth_setspecific(_worker_id_key, (void*)(uintptr_t)(worker_id + 1));  // +1 to distinguish from unset (NULL=0)
+#else
+    _worker_id = worker_id;
+#endif
+  }
 
 public:
-  static uint worker_id() { return _worker_id; }
+  static uint worker_id() {
+#ifdef USE_LIBAPTH
+    if (!_worker_id_key_initialized) return 0;
+    uintptr_t val = (uintptr_t)apth_getspecific(_worker_id_key);
+    return val == 0 ? 0 : (uint)(val - 1);  // -1 to undo the +1 encoding
+#else
+    return _worker_id;
+#endif
+  }
 
   WorkerThread(const char* name_prefix, uint which, WorkerTaskDispatcher* dispatcher);
 

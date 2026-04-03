@@ -187,7 +187,12 @@ void WorkerThreads::run_task(WorkerTask* task, uint num_workers) {
   run_task(task);
 }
 
+#ifdef USE_LIBAPTH
+apth_key_t WorkerThread::_worker_id_key;
+bool WorkerThread::_worker_id_key_initialized = false;
+#else
 THREAD_LOCAL uint WorkerThread::_worker_id = UINT_MAX;
+#endif
 
 WorkerThread::WorkerThread(const char* name_prefix, uint name_suffix, WorkerTaskDispatcher* dispatcher) :
     _dispatcher(dispatcher) {
