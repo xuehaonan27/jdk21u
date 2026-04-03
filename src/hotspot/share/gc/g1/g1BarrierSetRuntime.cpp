@@ -25,7 +25,10 @@
 #include "precompiled.hpp"
 #include "gc/g1/g1BarrierSet.inline.hpp"
 #include "gc/g1/g1BarrierSetRuntime.hpp"
+#include "gc/g1/g1CollectedHeap.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
+#include "runtime/os.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "utilities/macros.hpp"
@@ -64,10 +67,72 @@ JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_post_entry(volatile G1CardTa
 JRT_END
 
 // Disaggregated memory: resolve a tagged oop to a clean local oop.
-// Called from G1BarrierSetAssembler::load_at() when bit 63 (sign bit) is set,
-// indicating a managed oop (Unique or Shared with Handle indirection).
-// This is a JRT_LEAF (no safepoint, no blocking) — only for local resolution.
-// Remote objects (is_remote bit) are not handled here (would need non-leaf for RDMA).
+// Called from G1BarrierSetAssembler::load_at() when bit 63 (sign bit) is set.
+// Handles LOCAL (fast), REMOTE (simulated fetch), and FETCHING (spin-wait).
+// Phase 3: simulated fetch is just memcpy, so JRT_LEAF is safe.
+// Phase 5+: real RDMA would need non-leaf with ThreadBlockInVM.
 JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
-  return (oopDesc*)resolve_oop_raw(cast_to_oop(tagged));
+  uintptr_t v = (uintptr_t)tagged;
+
+  if (v & G1_OOP_INDIRECT_BIT) {
+    // Shared OOP: follow Handle
+    RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+
+    if (state == REMOTE_HANDLE_LOCAL) {
+      // Fast path: Handle is LOCAL
+      return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+    }
+
+    if (state == REMOTE_HANDLE_REMOTE) {
+      // Object is remote — trigger simulated fetch.
+      // CAS REMOTE → FETCHING (we win the fetch race)
+      if (h->cas_remote_to_fetching()) {
+        G1CollectedHeap* g1h = G1CollectedHeap::heap();
+        G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+
+        // Look up object size from remote metadata table
+        uintptr_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
+        size_t word_size = rmm->sim_remote_word_size(slot_id);
+        size_t byte_size = word_size * HeapWordSize;
+
+        // Allocate local buffer for fetched object (Phase 3: C heap; Phase 5: FTLAB)
+        HeapWord* dest = (HeapWord*)os::malloc(byte_size, mtGC);
+        guarantee(dest != nullptr, "Failed to allocate fetch buffer");
+
+        // Simulated fetch: memcpy from sim-remote
+        rmm->fetch_remote_object(h, dest);
+
+        // Publish: release-store LOCAL with new address
+        h->set_local_release(dest);
+        return (oopDesc*)dest;
+      }
+      // CAS failed: someone else is fetching. Fall through to FETCHING wait.
+      sa = h->load_state_and_addr_acquire();
+      state = sa & REMOTE_HANDLE_STATE_MASK;
+    }
+
+    if (state == REMOTE_HANDLE_FETCHING) {
+      // Another thread is fetching. Spin-wait until LOCAL.
+      int spins = 0;
+      while (true) {
+        sa = h->load_state_and_addr_acquire();
+        state = sa & REMOTE_HANDLE_STATE_MASK;
+        if (state == REMOTE_HANDLE_LOCAL) {
+          return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+        }
+        if (++spins > 1000) {
+          os::naked_yield();
+          spins = 0;
+        }
+      }
+    }
+
+    // Shouldn't reach here
+    return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+  }
+
+  // Unique/Direct OOP: strip tags
+  return (oopDesc*)(v & G1_OOP_ADDR_MASK);
 JRT_END

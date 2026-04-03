@@ -216,6 +216,10 @@ public:
 
   size_t sim_remote_evicted_count() const { return _sim_remote_evicted_count; }
   size_t sim_remote_fetched_count() const { return _sim_remote_fetched_count; }
+  size_t sim_remote_word_size(size_t slot_id) const {
+    assert(slot_id < SIM_REMOTE_MAX_SLOTS, "Invalid slot");
+    return _sim_remote_slots[slot_id]._word_size;
+  }
 
   // ============================================================
   // Manual Eviction API (for testing)
