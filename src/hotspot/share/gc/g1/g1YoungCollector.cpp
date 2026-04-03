@@ -39,6 +39,7 @@
 #include "gc/g1/g1MonitoringSupport.hpp"
 #include "gc/g1/g1ParScanThreadState.inline.hpp"
 #include "gc/g1/g1Policy.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RedirtyCardsQueue.hpp"
 #include "gc/g1/g1RemSet.hpp"
 #include "gc/g1/g1RootProcessor.hpp"
@@ -994,6 +995,39 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   _evac_failure_regions.post_collection();
 
   assert_used_and_recalculate_used_equal(_g1h);
+
+  // Simulated remote memory eviction (Phase 1 testing).
+  // When G1SimulateRemoteEviction is enabled, walk a few old objects
+  // after each GC and "evict" them to simulated remote memory.
+  if (G1SimulateRemoteEviction) {
+    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+    RemoteHandleAllocBuffer hab;
+    int evicted = 0;
+    // Walk old regions looking for non-humongous, non-managed objects to evict
+    for (uint i = 0; i < _g1h->num_regions() && evicted < 3; i++) {
+      HeapRegion* hr = _g1h->region_at(i);
+      if (!hr->is_old() || hr->is_humongous()) continue;
+      // Walk objects in this region
+      HeapWord* p = hr->bottom();
+      while (p < hr->top() && evicted < 3) {
+        oop obj = cast_to_oop(p);
+        size_t sz = obj->size();
+        markWord mw = obj->mark();
+        // Only evict unlocked, non-managed objects
+        if (mw.is_unlocked() && !mw.has_remote_metadata() && sz >= 2 && sz <= 128) {
+          if (rmm->evict_object(obj, &hab)) {
+            evicted++;
+          }
+        }
+        p += sz;
+      }
+    }
+    if (evicted > 0) {
+      log_info(gc)("G1SimulateRemoteEviction: evicted %d objects (total evicted: " SIZE_FORMAT
+                   ", total fetched: " SIZE_FORMAT ")",
+                   evicted, rmm->sim_remote_evicted_count(), rmm->sim_remote_fetched_count());
+    }
+  }
 
   _g1h->rebuild_free_region_list();
 

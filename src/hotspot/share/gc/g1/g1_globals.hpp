@@ -280,6 +280,10 @@
   develop(bool, G1VerifyBitmaps, false,                                     \
           "Verifies the consistency of the marking bitmaps")                \
                                                                             \
+  product(bool, G1SimulateRemoteEviction, false, DIAGNOSTIC,                \
+          "After each GC, simulate evicting a few old objects to remote "   \
+          "memory. For testing disaggregated memory infrastructure.")                \
+                                                                            \
   product(uintx, G1PeriodicGCInterval, 0, MANAGEABLE,                       \
           "Number of milliseconds after a previous GC to wait before "      \
           "triggering a periodic gc. A value of zero disables periodically "\

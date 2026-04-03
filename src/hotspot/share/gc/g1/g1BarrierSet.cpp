@@ -25,6 +25,7 @@
 #include "precompiled.hpp"
 #include "gc/g1/g1BarrierSet.inline.hpp"
 #include "gc/g1/g1BarrierSetAssembler.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1CardTable.inline.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1SATBMarkQueueSet.hpp"
@@ -174,5 +175,58 @@ void G1BarrierSet::on_thread_detach(Thread* thread) {
     G1DirtyCardQueueSet& qset = G1BarrierSet::dirty_card_queue_set();
     qset.flush_queue(queue);
     qset.record_detached_refinement_stats(queue.refinement_stats());
+  }
+}
+
+// ============================================================
+// Disaggregated Memory: Remote Object Fetch (Tier 2 Slow Path)
+// ============================================================
+// Phase 1: simulated fetch (copies from local sim-remote buffer).
+// Phase 2+: real RDMA READ with ThreadBlockInVM + apth_rdma_wait.
+
+oop G1BarrierSet::resolve_remote_fetch(RemoteHandle* h) {
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+
+  // Determine object size from remote metadata
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
+
+  // For Phase 1: allocate space on the C heap (simulating FTLAB allocation).
+  // Phase 2+ will use actual FTLAB backed by FCR regions.
+  size_t word_size = rmm->_sim_remote_slots[slot_id]._word_size;
+  size_t byte_size = word_size * HeapWordSize;
+
+  // Allocate local buffer for the fetched object.
+  // Phase 1: use C heap. This is NOT a proper heap object — it's a temporary
+  // that lets us test the infrastructure. Phase 2 will use FTLAB in FCR.
+  HeapWord* dest = (HeapWord*)os::malloc(byte_size, mtGC);
+  guarantee(dest != nullptr, "Failed to allocate fetch buffer");
+
+  // Fetch from simulated remote
+  rmm->fetch_remote_object(h, dest);
+
+  // Publish: release-store the local address into Handle.
+  // After this, other threads doing acquire-load will see the local copy.
+  h->set_local_release(dest);
+
+  return cast_to_oop(dest);
+}
+
+oop G1BarrierSet::wait_for_fetch(RemoteHandle* h) {
+  // Spin-yield until the Handle transitions to LOCAL.
+  // Phase 1: simple spin. Phase 5: apth_yield for M:N scheduling.
+  int spins = 0;
+  while (true) {
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    if (state == REMOTE_HANDLE_LOCAL) {
+      return cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+    }
+    // Yield CPU briefly
+    if (++spins > 1000) {
+      os::naked_yield();
+      spins = 0;
+    }
   }
 }

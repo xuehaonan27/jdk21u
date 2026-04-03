@@ -126,8 +126,39 @@ template <typename T>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_in_heap(T* addr) {
   oop value = ModRef::oop_load_in_heap(addr);
-  // Resolve tag bits before SATB enqueue — SATB queue requires clean oops
-  value = resolve_oop_raw(value);
+
+  // === Disaggregated Memory Load Barrier ===
+  // Resolve tag bits. For REMOTE objects, trigger simulated fetch.
+  uintptr_t v = cast_from_oop<uintptr_t>(value);
+  if ((v & G1_OOP_TAG_MASK) != 0) {
+    if (v & G1_OOP_INDIRECT_BIT) {
+      // Shared OOP: follow Handle
+      RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+
+      if (state == REMOTE_HANDLE_LOCAL) {
+        // Fast path: Handle is LOCAL
+        value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+      } else if (state == REMOTE_HANDLE_REMOTE) {
+        // Slow path: object is remote — trigger fetch
+        // CAS REMOTE -> FETCHING (we win the fetch race)
+        if (h->cas_remote_to_fetching()) {
+          value = G1BarrierSet::resolve_remote_fetch(h);
+        } else {
+          // Someone else is fetching — spin until LOCAL
+          value = G1BarrierSet::wait_for_fetch(h);
+        }
+      } else {
+        // FETCHING state — someone else is fetching, wait
+        value = G1BarrierSet::wait_for_fetch(h);
+      }
+    } else {
+      // Unique/Direct OOP: just strip tags
+      value = cast_to_oop(v & G1_OOP_ADDR_MASK);
+    }
+  }
+
   enqueue_preloaded_if_weak(decorators, value);
   return value;
 }

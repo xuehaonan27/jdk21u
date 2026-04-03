@@ -32,6 +32,7 @@
 #include "gc/shared/bufferNode.hpp"
 
 class G1CardTable;
+struct RemoteHandle;
 
 // This barrier is specialized to use a logging barrier to support
 // snapshot-at-the-beginning marking.
@@ -81,6 +82,13 @@ class G1BarrierSet: public CardTableBarrierSet {
   template <DecoratorSet decorators, typename T>
   void write_ref_field_post(T* field);
   void write_ref_field_post_slow(volatile CardValue* byte);
+
+  // Disaggregated memory: remote object fetch (Tier 2 slow path).
+  // Called when load barrier encounters a REMOTE Handle.
+  // Fetches object from simulated remote, allocates local copy, returns clean oop.
+  static oop resolve_remote_fetch(RemoteHandle* h);
+  // Wait for another thread's in-flight fetch to complete.
+  static oop wait_for_fetch(RemoteHandle* h);
 
   virtual void on_thread_create(Thread* thread);
   virtual void on_thread_destroy(Thread* thread);

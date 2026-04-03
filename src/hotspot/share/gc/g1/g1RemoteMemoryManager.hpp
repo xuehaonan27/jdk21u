@@ -159,15 +159,65 @@ public:
   }
 
   // ============================================================
+  // Simulated Remote Memory (Phase 1, no actual RDMA)
+  // ============================================================
+  // A simple local buffer that pretends to be remote storage.
+  // Objects are copied here during "eviction" and copied back during "fetch".
+
+  struct SimRemoteSlot {
+    void*   _data;        // malloc'd buffer holding object bytes
+    size_t  _word_size;   // object size in HeapWords
+    Klass*  _klass;       // Klass pointer (always local)
+    bool    _in_use;
+  };
+
+  static const size_t SIM_REMOTE_MAX_SLOTS = 1024;
+  SimRemoteSlot _sim_remote_slots[SIM_REMOTE_MAX_SLOTS];
+  size_t _sim_remote_next_slot;
+  size_t _sim_remote_evicted_count;
+  size_t _sim_remote_fetched_count;
+
+  // Allocate a simulated remote slot and copy object bytes into it.
+  // Returns the slot index (used as remote_id in Handle).
+  size_t sim_remote_evict(oop obj, size_t word_size, Klass* klass);
+
+  // Fetch object bytes from simulated remote slot into local address.
+  // Returns the Klass pointer stored at eviction time.
+  Klass* sim_remote_fetch(size_t slot_id, void* dest, size_t word_size);
+
+public:
+  // ============================================================
   // Accessors
   // ============================================================
 
   RemoteHandleAllocator* handle_allocator() { return &_handle_allocator; }
 
-  // Check if an object is managed (has a Handle)
   bool is_managed(oop obj) const {
     return handle_for(obj) != nullptr;
   }
+
+  size_t sim_remote_evicted_count() const { return _sim_remote_evicted_count; }
+  size_t sim_remote_fetched_count() const { return _sim_remote_fetched_count; }
+
+  // ============================================================
+  // Manual Eviction API (for testing)
+  // ============================================================
+
+  // Evict an object to simulated remote memory:
+  // 1. Create Handle (if not already managed)
+  // 2. Copy object bytes to simulated remote slot
+  // 3. Set Handle to REMOTE state with slot_id
+  // 4. Set mark word oop_managed bit
+  // Returns true on success.
+  bool evict_object(oop obj, RemoteHandleAllocBuffer* hab);
+
+  // Fetch a remote object back to a local destination address.
+  // Called from the load barrier when a REMOTE Handle is encountered.
+  // 1. Looks up slot from Handle's remote_id
+  // 2. Copies bytes from simulated remote to dest
+  // 3. Updates Handle to LOCAL
+  // Returns the fetched object's Klass pointer.
+  Klass* fetch_remote_object(RemoteHandle* h, void* dest);
 };
 
 #endif // SHARE_GC_G1_G1REMOTEMEMORYMANAGER_HPP
