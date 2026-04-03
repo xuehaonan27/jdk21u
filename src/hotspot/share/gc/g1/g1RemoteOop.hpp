@@ -84,20 +84,24 @@ inline oop g1_make_unique_oop(oop obj) {
 // ============================================================
 // Mark Word Remote Metadata Constants
 // ============================================================
-// These occupy bits 58-63 of the 64-bit mark word (within the
+// These occupy bits 39-44 of the 64-bit mark word (within the
 // 25-bit "unused" region at bits 39-63).
 //
-// Bit 63: oop_managed     -- classified as Unique or Shared
-// Bit 62: oop_shared      -- 0=Unique (RC=1), 1=Shared (RC>1)
-// Bit 61: has_handle      -- Handle allocated (partially-upgraded)
-// Bit 60: remote_stored   -- object bytes on remote memory
-// Bits 59-58: hotness     -- 00=Cold, 01=Warm, 10=Hot, 11=VeryHot
+// We use LOWER bits (39-44) instead of higher bits (58-63) to avoid
+// the sign bit (bit 63) and high bits that might be interpreted
+// differently by some runtime code paths (MethodHandles, monitors).
+//
+// Bit 44: oop_managed     -- classified as Unique or Shared
+// Bit 43: oop_shared      -- 0=Unique (RC=1), 1=Shared (RC>1)
+// Bit 42: has_handle      -- Handle allocated (partially-upgraded)
+// Bit 41: remote_stored   -- object bytes on remote memory
+// Bits 40-39: hotness     -- 00=Cold, 01=Warm, 10=Hot, 11=VeryHot
 
-const int      G1_MW_MANAGED_SHIFT   = 63;
-const int      G1_MW_SHARED_SHIFT    = 62;
-const int      G1_MW_HAS_HANDLE_SHIFT = 61;
-const int      G1_MW_REMOTE_SHIFT    = 60;
-const int      G1_MW_HOTNESS_SHIFT   = 58;
+const int      G1_MW_MANAGED_SHIFT   = 44;
+const int      G1_MW_SHARED_SHIFT    = 43;
+const int      G1_MW_HAS_HANDLE_SHIFT = 42;
+const int      G1_MW_REMOTE_SHIFT    = 41;
+const int      G1_MW_HOTNESS_SHIFT   = 39;
 
 const uintptr_t G1_MW_MANAGED_BIT    = uintptr_t(1) << G1_MW_MANAGED_SHIFT;
 const uintptr_t G1_MW_SHARED_BIT     = uintptr_t(1) << G1_MW_SHARED_SHIFT;

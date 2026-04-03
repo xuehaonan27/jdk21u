@@ -718,39 +718,22 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         }
 
         if (info.count == 1) {
-          // RC=1 -> Unique: set mark word, tag the single ref site
+          // RC=1 -> Unique: set mark word ONLY. No Handle needed.
+          // Reference slots are NOT rewritten — they remain as clean oops.
+          // Tagging happens lazily via the write barrier when the application
+          // stores a new reference to this object.
+          // This avoids the need for interpreter load barrier support (Phase 4).
           markWord new_mw = markWord(mw.value() | G1_MW_MANAGED_BIT);
           obj->set_mark(new_mw);
-
-          // Tag the reference site as Unique OOP — but ONLY if it's in the heap.
-          // Stack/root references are read without the load barrier (interpreter
-          // accesses stack oops directly), so they must remain clean.
-          G1ParScanThreadState::RCRefSite& site = info.first_site;
-          if (!site._is_narrow && _g1h->is_in((void*)site._ref_site)) {
-            oop* slot = (oop*)site._ref_site;
-            *slot = g1_make_unique_oop(obj);
-          }
           unique_count++;
         } else {
-          // RC>1 -> Shared: allocate Handle, set mark word, tag all ref sites
+          // RC>1 -> Shared: allocate Handle, set mark word. No ref slot rewriting.
+          // The Handle is registered in the object->Handle map so the write
+          // barrier can find it when encoding future stores as Shared OOPs.
           RemoteHandle* h = rmm->create_handle_for(obj, &hab);
 
           markWord new_mw = markWord(mw.value() | G1_MW_MANAGED_BIT | G1_MW_SHARED_BIT);
           obj->set_mark(new_mw);
-
-          oop shared_oop = g1_make_shared_oop((void*)h);
-
-          // Tag heap reference sites only. Stack/root refs stay clean.
-          if (!info.first_site._is_narrow && _g1h->is_in((void*)info.first_site._ref_site)) {
-            oop* slot = (oop*)info.first_site._ref_site;
-            *slot = shared_oop;
-          }
-          for (int i = 0; i < info.extra_count; i++) {
-            if (!info.extra_sites[i]._is_narrow && _g1h->is_in((void*)info.extra_sites[i]._ref_site)) {
-              oop* slot = (oop*)info.extra_sites[i]._ref_site;
-              *slot = shared_oop;
-            }
-          }
           shared_count++;
         }
       }
@@ -776,10 +759,10 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
 void G1ParScanThreadStateSet::flush_stats() {
   assert(!_flushed, "thread local state from the per thread states should be flushed once");
 
-  // Phase 2: OOP Classification Fixup — DISABLED pending crash investigation.
-  // The fixup tags heap OOP slots, but something downstream reads them without barrier.
-  // TODO: investigate which interpreter/runtime paths bypass oop_load_in_heap.
-  // process_oop_classification_fixup();
+  // Phase 2: OOP Classification Fixup — classifies promoted Old objects.
+  // Sets mark word bits (oop_managed, oop_shared) and creates Handles for Shared objects.
+  // Does NOT rewrite reference slots — tagging is done lazily by the write barrier.
+  process_oop_classification_fixup();
 
   for (uint worker_id = 0; worker_id < _num_workers; ++worker_id) {
     G1ParScanThreadState* pss = _states[worker_id];

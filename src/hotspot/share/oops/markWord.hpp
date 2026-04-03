@@ -160,10 +160,10 @@ class markWord {
   // Fast-locking does not use INFLATING.
   static markWord INFLATING() { return zero(); }    // inflate-in-progress
 
-  // Remote memory metadata bits (bits 58-63, within the unused region 39-63).
-  // These track OOP classification and remote status for disaggregated memory.
-  // See g1RemoteOop.hpp for full documentation.
-  static const uintptr_t remote_metadata_mask = uintptr_t(0x3F) << 58;  // bits 58-63
+  // Remote memory metadata bits (bits 39-44, within the unused region 39-63).
+  // Uses lower bits to avoid the sign bit (63) and high bits that some runtime
+  // code paths may interpret differently. See g1RemoteOop.hpp for full documentation.
+  static const uintptr_t remote_metadata_mask = uintptr_t(0x3F) << 39;  // bits 39-44
 
   bool has_remote_metadata() const {
     // Only check remote metadata bits when mark is in normal (unlocked) state.
