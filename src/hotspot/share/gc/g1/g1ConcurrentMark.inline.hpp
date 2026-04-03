@@ -267,6 +267,14 @@ inline bool G1CMTask::deal_with_reference(T* p) {
   if (obj == nullptr) {
     return false;
   }
+  // Phase 6: If the resolved oop points to a remote object (Handle was REMOTE),
+  // resolve_oop_raw returns the remote slot_id which is NOT a valid heap address.
+  // Skip marking for remote objects — they are kept alive by their Handle.
+  // Fetch-for-scan would bring them local for field scanning, but for the
+  // prototype we conservatively mark them as "remote-alive" without scanning.
+  if (!_g1h->is_in(obj)) {
+    return false;
+  }
   return make_reference_grey(obj);
 }
 

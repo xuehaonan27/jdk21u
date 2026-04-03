@@ -208,6 +208,11 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   // Reference should not be null here as such are never pushed to the task queue.
   oop obj = g1_resolved_load<IS_NOT_NULL>(p);
 
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
+    return;
+  }
+
   // Although we never intentionally push references outside of the collection
   // set, due to (benign) races in the claim mechanism during RSet scanning more
   // than one thread might claim the same card. So the same card may be

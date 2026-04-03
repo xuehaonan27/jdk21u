@@ -84,6 +84,10 @@ inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
+    return;
+  }
   const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
   if (region_attr.is_in_cset()) {
     prefetch_and_push(p, obj);
@@ -108,6 +112,10 @@ inline void G1RootRegionScanClosure::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
+    return;
+  }
   _cm->mark_in_bitmap(_worker_id, obj);
 }
 
@@ -127,6 +135,10 @@ template <class T>
 inline void G1ConcurrentRefineOopClosure::do_oop_work(T* p) {
   oop obj = g1_resolved_load<MO_RELAXED>(p);
   if (obj == nullptr) {
+    return;
+  }
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
 
@@ -155,6 +167,10 @@ template <class T>
 inline void G1ScanCardClosure::do_oop_work(T* p) {
   oop obj = g1_resolved_load(p);
   if (obj == nullptr) {
+    return;
+  }
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
 
@@ -213,6 +229,10 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
+    return;
+  }
 
   assert(_worker_id == _par_scan_state->worker_id(), "sanity");
 
@@ -251,6 +271,10 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
 template <class T> void G1RebuildRemSetClosure::do_oop_work(T* p) {
   oop const obj = g1_resolved_load<MO_RELAXED>(p);
   if (obj == nullptr) {
+    return;
+  }
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
 
