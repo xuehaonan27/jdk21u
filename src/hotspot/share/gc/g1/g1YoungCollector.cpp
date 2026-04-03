@@ -996,34 +996,59 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
   assert_used_and_recalculate_used_equal(_g1h);
 
-  // Simulated remote memory eviction (Phase 1 testing).
-  // When G1SimulateRemoteEviction is enabled, walk a few old objects
-  // after each GC and "evict" them to simulated remote memory.
+  // Simulated remote memory eviction.
+  // Phase 2+: uses classification bitmap to prefer Shared objects (have Handles).
+  // Shared objects can be evicted via Handle → REMOTE transition.
+  // Unique objects are evicted by first upgrading to Shared.
   if (G1SimulateRemoteEviction) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     RemoteHandleAllocBuffer hab;
     int evicted = 0;
-    // Walk old regions looking for non-humongous, non-managed objects to evict
+
     for (uint i = 0; i < _g1h->num_regions() && evicted < 3; i++) {
       HeapRegion* hr = _g1h->region_at(i);
       if (!hr->is_old() || hr->is_humongous()) continue;
-      // Walk objects in this region
+      if (!hr->has_remote_class_map()) continue;  // No classified objects
+
       HeapWord* p = hr->bottom();
       while (p < hr->top() && evicted < 3) {
         oop obj = cast_to_oop(p);
         size_t sz = obj->size();
-        markWord mw = obj->mark();
-        // Only evict unlocked, non-managed objects
-        if (mw.is_unlocked() && !mw.has_remote_metadata() && sz >= 2 && sz <= 128) {
-          if (rmm->evict_object(obj, &hab)) {
+        uint8_t cls = hr->get_remote_class(p);
+
+        if (cls == HeapRegion::REMOTE_CLASS_SHARED && sz >= 2 && sz <= 128) {
+          // Shared object: ensure Handle exists, then evict.
+          RemoteHandle* h = rmm->handle_for(obj);
+          if (h == nullptr) {
+            h = rmm->create_handle_for(obj, &hab);
+          }
+          if (h != nullptr && h->is_local()) {
+            // Evict: copy to sim-remote, set Handle to REMOTE
+            Klass* klass = obj->klass();
+            size_t slot_id = rmm->sim_remote_evict(obj, sz, klass);
+            h->set_remote(slot_id);
             evicted++;
+            log_info(gc)("Remote evict (Shared): obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT,
+                         p2i((void*)obj), klass->external_name(), sz, slot_id);
+          }
+        } else if (cls == HeapRegion::REMOTE_CLASS_UNIQUE && sz >= 2 && sz <= 128) {
+          // Unique object: upgrade to Shared first, then evict.
+          RemoteHandle* h = rmm->create_handle_for(obj, &hab);
+          hr->set_remote_class(p, HeapRegion::REMOTE_CLASS_SHARED);
+          if (h != nullptr) {
+            Klass* klass = obj->klass();
+            size_t slot_id = rmm->sim_remote_evict(obj, sz, klass);
+            h->set_remote(slot_id);
+            evicted++;
+            log_info(gc)("Remote evict (Unique->Shared): obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT,
+                         p2i((void*)obj), klass->external_name(), sz, slot_id);
           }
         }
         p += sz;
       }
     }
     if (evicted > 0) {
-      log_info(gc)("G1SimulateRemoteEviction: evicted %d objects (total evicted: " SIZE_FORMAT
+      log_info(gc)("G1SimulateRemoteEviction: evicted %d classified objects (total evicted: " SIZE_FORMAT
                    ", total fetched: " SIZE_FORMAT ")",
                    evicted, rmm->sim_remote_evicted_count(), rmm->sim_remote_fetched_count());
     }
