@@ -23,4 +23,5 @@ LD_PRELOAD=/home/xuehaonan/libapth/build/lib/libapth.so \
 LD_PRELOAD=/home/xuehaonan/libapth/build/lib/libapth.so \
   "$JDK_IMAGE/bin/java" \
   -Xshare:off -XX:-UseCompressedOops -XX:-UseCompressedClassPointers \
-  -Xint -Xmx128m -XX:+UnlockDiagnosticVMOptions
+  -Xint -Xmx128m -XX:+UnlockDiagnosticVMOptions \
+  -XX:+G1SimulateRemoteEviction -Xlog:gc RemoteMemTest.java
