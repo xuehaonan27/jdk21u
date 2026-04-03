@@ -50,7 +50,7 @@ make images CONF=linux-x86_64-server-release JOBS=$(nproc)
 
 # === Patchelf: point all binaries to custom GLIBC 2.43 ===
 CUSTOM_DYNLINKER="$CUSTOM_SYSROOT/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
-JDK_IMAGE="./build/linux-x86_64-server-release/images/jdk"
+JDK_IMAGE="/home/xuehaonan/jdks/jdk21u/build/linux-x86_64-server-release/images/jdk"
 LIBAPTH_DIR="/home/xuehaonan/libapth"
 
 echo "Patching ELF binaries to use custom GLIBC 2.43..."
@@ -84,4 +84,17 @@ echo "=== Verification ==="
 echo ""
 
 # Run java using the custom dynamic linker explicitly
-LD_PRELOAD=/home/xuehaonan/libapth/build/lib/libapth.so "$JDK_IMAGE/bin/java" -version
+LD_PRELOAD=/home/xuehaonan/libapth/build/lib/libapth.so \
+  "$JDK_IMAGE/bin/java" \
+  -Xshare:off -XX:-UseCompressedOops -XX:-UseCompressedClassPointers \
+  -version
+
+LD_PRELOAD=/home/xuehaonan/libapth/build/lib/libapth.so \
+  "$JDK_IMAGE/bin/java" \
+  -Xshare:off -XX:-UseCompressedOops -XX:-UseCompressedClassPointers \
+  -Xint -Xmx64m GCStressTest.java
+
+LD_PRELOAD=/home/xuehaonan/libapth/build/lib/libapth.so \
+  "$JDK_IMAGE/bin/java" \
+  -Xshare:off -XX:-UseCompressedOops -XX:-UseCompressedClassPointers \
+  -Xint -Xmx128m -XX:+UnlockDiagnosticVMOptions
