@@ -27,6 +27,7 @@
 #include "gc/g1/g1BarrierSet.hpp"
 #include "gc/g1/g1BarrierSetAssembler.hpp"
 #include "gc/g1/g1BarrierSetRuntime.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1CardTable.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/heapRegion.hpp"
@@ -124,6 +125,31 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
   bool on_phantom = (decorators & ON_PHANTOM_OOP_REF) != 0;
   bool on_reference = on_weak || on_phantom;
   ModRefBarrierSetAssembler::load_at(masm, decorators, type, dst, src, tmp1, tmp_thread);
+
+  // ================================================================
+  // Disaggregated memory: assembler-level load barrier (Phase 4).
+  // After the actual load, check if the oop is tagged (bit 63 set).
+  // Valid heap pointers have bit 63 = 0 (heap below 2^47).
+  // Tagged oops (Managed/Shared/Remote) have bit 63 = 1 ("negative").
+  // Fast path: test + js = 2 instructions, 5 bytes. Same as ZGC.
+  // ================================================================
+  if (on_oop) {
+    Label done;
+    // test dst, dst: sets SF if bit 63 is set (tagged oop)
+    __ testptr(dst, dst);
+    // If positive (clean oop) or null: skip slow path
+    __ jcc(Assembler::positive, done);
+    // Slow path: resolve tagged oop via runtime call (JRT_LEAF)
+    if (dst != c_rarg0) {
+      __ mov(c_rarg0, dst);
+    }
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
+    if (dst != rax) {
+      __ mov(dst, rax);
+    }
+    __ bind(done);
+  }
+
   if (on_oop && on_reference) {
     Register thread = NOT_LP64(tmp_thread) LP64_ONLY(r15_thread);
 

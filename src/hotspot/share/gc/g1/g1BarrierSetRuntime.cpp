@@ -25,6 +25,7 @@
 #include "precompiled.hpp"
 #include "gc/g1/g1BarrierSet.inline.hpp"
 #include "gc/g1/g1BarrierSetRuntime.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "utilities/macros.hpp"
@@ -60,4 +61,13 @@ JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_post_entry(volatile G1CardTa
   assert(thread == JavaThread::current(), "pre-condition");
   G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(thread);
   G1BarrierSet::dirty_card_queue_set().enqueue(queue, card_addr);
+JRT_END
+
+// Disaggregated memory: resolve a tagged oop to a clean local oop.
+// Called from G1BarrierSetAssembler::load_at() when bit 63 (sign bit) is set,
+// indicating a managed oop (Unique or Shared with Handle indirection).
+// This is a JRT_LEAF (no safepoint, no blocking) — only for local resolution.
+// Remote objects (is_remote bit) are not handled here (would need non-leaf for RDMA).
+JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
+  return (oopDesc*)resolve_oop_raw(cast_to_oop(tagged));
 JRT_END

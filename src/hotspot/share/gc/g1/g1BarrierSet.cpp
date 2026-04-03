@@ -253,20 +253,24 @@ oop G1BarrierSet::resolve_managed_store(oop new_value) {
 
   uint8_t cls = r->get_remote_class(cast_from_oop<HeapWord*>(new_value));
 
-  if (cls == HeapRegion::REMOTE_CLASS_UNIQUE) {
-    // Unique → Shared upgrade: allocate Handle, update bitmap.
-    // This runs during mutator time (not STW), so single os::malloc is OK.
-    // IMPORTANT: we do NOT tag the stored oop. Heap slots must remain CLEAN
-    // because the interpreter reads oops via raw movptr without the load barrier
-    // (aload, load_klass, MethodHandle adapters). The Handle is registered in
-    // the side table for use during eviction; the stored oop stays plain.
+  if (cls == HeapRegion::REMOTE_CLASS_SHARED) {
+    // Already Shared: find Handle and encode as Shared OOP.
+    // With Phase 4 assembler load barrier, the interpreter resolves tagged oops
+    // via testptr+js in G1BarrierSetAssembler::load_at().
+    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+    RemoteHandle* h = rmm->handle_for(new_value);
+    if (h != nullptr) {
+      return g1_make_shared_oop((void*)h);
+    }
+  } else if (cls == HeapRegion::REMOTE_CLASS_UNIQUE) {
+    // Unique → Shared upgrade: allocate Handle, update bitmap, encode as Shared OOP.
     G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
     RemoteHandleAllocBuffer hab;
-    rmm->create_handle_for(new_value, &hab);
+    RemoteHandle* h = rmm->create_handle_for(new_value, &hab);
     r->set_remote_class(cast_from_oop<HeapWord*>(new_value), HeapRegion::REMOTE_CLASS_SHARED);
     log_debug(gc)("Unique->Shared upgrade: obj=" PTR_FORMAT, p2i((void*)new_value));
+    return g1_make_shared_oop((void*)h);
   }
-  // For both Shared and Untracked: return the CLEAN (untagged) oop.
-  // Tagged OOPs in heap slots are only safe with full interpreter load barrier (Phase 4).
+  // UNTRACKED: not managed, return clean oop.
   return new_value;
 }

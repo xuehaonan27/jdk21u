@@ -46,6 +46,11 @@ public:
   // C2 slow-path runtime calls.
   static void write_ref_field_pre_entry(oopDesc* orig, JavaThread *thread);
   static void write_ref_field_post_entry(volatile CardValue* card_addr, JavaThread* thread);
+
+  // Disaggregated memory: resolve a tagged oop to a clean oop.
+  // Called from the assembler-level load barrier when bit 63 (sign bit) is set.
+  // This is a leaf call (no safepoint, no blocking) for local resolution.
+  static oopDesc* resolve_tagged_oop(oopDesc* tagged);
 };
 
 #endif // SHARE_GC_G1_G1BARRIERSETRUNTIME_HPP
