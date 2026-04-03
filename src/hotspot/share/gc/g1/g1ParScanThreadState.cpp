@@ -25,6 +25,7 @@
 #include "precompiled.hpp"
 #include "gc/g1/g1Allocator.inline.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1CollectionSet.hpp"
 #include "gc/g1/g1EvacFailureRegions.inline.hpp"
 #include "gc/g1/g1OopClosures.inline.hpp"
@@ -496,6 +497,13 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
   // may not be up to date for them.
   const oop forward_ptr = old->forward_to_atomic(obj, old_mark, memory_order_relaxed);
   if (forward_ptr == nullptr) {
+
+    // Update Handle when a managed (has-Handle) object is evacuated.
+    // The Handle must point to the new copy, otherwise Shared OOP -> Handle
+    // chains resolve to a stale address (critical correctness, see plan 9.7).
+    if (old_mark.has_remote_metadata()) {
+      _g1h->remote_memory_manager()->update_handle_for_evacuation(old, obj);
+    }
 
     {
       const uint young_index = from_region->young_index_in_cset();

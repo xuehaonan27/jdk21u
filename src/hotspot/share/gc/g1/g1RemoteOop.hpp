@@ -118,18 +118,29 @@ const uintptr_t G1_MW_REMOTE_METADATA_MASK =
 // Used by GC closures during STW when all scanned objects are local.
 // Does NOT handle remote objects (asserts local during STW).
 
-// Forward declaration -- RemoteHandle is defined in g1RemoteHandle.hpp
-// For now, resolve_oop_raw only strips tags (Phase 1a).
-// Handle following will be added when Handle table is implemented (Phase 1b).
+// RemoteHandle is defined in g1RemoteHandle.hpp.
+// We include it here so resolve_oop_raw can follow Handles.
+#include "gc/g1/g1RemoteHandle.hpp"
 
 inline oop resolve_oop_raw(oop tagged) {
   uintptr_t v = cast_from_oop<uintptr_t>(tagged);
   if ((v & G1_OOP_TAG_MASK) == 0) {
     return tagged;  // Ordinary (fast path -- no tags)
   }
-  // For now (Phase 1a): just strip tags.
-  // Phase 1b will add Handle following for Indirect/Shared OOPs.
-  // Phase 1c will add remote fetch for Remote OOPs.
+
+  if (v & G1_OOP_INDIRECT_BIT) {
+    // Shared OOP: bits 47:0 is Handle address. Follow the Handle.
+    RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+    // During STW GC, all scanned objects are local. The Handle should
+    // be in LOCAL state. For the mutator load barrier (non-STW), a
+    // REMOTE Handle triggers Tier 2 fetch — but that's handled by the
+    // load barrier, not here. resolve_oop_raw is GC-side only.
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    return cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+  }
+
+  // Unique OOP (Managed, Direct): strip tag bits, return clean address.
+  // The R (remote) bit is not expected during STW GC scanning.
   return cast_to_oop(v & G1_OOP_ADDR_MASK);
 }
 

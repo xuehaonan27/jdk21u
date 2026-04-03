@@ -30,6 +30,7 @@
 #include "code/icBuffer.hpp"
 #include "compiler/oopMap.hpp"
 #include "gc/g1/g1Allocator.inline.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1Arguments.hpp"
 #include "gc/g1/g1BarrierSet.hpp"
 #include "gc/g1/g1BatchedTask.hpp"
@@ -1282,6 +1283,8 @@ G1CollectedHeap::G1CollectedHeap() :
   _verifier = new G1HeapVerifier(this);
 
   _allocator = new G1Allocator(this);
+
+  _remote_memory_manager = new G1RemoteMemoryManager(this);
 
   _heap_sizing_policy = G1HeapSizingPolicy::create(this, _policy->analytics());
 

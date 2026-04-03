@@ -76,6 +76,7 @@ class G1GCCounters;
 class G1GCPhaseTimes;
 class G1HeapSizingPolicy;
 class G1NewTracer;
+class G1RemoteMemoryManager;
 class G1RemSet;
 class G1ServiceTask;
 class G1ServiceThread;
@@ -219,6 +220,10 @@ private:
 
   // Manages all allocations with regions except humongous object allocations.
   G1Allocator* _allocator;
+
+  // Manages disaggregated remote memory: Handle table, object->Handle mapping,
+  // remote object metadata. Created at heap init, used by barriers and GC.
+  class G1RemoteMemoryManager* _remote_memory_manager;
 
   G1YoungGCEvacFailureInjector _evac_failure_injector;
 
@@ -545,6 +550,8 @@ public:
   G1Allocator* allocator() {
     return _allocator;
   }
+
+  G1RemoteMemoryManager* remote_memory_manager() { return _remote_memory_manager; }
 
   G1YoungGCEvacFailureInjector* evac_failure_injector() { return &_evac_failure_injector; }
 
