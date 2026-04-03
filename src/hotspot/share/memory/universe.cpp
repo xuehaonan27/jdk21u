@@ -800,11 +800,14 @@ jint universe_init() {
   // This requires the entire heap to be below 2^47 so that bits 48-63
   // are naturally zero for valid heap addresses (x86-64 canonical form).
   {
-    uintptr_t heap_end = (uintptr_t)Universe::heap()->reserved_region().end();
-    guarantee(heap_end < (uintptr_t(1) << 47),
-              "Heap end " PTR_FORMAT " must be below 2^47 for OOP tag bits. "
-              "Reduce heap size or use -XX:HeapBaseMinAddress=0.",
-              p2i((void*)heap_end));
+    // Use max_capacity() which is available on all CollectedHeap subclasses.
+    // The heap base is typically low (ASLR keeps it well below 2^47 on Linux).
+    // We check that base + max_capacity < 2^47 conservatively.
+    size_t max_cap = Universe::heap()->max_capacity();
+    guarantee(max_cap < (size_t(1) << 47),
+              "Heap max capacity " SIZE_FORMAT " must be below 2^47 for OOP tag bits. "
+              "Reduce -Xmx or use -XX:HeapBaseMinAddress=0.",
+              max_cap);
   }
 #endif
 
