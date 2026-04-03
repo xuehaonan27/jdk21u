@@ -28,6 +28,7 @@
 #include "gc/g1/g1FullGCOopClosures.hpp"
 
 #include "gc/g1/g1Allocator.inline.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1FullCollector.inline.hpp"
 #include "gc/g1/g1ConcurrentMarkBitMap.inline.hpp"
 #include "gc/g1/g1FullGCMarker.inline.hpp"
@@ -52,12 +53,10 @@ inline void G1MarkAndPushClosure::do_oop(narrowOop* p) {
 }
 
 template <class T> inline void G1AdjustClosure::adjust_pointer(T* p) {
-  T heap_oop = RawAccess<>::oop_load(p);
-  if (CompressedOops::is_null(heap_oop)) {
+  oop obj = g1_resolved_load(p);
+  if (obj == nullptr) {
     return;
   }
-
-  oop obj = CompressedOops::decode_not_null(heap_oop);
   assert(Universe::heap()->is_in(obj), "should be in heap");
   if (!_collector->is_compacting(obj)) {
     // We never forward objects in non-compacting regions so there is no need to

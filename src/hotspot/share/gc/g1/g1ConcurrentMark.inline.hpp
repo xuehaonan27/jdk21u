@@ -263,7 +263,7 @@ inline bool G1CMTask::make_reference_grey(oop obj) {
 template <class T>
 inline bool G1CMTask::deal_with_reference(T* p) {
   increment_refs_reached();
-  oop const obj = RawAccess<MO_RELAXED>::oop_load(p);
+  oop const obj = g1_resolved_load<MO_RELAXED>(p);
   if (obj == nullptr) {
     return false;
   }

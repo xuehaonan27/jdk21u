@@ -810,7 +810,8 @@ public:
   G1KeepAliveClosure(G1CollectedHeap* g1h) :_g1h(g1h) {}
   void do_oop(narrowOop* p) { guarantee(false, "Not needed"); }
   void do_oop(oop* p) {
-    oop obj = *p;
+    // Use g1_resolved_load instead of raw *p to handle tagged oops
+    oop obj = g1_resolved_load(p);
     assert(obj != nullptr, "the caller should have filtered out null values");
 
     const G1HeapRegionAttr region_attr =_g1h->region_attr(obj);
@@ -848,7 +849,7 @@ public:
   virtual void do_oop(      oop* p) { do_oop_work(p); }
 
   template <class T> void do_oop_work(T* p) {
-    oop obj = RawAccess<>::oop_load(p);
+    oop obj = g1_resolved_load(p);
 
     if (_g1h->is_in_cset_or_humongous_candidate(obj)) {
       // If the referent object has been forwarded (either copied

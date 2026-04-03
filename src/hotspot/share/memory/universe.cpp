@@ -795,6 +795,19 @@ jint universe_init() {
     return status;
   }
 
+#ifdef USE_LIBAPTH
+  // Disaggregated memory OOP tagging uses bits 48-63 of oop pointers.
+  // This requires the entire heap to be below 2^47 so that bits 48-63
+  // are naturally zero for valid heap addresses (x86-64 canonical form).
+  {
+    uintptr_t heap_end = (uintptr_t)Universe::heap()->reserved_region().end();
+    guarantee(heap_end < (uintptr_t(1) << 47),
+              "Heap end " PTR_FORMAT " must be below 2^47 for OOP tag bits. "
+              "Reduce heap size or use -XX:HeapBaseMinAddress=0.",
+              p2i((void*)heap_end));
+  }
+#endif
+
   Universe::initialize_tlab();
 
   Metaspace::global_initialize();

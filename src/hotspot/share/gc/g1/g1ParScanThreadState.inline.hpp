@@ -28,6 +28,7 @@
 #include "gc/g1/g1ParScanThreadState.hpp"
 
 #include "gc/g1/g1CardTable.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1OopStarChunkedList.inline.hpp"
 #include "gc/g1/g1RemSet.hpp"
@@ -72,7 +73,7 @@ inline void G1ParScanThreadState::reset_trim_ticks() {
 
 template <typename T>
 inline void G1ParScanThreadState::remember_root_into_optional_region(T* p) {
-  oop o = RawAccess<IS_NOT_NULL>::oop_load(p);
+  oop o = g1_resolved_load<IS_NOT_NULL>(p);
   uint index = _g1h->heap_region_containing(o)->index_in_opt_cset();
   assert(index < _max_num_optional_regions,
          "Trying to access optional region idx %u beyond " SIZE_FORMAT, index, _max_num_optional_regions);
@@ -81,7 +82,7 @@ inline void G1ParScanThreadState::remember_root_into_optional_region(T* p) {
 
 template <typename T>
 inline void G1ParScanThreadState::remember_reference_into_optional_region(T* p) {
-  oop o = RawAccess<IS_NOT_NULL>::oop_load(p);
+  oop o = g1_resolved_load<IS_NOT_NULL>(p);
   uint index = _g1h->heap_region_containing(o)->index_in_opt_cset();
   assert(index < _max_num_optional_regions,
          "Trying to access optional region idx %u beyond " SIZE_FORMAT, index, _max_num_optional_regions);

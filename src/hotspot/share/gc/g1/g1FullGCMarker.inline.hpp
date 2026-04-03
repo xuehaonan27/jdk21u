@@ -28,6 +28,7 @@
 #include "gc/g1/g1FullGCMarker.hpp"
 
 #include "classfile/classLoaderData.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "classfile/javaClasses.inline.hpp"
 #include "gc/g1/g1Allocator.inline.hpp"
 #include "gc/g1/g1ConcurrentMarkBitMap.inline.hpp"
@@ -74,9 +75,8 @@ inline bool G1FullGCMarker::mark_object(oop obj) {
 }
 
 template <class T> inline void G1FullGCMarker::mark_and_push(T* p) {
-  T heap_oop = RawAccess<>::oop_load(p);
-  if (!CompressedOops::is_null(heap_oop)) {
-    oop obj = CompressedOops::decode_not_null(heap_oop);
+  oop obj = g1_resolved_load(p);
+  if (obj != nullptr) {
     if (mark_object(obj)) {
       _oop_stack.push(obj);
     }

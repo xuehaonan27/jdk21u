@@ -160,9 +160,23 @@ class markWord {
   // Fast-locking does not use INFLATING.
   static markWord INFLATING() { return zero(); }    // inflate-in-progress
 
+  // Remote memory metadata bits (bits 58-63, within the unused region 39-63).
+  // These track OOP classification and remote status for disaggregated memory.
+  // See g1RemoteOop.hpp for full documentation.
+  static const uintptr_t remote_metadata_mask = uintptr_t(0x3F) << 58;  // bits 58-63
+
+  bool has_remote_metadata() const {
+    return (value() & remote_metadata_mask) != 0;
+  }
+
+  // Clear remote metadata bits (used in forward_to for safety).
+  markWord clear_remote_metadata() const {
+    return markWord(value() & ~remote_metadata_mask);
+  }
+
   // Should this header be preserved during GC?
   bool must_be_preserved(const oopDesc* obj) const {
-    return (!is_unlocked() || !has_no_hash());
+    return (!is_unlocked() || !has_no_hash() || has_remote_metadata());
   }
 
   // WARNING: The following routines are used EXCLUSIVELY by

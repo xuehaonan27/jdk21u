@@ -29,6 +29,7 @@
 
 #include "gc/g1/g1CardTable.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/shared/accessBarrierSupport.inline.hpp"
 #include "oops/access.inline.hpp"
 #include "oops/compressedOops.inline.hpp"
@@ -53,8 +54,11 @@ inline void G1BarrierSet::enqueue(T* dst) {
 
   T heap_oop = RawAccess<MO_RELAXED>::oop_load(dst);
   if (!CompressedOops::is_null(heap_oop)) {
+    // Resolve tag bits before SATB enqueue — SATB queue asserts valid heap pointers
+    // (g1SATBMarkQueueSet.cpp:83). Tagged oops would fail this assertion.
+    oop resolved = resolve_oop_raw(CompressedOops::decode_not_null(heap_oop));
     SATBMarkQueue& queue = G1ThreadLocalData::satb_mark_queue(Thread::current());
-    queue_set.enqueue_known_active(queue, CompressedOops::decode_not_null(heap_oop));
+    queue_set.enqueue_known_active(queue, resolved);
   }
 }
 
@@ -108,6 +112,8 @@ template <typename T>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_not_in_heap(T* addr) {
   oop value = ModRef::oop_load_not_in_heap(addr);
+  // Resolve tag bits before SATB enqueue — SATB queue requires clean oops
+  value = resolve_oop_raw(value);
   enqueue_preloaded_if_weak(decorators, value);
   return value;
 }
@@ -117,6 +123,8 @@ template <typename T>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_in_heap(T* addr) {
   oop value = ModRef::oop_load_in_heap(addr);
+  // Resolve tag bits before SATB enqueue — SATB queue requires clean oops
+  value = resolve_oop_raw(value);
   enqueue_preloaded_if_weak(decorators, value);
   return value;
 }
@@ -125,6 +133,8 @@ template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_in_heap_at(oop base, ptrdiff_t offset) {
   oop value = ModRef::oop_load_in_heap_at(base, offset);
+  // Resolve tag bits before SATB enqueue — SATB queue requires clean oops
+  value = resolve_oop_raw(value);
   enqueue_preloaded_if_weak(AccessBarrierSupport::resolve_possibly_unknown_oop_ref_strength<decorators>(base, offset), value);
   return value;
 }

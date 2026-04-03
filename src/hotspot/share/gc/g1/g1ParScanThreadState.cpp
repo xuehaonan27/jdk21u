@@ -151,14 +151,14 @@ size_t G1ParScanThreadState::lab_undo_waste_words() const {
 void G1ParScanThreadState::verify_task(narrowOop* task) const {
   assert(task != nullptr, "invariant");
   assert(UseCompressedOops, "sanity");
-  oop p = RawAccess<>::oop_load(task);
+  oop p = g1_resolved_load(task);
   assert(_g1h->is_in_reserved(p),
          "task=" PTR_FORMAT " p=" PTR_FORMAT, p2i(task), p2i(p));
 }
 
 void G1ParScanThreadState::verify_task(oop* task) const {
   assert(task != nullptr, "invariant");
-  oop p = RawAccess<>::oop_load(task);
+  oop p = g1_resolved_load(task);
   assert(_g1h->is_in_reserved(p),
          "task=" PTR_FORMAT " p=" PTR_FORMAT, p2i(task), p2i(p));
 }
@@ -186,7 +186,7 @@ template <class T>
 MAYBE_INLINE_EVACUATION
 void G1ParScanThreadState::do_oop_evac(T* p) {
   // Reference should not be null here as such are never pushed to the task queue.
-  oop obj = RawAccess<IS_NOT_NULL>::oop_load(p);
+  oop obj = g1_resolved_load<IS_NOT_NULL>(p);
 
   // Although we never intentionally push references outside of the collection
   // set, due to (benign) races in the claim mechanism during RSet scanning more

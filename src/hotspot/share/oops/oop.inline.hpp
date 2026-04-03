@@ -273,12 +273,17 @@ bool oopDesc::is_forwarded() const {
 // Used by scavengers
 void oopDesc::forward_to(oop p) {
   markWord m = markWord::encode_pointer_as_mark(p);
+  // Safety: clear remote metadata bits (bits 58-63) from forwarding pointer.
+  // On x86-64 canonical addresses these bits are naturally zero, but we clear
+  // explicitly as defense-in-depth for disaggregated memory support.
+  m = m.clear_remote_metadata();
   assert(m.decode_pointer() == p, "encoding must be reversible");
   set_mark(m);
 }
 
 oop oopDesc::forward_to_atomic(oop p, markWord compare, atomic_memory_order order) {
   markWord m = markWord::encode_pointer_as_mark(p);
+  m = m.clear_remote_metadata();  // Safety: clear remote metadata bits
   assert(m.decode_pointer() == p, "encoding must be reversible");
   markWord old_mark = cas_set_mark(m, compare, order);
   if (old_mark == compare) {

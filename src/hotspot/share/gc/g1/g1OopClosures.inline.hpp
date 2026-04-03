@@ -28,6 +28,7 @@
 #include "gc/g1/g1OopClosures.hpp"
 
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1ParScanThreadState.inline.hpp"
 #include "gc/g1/g1RemSet.hpp"
@@ -79,12 +80,10 @@ inline void G1ScanClosureBase::trim_queue_partially() {
 
 template <class T>
 inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
-  T heap_oop = RawAccess<>::oop_load(p);
-
-  if (CompressedOops::is_null(heap_oop)) {
+  oop obj = g1_resolved_load(p);
+  if (obj == nullptr) {
     return;
   }
-  oop obj = CompressedOops::decode_not_null(heap_oop);
   const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
   if (region_attr.is_in_cset()) {
     prefetch_and_push(p, obj);
@@ -105,11 +104,10 @@ inline void G1CMOopClosure::do_oop_work(T* p) {
 
 template <class T>
 inline void G1RootRegionScanClosure::do_oop_work(T* p) {
-  T heap_oop = RawAccess<MO_RELAXED>::oop_load(p);
-  if (CompressedOops::is_null(heap_oop)) {
+  oop obj = g1_resolved_load<MO_RELAXED>(p);
+  if (obj == nullptr) {
     return;
   }
-  oop obj = CompressedOops::decode_not_null(heap_oop);
   _cm->mark_in_bitmap(_worker_id, obj);
 }
 
@@ -127,11 +125,10 @@ inline static void check_obj_during_refinement(T* p, oop const obj) {
 
 template <class T>
 inline void G1ConcurrentRefineOopClosure::do_oop_work(T* p) {
-  T o = RawAccess<MO_RELAXED>::oop_load(p);
-  if (CompressedOops::is_null(o)) {
+  oop obj = g1_resolved_load<MO_RELAXED>(p);
+  if (obj == nullptr) {
     return;
   }
-  oop obj = CompressedOops::decode_not_null(o);
 
   check_obj_during_refinement(p, obj);
 
@@ -156,11 +153,10 @@ inline void G1ConcurrentRefineOopClosure::do_oop_work(T* p) {
 
 template <class T>
 inline void G1ScanCardClosure::do_oop_work(T* p) {
-  T o = RawAccess<>::oop_load(p);
-  if (CompressedOops::is_null(o)) {
+  oop obj = g1_resolved_load(p);
+  if (obj == nullptr) {
     return;
   }
-  oop obj = CompressedOops::decode_not_null(o);
 
   check_obj_during_refinement(p, obj);
 
@@ -213,13 +209,10 @@ void G1ParCopyHelper::trim_queue_partially() {
 template <G1Barrier barrier, bool should_mark>
 template <class T>
 void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
-  T heap_oop = RawAccess<>::oop_load(p);
-
-  if (CompressedOops::is_null(heap_oop)) {
+  oop obj = g1_resolved_load(p);
+  if (obj == nullptr) {
     return;
   }
-
-  oop obj = CompressedOops::decode_not_null(heap_oop);
 
   assert(_worker_id == _par_scan_state->worker_id(), "sanity");
 
@@ -256,7 +249,7 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
 }
 
 template <class T> void G1RebuildRemSetClosure::do_oop_work(T* p) {
-  oop const obj = RawAccess<MO_RELAXED>::oop_load(p);
+  oop const obj = g1_resolved_load<MO_RELAXED>(p);
   if (obj == nullptr) {
     return;
   }
