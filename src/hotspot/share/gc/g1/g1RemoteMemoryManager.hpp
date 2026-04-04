@@ -30,8 +30,14 @@ class HeapRegion;
 // G1RemoteMemoryManager
 // ============================================================
 
+class G1RemoteBackend;
+
 class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   G1CollectedHeap* _g1h;
+
+  // Remote storage backend (sim-local, TCP executor, or RDMA executor).
+  // Selected by UseRemoteExecutor flag. Created in constructor.
+  G1RemoteBackend* _backend;
 
   // Handle allocator (global chunk pool + per-thread HABs)
   RemoteHandleAllocator _handle_allocator;
@@ -210,6 +216,7 @@ public:
   // ============================================================
 
   RemoteHandleAllocator* handle_allocator() { return &_handle_allocator; }
+  G1RemoteBackend* backend() { return _backend; }
 
   // ============================================================
   // Fetch Cache Region (FCR) Allocation
@@ -251,30 +258,13 @@ public:
     return handle_for(obj) != nullptr;
   }
 
-  // ============================================================
-  // Remote Executor Client (TCP to executor process)
-  // ============================================================
-  // When UseRemoteExecutor is enabled, these replace sim_remote_* operations.
-  // The executor is a separate C process (remote_executor) that manages
-  // object storage on the memory node and performs garbage identification.
+  // Legacy fields (kept for struct layout compat; unused when backend is active):
 private:
-  int      _executor_fd;           // TCP socket (-1 if not connected)
+  int      _executor_fd;
   bool     _executor_connected;
   uint64_t _executor_seq_id;
 
-  bool ensure_executor_connected();
-  bool executor_send_all(const void* data, size_t len);
-  bool executor_recv_all(void* buf, size_t len);
-  bool executor_send_msg(const void* data, size_t len);
-  bool executor_recv_msg(void* buf, size_t max_len, size_t* actual_len);
-  bool executor_hello();
-
 public:
-  // Executor-backed operations (dispatch based on UseRemoteExecutor flag)
-  size_t remote_evict(oop obj, size_t word_size, Klass* klass);
-  Klass* remote_fetch(size_t slot_id, void* dest, size_t* out_word_size);
-  size_t remote_collect_dead();
-
   size_t sim_remote_evicted_count() const { return _sim_remote_evicted_count; }
   size_t sim_remote_fetched_count() const { return _sim_remote_fetched_count; }
   size_t sim_remote_word_size(size_t slot_id) const {
