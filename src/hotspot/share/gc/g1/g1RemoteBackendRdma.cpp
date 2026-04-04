@@ -395,6 +395,7 @@ bool RDMAExecutorBackend::initialize() {
   if (!setup_rdma_resources()) return false;
 
   // TCP connect for bootstrap
+  log_info(gc)("RDMA: trying to open TCP socket");
   _tcp_fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (_tcp_fd < 0) { log_warning(gc)("RDMA: socket failed"); return false; }
 
@@ -406,17 +407,20 @@ bool RDMAExecutorBackend::initialize() {
     log_warning(gc)("RDMA: invalid host %s", host);
     return false;
   }
+
+  log_info(gc)("RDMA: trying to connect to TCP socket");
   if (::connect(_tcp_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
     log_warning(gc)("RDMA: TCP connect to %s:%d failed: %s", host, port, os::strerror(errno));
     return false;
   }
 
+  log_info(gc)("RDMA: trying to exchange QP info");
   if (!exchange_qp_info()) return false;
 
   // Pre-post recv buffers
   for (int i = 0; i < 4; i++) {
     void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
-    struct ibv_sge sge = { (uintptr_t)recv_buf, RDMAMsgBufSize, _local_mr->lkey };
+    struct ibv_sge sge = { (uintptr_t)recv_buf, (size_t)RDMAMsgBufSize, _local_mr->lkey };
     struct ibv_recv_wr wr;
     memset(&wr, 0, sizeof(wr));
     wr.sg_list = &sge; wr.num_sge = 1;
@@ -432,6 +436,7 @@ bool RDMAExecutorBackend::initialize() {
   *(uint64_t*)(hello + 8) = _seq_id++;
   *(uint32_t*)(hello + 16) = 1;  // protocol version
 
+  log_info(gc)("RDMA: sending hello");
   if (!rdma_send_msg(hello, 32)) { log_warning(gc)("RDMA: hello send failed"); return false; }
 
   uint8_t resp[64];

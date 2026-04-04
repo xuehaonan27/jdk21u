@@ -44,7 +44,9 @@ bash configure \
   --enable-unlimited-crypto \
   --with-freetype=bundled \
   --with-zlib=bundled \
-  --with-libapth=/home/xuehaonan/libapth
+  --with-libapth=/home/xuehaonan/libapth \
+  --with-remote=RDMA \
+  --enable-cds=no
 
 make images CONF=linux-x86_64-server-release JOBS=$(nproc)
 
