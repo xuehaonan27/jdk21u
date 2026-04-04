@@ -5,6 +5,7 @@
 
 #include "precompiled.hpp"
 #include "gc/g1/g1RemoteBackendTcp.hpp"
+#include "gc/g1/g1CollectedHeap.hpp"
 #include "gc/shared/gc_globals.hpp"
 #include "runtime/globals.hpp"
 #include "logging/log.hpp"
@@ -130,17 +131,19 @@ bool TCPExecutorBackend::initialize() {
 }
 
 bool TCPExecutorBackend::send_hello() {
-  // CMD_HELLO: header(12) + version(4) + heap_base(8) + heap_size(8) + align(4) = 36
-  // Simplified: just send 32 bytes with type+length+seq+padding
-  uint8_t msg[32];
+  // remote_cmd_hello_t: hdr(16) + version(4) + heap_base(8) + heap_size(8) + align(4) = 40
+  uint8_t msg[40];
   memset(msg, 0, sizeof(msg));
-  *(uint32_t*)(msg + 0) = RE_CMD_HELLO;
-  *(uint32_t*)(msg + 4) = 32;
-  *(uint64_t*)(msg + 8) = _seq_id++;
-  // payload: protocol version=1, rest informational
-  *(uint32_t*)(msg + 16) = 1;
+  *(uint32_t*)(msg + 0)  = RE_CMD_HELLO;           // hdr.type
+  *(uint32_t*)(msg + 4)  = 40;                      // hdr.length
+  *(uint64_t*)(msg + 8)  = _seq_id++;               // hdr.seq_id
+  *(uint32_t*)(msg + 16) = 1;                       // protocol_version
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  *(uint64_t*)(msg + 20) = (uint64_t)g1h->reserved().start();  // heap_base
+  *(uint64_t*)(msg + 28) = (uint64_t)g1h->max_capacity();      // heap_size
+  *(uint32_t*)(msg + 36) = (uint32_t)MinObjAlignmentInBytes;   // min_obj_alignment
 
-  if (!send_msg(msg, 32)) return false;
+  if (!send_msg(msg, 40)) return false;
 
   uint8_t resp[64];
   size_t resp_len = 0;

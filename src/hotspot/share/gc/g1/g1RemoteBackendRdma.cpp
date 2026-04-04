@@ -13,6 +13,7 @@
 #ifdef REMOTE_EXECUTOR_USE_RDMA
 
 #include "gc/g1/g1RemoteBackendRdma.hpp"
+#include "gc/g1/g1CollectedHeap.hpp"
 #include "gc/shared/gc_globals.hpp"
 #include "runtime/globals.hpp"
 #include "logging/log.hpp"
@@ -428,16 +429,20 @@ bool RDMAExecutorBackend::initialize() {
     ibv_post_recv(_qp, &wr, &bad_wr);
   }
 
-  // Send hello via RDMA SEND
-  uint8_t hello[32];
+  // Send hello via RDMA SEND — remote_cmd_hello_t (40 bytes)
+  uint8_t hello[40];
   memset(hello, 0, sizeof(hello));
-  *(uint32_t*)(hello + 0) = RE_CMD_HELLO;
-  *(uint32_t*)(hello + 4) = 32;
-  *(uint64_t*)(hello + 8) = _seq_id++;
-  *(uint32_t*)(hello + 16) = 1;  // protocol version
+  *(uint32_t*)(hello + 0)  = RE_CMD_HELLO;           // hdr.type
+  *(uint32_t*)(hello + 4)  = 40;                      // hdr.length
+  *(uint64_t*)(hello + 8)  = _seq_id++;               // hdr.seq_id
+  *(uint32_t*)(hello + 16) = 1;                       // protocol_version
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  *(uint64_t*)(hello + 20) = (uint64_t)g1h->reserved().start();  // heap_base
+  *(uint64_t*)(hello + 28) = (uint64_t)g1h->max_capacity();      // heap_size
+  *(uint32_t*)(hello + 36) = (uint32_t)MinObjAlignmentInBytes;   // min_obj_alignment
 
   log_info(gc)("RDMA: sending hello");
-  if (!rdma_send_msg(hello, 32)) { log_warning(gc)("RDMA: hello send failed"); return false; }
+  if (!rdma_send_msg(hello, 40)) { log_warning(gc)("RDMA: hello send failed"); return false; }
 
   uint8_t resp[64];
   size_t resp_len = 0;
