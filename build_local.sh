@@ -16,7 +16,10 @@ JDK_IMAGE="/home/ubuntu/jvm_libapth/jdk21u/build/linux-x86_64-server-release/ima
 
 # No Boot JDK or Build JDK needed, because we have apt installed a JDK21 to system on local machine
 
-bash configure --with-libapth=/home/ubuntu/jvm_libapth/libapth
+bash configure --with-libapth=/home/ubuntu/jvm_libapth/libapth \
+	--with-build-jdk=/usr/lib/jvm/java-21-openjdk-amd64 \
+	--with-boot-jdk=/usr/lib/jvm/java-21-openjdk-amd64 \
+	--enable-cds=no
 
 make images CONF=linux-x86_64-server-release JOBS=$(nproc)
 

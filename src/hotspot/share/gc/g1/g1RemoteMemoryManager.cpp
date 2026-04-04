@@ -147,11 +147,16 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
     h = create_handle_for(obj, hab);
   }
 
-  // 2. Copy object bytes to simulated remote
-  size_t slot_id = sim_remote_evict(obj, word_size, klass);
+  // 2. Evict object bytes via backend (SIM/TCP/RDMA)
+  size_t slot_id = _backend->evict(cast_from_oop<void*>(obj), word_size, klass, (size_t)-1);
+  if (slot_id == (size_t)-1) {
+    log_warning(gc)("Remote evict failed for obj=" PTR_FORMAT, p2i((void*)obj));
+    return false;
+  }
 
-  // 3. Set Handle to REMOTE with slot_id
+  // 3. Set Handle to REMOTE with slot_id + store word_size for fetch-time allocation
   h->set_remote(slot_id);
+  h->set_eviction_word_size(word_size);
 
   // 4. Set classification in per-region bitmap (NOT mark word — mark word bits
   //    cause CAS conflicts in synchronizer.cpp, see lessons learned).
@@ -175,13 +180,17 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
          "Handle must be REMOTE or FETCHING");
 
   size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
-  assert(slot_id < SIM_REMOTE_MAX_SLOTS, "Invalid remote slot");
 
-  size_t word_size = _sim_remote_slots[slot_id]._word_size;
-  Klass* klass = sim_remote_fetch(slot_id, dest, word_size);
+  // Fetch object bytes via backend (SIM/TCP/RDMA)
+  size_t word_size = 0;
+  Klass* klass = _backend->fetch(slot_id, dest, &word_size);
 
-  log_info(gc)("Remote fetch: slot=" SIZE_FORMAT " -> dest=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w",
-               slot_id, p2i(dest), klass->external_name(), word_size);
+  if (klass != nullptr) {
+    log_info(gc)("Remote fetch: slot=" SIZE_FORMAT " -> dest=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w",
+                 slot_id, p2i(dest), klass->external_name(), word_size);
+  } else {
+    log_warning(gc)("Remote fetch FAILED: slot=" SIZE_FORMAT, slot_id);
+  }
 
   return klass;
 }
@@ -206,66 +215,94 @@ HeapRegion* G1RemoteMemoryManager::allocate_new_fcr_region() {
 
 size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   G1ConcurrentMark* cm = _g1h->concurrent_mark();
-  size_t collected = 0;
-  size_t retained = 0;
-  size_t bytes_freed = 0;
+
+  // Step 1: Gather live root slot_ids from Handle table.
+  // A remote object is "alive" if its local reference is marked in the bitmap.
+  size_t root_capacity = 256;
+  size_t* root_ids = (size_t*)os::malloc(root_capacity * sizeof(size_t), mtGC);
+  size_t num_roots = 0;
+  size_t total_remote = 0;
 
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    HandleEntry** pp = &_table[idx];
-    while (*pp != nullptr) {
-      HandleEntry* entry = *pp;
-
-      // Only process entries with REMOTE handles (evicted objects)
-      if (entry->_handle != nullptr && entry->_handle->is_remote()) {
-        oop obj = cast_to_oop(entry->_obj_addr);
-
-        // Check if the local copy of this object is still reachable.
-        // The local object is at entry->_obj_addr (still valid — we don't
-        // release local memory in the current prototype).
+    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+      if (e->_handle != nullptr && e->_handle->is_remote()) {
+        total_remote++;
+        oop obj = cast_to_oop(e->_obj_addr);
         bool is_alive = false;
         if (_g1h->is_in(obj)) {
-          // Check marking bitmap: was this object marked during concurrent marking?
           HeapRegion* hr = _g1h->heap_region_containing(obj);
           if (hr != nullptr) {
             is_alive = cm->is_marked_in_bitmap(obj);
           }
         }
-
-        if (!is_alive) {
-          // DEAD remote object — free sim-remote slot without fetching.
-          // This is "garbage never crosses the network."
-          uintptr_t sa = entry->_handle->load_state_and_addr_acquire();
-          size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
-          if (slot_id < SIM_REMOTE_MAX_SLOTS && _sim_remote_slots[slot_id]._in_use) {
-            bytes_freed += _sim_remote_slots[slot_id]._word_size * HeapWordSize;
-            os::free(_sim_remote_slots[slot_id]._data);
-            _sim_remote_slots[slot_id]._data = nullptr;
-            _sim_remote_slots[slot_id]._in_use = false;
+        if (is_alive) {
+          if (num_roots >= root_capacity) {
+            root_capacity *= 2;
+            root_ids = (size_t*)os::realloc(root_ids, root_capacity * sizeof(size_t), mtGC);
           }
-
-          // Clear region bitmap classification
-          if (_g1h->is_in(obj)) {
-            HeapRegion* hr = _g1h->heap_region_containing(obj);
-            if (hr != nullptr && hr->has_remote_class_map()) {
-              hr->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_UNTRACKED);
-            }
-          }
-
-          // Remove Handle entry from table
-          *pp = entry->_next;
-          os::free(entry);
-          collected++;
-          continue;
-        } else {
-          retained++;
+          uintptr_t sa = e->_handle->load_state_and_addr_acquire();
+          root_ids[num_roots++] = sa & REMOTE_HANDLE_ADDR_MASK;
         }
       }
-      pp = &(*pp)->_next;
     }
   }
   table_unlock();
 
+  // Step 2: Report roots to backend and request collection.
+  _backend->report_roots(root_ids, num_roots);
+  os::free(root_ids);
+
+  size_t* dead_ids = nullptr;
+  size_t num_dead = 0;
+  size_t bytes_freed = 0;
+  _backend->collect_dead(&dead_ids, &num_dead, &bytes_freed);
+
+  // Step 3: Clean up Handle entries + bitmaps for dead objects.
+  // Build a set of dead slot_ids for fast lookup.
+  size_t collected = 0;
+  if (num_dead > 0) {
+    table_lock();
+    for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+      HandleEntry** pp = &_table[idx];
+      while (*pp != nullptr) {
+        HandleEntry* entry = *pp;
+        if (entry->_handle != nullptr && entry->_handle->is_remote()) {
+          uintptr_t sa = entry->_handle->load_state_and_addr_acquire();
+          size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
+
+          // Check if this slot_id is in the dead list
+          bool is_dead = false;
+          for (size_t d = 0; d < num_dead; d++) {
+            if (dead_ids[d] == slot_id) { is_dead = true; break; }
+          }
+
+          if (is_dead) {
+            // Clear region bitmap classification
+            oop obj = cast_to_oop(entry->_obj_addr);
+            if (_g1h->is_in(obj)) {
+              HeapRegion* hr = _g1h->heap_region_containing(obj);
+              if (hr != nullptr && hr->has_remote_class_map()) {
+                hr->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_UNTRACKED);
+              }
+            }
+
+            // Remove Handle entry from table
+            *pp = entry->_next;
+            os::free(entry);
+            collected++;
+            continue;
+          }
+        }
+        pp = &(*pp)->_next;
+      }
+    }
+    table_unlock();
+  }
+
+  if (dead_ids) os::free(dead_ids);
+
+  size_t retained = total_remote - collected;
   if (collected > 0 || retained > 0) {
     log_info(gc)("Remote collection: " SIZE_FORMAT " dead objects freed (" SIZE_FORMAT " bytes reclaimed remotely), "
                  SIZE_FORMAT " live objects retained",

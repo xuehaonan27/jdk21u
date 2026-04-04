@@ -90,6 +90,12 @@ struct RemoteHandle {
     _state_and_addr = REMOTE_HANDLE_LOCAL | (uintptr_t(obj_addr) & REMOTE_HANDLE_ADDR_MASK);
   }
 
+  // Store/retrieve eviction metadata in _reserved field.
+  // word_size is set at eviction time so the fetch path can allocate
+  // the correct FCR buffer size without querying the (possibly remote) backend.
+  void set_eviction_word_size(size_t ws) { _reserved = (uintptr_t)ws; }
+  size_t eviction_word_size() const      { return (size_t)_reserved; }
+
   // Initialize a fresh Handle
   void initialize(void* obj_addr) {
     set_local(obj_addr);

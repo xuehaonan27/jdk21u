@@ -188,11 +188,8 @@ oop G1BarrierSet::resolve_remote_fetch(RemoteHandle* h) {
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
 
-  // Determine object size from remote metadata
-  uintptr_t sa = h->load_state_and_addr_acquire();
-  size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
-
-  size_t word_size = rmm->sim_remote_word_size(slot_id);
+  // Read object size from Handle metadata (stored at eviction time)
+  size_t word_size = h->eviction_word_size();
 
   // Allocate in FCR region (GC-managed, proper lifecycle).
   HeapWord* dest = rmm->allocate_in_fcr(word_size);
@@ -201,7 +198,7 @@ oop G1BarrierSet::resolve_remote_fetch(RemoteHandle* h) {
   }
   guarantee(dest != nullptr, "Failed to allocate fetch buffer");
 
-  // Fetch from simulated remote
+  // Fetch object bytes from remote via backend (SIM/TCP/RDMA)
   rmm->fetch_remote_object(h, dest);
 
   // Publish: release-store the local address into Handle.

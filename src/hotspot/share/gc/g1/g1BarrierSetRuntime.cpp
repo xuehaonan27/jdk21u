@@ -68,9 +68,9 @@ JRT_END
 
 // Disaggregated memory: resolve a tagged oop to a clean local oop.
 // Called from G1BarrierSetAssembler::load_at() when bit 63 (sign bit) is set.
-// Handles LOCAL (fast), REMOTE (simulated fetch), and FETCHING (spin-wait).
-// Phase 3: simulated fetch is just memcpy, so JRT_LEAF is safe.
-// Phase 5+: real RDMA would need non-leaf with ThreadBlockInVM.
+// Handles LOCAL (fast), REMOTE (fetch via backend), and FETCHING (spin-wait).
+// NOTE: JRT_LEAF — real RDMA backend currently does synchronous fetch here.
+// Phase 5+: should use non-leaf with ThreadBlockInVM + apth_rdma_wait.
 JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   uintptr_t v = (uintptr_t)tagged;
 
@@ -92,9 +92,8 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
         G1CollectedHeap* g1h = G1CollectedHeap::heap();
         G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
 
-        // Look up object size from remote metadata table
-        uintptr_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
-        size_t word_size = rmm->sim_remote_word_size(slot_id);
+        // Read object size from Handle metadata (stored at eviction time)
+        size_t word_size = h->eviction_word_size();
 
         // Allocate in FCR region (GC-managed, proper lifecycle).
         // Falls back to os::malloc if FCR allocation fails (e.g., during
@@ -106,7 +105,7 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
         }
         guarantee(dest != nullptr, "Failed to allocate fetch buffer");
 
-        // Simulated fetch: memcpy from sim-remote
+        // Fetch object bytes from remote via backend (SIM/TCP/RDMA)
         rmm->fetch_remote_object(h, dest);
 
         // Publish: release-store LOCAL with new address
