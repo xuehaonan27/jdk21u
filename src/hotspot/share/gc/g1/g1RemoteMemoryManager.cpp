@@ -4,7 +4,7 @@
 
 #include "precompiled.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
-#include "gc/g1/g1CollectedHeap.hpp"
+#include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "logging/log.hpp"
 #include "oops/oop.inline.hpp"
@@ -93,17 +93,12 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
   // 3. Set Handle to REMOTE with slot_id
   h->set_remote(slot_id);
 
-  // 4. Set mark word remote metadata bits (oop_managed)
-  //    We need to CAS because other threads may be accessing the object.
-  markWord old_mark = obj->mark();
-  if (!old_mark.is_unlocked()) {
-    // Object got locked between our check and here; bail out
-    // (Handle is already REMOTE — need to undo. For simplicity in Phase 1, abort.)
-    h->set_local(cast_from_oop<void*>(obj));
-    return false;
+  // 4. Set classification in per-region bitmap (NOT mark word — mark word bits
+  //    cause CAS conflicts in synchronizer.cpp, see lessons learned).
+  HeapRegion* hr = _g1h->heap_region_containing(obj);
+  if (hr != nullptr) {
+    hr->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_SHARED);
   }
-  markWord new_mark = markWord(old_mark.value() | G1_MW_MANAGED_BIT);
-  obj->set_mark(new_mark);
 
   log_info(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT,
                p2i((void*)obj), klass->external_name(), word_size, slot_id);

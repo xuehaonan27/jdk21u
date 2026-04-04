@@ -533,8 +533,12 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
     // Update Handle when a managed (has-Handle) object is evacuated.
     // The Handle must point to the new copy, otherwise Shared OOP -> Handle
     // chains resolve to a stale address (critical correctness, see plan 9.7).
-    if (old_mark.has_remote_metadata()) {
-      _g1h->remote_memory_manager()->update_handle_for_evacuation(old, obj);
+    // Check per-region bitmap (not mark word — mark word bits are unsafe).
+    {
+      uint8_t cls = from_region->get_remote_class(cast_from_oop<HeapWord*>(old));
+      if (cls == HeapRegion::REMOTE_CLASS_SHARED) {
+        _g1h->remote_memory_manager()->update_handle_for_evacuation(old, obj);
+      }
     }
 
     {
@@ -712,11 +716,11 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
       }
 
       {
-        markWord mw = obj->mark();
         // Skip already-managed objects (from previous GC cycles)
-        if (mw.has_remote_metadata()) {
+        if (dest->get_remote_class(cast_from_oop<HeapWord*>(obj)) != HeapRegion::REMOTE_CLASS_UNTRACKED) {
           goto next_entry;
         }
+        markWord mw = obj->mark();
         // Skip locked/inflated objects
         if (!mw.is_unlocked()) {
           goto next_entry;

@@ -178,7 +178,9 @@ class markWord {
 
   // Should this header be preserved during GC?
   bool must_be_preserved(const oopDesc* obj) const {
-    return (!is_unlocked() || !has_no_hash() || has_remote_metadata());
+    // Note: has_remote_metadata() was removed from this check because all
+    // classification metadata is now in per-region bitmaps, not mark word bits.
+    return (!is_unlocked() || !has_no_hash());
   }
 
   // WARNING: The following routines are used EXCLUSIVELY by

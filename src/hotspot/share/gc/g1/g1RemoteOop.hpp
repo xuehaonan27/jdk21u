@@ -91,14 +91,11 @@ inline oop g1_make_unique_oop(oop obj) {
 // the sign bit (bit 63) and high bits that might be interpreted
 // differently by some runtime code paths (MethodHandles, monitors).
 //
-// Only G1_MW_MANAGED_BIT is actively used (by evict_object to mark
-// individually evicted objects via mark word). Other classification
-// metadata is stored in the per-region bitmap (see HeapRegion::_remote_class_map).
-// Mark word bits were abandoned for bulk classification because HotSpot's
-// synchronization subsystem does full 64-bit CAS on mark words.
-
-const int       G1_MW_MANAGED_SHIFT  = 44;
-const uintptr_t G1_MW_MANAGED_BIT   = uintptr_t(1) << G1_MW_MANAGED_SHIFT;
+// All mark word metadata constants have been removed. Classification is stored
+// ENTIRELY in the per-region bitmap (HeapRegion::_remote_class_map).
+// Mark word bits are UNSAFE for custom metadata — HotSpot's synchronization
+// subsystem does full 64-bit CAS on the mark word, causing CAS conflicts
+// that crash MethodHandle adapters, monitor inflation, and hash installation.
 
 
 // ============================================================
