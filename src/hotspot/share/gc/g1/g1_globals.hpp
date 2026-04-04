@@ -292,7 +292,25 @@
           "Hostname or IP of the remote executor process.")                 \
                                                                             \
   product(uint, RemoteExecutorPort, 18515, DIAGNOSTIC,                      \
-          "TCP port of the remote executor process.")                \
+          "TCP port of the remote executor process.")                       \
+                                                                            \
+  product(size_t, RDMADataBufSize, 4*M, DIAGNOSTIC,                         \
+          "Size of the RDMA data staging buffer in bytes. Used for "        \
+          "RDMA WRITE (eviction) and RDMA READ (fetch). Larger values "     \
+          "allow bigger objects but require more locked memory "             \
+          "(check ulimit -l).")                                             \
+                                                                            \
+  product(size_t, RDMAMsgBufSize, 64*K, DIAGNOSTIC,                         \
+          "Size of each RDMA SEND/RECV message buffer in bytes.")           \
+                                                                            \
+  product(uint, RDMACQDepth, 256, DIAGNOSTIC,                               \
+          "Depth of RDMA completion queues.")                               \
+                                                                            \
+  product(uint, RDMASQDepth, 128, DIAGNOSTIC,                               \
+          "Depth of RDMA send queue.")                                      \
+                                                                            \
+  product(uint, RDMARQDepth, 128, DIAGNOSTIC,                               \
+          "Depth of RDMA receive queue.")                \
                                                                             \
   product(uintx, G1PeriodicGCInterval, 0, MANAGEABLE,                       \
           "Number of milliseconds after a previous GC to wait before "      \

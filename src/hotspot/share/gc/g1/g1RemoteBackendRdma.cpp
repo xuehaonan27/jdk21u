@@ -38,11 +38,13 @@ static const uint32_t RE_RESP_OK                = 0x81;
 static const uint32_t RE_RESP_OBJECT_DATA       = 0x83;
 static const uint32_t RE_RESP_COLLECTION_RESULT = 0x84;
 
-static const size_t RDMA_MAX_MSG_SIZE   = 64 * 1024;
-static const size_t RDMA_DATA_BUF_SIZE  = 256ULL * 1024 * 1024;
-static const int    RDMA_CQ_DEPTH       = 256;
-static const int    RDMA_SQ_DEPTH       = 128;
-static const int    RDMA_RQ_DEPTH       = 128;
+// RDMA parameters are set via JVM flags (g1_globals.hpp):
+//   -XX:RDMAMsgBufSize=65536    (SEND/RECV buffer, default 64K)
+//   -XX:RDMADataBufSize=4194304 (WRITE/READ staging, default 4M)
+//   -XX:RDMACQDepth=256
+//   -XX:RDMASQDepth=128
+//   -XX:RDMARQDepth=128
+// Increase RDMADataBufSize for large objects; ensure ulimit -l covers it.
 
 // QP metadata for bootstrap (must match executor's rdma_qp_info_t)
 struct RdmaQPInfo {
@@ -127,16 +129,16 @@ bool RDMAExecutorBackend::setup_rdma_resources() {
   _pd = ibv_alloc_pd(_ctx);
   if (!_pd) { log_warning(gc)("RDMA: ibv_alloc_pd failed"); return false; }
 
-  _send_cq = ibv_create_cq(_ctx, RDMA_CQ_DEPTH, NULL, NULL, 0);
-  _recv_cq = ibv_create_cq(_ctx, RDMA_CQ_DEPTH, NULL, NULL, 0);
+  _send_cq = ibv_create_cq(_ctx, RDMACQDepth, NULL, NULL, 0);
+  _recv_cq = ibv_create_cq(_ctx, RDMACQDepth, NULL, NULL, 0);
   if (!_send_cq || !_recv_cq) { log_warning(gc)("RDMA: ibv_create_cq failed"); return false; }
 
   struct ibv_qp_init_attr qp_init;
   memset(&qp_init, 0, sizeof(qp_init));
   qp_init.send_cq = _send_cq;
   qp_init.recv_cq = _recv_cq;
-  qp_init.cap.max_send_wr = RDMA_SQ_DEPTH;
-  qp_init.cap.max_recv_wr = RDMA_RQ_DEPTH;
+  qp_init.cap.max_send_wr = RDMASQDepth;
+  qp_init.cap.max_recv_wr = RDMARQDepth;
   qp_init.cap.max_send_sge = 1;
   qp_init.cap.max_recv_sge = 1;
   qp_init.cap.max_inline_data = 64;
@@ -147,10 +149,10 @@ bool RDMAExecutorBackend::setup_rdma_resources() {
 
   // Allocate and register buffers: send, recv, data staging
   // We use a single large MR for all three, with offsets:
-  //   [0, RDMA_MAX_MSG_SIZE)            = send buffer
-  //   [RDMA_MAX_MSG_SIZE, 2*MAX)        = recv buffer
-  //   [2*MAX, 2*MAX + RDMA_DATA_BUF_SIZE) = data staging (for RDMA WRITE/READ)
-  size_t total_size = 2 * RDMA_MAX_MSG_SIZE + RDMA_DATA_BUF_SIZE;
+  //   [0, RDMAMsgBufSize)            = send buffer
+  //   [RDMAMsgBufSize, 2*MAX)        = recv buffer
+  //   [2*MAX, 2*MAX + RDMADataBufSize) = data staging (for RDMA WRITE/READ)
+  size_t total_size = 2 * RDMAMsgBufSize + RDMADataBufSize;
   void* buf = os::malloc(total_size, mtGC);
   if (!buf) { log_warning(gc)("RDMA: buffer malloc failed"); return false; }
   memset(buf, 0, total_size);
@@ -158,7 +160,15 @@ bool RDMAExecutorBackend::setup_rdma_resources() {
   _local_mr = ibv_reg_mr(_pd, buf, total_size,
                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                           IBV_ACCESS_REMOTE_READ);
-  if (!_local_mr) { log_warning(gc)("RDMA: ibv_reg_mr failed"); os::free(buf); return false; }
+  if (!_local_mr) {
+    log_warning(gc)("RDMA: ibv_reg_mr failed for " SIZE_FORMAT " bytes (errno=%d: %s). "
+                    "Check 'ulimit -l' (locked memory limit). RDMA pins pages. "
+                    "Fix: 'ulimit -l unlimited' or /etc/security/limits.conf. "
+                    "Or reduce: -XX:RDMADataBufSize=<smaller> -XX:RDMAMsgBufSize=<smaller>",
+                    total_size, errno, os::strerror(errno));
+    os::free(buf);
+    return false;
+  }
 
   // Transition QP to INIT
   struct ibv_qp_attr attr;
@@ -193,7 +203,7 @@ bool RDMAExecutorBackend::exchange_qp_info() {
   memcpy(local_info.gid, &gid, 16);
   local_info.rkey = _local_mr->rkey;
   local_info.base_addr = (uint64_t)_local_mr->addr;
-  local_info.arena_size = RDMA_DATA_BUF_SIZE;
+  local_info.arena_size = RDMADataBufSize;
 
   // Exchange via TCP
   RdmaQPInfo remote_info;
@@ -264,7 +274,7 @@ bool RDMAExecutorBackend::exchange_qp_info() {
 // ================================================================
 
 bool RDMAExecutorBackend::rdma_send_msg(const void* data, size_t len) {
-  if (len > RDMA_MAX_MSG_SIZE) return false;
+  if (len > RDMAMsgBufSize) return false;
   void* send_buf = _local_mr->addr;  // offset 0 = send buffer
   memcpy(send_buf, data, len);
 
@@ -290,11 +300,11 @@ bool RDMAExecutorBackend::rdma_send_msg(const void* data, size_t len) {
 
 bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actual_len) {
   // Post recv
-  void* recv_buf = (char*)_local_mr->addr + RDMA_MAX_MSG_SIZE;  // offset = recv buffer
+  void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;  // offset = recv buffer
 
   struct ibv_sge sge;
   sge.addr = (uintptr_t)recv_buf;
-  sge.length = RDMA_MAX_MSG_SIZE;
+  sge.length = RDMAMsgBufSize;
   sge.lkey = _local_mr->lkey;
 
   struct ibv_recv_wr wr;
@@ -321,7 +331,7 @@ bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actua
 // ================================================================
 
 bool RDMAExecutorBackend::rdma_write(uint64_t remote_offset, const void* local_buf, size_t len) {
-  void* data_buf = (char*)_local_mr->addr + 2 * RDMA_MAX_MSG_SIZE;
+  void* data_buf = (char*)_local_mr->addr + 2 * RDMAMsgBufSize;
   memcpy(data_buf, local_buf, len);
 
   struct ibv_sge sge;
@@ -347,7 +357,7 @@ bool RDMAExecutorBackend::rdma_write(uint64_t remote_offset, const void* local_b
 }
 
 bool RDMAExecutorBackend::rdma_read(uint64_t remote_offset, void* local_buf, size_t len) {
-  void* data_buf = (char*)_local_mr->addr + 2 * RDMA_MAX_MSG_SIZE;
+  void* data_buf = (char*)_local_mr->addr + 2 * RDMAMsgBufSize;
 
   struct ibv_sge sge;
   sge.addr = (uintptr_t)data_buf;
@@ -405,8 +415,8 @@ bool RDMAExecutorBackend::initialize() {
 
   // Pre-post recv buffers
   for (int i = 0; i < 4; i++) {
-    void* recv_buf = (char*)_local_mr->addr + RDMA_MAX_MSG_SIZE;
-    struct ibv_sge sge = { (uintptr_t)recv_buf, RDMA_MAX_MSG_SIZE, _local_mr->lkey };
+    void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
+    struct ibv_sge sge = { (uintptr_t)recv_buf, RDMAMsgBufSize, _local_mr->lkey };
     struct ibv_recv_wr wr;
     memset(&wr, 0, sizeof(wr));
     wr.sg_list = &sge; wr.num_sge = 1;
