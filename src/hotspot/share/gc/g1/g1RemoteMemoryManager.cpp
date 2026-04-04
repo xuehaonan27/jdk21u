@@ -34,21 +34,40 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   memset(_table, 0, sizeof(_table));
   memset(_sim_remote_slots, 0, sizeof(_sim_remote_slots));
 
-  // Create remote storage backend based on UseRemoteExecutor flag.
+  // Create remote storage backend.
+  // Selection priority:
+  //   1. Compile-time: --with-remote=RDMA/TCP/SIM sets REMOTE_BACKEND_* macros
+  //   2. Runtime: -XX:+UseRemoteExecutor overrides to TCP (or RDMA if compiled)
+  //   3. Default: SimLocalBackend (in-process, no network)
+  //
+  // With --with-remote=RDMA, the RDMA backend is the DEFAULT (no runtime flag needed).
+  // With --with-remote=TCP, the TCP backend is the DEFAULT.
+  // UseRemoteExecutor=true at runtime overrides SIM to the compiled executor backend.
+
+#if defined(REMOTE_BACKEND_RDMA)
+  // Compiled with --with-remote=RDMA: default to RDMA executor
+  _backend = new RDMAExecutorBackend();
+#elif defined(REMOTE_BACKEND_TCP)
+  // Compiled with --with-remote=TCP: default to TCP executor
+  _backend = new TCPExecutorBackend();
+#else
+  // Compiled with --with-remote=SIM (or not specified): default to sim-local
+  // But UseRemoteExecutor at runtime can override to executor
   if (UseRemoteExecutor) {
 #ifdef REMOTE_EXECUTOR_USE_RDMA
     _backend = new RDMAExecutorBackend();
 #else
     _backend = new TCPExecutorBackend();
 #endif
-    if (!_backend->initialize()) {
-      log_warning(gc)("Remote executor backend (%s) initialization failed, falling back to sim-local",
-                      _backend->name());
-      delete _backend;
-      _backend = new SimLocalBackend();
-      _backend->initialize();
-    }
   } else {
+    _backend = new SimLocalBackend();
+  }
+#endif
+
+  if (!_backend->initialize()) {
+    log_warning(gc)("Remote backend (%s) initialization failed, falling back to sim-local",
+                    _backend->name());
+    delete _backend;
     _backend = new SimLocalBackend();
     _backend->initialize();
   }
