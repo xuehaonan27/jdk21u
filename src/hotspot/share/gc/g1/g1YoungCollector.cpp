@@ -996,6 +996,16 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
   assert_used_and_recalculate_used_equal(_g1h);
 
+  // Remote collection: free dead remote objects without fetching.
+  // "Garbage never crosses the network" — dispatches to the selected backend
+  // (sim, TCP executor, or RDMA executor) via G1RemoteMemoryManager.
+  {
+    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      rmm->collect_dead_remote_objects();
+    }
+  }
+
   // Simulated remote memory eviction.
   // Phase 2+: uses classification bitmap to prefer Shared objects (have Handles).
   // Shared objects can be evicted via Handle → REMOTE transition.

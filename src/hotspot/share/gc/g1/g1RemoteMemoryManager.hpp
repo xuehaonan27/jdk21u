@@ -234,9 +234,46 @@ public:
   // and we can't allocate a new one (e.g., in JRT_LEAF context).
   HeapWord* allocate_in_fcr(size_t word_size);
 
+  // ============================================================
+  // Remote Collection — "Garbage Never Crosses the Network"
+  // ============================================================
+  // After concurrent marking, identify dead remote objects and free their
+  // sim-remote slots WITHOUT fetching them back. Only live remote objects
+  // are kept (and fetched lazily on access via the load barrier).
+  //
+  // This is the core research contribution: object-granularity remote memory
+  // management where garbage stays remote and is discarded in-place.
+  //
+  // Returns: number of dead remote objects collected.
+  size_t collect_dead_remote_objects();
+
   bool is_managed(oop obj) const {
     return handle_for(obj) != nullptr;
   }
+
+  // ============================================================
+  // Remote Executor Client (TCP to executor process)
+  // ============================================================
+  // When UseRemoteExecutor is enabled, these replace sim_remote_* operations.
+  // The executor is a separate C process (remote_executor) that manages
+  // object storage on the memory node and performs garbage identification.
+private:
+  int      _executor_fd;           // TCP socket (-1 if not connected)
+  bool     _executor_connected;
+  uint64_t _executor_seq_id;
+
+  bool ensure_executor_connected();
+  bool executor_send_all(const void* data, size_t len);
+  bool executor_recv_all(void* buf, size_t len);
+  bool executor_send_msg(const void* data, size_t len);
+  bool executor_recv_msg(void* buf, size_t max_len, size_t* actual_len);
+  bool executor_hello();
+
+public:
+  // Executor-backed operations (dispatch based on UseRemoteExecutor flag)
+  size_t remote_evict(oop obj, size_t word_size, Klass* klass);
+  Klass* remote_fetch(size_t slot_id, void* dest, size_t* out_word_size);
+  size_t remote_collect_dead();
 
   size_t sim_remote_evicted_count() const { return _sim_remote_evicted_count; }
   size_t sim_remote_fetched_count() const { return _sim_remote_fetched_count; }

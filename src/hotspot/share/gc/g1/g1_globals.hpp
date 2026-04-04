@@ -282,7 +282,17 @@
                                                                             \
   product(bool, G1SimulateRemoteEviction, false, DIAGNOSTIC,                \
           "After each GC, simulate evicting a few old objects to remote "   \
-          "memory. For testing disaggregated memory infrastructure.")                \
+          "memory. For testing disaggregated memory infrastructure.")       \
+                                                                            \
+  product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
+          "Connect to a remote executor process for disaggregated memory "  \
+          "object storage instead of local simulation (sim-remote).")       \
+                                                                            \
+  product(ccstr, RemoteExecutorHost, "127.0.0.1", DIAGNOSTIC,               \
+          "Hostname or IP of the remote executor process.")                 \
+                                                                            \
+  product(uint, RemoteExecutorPort, 18515, DIAGNOSTIC,                      \
+          "TCP port of the remote executor process.")                \
                                                                             \
   product(uintx, G1PeriodicGCInterval, 0, MANAGEABLE,                       \
           "Number of milliseconds after a previous GC to wait before "      \
