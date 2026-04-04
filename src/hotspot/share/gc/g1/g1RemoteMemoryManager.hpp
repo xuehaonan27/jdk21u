@@ -78,6 +78,12 @@ public:
   G1RemoteMemoryManager(G1CollectedHeap* g1h);
   ~G1RemoteMemoryManager();
 
+  // Must be called AFTER G1CollectedHeap::initialize() has set up the heap
+  // regions (_hrm.initialize, initialize_reserved_region). At that point
+  // G1CollectedHeap::heap(), reserved(), and max_capacity() are valid.
+  // Connects the backend to the remote executor and sends the hello handshake.
+  void initialize_backend();
+
   // ============================================================
   // Handle management
   // ============================================================

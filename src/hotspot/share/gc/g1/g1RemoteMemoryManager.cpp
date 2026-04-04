@@ -64,6 +64,11 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   }
 #endif
 
+  // Backend object created; connection deferred to initialize_backend()
+  // (called from G1CollectedHeap::initialize() when heap info is available).
+}
+
+void G1RemoteMemoryManager::initialize_backend() {
   if (!_backend->initialize()) {
     log_warning(gc)("Remote backend (%s) initialization failed, falling back to sim-local",
                     _backend->name());

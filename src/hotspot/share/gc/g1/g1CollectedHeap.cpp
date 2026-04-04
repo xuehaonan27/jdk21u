@@ -1455,6 +1455,10 @@ jint G1CollectedHeap::initialize() {
   _hrm.initialize(heap_storage, bitmap_storage, bot_storage, cardtable_storage);
   _card_table->initialize(cardtable_storage);
 
+  // Now that reserved() and max_capacity() are valid, connect the remote
+  // backend and send the hello handshake with heap info.
+  _remote_memory_manager->initialize_backend();
+
   // 6843694 - ensure that the maximum region index can fit
   // in the remembered set structures.
   const uint max_region_idx = (1U << (sizeof(RegionIdx_t)*BitsPerByte-1)) - 1;
