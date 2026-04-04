@@ -172,10 +172,9 @@ class markWord {
     return is_unlocked() && (value() & remote_metadata_mask) != 0;
   }
 
-  // Clear remote metadata bits (used in forward_to for safety).
-  markWord clear_remote_metadata() const {
-    return markWord(value() & ~remote_metadata_mask);
-  }
+  // NOTE: clear_remote_metadata() was removed. During forwarding, the mark word
+  // stores a real heap address in bits 2-63. Clearing any bits corrupts it.
+  // has_remote_metadata() guards against forwarding state via is_unlocked().
 
   // Should this header be preserved during GC?
   bool must_be_preserved(const oopDesc* obj) const {

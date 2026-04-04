@@ -654,6 +654,13 @@ class G1VerifyLiveAndRemSetClosure : public BasicOopIterateClosure {
       return;
     }
     oop obj = CompressedOops::decode_not_null(heap_oop);
+    // Resolve tagged oops for managed objects (disaggregated memory).
+    // Without this, tagged Shared OOPs would fail is_in() checks.
+    obj = resolve_oop_raw(obj);
+    // Skip remote objects (resolved to non-heap slot_id)
+    if (!G1CollectedHeap::heap()->is_in(obj)) {
+      return;
+    }
 
     LiveChecker<T> live_check(this, _containing_obj, p, obj, _vo);
     if (live_check.failed()) {

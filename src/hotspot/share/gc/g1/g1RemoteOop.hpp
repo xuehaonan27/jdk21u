@@ -91,28 +91,14 @@ inline oop g1_make_unique_oop(oop obj) {
 // the sign bit (bit 63) and high bits that might be interpreted
 // differently by some runtime code paths (MethodHandles, monitors).
 //
-// Bit 44: oop_managed     -- classified as Unique or Shared
-// Bit 43: oop_shared      -- 0=Unique (RC=1), 1=Shared (RC>1)
-// Bit 42: has_handle      -- Handle allocated (partially-upgraded)
-// Bit 41: remote_stored   -- object bytes on remote memory
-// Bits 40-39: hotness     -- 00=Cold, 01=Warm, 10=Hot, 11=VeryHot
+// Only G1_MW_MANAGED_BIT is actively used (by evict_object to mark
+// individually evicted objects via mark word). Other classification
+// metadata is stored in the per-region bitmap (see HeapRegion::_remote_class_map).
+// Mark word bits were abandoned for bulk classification because HotSpot's
+// synchronization subsystem does full 64-bit CAS on mark words.
 
-const int      G1_MW_MANAGED_SHIFT   = 44;
-const int      G1_MW_SHARED_SHIFT    = 43;
-const int      G1_MW_HAS_HANDLE_SHIFT = 42;
-const int      G1_MW_REMOTE_SHIFT    = 41;
-const int      G1_MW_HOTNESS_SHIFT   = 39;
-
-const uintptr_t G1_MW_MANAGED_BIT    = uintptr_t(1) << G1_MW_MANAGED_SHIFT;
-const uintptr_t G1_MW_SHARED_BIT     = uintptr_t(1) << G1_MW_SHARED_SHIFT;
-const uintptr_t G1_MW_HAS_HANDLE_BIT = uintptr_t(1) << G1_MW_HAS_HANDLE_SHIFT;
-const uintptr_t G1_MW_REMOTE_BIT     = uintptr_t(1) << G1_MW_REMOTE_SHIFT;
-const uintptr_t G1_MW_HOTNESS_MASK   = uintptr_t(3) << G1_MW_HOTNESS_SHIFT;
-
-// All remote metadata bits (for must_be_preserved check and forward_to safety clear)
-const uintptr_t G1_MW_REMOTE_METADATA_MASK =
-    G1_MW_MANAGED_BIT | G1_MW_SHARED_BIT | G1_MW_HAS_HANDLE_BIT |
-    G1_MW_REMOTE_BIT  | G1_MW_HOTNESS_MASK;
+const int       G1_MW_MANAGED_SHIFT  = 44;
+const uintptr_t G1_MW_MANAGED_BIT   = uintptr_t(1) << G1_MW_MANAGED_SHIFT;
 
 
 // ============================================================
