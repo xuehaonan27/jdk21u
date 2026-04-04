@@ -1,0 +1,597 @@
+/*
+ * RDMAExecutorBackend — JVM-side RDMA client for the remote executor.
+ *
+ * Uses ibverbs for:
+ *   Control: RDMA SEND/RECV (reliable connected QP) — same protocol as TCP
+ *   Data: RDMA WRITE (eviction), RDMA READ (fetch) — one-sided, bypasses remote CPU
+ *
+ * Bootstrap via TCP (exchange QP metadata), then all communication is RDMA.
+ */
+
+#include "precompiled.hpp"
+
+#ifdef REMOTE_EXECUTOR_USE_RDMA
+
+#include "gc/g1/g1RemoteBackendRdma.hpp"
+#include "gc/shared/gc_globals.hpp"
+#include "runtime/globals.hpp"
+#include "logging/log.hpp"
+#include "runtime/os.hpp"
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <infiniband/verbs.h>
+
+// Protocol constants (match remote_protocol.h)
+static const uint32_t RE_CMD_HELLO              = 0x01;
+static const uint32_t RE_CMD_EVICT_OBJECT       = 0x03;
+static const uint32_t RE_CMD_REPORT_ROOTS       = 0x04;
+static const uint32_t RE_CMD_REQUEST_COLLECTION = 0x05;
+static const uint32_t RE_CMD_FETCH_OBJECT       = 0x06;
+static const uint32_t RE_CMD_DISCARD_SLOT       = 0x07;
+static const uint32_t RE_CMD_SHUTDOWN           = 0xFF;
+static const uint32_t RE_RESP_OK                = 0x81;
+static const uint32_t RE_RESP_OBJECT_DATA       = 0x83;
+static const uint32_t RE_RESP_COLLECTION_RESULT = 0x84;
+
+static const size_t RDMA_MAX_MSG_SIZE   = 64 * 1024;
+static const size_t RDMA_DATA_BUF_SIZE  = 256ULL * 1024 * 1024;
+static const int    RDMA_CQ_DEPTH       = 256;
+static const int    RDMA_SQ_DEPTH       = 128;
+static const int    RDMA_RQ_DEPTH       = 128;
+
+// QP metadata for bootstrap (must match executor's rdma_qp_info_t)
+struct RdmaQPInfo {
+    uint32_t qpn;
+    uint32_t psn;
+    uint16_t lid;
+    uint8_t  gid[16];
+    uint32_t rkey;
+    uint64_t base_addr;
+    uint64_t arena_size;
+} __attribute__((packed));
+
+// ================================================================
+// TCP helpers for bootstrap
+// ================================================================
+
+static bool tcp_send_exact(int fd, const void* buf, size_t len) {
+  const uint8_t* p = (const uint8_t*)buf;
+  while (len > 0) {
+    ssize_t n = ::send(fd, p, len, 0);
+    if (n <= 0) { if (n < 0 && errno == EINTR) continue; return false; }
+    p += n; len -= n;
+  }
+  return true;
+}
+
+static bool tcp_recv_exact(int fd, void* buf, size_t len) {
+  uint8_t* p = (uint8_t*)buf;
+  while (len > 0) {
+    ssize_t n = ::recv(fd, p, len, 0);
+    if (n <= 0) { if (n < 0 && errno == EINTR) continue; return false; }
+    p += n; len -= n;
+  }
+  return true;
+}
+
+// ================================================================
+// CQ polling helper
+// ================================================================
+
+static bool poll_cq_wait(struct ibv_cq* cq, struct ibv_wc* wc) {
+  int ne;
+  do { ne = ibv_poll_cq(cq, 1, wc); } while (ne == 0);
+  if (ne < 0 || wc->status != IBV_WC_SUCCESS) {
+    log_warning(gc)("RDMA: poll_cq failed: ne=%d status=%d", ne, wc->status);
+    return false;
+  }
+  return true;
+}
+
+// ================================================================
+// Constructor / Destructor
+// ================================================================
+
+RDMAExecutorBackend::RDMAExecutorBackend()
+  : _ctx(nullptr), _pd(nullptr), _send_cq(nullptr), _recv_cq(nullptr),
+    _qp(nullptr), _local_mr(nullptr),
+    _remote_base_addr(0), _remote_rkey(0), _remote_arena_size(0),
+    _tcp_fd(-1), _connected(false), _seq_id(0),
+    _next_slot(0), _total_evicted(0), _total_fetched(0) {
+}
+
+RDMAExecutorBackend::~RDMAExecutorBackend() {
+  shutdown();
+}
+
+// ================================================================
+// RDMA resource setup
+// ================================================================
+
+bool RDMAExecutorBackend::setup_rdma_resources() {
+  // Open first IB device
+  struct ibv_device** dev_list = ibv_get_device_list(NULL);
+  if (!dev_list || !dev_list[0]) {
+    log_warning(gc)("RDMA: no IB devices found");
+    return false;
+  }
+  _ctx = ibv_open_device(dev_list[0]);
+  ibv_free_device_list(dev_list);
+  if (!_ctx) { log_warning(gc)("RDMA: ibv_open_device failed"); return false; }
+
+  _pd = ibv_alloc_pd(_ctx);
+  if (!_pd) { log_warning(gc)("RDMA: ibv_alloc_pd failed"); return false; }
+
+  _send_cq = ibv_create_cq(_ctx, RDMA_CQ_DEPTH, NULL, NULL, 0);
+  _recv_cq = ibv_create_cq(_ctx, RDMA_CQ_DEPTH, NULL, NULL, 0);
+  if (!_send_cq || !_recv_cq) { log_warning(gc)("RDMA: ibv_create_cq failed"); return false; }
+
+  struct ibv_qp_init_attr qp_init;
+  memset(&qp_init, 0, sizeof(qp_init));
+  qp_init.send_cq = _send_cq;
+  qp_init.recv_cq = _recv_cq;
+  qp_init.cap.max_send_wr = RDMA_SQ_DEPTH;
+  qp_init.cap.max_recv_wr = RDMA_RQ_DEPTH;
+  qp_init.cap.max_send_sge = 1;
+  qp_init.cap.max_recv_sge = 1;
+  qp_init.cap.max_inline_data = 64;
+  qp_init.qp_type = IBV_QPT_RC;
+
+  _qp = ibv_create_qp(_pd, &qp_init);
+  if (!_qp) { log_warning(gc)("RDMA: ibv_create_qp failed"); return false; }
+
+  // Allocate and register buffers: send, recv, data staging
+  // We use a single large MR for all three, with offsets:
+  //   [0, RDMA_MAX_MSG_SIZE)            = send buffer
+  //   [RDMA_MAX_MSG_SIZE, 2*MAX)        = recv buffer
+  //   [2*MAX, 2*MAX + RDMA_DATA_BUF_SIZE) = data staging (for RDMA WRITE/READ)
+  size_t total_size = 2 * RDMA_MAX_MSG_SIZE + RDMA_DATA_BUF_SIZE;
+  void* buf = os::malloc(total_size, mtGC);
+  if (!buf) { log_warning(gc)("RDMA: buffer malloc failed"); return false; }
+  memset(buf, 0, total_size);
+
+  _local_mr = ibv_reg_mr(_pd, buf, total_size,
+                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_REMOTE_READ);
+  if (!_local_mr) { log_warning(gc)("RDMA: ibv_reg_mr failed"); os::free(buf); return false; }
+
+  // Transition QP to INIT
+  struct ibv_qp_attr attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.qp_state = IBV_QPS_INIT;
+  attr.pkey_index = 0;
+  attr.port_num = 1;
+  attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+  if (ibv_modify_qp(_qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+    log_warning(gc)("RDMA: QP to INIT failed"); return false;
+  }
+
+  log_info(gc)("RDMA: resources created (QP=%u)", _qp->qp_num);
+  return true;
+}
+
+bool RDMAExecutorBackend::exchange_qp_info() {
+  // Fill local info
+  struct ibv_port_attr port_attr;
+  ibv_query_port(_ctx, 1, &port_attr);
+
+  union ibv_gid gid;
+  ibv_query_gid(_ctx, 1, 0, &gid);
+
+  uint32_t local_psn = lrand48() & 0xFFFFFF;
+
+  RdmaQPInfo local_info;
+  memset(&local_info, 0, sizeof(local_info));
+  local_info.qpn = _qp->qp_num;
+  local_info.psn = local_psn;
+  local_info.lid = port_attr.lid;
+  memcpy(local_info.gid, &gid, 16);
+  local_info.rkey = _local_mr->rkey;
+  local_info.base_addr = (uint64_t)_local_mr->addr;
+  local_info.arena_size = RDMA_DATA_BUF_SIZE;
+
+  // Exchange via TCP
+  RdmaQPInfo remote_info;
+  if (!tcp_send_exact(_tcp_fd, &local_info, sizeof(local_info))) return false;
+  if (!tcp_recv_exact(_tcp_fd, &remote_info, sizeof(remote_info))) return false;
+
+  _remote_rkey = remote_info.rkey;
+  _remote_base_addr = remote_info.base_addr;
+  _remote_arena_size = remote_info.arena_size;
+
+  log_info(gc)("RDMA: local QP=%u PSN=%u LID=%u, remote QP=%u PSN=%u LID=%u rkey=0x%x",
+               local_info.qpn, local_info.psn, local_info.lid,
+               remote_info.qpn, remote_info.psn, remote_info.lid, remote_info.rkey);
+
+  // Transition QP: INIT → RTR
+  struct ibv_qp_attr rtr_attr;
+  memset(&rtr_attr, 0, sizeof(rtr_attr));
+  rtr_attr.qp_state = IBV_QPS_RTR;
+  rtr_attr.path_mtu = IBV_MTU_1024;
+  rtr_attr.dest_qp_num = remote_info.qpn;
+  rtr_attr.rq_psn = remote_info.psn;
+  rtr_attr.max_dest_rd_atomic = 1;
+  rtr_attr.min_rnr_timer = 12;
+  rtr_attr.ah_attr.dlid = remote_info.lid;
+  rtr_attr.ah_attr.sl = 0;
+  rtr_attr.ah_attr.src_path_bits = 0;
+  rtr_attr.ah_attr.port_num = 1;
+  rtr_attr.ah_attr.is_global = 0;
+
+  // Check if GID is non-zero (RoCE)
+  bool has_gid = false;
+  for (int i = 0; i < 16; i++) { if (remote_info.gid[i]) { has_gid = true; break; } }
+  if (has_gid) {
+    rtr_attr.ah_attr.is_global = 1;
+    memcpy(&rtr_attr.ah_attr.grh.dgid, remote_info.gid, 16);
+    rtr_attr.ah_attr.grh.hop_limit = 255;
+    rtr_attr.ah_attr.grh.sgid_index = 0;
+  }
+
+  if (ibv_modify_qp(_qp, &rtr_attr,
+      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+      IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
+    log_warning(gc)("RDMA: QP to RTR failed"); return false;
+  }
+
+  // Transition QP: RTR → RTS
+  struct ibv_qp_attr rts_attr;
+  memset(&rts_attr, 0, sizeof(rts_attr));
+  rts_attr.qp_state = IBV_QPS_RTS;
+  rts_attr.timeout = 14;
+  rts_attr.retry_cnt = 7;
+  rts_attr.rnr_retry = 7;
+  rts_attr.sq_psn = local_psn;
+  rts_attr.max_rd_atomic = 1;
+
+  if (ibv_modify_qp(_qp, &rts_attr,
+      IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+      IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
+    log_warning(gc)("RDMA: QP to RTS failed"); return false;
+  }
+
+  log_info(gc)("RDMA: QP ready (RTS)");
+  return true;
+}
+
+// ================================================================
+// RDMA SEND/RECV for control messages
+// ================================================================
+
+bool RDMAExecutorBackend::rdma_send_msg(const void* data, size_t len) {
+  if (len > RDMA_MAX_MSG_SIZE) return false;
+  void* send_buf = _local_mr->addr;  // offset 0 = send buffer
+  memcpy(send_buf, data, len);
+
+  struct ibv_sge sge;
+  sge.addr = (uintptr_t)send_buf;
+  sge.length = (uint32_t)len;
+  sge.lkey = _local_mr->lkey;
+
+  struct ibv_send_wr wr;
+  memset(&wr, 0, sizeof(wr));
+  wr.wr_id = 1;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_SEND;
+  wr.send_flags = IBV_SEND_SIGNALED;
+
+  struct ibv_send_wr* bad_wr = NULL;
+  if (ibv_post_send(_qp, &wr, &bad_wr)) return false;
+
+  struct ibv_wc wc;
+  return poll_cq_wait(_send_cq, &wc);
+}
+
+bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actual_len) {
+  // Post recv
+  void* recv_buf = (char*)_local_mr->addr + RDMA_MAX_MSG_SIZE;  // offset = recv buffer
+
+  struct ibv_sge sge;
+  sge.addr = (uintptr_t)recv_buf;
+  sge.length = RDMA_MAX_MSG_SIZE;
+  sge.lkey = _local_mr->lkey;
+
+  struct ibv_recv_wr wr;
+  memset(&wr, 0, sizeof(wr));
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+
+  struct ibv_recv_wr* bad_wr = NULL;
+  if (ibv_post_recv(_qp, &wr, &bad_wr)) return false;
+
+  // Wait for completion
+  struct ibv_wc wc;
+  if (!poll_cq_wait(_recv_cq, &wc)) return false;
+
+  size_t len = wc.byte_len;
+  if (len > max_len) len = max_len;
+  memcpy(buf, recv_buf, len);
+  if (actual_len) *actual_len = len;
+  return true;
+}
+
+// ================================================================
+// RDMA one-sided data operations
+// ================================================================
+
+bool RDMAExecutorBackend::rdma_write(uint64_t remote_offset, const void* local_buf, size_t len) {
+  void* data_buf = (char*)_local_mr->addr + 2 * RDMA_MAX_MSG_SIZE;
+  memcpy(data_buf, local_buf, len);
+
+  struct ibv_sge sge;
+  sge.addr = (uintptr_t)data_buf;
+  sge.length = (uint32_t)len;
+  sge.lkey = _local_mr->lkey;
+
+  struct ibv_send_wr wr;
+  memset(&wr, 0, sizeof(wr));
+  wr.wr_id = 2;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = _remote_base_addr + remote_offset;
+  wr.wr.rdma.rkey = _remote_rkey;
+
+  struct ibv_send_wr* bad_wr = NULL;
+  if (ibv_post_send(_qp, &wr, &bad_wr)) return false;
+
+  struct ibv_wc wc;
+  return poll_cq_wait(_send_cq, &wc);
+}
+
+bool RDMAExecutorBackend::rdma_read(uint64_t remote_offset, void* local_buf, size_t len) {
+  void* data_buf = (char*)_local_mr->addr + 2 * RDMA_MAX_MSG_SIZE;
+
+  struct ibv_sge sge;
+  sge.addr = (uintptr_t)data_buf;
+  sge.length = (uint32_t)len;
+  sge.lkey = _local_mr->lkey;
+
+  struct ibv_send_wr wr;
+  memset(&wr, 0, sizeof(wr));
+  wr.wr_id = 3;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_READ;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = _remote_base_addr + remote_offset;
+  wr.wr.rdma.rkey = _remote_rkey;
+
+  struct ibv_send_wr* bad_wr = NULL;
+  if (ibv_post_send(_qp, &wr, &bad_wr)) return false;
+
+  struct ibv_wc wc;
+  if (!poll_cq_wait(_send_cq, &wc)) return false;
+
+  memcpy(local_buf, data_buf, len);
+  return true;
+}
+
+// ================================================================
+// Lifecycle
+// ================================================================
+
+bool RDMAExecutorBackend::initialize() {
+  const char* host = RemoteExecutorHost;
+  int port = (int)RemoteExecutorPort;
+
+  if (!setup_rdma_resources()) return false;
+
+  // TCP connect for bootstrap
+  _tcp_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (_tcp_fd < 0) { log_warning(gc)("RDMA: socket failed"); return false; }
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+    log_warning(gc)("RDMA: invalid host %s", host);
+    return false;
+  }
+  if (::connect(_tcp_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    log_warning(gc)("RDMA: TCP connect to %s:%d failed: %s", host, port, os::strerror(errno));
+    return false;
+  }
+
+  if (!exchange_qp_info()) return false;
+
+  // Pre-post recv buffers
+  for (int i = 0; i < 4; i++) {
+    void* recv_buf = (char*)_local_mr->addr + RDMA_MAX_MSG_SIZE;
+    struct ibv_sge sge = { (uintptr_t)recv_buf, RDMA_MAX_MSG_SIZE, _local_mr->lkey };
+    struct ibv_recv_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sge; wr.num_sge = 1;
+    struct ibv_recv_wr* bad_wr = NULL;
+    ibv_post_recv(_qp, &wr, &bad_wr);
+  }
+
+  // Send hello via RDMA SEND
+  uint8_t hello[32];
+  memset(hello, 0, sizeof(hello));
+  *(uint32_t*)(hello + 0) = RE_CMD_HELLO;
+  *(uint32_t*)(hello + 4) = 32;
+  *(uint64_t*)(hello + 8) = _seq_id++;
+  *(uint32_t*)(hello + 16) = 1;  // protocol version
+
+  if (!rdma_send_msg(hello, 32)) { log_warning(gc)("RDMA: hello send failed"); return false; }
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) { log_warning(gc)("RDMA: hello recv failed"); return false; }
+  if (*(uint32_t*)resp != RE_RESP_OK) { log_warning(gc)("RDMA: hello rejected"); return false; }
+
+  _connected = true;
+  log_info(gc)("Remote backend: rdma-executor connected to %s:%d via RDMA", host, port);
+  return true;
+}
+
+void RDMAExecutorBackend::shutdown() {
+  if (_connected) {
+    uint8_t msg[16];
+    memset(msg, 0, sizeof(msg));
+    *(uint32_t*)msg = RE_CMD_SHUTDOWN;
+    *(uint32_t*)(msg + 4) = 16;
+    rdma_send_msg(msg, 16);
+    _connected = false;
+  }
+  if (_qp) { ibv_destroy_qp(_qp); _qp = nullptr; }
+  if (_send_cq) { ibv_destroy_cq(_send_cq); _send_cq = nullptr; }
+  if (_recv_cq) { ibv_destroy_cq(_recv_cq); _recv_cq = nullptr; }
+  if (_local_mr) {
+    void* buf = _local_mr->addr;
+    ibv_dereg_mr(_local_mr);
+    os::free(buf);
+    _local_mr = nullptr;
+  }
+  if (_pd) { ibv_dealloc_pd(_pd); _pd = nullptr; }
+  if (_ctx) { ibv_close_device(_ctx); _ctx = nullptr; }
+  if (_tcp_fd >= 0) { ::close(_tcp_fd); _tcp_fd = -1; }
+}
+
+// ================================================================
+// Backend operations — same protocol as TCPExecutorBackend
+// but using RDMA SEND/RECV instead of TCP
+// ================================================================
+
+size_t RDMAExecutorBackend::evict(const void* obj_bytes, size_t word_size,
+                                  Klass* klass, size_t hint_slot_id) {
+  if (!_connected) return (size_t)-1;
+
+  size_t slot_id = (hint_slot_id != (size_t)-1) ? hint_slot_id : _next_slot++;
+  size_t byte_size = word_size * HeapWordSize;
+
+  // CMD_EVICT_OBJECT: header(16) + slot_id(8) + klass(8) + word_size(4) + bytes
+  size_t msg_size = 36 + byte_size;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  *(uint32_t*)(msg + 0)  = RE_CMD_EVICT_OBJECT;
+  *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8)  = _seq_id++;
+  *(uint64_t*)(msg + 16) = slot_id;
+  *(uint64_t*)(msg + 24) = (uint64_t)klass;
+  *(uint32_t*)(msg + 32) = (uint32_t)word_size;
+  memcpy(msg + 36, obj_bytes, byte_size);
+
+  bool ok = rdma_send_msg(msg, msg_size);
+  os::free(msg);
+  if (!ok) return (size_t)-1;
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) return (size_t)-1;
+
+  _total_evicted++;
+  return slot_id;
+}
+
+Klass* RDMAExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_size) {
+  if (!_connected) return nullptr;
+
+  uint8_t msg[24];
+  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_OBJECT;
+  *(uint32_t*)(msg + 4) = 24;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = slot_id;
+  if (!rdma_send_msg(msg, 24)) return nullptr;
+
+  uint8_t* resp = (uint8_t*)os::malloc(128 * 1024, mtGC);
+  size_t resp_len = 0;
+  if (!rdma_recv_msg(resp, 128 * 1024, &resp_len)) { os::free(resp); return nullptr; }
+  if (*(uint32_t*)resp != RE_RESP_OBJECT_DATA) { os::free(resp); return nullptr; }
+
+  uint64_t resp_klass = *(uint64_t*)(resp + 24);
+  uint32_t resp_ws = *(uint32_t*)(resp + 32);
+  memcpy(dest, resp + 36, resp_ws * HeapWordSize);
+  if (out_word_size) *out_word_size = resp_ws;
+
+  os::free(resp);
+  _total_fetched++;
+  return (Klass*)resp_klass;
+}
+
+void RDMAExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_roots) {
+  if (!_connected) return;
+
+  size_t msg_size = 20 + num_roots * 8;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  *(uint32_t*)(msg + 0) = RE_CMD_REPORT_ROOTS;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint32_t*)(msg + 16) = (uint32_t)num_roots;
+  uint64_t* ids = (uint64_t*)(msg + 20);
+  for (size_t i = 0; i < num_roots; i++) ids[i] = (uint64_t)root_slot_ids[i];
+
+  rdma_send_msg(msg, msg_size);
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+}
+
+void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_dead,
+                                       size_t* out_bytes_freed) {
+  if (!_connected) {
+    *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
+    return;
+  }
+
+  uint8_t msg[16];
+  *(uint32_t*)(msg + 0) = RE_CMD_REQUEST_COLLECTION;
+  *(uint32_t*)(msg + 4) = 16;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  rdma_send_msg(msg, 16);
+
+  uint8_t* resp = (uint8_t*)os::malloc(1024 * 1024, mtGC);
+  size_t resp_len = 0;
+  if (!rdma_recv_msg(resp, 1024 * 1024, &resp_len)) {
+    os::free(resp);
+    *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
+    return;
+  }
+
+  if (*(uint32_t*)resp != RE_RESP_COLLECTION_RESULT) {
+    os::free(resp);
+    *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
+    return;
+  }
+
+  uint32_t num_dead = *(uint32_t*)(resp + 16);
+  uint64_t bytes_freed = *(uint64_t*)(resp + 24);
+  uint64_t* dead_raw = (uint64_t*)(resp + 32);
+
+  size_t* dead = (size_t*)os::malloc(num_dead * sizeof(size_t), mtGC);
+  for (uint32_t i = 0; i < num_dead; i++) dead[i] = (size_t)dead_raw[i];
+
+  *out_dead_ids = dead;
+  *out_num_dead = num_dead;
+  *out_bytes_freed = bytes_freed;
+  os::free(resp);
+}
+
+void RDMAExecutorBackend::discard_slot(size_t slot_id) {
+  if (!_connected) return;
+  uint8_t msg[24];
+  *(uint32_t*)(msg + 0) = RE_CMD_DISCARD_SLOT;
+  *(uint32_t*)(msg + 4) = 24;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = slot_id;
+  rdma_send_msg(msg, 24);
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+}
+
+size_t RDMAExecutorBackend::slot_word_size(size_t /*slot_id*/) const {
+  return 0;  // Remote metadata — fetch response includes size
+}
+
+#endif // REMOTE_EXECUTOR_USE_RDMA
