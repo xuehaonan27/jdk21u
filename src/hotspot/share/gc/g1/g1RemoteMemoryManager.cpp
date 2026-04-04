@@ -5,6 +5,7 @@
 #include "precompiled.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1NUMA.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "logging/log.hpp"
 #include "oops/oop.inline.hpp"
@@ -14,7 +15,8 @@
 G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   : _g1h(g1h), _handle_allocator(), _table_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
-    _sim_remote_fetched_count(0) {
+    _sim_remote_fetched_count(0),
+    _current_fcr(nullptr), _fcr_lock(0) {
   memset(_table, 0, sizeof(_table));
   memset(_sim_remote_slots, 0, sizeof(_sim_remote_slots));
 }
@@ -124,4 +126,51 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
                slot_id, p2i(dest), klass->external_name(), word_size);
 
   return klass;
+}
+
+// ============================================================
+// Fetch Cache Region (FCR) Allocation
+// ============================================================
+
+HeapRegion* G1RemoteMemoryManager::allocate_new_fcr_region() {
+  return _g1h->allocate_fcr_region();
+}
+
+HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
+  // Try allocating in the current FCR region (CAS-based, thread-safe)
+  HeapRegion* fcr = _current_fcr;
+  if (fcr != nullptr) {
+    size_t actual = 0;
+    HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
+    if (result != nullptr) {
+      return result;
+    }
+  }
+
+  // Current FCR is full or doesn't exist. Try to get a new one.
+  // This path requires locks (cannot be called from JRT_LEAF).
+  // The caller must handle nullptr gracefully.
+  fcr_lock();
+  // Double-check: another thread might have allocated a new FCR
+  if (_current_fcr != fcr) {
+    fcr = _current_fcr;
+    fcr_unlock();
+    if (fcr != nullptr) {
+      size_t actual = 0;
+      HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
+      if (result != nullptr) return result;
+    }
+    return nullptr;  // Still full — give up for this call
+  }
+
+  HeapRegion* new_fcr = allocate_new_fcr_region();
+  if (new_fcr != nullptr) {
+    _current_fcr = new_fcr;
+    fcr_unlock();
+    size_t actual = 0;
+    return new_fcr->par_allocate(word_size, word_size, &actual);
+  }
+
+  fcr_unlock();
+  return nullptr;
 }

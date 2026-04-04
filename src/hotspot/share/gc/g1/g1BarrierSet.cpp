@@ -192,15 +192,13 @@ oop G1BarrierSet::resolve_remote_fetch(RemoteHandle* h) {
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
 
-  // For Phase 1: allocate space on the C heap (simulating FTLAB allocation).
-  // Phase 2+ will use actual FTLAB backed by FCR regions.
-  size_t word_size = rmm->_sim_remote_slots[slot_id]._word_size;
-  size_t byte_size = word_size * HeapWordSize;
+  size_t word_size = rmm->sim_remote_word_size(slot_id);
 
-  // Allocate local buffer for the fetched object.
-  // Phase 1: use C heap. This is NOT a proper heap object — it's a temporary
-  // that lets us test the infrastructure. Phase 2 will use FTLAB in FCR.
-  HeapWord* dest = (HeapWord*)os::malloc(byte_size, mtGC);
+  // Allocate in FCR region (GC-managed, proper lifecycle).
+  HeapWord* dest = rmm->allocate_in_fcr(word_size);
+  if (dest == nullptr) {
+    dest = (HeapWord*)os::malloc(word_size * HeapWordSize, mtGC);
+  }
   guarantee(dest != nullptr, "Failed to allocate fetch buffer");
 
   // Fetch from simulated remote

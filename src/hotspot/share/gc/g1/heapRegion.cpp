@@ -221,6 +221,11 @@ void HeapRegion::set_old() {
   _type.set_old();
 }
 
+void HeapRegion::set_fetch_cache() {
+  report_region_type_change(G1HeapRegionTraceType::FetchCache);
+  _type.set_fetch_cache();
+}
+
 void HeapRegion::set_starts_humongous(HeapWord* obj_top, size_t fill_size) {
   assert(!is_humongous(), "sanity / pre-condition");
   assert(top() == bottom(), "should be empty");

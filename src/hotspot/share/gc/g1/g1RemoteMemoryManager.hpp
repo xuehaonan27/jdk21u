@@ -24,6 +24,7 @@
 #include "utilities/globalDefinitions.hpp"
 
 class G1CollectedHeap;
+class HeapRegion;
 
 // ============================================================
 // G1RemoteMemoryManager
@@ -209,6 +210,29 @@ public:
   // ============================================================
 
   RemoteHandleAllocator* handle_allocator() { return &_handle_allocator; }
+
+  // ============================================================
+  // Fetch Cache Region (FCR) Allocation
+  // ============================================================
+  // Fetched remote objects are allocated into FCR regions (G1 Old sub-type).
+  // FCR regions participate in GC like Old regions (marking, evacuation).
+  // Uses par_allocate() (CAS-based bump pointer) for thread-safe allocation.
+private:
+  HeapRegion* _current_fcr;       // Current FCR region for fetch allocation
+  volatile int _fcr_lock;         // Spinlock for FCR region creation
+
+  void fcr_lock()   { while (Atomic::cmpxchg(&_fcr_lock, 0, 1) != 0) { /* spin */ } }
+  void fcr_unlock() { Atomic::release_store(&_fcr_lock, 0); }
+
+  // Allocate a new FCR region from the free region pool.
+  // Must NOT be called from JRT_LEAF (needs Heap_lock).
+  HeapRegion* allocate_new_fcr_region();
+
+public:
+  // Allocate space for a fetched object in the current FCR region.
+  // Thread-safe (CAS-based bump pointer). Returns nullptr if FCR is full
+  // and we can't allocate a new one (e.g., in JRT_LEAF context).
+  HeapWord* allocate_in_fcr(size_t word_size);
 
   bool is_managed(oop obj) const {
     return handle_for(obj) != nullptr;

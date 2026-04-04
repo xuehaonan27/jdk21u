@@ -95,10 +95,15 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
         // Look up object size from remote metadata table
         uintptr_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
         size_t word_size = rmm->sim_remote_word_size(slot_id);
-        size_t byte_size = word_size * HeapWordSize;
 
-        // Allocate local buffer for fetched object (Phase 3: C heap; Phase 5: FTLAB)
-        HeapWord* dest = (HeapWord*)os::malloc(byte_size, mtGC);
+        // Allocate in FCR region (GC-managed, proper lifecycle).
+        // Falls back to os::malloc if FCR allocation fails (e.g., during
+        // JRT_LEAF when we can't acquire Heap_lock for a new FCR region).
+        HeapWord* dest = rmm->allocate_in_fcr(word_size);
+        if (dest == nullptr) {
+          // Fallback: C heap allocation (will leak, but prevents crash)
+          dest = (HeapWord*)os::malloc(word_size * HeapWordSize, mtGC);
+        }
         guarantee(dest != nullptr, "Failed to allocate fetch buffer");
 
         // Simulated fetch: memcpy from sim-remote

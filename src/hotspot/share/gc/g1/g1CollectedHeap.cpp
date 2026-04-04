@@ -1350,6 +1350,18 @@ jint G1CollectedHeap::initialize_service_thread() {
   return JNI_OK;
 }
 
+HeapRegion* G1CollectedHeap::allocate_fcr_region() {
+  // Allocate a free region for Fetch Cache without expansion (safe outside safepoint).
+  HeapRegion* fcr = new_region(HeapRegion::GrainWords, HeapRegionType::Old,
+                                false /* do_expand */, G1NUMA::AnyNodeIndex);
+  if (fcr != nullptr) {
+    fcr->set_fetch_cache();
+    log_info(gc)("Allocated FCR region: " PTR_FORMAT " (idx=%u)",
+                 p2i(fcr->bottom()), fcr->hrm_index());
+  }
+  return fcr;
+}
+
 jint G1CollectedHeap::initialize() {
 
   // Necessary to satisfy locking discipline assertions.

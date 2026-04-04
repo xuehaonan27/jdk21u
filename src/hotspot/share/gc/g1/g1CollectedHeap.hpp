@@ -553,6 +553,10 @@ public:
 
   G1RemoteMemoryManager* remote_memory_manager() { return _remote_memory_manager; }
 
+  // Allocate a free region for Fetch Cache (FCR).
+  // Sets the region type to FetchCacheTag. Returns nullptr if no region available.
+  HeapRegion* allocate_fcr_region();
+
   G1YoungGCEvacFailureInjector* evac_failure_injector() { return &_evac_failure_injector; }
 
   G1HeapVerifier* verifier() {

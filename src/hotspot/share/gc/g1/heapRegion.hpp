@@ -423,6 +423,7 @@ public:
 
   void move_to_old();
   void set_old();
+  void set_fetch_cache();
 
   // For a humongous region, region in which it starts.
   HeapRegion* humongous_start_region() const {
