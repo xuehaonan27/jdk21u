@@ -234,17 +234,6 @@ oop G1BarrierSet::wait_for_fetch(RemoteHandle* h) {
 // Returns: Shared OOP (if managed+Shared), or original oop (otherwise).
 
 oop G1BarrierSet::resolve_managed_store(oop new_value) {
-  // Write barrier tagging DISABLED pending C1 register allocation investigation.
-  // The C1 custom LIR op (LIR_OpG1TagResolve) emits testptr+jcc at codegen time
-  // to bypass C1's type-aware optimization that eliminates "oop < 0". However,
-  // tagged oops still leak through C1-compiled code. Investigation shows the
-  // post-barrier assertion never fires (barrier passes value as "clean") yet the
-  // value IS tagged (RSI=0xC000...). This suggests C1's register allocator moves
-  // the loaded value to a different register between the load and our barrier test.
-  // Requires deep C1 compiler internals debugging (LIR register allocation +
-  // interval splitting analysis). Until resolved, heap slots stay clean.
-  return new_value;
-
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   if (g1h == nullptr) return new_value;
 

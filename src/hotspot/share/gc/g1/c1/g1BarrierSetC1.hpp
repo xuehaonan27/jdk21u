@@ -126,7 +126,7 @@ class G1PostBarrierStub: public CodeStub {
 class G1TagResolveStub: public CodeStub {
   friend class G1BarrierSetC1;
  private:
-  // The register holding the loaded oop value -- both input and output.
+  // The output register from LIR_OpG1TagResolve — holds the oop to resolve.
   LIR_Opr _ref;
 
  public:
@@ -137,13 +137,12 @@ class G1TagResolveStub: public CodeStub {
   }
 
   LIR_Opr ref() const { return _ref; }
+  // Called by LIR_OpG1TagResolve to update after register allocation
+  void set_ref(LIR_Opr ref) { _ref = ref; }
 
   virtual void emit_code(LIR_Assembler* e);
   virtual void visit(LIR_OpVisitState* visitor) {
     visitor->do_slow_case();
-    // _ref is both input and output (the resolved oop overwrites the tagged one)
-    visitor->do_input(_ref);
-    visitor->do_temp(_ref);
   }
 #ifndef PRODUCT
   virtual void print_name(outputStream* out) const { out->print("G1TagResolveStub"); }

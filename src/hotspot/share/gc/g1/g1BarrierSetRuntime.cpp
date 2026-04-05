@@ -73,8 +73,8 @@ JRT_END
 // Phase 5+: should use non-leaf with ThreadBlockInVM + apth_rdma_wait.
 JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   uintptr_t v = (uintptr_t)tagged;
-  // DEBUG: verify this is actually tagged (bit 63 set)
-  guarantee((v >> 63) != 0, "resolve_tagged_oop called with non-tagged value: " PTR_FORMAT, v);
+  // Fast path: null or clean oop (bit 63 clear)
+  if ((v >> 63) == 0) return tagged;
 
   if (v & G1_OOP_INDIRECT_BIT) {
     // Shared OOP: follow Handle

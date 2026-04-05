@@ -517,6 +517,7 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_stub(LIR_Assembler* ce, G1Ta
   assert(stub->ref()->is_register(), "Precondition.");
   Register ref_reg = stub->ref()->as_register();
 
+
   // Pass the tagged oop to the runtime blob via the parameter area on the stack.
   ce->store_parameter(ref_reg, 0);
   __ call(RuntimeAddress(bs->tag_resolve_c1_runtime_code_blob()->code_begin()));
