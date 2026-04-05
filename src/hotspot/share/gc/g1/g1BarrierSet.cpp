@@ -234,19 +234,81 @@ oop G1BarrierSet::wait_for_fetch(RemoteHandle* h) {
 // Returns: Shared OOP (if managed+Shared), or original oop (otherwise).
 
 oop G1BarrierSet::resolve_managed_store(oop new_value) {
-  // Write barrier tagging is DISABLED.
-  //
-  // Comprehensive investigation (2026-04-05) confirmed that writing tagged
-  // oops (bit 63 set) into heap slots breaks MethodHandle/VarHandle resolution.
-  // Despite load barriers at all 4 levels (interpreter, C1, C2, C++ runtime),
-  // there exist JVM-internal paths that read oop fields without going through
-  // BarrierSet dispatch (e.g., get_vm_result raw movptr, interpreter stack
-  // operand reuse after getfield, possible constant pool cache paths).
-  //
-  // Classification metadata lives in the mark word (bits 39-40). Eviction reads
-  // it from the mark word. The write barrier returns clean oops only.
-  //
-  // TODO: When ALL oop readers are guaranteed to go through barriers (requires
-  // auditing every raw oop read in HotSpot), re-enable tagging for Shared OOPs.
+  // Write barrier tagging DISABLED pending C1 register allocation investigation.
+  // The C1 custom LIR op (LIR_OpG1TagResolve) emits testptr+jcc at codegen time
+  // to bypass C1's type-aware optimization that eliminates "oop < 0". However,
+  // tagged oops still leak through C1-compiled code. Investigation shows the
+  // post-barrier assertion never fires (barrier passes value as "clean") yet the
+  // value IS tagged (RSI=0xC000...). This suggests C1's register allocator moves
+  // the loaded value to a different register between the load and our barrier test.
+  // Requires deep C1 compiler internals debugging (LIR register allocation +
+  // interval splitting analysis). Until resolved, heap slots stay clean.
+  return new_value;
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  if (g1h == nullptr) return new_value;
+
+  // Fast negative 1: not in heap
+  if (!g1h->is_in(new_value)) {
+    return new_value;
+  }
+
+  // Fast negative 2: region has no classified objects
+  HeapRegion* r = g1h->heap_region_containing(new_value);
+  if (r == nullptr || !r->has_classified_objects()) {
+    return new_value;
+  }
+
+  // CRITICAL: check is_unlocked(). In locked/inflated states, the mark word
+  // holds a pointer (BasicLock* or ObjectMonitor*), and bits 39-40 of that
+  // pointer are part of the ADDRESS. On x86-64, stack addresses (0x7fff...)
+  // have bit 39 = 1, which falsely matches remote_class_unique.
+  markWord mw = new_value->mark_acquire();
+  if (!mw.is_unlocked()) {
+    return new_value;
+  }
+  uintptr_t cls = mw.remote_class();
+
+  if (cls == markWord::remote_class_shared) {
+    // Already Shared: find Handle and encode as Shared OOP.
+    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+    RemoteHandle* h = rmm->handle_for(new_value);
+    if (h != nullptr) {
+      // Verify Handle points to the correct object
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) {
+        void* handle_target = (void*)(sa & REMOTE_HANDLE_ADDR_MASK);
+        if (handle_target != cast_from_oop<void*>(new_value)) {
+          log_warning(gc)("WB: Handle mismatch! obj=" PTR_FORMAT " handle_target=" PTR_FORMAT
+                          " klass=%s",
+                          p2i((void*)new_value), p2i(handle_target),
+                          new_value->klass()->external_name());
+          return new_value; // Don't tag — Handle points to wrong object
+        }
+      }
+      return g1_make_shared_oop((void*)h);
+    }
+    // Handle not found for SHARED object — classification without Handle.
+    // This happens for objects classified as SHARED during fixup but
+    // not yet given a Handle (Handle creation is deferred to eviction).
+    // Return clean oop — no tagging.
+    return new_value;
+  } else if (cls == markWord::remote_class_unique) {
+    // Unique → Shared upgrade: allocate Handle, CAS mark word bits.
+    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+    RemoteHandleAllocBuffer hab;
+    RemoteHandle* h = rmm->create_handle_for(new_value, &hab);
+    // CAS mark word: UNIQUE → SHARED (retry for concurrent lock/hash CAS)
+    markWord old_mw;
+    do {
+      old_mw = new_value->mark_acquire();
+      if (!old_mw.is_unlocked()) break;
+      markWord new_mw = old_mw.set_remote_class(markWord::remote_class_shared);
+      if (new_value->cas_set_mark(new_mw, old_mw) == old_mw) break;
+    } while (true);
+    return g1_make_shared_oop((void*)h);
+  }
+
   return new_value;
 }

@@ -23,7 +23,9 @@
  */
 
 #include "precompiled.hpp"
+#include "c1/c1_LIRAssembler.hpp"
 #include "c1/c1_LIRGenerator.hpp"
+#include "c1/c1_MacroAssembler.hpp"
 #include "c1/c1_CodeStubs.hpp"
 #include "gc/g1/c1/g1BarrierSetC1.hpp"
 #include "gc/g1/g1BarrierSet.hpp"
@@ -49,9 +51,55 @@ void G1PostBarrierStub::emit_code(LIR_Assembler* ce) {
 }
 
 void G1TagResolveStub::emit_code(LIR_Assembler* ce) {
+  // Out-of-line slow path only (call runtime blob, jump back to continuation)
   G1BarrierSetAssembler* bs = (G1BarrierSetAssembler*)BarrierSet::barrier_set()->barrier_set_assembler();
   bs->generate_c1_tag_resolve_stub(ce, this);
 }
+
+// Custom LIR op for the disaggregated memory load barrier.
+// Emits raw testptr + jcc during codegen, bypassing C1's type-aware
+// comparison optimizations (which would eliminate "oop < 0" as always-false).
+class LIR_OpG1TagResolve : public LIR_Op {
+private:
+  LIR_Opr                 _ref;
+  G1TagResolveStub* const _stub;
+
+public:
+  LIR_OpG1TagResolve(LIR_Opr ref, G1TagResolveStub* stub)
+    : LIR_Op(), _ref(ref), _stub(stub) {}
+
+  virtual void visit(LIR_OpVisitState* state) {
+    // _ref is both input (the loaded tagged oop) and output (the resolved clean oop)
+    state->do_input(_ref);
+    state->do_output(_ref);
+    state->do_stub(_stub);
+  }
+
+  virtual void emit_code(LIR_Assembler* ce) {
+    auto* masm = ce->masm();
+    Register ref_reg = _ref->as_register();
+    // Inline fast path: test bit 63 (sign bit). Clean oops are positive.
+    // Raw assembly — NOT subject to C1 LIR optimizations.
+    masm->testptr(ref_reg, ref_reg);
+    masm->jcc(Assembler::negative, *_stub->entry());
+    masm->bind(*_stub->continuation());
+    // Post-barrier verify: ref must be clean (bit 63 = 0) or null.
+    // If it's still tagged after the barrier, something is very wrong.
+#ifdef ASSERT
+    Label ok;
+    masm->testptr(ref_reg, ref_reg);
+    masm->jcc(Assembler::positive, ok);
+    masm->jcc(Assembler::zero, ok);
+    masm->stop("C1 tag resolve barrier failed: tagged oop leaked past barrier");
+    masm->bind(ok);
+#endif
+  }
+
+  virtual void print_instr(outputStream* out) const { _ref->print(out); }
+#ifndef PRODUCT
+  virtual const char* name() const { return "g1_tag_resolve"; }
+#endif
+};
 
 void G1BarrierSetC1::pre_barrier(LIRAccess& access, LIR_Opr addr_opr,
                                  LIR_Opr pre_val, CodeEmitInfo* info) {
@@ -194,15 +242,14 @@ void G1BarrierSetC1::load_at_resolved(LIRAccess& access, LIR_Opr result) {
   // If bit 63 of the loaded oop is set (negative value = tagged/remote oop),
   // branch to the out-of-line stub which calls resolve_tagged_oop().
   // Fast path (clean local oop, bit 63 clear): cmp + jge = 0 extra cost.
-  // Disaggregated memory: tag-resolve barrier for uncompressed oops only.
-  // With compressed oops, LoadN is 32-bit and bit 63 has no meaning.
+  // Disaggregated memory: resolve tagged oops after raw load.
+  // Uses a custom LIR op (LIR_OpG1TagResolve) that emits raw testptr+jcc
+  // during codegen. We CANNOT use lir_cmp + lir_branch because C1's type
+  // system considers oops always non-negative, and eliminates "oop < 0"
+  // as always-false (confirmed: resolve_tagged_oop was never called).
   if (access.is_oop() && !UseCompressedOops) {
-    CodeStub* slow = new G1TagResolveStub(result);
-    // Compare result against null (0).  On x86-64 this emits cmpptr(reg, 0).
-    // lir_cond_less triggers when the value is negative, i.e., bit 63 is set.
-    __ cmp(lir_cond_less, result, LIR_OprFact::oopConst(nullptr));
-    __ branch(lir_cond_less, slow);
-    __ branch_destination(slow->continuation());
+    G1TagResolveStub* stub = new G1TagResolveStub(result);
+    gen->lir()->append(new LIR_OpG1TagResolve(result, stub));
   }
 
   if (access.is_oop() && (is_weak || is_phantom || is_anonymous)) {
