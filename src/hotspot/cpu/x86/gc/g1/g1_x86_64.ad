@@ -1,0 +1,159 @@
+//
+// Copyright (c) 2026, LIBAPTH Research. All rights reserved.
+//
+// G1 disaggregated-memory C2 load barrier for x86-64.
+//
+// Intercepts every oop load/atomic that carries barrier_data != 0
+// (set by G1BarrierSetC2::load_at_resolved / atomic overrides).
+// After the load, if the result has bit 63 set (tagged oop), we jump
+// to an out-of-line stub that calls G1BarrierSetRuntime::resolve_tagged_oop().
+//
+// The stub saves/restores all call-clobbered registers so the resolved
+// oop is transparent to the rest of the compiled code.
+//
+
+source_hpp %{
+
+#include "gc/shared/gc_globals.hpp"
+#include "gc/g1/c2/g1BarrierSetC2.hpp"
+#include "gc/g1/g1BarrierSetRuntime.hpp"
+#include "opto/compile.hpp"
+#include "opto/output.hpp"
+
+%}
+
+source %{
+
+#include "gc/g1/c2/g1BarrierSetC2.hpp"
+#include "gc/g1/g1BarrierSetRuntime.hpp"
+
+// Emit the inline sign-bit test + jump to out-of-line stub.
+// Called from every g1Load / g1CompareAndExchange / g1GetAndSet
+// instruction after the actual memory operation.
+static void g1_tag_resolve_barrier(MacroAssembler& _masm,
+                                   const MachNode* node,
+                                   Address ref_addr,
+                                   Register ref) {
+  if (node->barrier_data() == 0) return;
+
+  // Fast path: test bit 63 (sign bit).  If clear, the oop is untagged.
+  __ testptr(ref, ref);
+
+  // Create out-of-line stub (registered with G1BarrierSetC2State)
+  G1TagResolveStubC2* const stub =
+      new (Compile::current()->comp_arena()) G1TagResolveStubC2(node, ref_addr, ref);
+  if (!Compile::current()->output()->in_scratch_emit_size()) {
+    G1BarrierSetC2State* bs_state =
+        reinterpret_cast<G1BarrierSetC2State*>(Compile::current()->barrier_set_state());
+    bs_state->stubs()->append(stub);
+  }
+
+  // Jump to stub if sign bit is set (JS = jump if sign flag)
+  __ jcc(Assembler::negative, *stub->entry());
+
+  // Continuation: oop is now resolved (either was untagged, or stub resolved it)
+  __ bind(*stub->continuation());
+}
+
+%}
+
+// ============================================================
+// Load Pointer with G1 tag-resolve barrier
+// ============================================================
+instruct g1LoadP(rRegP dst, memory mem, rFlagsReg cr)
+%{
+  predicate(UseG1GC && n->as_Load()->barrier_data() != 0);
+  match(Set dst (LoadP mem));
+  effect(TEMP dst, KILL cr);
+
+  ins_cost(125);
+
+  format %{ "movq     $dst, $mem\t# ptr (G1 tag-resolve barrier)" %}
+
+  ins_encode %{
+    __ movq($dst$$Register, $mem$$Address);
+    g1_tag_resolve_barrier(_masm, this, $mem$$Address, $dst$$Register);
+  %}
+
+  ins_pipe(ialu_reg_mem);
+%}
+
+// ============================================================
+// CompareAndExchangeP with G1 tag-resolve barrier on result
+// ============================================================
+// The result of cmpxchg is the old value read from memory, which
+// may be a tagged oop if another thread stored one.  We resolve
+// the tag on the returned old value.
+instruct g1CompareAndExchangeP(
+                         memory mem_ptr,
+                         rax_RegP oldval, rRegP newval,
+                         rFlagsReg cr)
+%{
+  predicate(UseG1GC && VM_Version::supports_cx8() && n->as_LoadStore()->barrier_data() != 0);
+  match(Set oldval (CompareAndExchangeP mem_ptr (Binary oldval newval)));
+  effect(KILL cr);
+
+  format %{ "lock\n\t"
+            "cmpxchgq $newval, $mem_ptr\t# (G1 tag-resolve barrier on old value)" %}
+
+  ins_encode %{
+    __ lock();
+    __ cmpxchgq($newval$$Register, $mem_ptr$$Address);
+    // oldval (rax) now holds the old value from memory -- resolve tags
+    g1_tag_resolve_barrier(_masm, this, $mem_ptr$$Address, $oldval$$Register);
+  %}
+
+  ins_pipe(pipe_cmpxchg);
+%}
+
+// ============================================================
+// CompareAndSwapP with G1 tag-resolve barrier
+// ============================================================
+// CAS returns a boolean (success/fail), not the old oop, so we
+// do NOT need to resolve the result.  But we still need to match
+// this instruction when barrier_data != 0 so the default
+// (barrier_data == 0) rule does not fire.
+instruct g1CompareAndSwapP(rRegI res,
+                           memory mem_ptr,
+                           rax_RegP oldval, rRegP newval,
+                           rFlagsReg cr)
+%{
+  predicate(UseG1GC && VM_Version::supports_cx8() && n->as_LoadStore()->barrier_data() != 0);
+  match(Set res (CompareAndSwapP mem_ptr (Binary oldval newval)));
+  match(Set res (WeakCompareAndSwapP mem_ptr (Binary oldval newval)));
+  effect(KILL cr, KILL oldval);
+
+  format %{ "lock\n\t"
+            "cmpxchgq $newval, $mem_ptr\n\t"
+            "sete     $res\n\t"
+            "movzbl   $res, $res\t# (G1 barrier - bool result, no tag resolve)" %}
+
+  ins_encode %{
+    __ lock();
+    __ cmpxchgq($newval$$Register, $mem_ptr$$Address);
+    __ setb(Assembler::equal, $res$$Register);
+    __ movzbl($res$$Register, $res$$Register);
+  %}
+
+  ins_pipe(pipe_cmpxchg);
+%}
+
+// ============================================================
+// GetAndSetP (xchg) with G1 tag-resolve barrier
+// ============================================================
+// xchg atomically swaps newval into memory and returns the old value.
+// The old value may be tagged, so we resolve it.
+instruct g1GetAndSetP(memory mem, rRegP newval, rFlagsReg cr) %{
+  predicate(UseG1GC && n->as_LoadStore()->barrier_data() != 0);
+  match(Set newval (GetAndSetP mem newval));
+  effect(KILL cr);
+
+  format %{ "xchgq    $newval, $mem\t# (G1 tag-resolve barrier on old value)" %}
+
+  ins_encode %{
+    __ xchgq($newval$$Register, $mem$$Address);
+    g1_tag_resolve_barrier(_masm, this, $mem$$Address, $newval$$Register);
+  %}
+
+  ins_pipe(pipe_cmpxchg);
+%}

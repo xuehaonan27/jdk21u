@@ -274,6 +274,11 @@ UNSAFE_ENTRY(void, Unsafe_PutReferenceVolatile(JNIEnv *env, jobject unsafe, jobj
 
 UNSAFE_ENTRY(jobject, Unsafe_GetUncompressedObject(JNIEnv *env, jobject unsafe, jlong addr)) {
   oop v = *(oop*) (address) addr;
+  // Disaggregated memory: resolve tagged oop (bit 63 set).
+  // Uses HeapAccess to go through the barrier set.
+  if (v != nullptr && (cast_from_oop<uintptr_t>(v) >> 63) != 0) {
+    v = HeapAccess<>::oop_load((oop*)(address)addr);
+  }
   return JNIHandles::make_local(THREAD, v);
 } UNSAFE_END
 

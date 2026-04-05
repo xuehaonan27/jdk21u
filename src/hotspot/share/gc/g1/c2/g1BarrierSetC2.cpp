@@ -23,6 +23,7 @@
  */
 
 #include "precompiled.hpp"
+#include "asm/macroAssembler.hpp"
 #include "classfile/javaClasses.hpp"
 #include "gc/g1/c2/g1BarrierSetC2.hpp"
 #include "gc/g1/g1BarrierSet.hpp"
@@ -35,10 +36,61 @@
 #include "opto/escape.hpp"
 #include "opto/graphKit.hpp"
 #include "opto/idealKit.hpp"
+#include "opto/machnode.hpp"
 #include "opto/macro.hpp"
+#include "opto/output.hpp"
 #include "opto/rootnode.hpp"
 #include "opto/type.hpp"
+#include "utilities/growableArray.hpp"
 #include "utilities/macros.hpp"
+
+// ============================================================
+// G1 disaggregated-memory C2 load-barrier stub implementation
+// ============================================================
+
+G1TagResolveStubC2::G1TagResolveStubC2(const MachNode* node, Address ref_addr, Register ref)
+  : _node(node), _ref_addr(ref_addr), _ref(ref), _entry(), _continuation() {}
+
+Label* G1TagResolveStubC2::entry() {
+  return Compile::current()->output()->in_scratch_emit_size() ? &_continuation : &_entry;
+}
+
+Label* G1TagResolveStubC2::continuation() { return &_continuation; }
+
+Register G1TagResolveStubC2::ref() const { return _ref; }
+
+void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
+  masm.bind(_entry);
+  // Save rbx (callee-saved) — we'll use it to stash the result across
+  // pop_call_clobbered_registers, which restores ALL call-clobbered regs
+  // including the one holding the tagged oop.
+  masm.push(rbx);
+  // Save all call-clobbered registers (no FPU — oop resolution is integer-only)
+  masm.push_call_clobbered_registers(false /* save_fpu */);
+  // Move tagged oop into c_rarg0 for the runtime call
+  if (_ref != c_rarg0) {
+    masm.movptr(c_rarg0, _ref);
+  }
+  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop)));
+  // Stash resolved oop in rbx (callee-saved, won't be clobbered by pop)
+  masm.movptr(rbx, rax);
+  // Restore all call-clobbered registers (this restores _ref to the old tagged value)
+  masm.pop_call_clobbered_registers(false /* save_fpu */);
+  // Now put the resolved oop into the destination register
+  masm.movptr(_ref, rbx);
+  // Restore original rbx
+  masm.pop(rbx);
+  masm.jmp(_continuation);
+}
+
+G1BarrierSetC2State::G1BarrierSetC2State(Arena* arena)
+  : _stubs(new (arena) GrowableArray<G1TagResolveStubC2*>(arena, 8, 0, nullptr)) {}
+
+GrowableArray<G1TagResolveStubC2*>* G1BarrierSetC2State::stubs() { return _stubs; }
+
+static G1BarrierSetC2State* barrier_set_state() {
+  return reinterpret_cast<G1BarrierSetC2State*>(Compile::current()->barrier_set_state());
+}
 
 const TypeFunc *G1BarrierSetC2::write_ref_field_pre_entry_Type() {
   const Type **fields = TypeTuple::fields(2);
@@ -621,7 +673,19 @@ Node* G1BarrierSetC2::load_at_resolved(C2Access& access, const Type* val_type) c
   bool need_read_barrier = (((on_weak || on_phantom) && !no_keepalive) ||
                             (in_heap && unknown && offset != top && obj != top));
 
-  if (!access.is_oop() || !need_read_barrier) {
+  if (!access.is_oop()) {
+    return CardTableBarrierSetC2::load_at_resolved(access, val_type);
+  }
+
+  // Set barrier_data for tag resolution on oop loads (uncompressed only).
+  // Our .ad file only provides g1LoadP (64-bit LoadP); with compressed
+  // oops, LoadN is 32-bit and bit 63 has no meaning.  The barrier is
+  // only meaningful when -XX:-UseCompressedOops.
+  if (!UseCompressedOops && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
+    access.set_barrier_data(G1BarrierTag);
+  }
+
+  if (!need_read_barrier) {
     return CardTableBarrierSetC2::load_at_resolved(access, val_type);
   }
 
@@ -1026,6 +1090,65 @@ void G1BarrierSetC2::verify_gc_barriers(Compile* compile, CompilePhase phase) co
   }
 }
 #endif
+
+// ============================================================
+// G1 disaggregated-memory C2 barrier: create_barrier_state / emit_stubs / estimate_stub_size
+// ============================================================
+
+void* G1BarrierSetC2::create_barrier_state(Arena* comp_arena) const {
+  return new (comp_arena) G1BarrierSetC2State(comp_arena);
+}
+
+void G1BarrierSetC2::emit_stubs(CodeBuffer& cb) const {
+  MacroAssembler masm(&cb);
+  GrowableArray<G1TagResolveStubC2*>* const stubs = barrier_set_state()->stubs();
+
+  for (int i = 0; i < stubs->length(); i++) {
+    // Ensure there is enough room in the code buffer
+    if (cb.insts()->maybe_expand_to_ensure_remaining(PhaseOutput::MAX_inst_size) && cb.blob() == nullptr) {
+      ciEnv::current()->record_failure("CodeCache is full");
+      return;
+    }
+    stubs->at(i)->emit_code(masm);
+  }
+
+  masm.flush();
+}
+
+int G1BarrierSetC2::estimate_stub_size() const {
+  Compile* const C = Compile::current();
+  BufferBlob* const blob = C->output()->scratch_buffer_blob();
+  GrowableArray<G1TagResolveStubC2*>* const stubs = barrier_set_state()->stubs();
+  int size = 0;
+
+  for (int i = 0; i < stubs->length(); i++) {
+    CodeBuffer cb(blob->content_begin(), (address)C->output()->scratch_locs_memory() - blob->content_begin());
+    MacroAssembler masm(&cb);
+    stubs->at(i)->emit_code(masm);
+    size += cb.insts_size();
+  }
+
+  return size;
+}
+
+// ============================================================
+// Atomic overrides: tag barrier_data on oop atomics
+// ============================================================
+
+Node* G1BarrierSetC2::atomic_cmpxchg_val_at_resolved(C2AtomicParseAccess& access, Node* expected_val,
+                                                       Node* new_val, const Type* val_type) const {
+  if (!UseCompressedOops && access.is_oop() && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
+    access.set_barrier_data(G1BarrierTag);
+  }
+  return CardTableBarrierSetC2::atomic_cmpxchg_val_at_resolved(access, expected_val, new_val, val_type);
+}
+
+Node* G1BarrierSetC2::atomic_xchg_at_resolved(C2AtomicParseAccess& access, Node* new_val, const Type* val_type) const {
+  if (!UseCompressedOops && access.is_oop() && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
+    access.set_barrier_data(G1BarrierTag);
+  }
+  return CardTableBarrierSetC2::atomic_xchg_at_resolved(access, new_val, val_type);
+}
 
 bool G1BarrierSetC2::escape_add_to_con_graph(ConnectionGraph* conn_graph, PhaseGVN* gvn, Unique_Node_List* delayed_worklist, Node* n, uint opcode) const {
   if (opcode == Op_StoreP) {

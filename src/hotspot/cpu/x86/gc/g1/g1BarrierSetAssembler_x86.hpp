@@ -32,6 +32,7 @@ class LIR_Assembler;
 class StubAssembler;
 class G1PreBarrierStub;
 class G1PostBarrierStub;
+class G1TagResolveStub;
 
 class G1BarrierSetAssembler: public ModRefBarrierSetAssembler {
  protected:
@@ -59,12 +60,21 @@ class G1BarrierSetAssembler: public ModRefBarrierSetAssembler {
  public:
   void gen_pre_barrier_stub(LIR_Assembler* ce, G1PreBarrierStub* stub);
   void gen_post_barrier_stub(LIR_Assembler* ce, G1PostBarrierStub* stub);
+  void generate_c1_tag_resolve_stub(LIR_Assembler* ce, G1TagResolveStub* stub);
 
   void generate_c1_pre_barrier_runtime_stub(StubAssembler* sasm);
   void generate_c1_post_barrier_runtime_stub(StubAssembler* sasm);
+  void generate_c1_tag_resolve_runtime_stub(StubAssembler* sasm);
 
   virtual void load_at(MacroAssembler* masm, DecoratorSet decorators, BasicType type,
                        Register dst, Address src, Register tmp1, Register tmp_thread);
+
+  // Bring all base class copy_load_at overloads into scope so we don't
+  // hide the XMMRegister (vector) variant with our scalar override.
+  using ModRefBarrierSetAssembler::copy_load_at;
+
+  virtual void copy_load_at(MacroAssembler* masm, DecoratorSet decorators, BasicType type,
+                            size_t bytes, Register dst, Address src, Register tmp);
 };
 
 #endif // CPU_X86_GC_G1_G1BARRIERSETASSEMBLER_X86_HPP

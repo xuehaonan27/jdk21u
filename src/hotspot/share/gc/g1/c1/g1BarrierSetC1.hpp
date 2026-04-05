@@ -119,12 +119,44 @@ class G1PostBarrierStub: public CodeStub {
 #endif // PRODUCT
 };
 
+// Disaggregated memory: C1 out-of-line stub for resolving tagged oops.
+// When bit 63 of a loaded oop is set (tagged/remote oop), the inline fast
+// path branches here.  The stub calls G1BarrierSetRuntime::resolve_tagged_oop
+// via a pre-generated runtime blob and jumps back to the continuation.
+class G1TagResolveStub: public CodeStub {
+  friend class G1BarrierSetC1;
+ private:
+  // The register holding the loaded oop value -- both input and output.
+  LIR_Opr _ref;
+
+ public:
+  G1TagResolveStub(LIR_Opr ref) : _ref(ref) {
+    assert(_ref->is_register(), "must be a register");
+    FrameMap* f = Compilation::current()->frame_map();
+    f->update_reserved_argument_area_size(2 * BytesPerWord);
+  }
+
+  LIR_Opr ref() const { return _ref; }
+
+  virtual void emit_code(LIR_Assembler* e);
+  virtual void visit(LIR_OpVisitState* visitor) {
+    visitor->do_slow_case();
+    // _ref is both input and output (the resolved oop overwrites the tagged one)
+    visitor->do_input(_ref);
+    visitor->do_temp(_ref);
+  }
+#ifndef PRODUCT
+  virtual void print_name(outputStream* out) const { out->print("G1TagResolveStub"); }
+#endif // PRODUCT
+};
+
 class CodeBlob;
 
 class G1BarrierSetC1 : public ModRefBarrierSetC1 {
  protected:
   CodeBlob* _pre_barrier_c1_runtime_code_blob;
   CodeBlob* _post_barrier_c1_runtime_code_blob;
+  CodeBlob* _tag_resolve_c1_runtime_code_blob;
 
   virtual void pre_barrier(LIRAccess& access, LIR_Opr addr_opr,
                            LIR_Opr pre_val, CodeEmitInfo* info);
@@ -135,10 +167,12 @@ class G1BarrierSetC1 : public ModRefBarrierSetC1 {
  public:
   G1BarrierSetC1()
     : _pre_barrier_c1_runtime_code_blob(nullptr),
-      _post_barrier_c1_runtime_code_blob(nullptr) {}
+      _post_barrier_c1_runtime_code_blob(nullptr),
+      _tag_resolve_c1_runtime_code_blob(nullptr) {}
 
   CodeBlob* pre_barrier_c1_runtime_code_blob() { return _pre_barrier_c1_runtime_code_blob; }
   CodeBlob* post_barrier_c1_runtime_code_blob() { return _post_barrier_c1_runtime_code_blob; }
+  CodeBlob* tag_resolve_c1_runtime_code_blob() { return _tag_resolve_c1_runtime_code_blob; }
 
   virtual void generate_c1_runtime_stubs(BufferBlob* buffer_blob);
 };

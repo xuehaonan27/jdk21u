@@ -186,6 +186,44 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
   }
 }
 
+// Disaggregated memory: arraycopy load barrier for tagged oops.
+// After the base copy_load_at loads the value into dst, check if it's tagged
+// (bit 63 set) and resolve it.  This is the same barrier as in load_at but
+// applied to individual element loads during oop arraycopy.
+// Note: arraycopy stubs use rscratch1 (r10) as tmp when type is T_OBJECT.
+// We must preserve all registers except dst across the runtime call.
+void G1BarrierSetAssembler::copy_load_at(MacroAssembler* masm, DecoratorSet decorators,
+                                         BasicType type, size_t bytes,
+                                         Register dst, Address src, Register tmp) {
+  // Delegate to the base implementation for the actual load.
+  ModRefBarrierSetAssembler::copy_load_at(masm, decorators, type, bytes, dst, src, tmp);
+
+  // Only apply the tag-resolve barrier to reference types.
+  if (is_reference_type(type)) {
+    Label done;
+    // test dst, dst: sets SF if bit 63 is set (tagged oop)
+    __ testptr(dst, dst);
+    __ jcc(Assembler::positive, done);
+    // Slow path: resolve tagged oop via runtime call (JRT_LEAF).
+    // Save all call-clobbered registers so the arraycopy stub's state
+    // is preserved.  We use push/pop_call_clobbered_registers(false) to
+    // skip FPU saves (arraycopy oop loops don't use XMM for oop moves).
+    // Use rbx (callee-saved) to stash the result across pop.
+    __ push(rbx);  // save rbx first (below clobbered regs on stack)
+    __ push_call_clobbered_registers(false /* save_fpu */);
+    if (dst != c_rarg0) {
+      __ mov(c_rarg0, dst);
+    }
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
+    // Result is in rax.  Stash it in rbx before restoring clobbered regs.
+    __ movptr(rbx, rax);
+    __ pop_call_clobbered_registers(false /* save_fpu */);
+    __ movptr(dst, rbx);
+    __ pop(rbx);  // restore original rbx
+    __ bind(done);
+  }
+}
+
 void G1BarrierSetAssembler::g1_write_barrier_pre(MacroAssembler* masm,
                                                  Register obj,
                                                  Register pre_val,
@@ -468,6 +506,27 @@ void G1BarrierSetAssembler::gen_post_barrier_stub(LIR_Assembler* ce, G1PostBarri
   __ jmp(*stub->continuation());
 }
 
+// Disaggregated memory: C1 out-of-line stub for resolving tagged oops.
+// This is the out-of-line code emitted after the main C1 instruction stream.
+// The inline fast path (testptr + jcc positive → continuation) is emitted by
+// load_at_resolved in g1BarrierSetC1.cpp; this stub handles the slow path.
+void G1BarrierSetAssembler::generate_c1_tag_resolve_stub(LIR_Assembler* ce, G1TagResolveStub* stub) {
+  G1BarrierSetC1* bs = (G1BarrierSetC1*)BarrierSet::barrier_set()->barrier_set_c1();
+  __ bind(*stub->entry());
+
+  assert(stub->ref()->is_register(), "Precondition.");
+  Register ref_reg = stub->ref()->as_register();
+
+  // Pass the tagged oop to the runtime blob via the parameter area on the stack.
+  ce->store_parameter(ref_reg, 0);
+  __ call(RuntimeAddress(bs->tag_resolve_c1_runtime_code_blob()->code_begin()));
+  // The runtime blob returns the resolved oop in rax.
+  if (ref_reg != rax) {
+    __ mov(ref_reg, rax);
+  }
+  __ jmp(*stub->continuation());
+}
+
 #undef __
 
 #define __ sasm->
@@ -607,6 +666,57 @@ void G1BarrierSetAssembler::generate_c1_post_barrier_runtime_stub(StubAssembler*
   __ pop(rcx);
   __ pop(rax);
 
+  __ epilogue();
+}
+
+// Disaggregated memory: C1 runtime blob for resolving tagged oops.
+// Called from generate_c1_tag_resolve_stub (the out-of-line CodeStub).
+// Receives the tagged oop via the parameter area (offset 0), calls the
+// JRT_LEAF resolve_tagged_oop, and returns the clean oop in rax.
+//
+// We must save/restore all call-clobbered registers because C1 may have
+// live values in them at the point of the tag-resolve barrier.  The result
+// is returned in rax: we poke it into the saved-rax slot on the stack
+// before popping so that pop_call_clobbered_registers restores the resolved
+// oop into rax instead of the original tagged value.
+void G1BarrierSetAssembler::generate_c1_tag_resolve_runtime_stub(StubAssembler* sasm) {
+  __ prologue("g1_tag_resolve", false);
+
+  // Save rbx (callee-saved) so we can use it to stash the result across
+  // pop_call_clobbered_registers.  Push it first (below the clobbered regs)
+  // so the stack layout is:
+  //   [rbp frame from prologue]
+  //   [saved rbx]              <-- pushed first, popped last
+  //   [clobbered regs]         <-- pushed second, popped first
+  __ push(rbx);
+
+  // Save all call-clobbered registers so C1's live values are preserved.
+  __ push_call_clobbered_registers();
+
+  // Load the tagged oop from the parameter area.
+  // load_parameter(0, reg) reads from [rbp + (0+2)*8] = [rbp+16].
+  // rbp was saved by prologue, so the parameter area is still accessible
+  // even after all the pushes.
+  __ load_parameter(0, c_rarg0);
+
+  // Call G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged) -> oopDesc*
+  // This is a JRT_LEAF: no safepoint, no thread transition, no GC.
+  // Result is returned in rax.
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
+
+  // Stash the resolved oop in rbx (callee-saved, not in the clobbered set).
+  __ movptr(rbx, rax);
+
+  // Restore all call-clobbered registers (rax gets the old tagged value, etc).
+  __ pop_call_clobbered_registers();
+
+  // Move the resolved oop from rbx into rax (the return register).
+  __ movptr(rax, rbx);
+
+  // Restore original rbx.
+  __ pop(rbx);
+
+  // epilogue does: leave; ret  -- rax holds the resolved oop.
   __ epilogue();
 }
 

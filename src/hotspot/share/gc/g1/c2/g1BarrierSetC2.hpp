@@ -26,10 +26,51 @@
 #define SHARE_GC_G1_C2_G1BARRIERSETC2_HPP
 
 #include "gc/shared/c2/cardTableBarrierSetC2.hpp"
+#include "memory/allocation.hpp"
+#include "utilities/growableArray.hpp"
 
+// G1 disaggregated-memory barrier_data bit for C2 load barrier.
+const uint8_t G1BarrierTag = 1;
+
+class MacroAssembler;
+class MachNode;
 class PhaseTransform;
 class Type;
 class TypeFunc;
+
+// ============================================================
+// G1 disaggregated-memory C2 load-barrier stub (out-of-line)
+// ============================================================
+// One instance per oop load that may encounter a tagged pointer (bit 63 set).
+// The slow-path calls G1BarrierSetRuntime::resolve_tagged_oop().
+
+class G1TagResolveStubC2 : public ArenaObj {
+private:
+  const MachNode* _node;
+  Address         _ref_addr;
+  Register        _ref;
+  Label           _entry;
+  Label           _continuation;
+
+public:
+  G1TagResolveStubC2(const MachNode* node, Address ref_addr, Register ref);
+
+  Label* entry();
+  Label* continuation();
+  Register ref() const;
+
+  void emit_code(MacroAssembler& masm);
+};
+
+// Compilation-scoped state holding the list of G1 tag-resolve stubs.
+class G1BarrierSetC2State : public ArenaObj {
+private:
+  GrowableArray<G1TagResolveStubC2*>* _stubs;
+
+public:
+  G1BarrierSetC2State(Arena* arena);
+  GrowableArray<G1TagResolveStubC2*>* stubs();
+};
 
 class G1BarrierSetC2: public CardTableBarrierSetC2 {
 protected:
@@ -92,6 +133,13 @@ protected:
 
   static bool is_g1_pre_val_load(Node* n);
 public:
+  virtual void* create_barrier_state(Arena* comp_arena) const;
+  virtual void emit_stubs(CodeBuffer& cb) const;
+  virtual int estimate_stub_size() const;
+  virtual Node* atomic_cmpxchg_val_at_resolved(C2AtomicParseAccess& access, Node* expected_val,
+                                                Node* new_val, const Type* val_type) const;
+  virtual Node* atomic_xchg_at_resolved(C2AtomicParseAccess& access, Node* new_val, const Type* val_type) const;
+
   virtual bool is_gc_pre_barrier_node(Node* node) const;
   virtual bool is_gc_barrier_node(Node* node) const;
   virtual void eliminate_gc_barrier(PhaseMacroExpand* macro, Node* node) const;

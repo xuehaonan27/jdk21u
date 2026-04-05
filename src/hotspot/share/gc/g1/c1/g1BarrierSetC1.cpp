@@ -48,6 +48,11 @@ void G1PostBarrierStub::emit_code(LIR_Assembler* ce) {
   bs->gen_post_barrier_stub(ce, this);
 }
 
+void G1TagResolveStub::emit_code(LIR_Assembler* ce) {
+  G1BarrierSetAssembler* bs = (G1BarrierSetAssembler*)BarrierSet::barrier_set()->barrier_set_assembler();
+  bs->generate_c1_tag_resolve_stub(ce, this);
+}
+
 void G1BarrierSetC1::pre_barrier(LIRAccess& access, LIR_Opr addr_opr,
                                  LIR_Opr pre_val, CodeEmitInfo* info) {
   LIRGenerator* gen = access.gen();
@@ -185,6 +190,21 @@ void G1BarrierSetC1::load_at_resolved(LIRAccess& access, LIR_Opr result) {
 
   BarrierSetC1::load_at_resolved(access, result);
 
+  // Disaggregated memory: resolve tagged oops after raw load.
+  // If bit 63 of the loaded oop is set (negative value = tagged/remote oop),
+  // branch to the out-of-line stub which calls resolve_tagged_oop().
+  // Fast path (clean local oop, bit 63 clear): cmp + jge = 0 extra cost.
+  // Disaggregated memory: tag-resolve barrier for uncompressed oops only.
+  // With compressed oops, LoadN is 32-bit and bit 63 has no meaning.
+  if (access.is_oop() && !UseCompressedOops) {
+    CodeStub* slow = new G1TagResolveStub(result);
+    // Compare result against null (0).  On x86-64 this emits cmpptr(reg, 0).
+    // lir_cond_less triggers when the value is negative, i.e., bit 63 is set.
+    __ cmp(lir_cond_less, result, LIR_OprFact::oopConst(nullptr));
+    __ branch(lir_cond_less, slow);
+    __ branch_destination(slow->continuation());
+  }
+
   if (access.is_oop() && (is_weak || is_phantom || is_anonymous)) {
     // Register the value in the referent field with the pre-barrier
     LabelObj *Lcont_anonymous;
@@ -216,11 +236,22 @@ class C1G1PostBarrierCodeGenClosure : public StubAssemblerCodeGenClosure {
   }
 };
 
+class C1G1TagResolveCodeGenClosure : public StubAssemblerCodeGenClosure {
+  virtual OopMapSet* generate_code(StubAssembler* sasm) {
+    G1BarrierSetAssembler* bs = (G1BarrierSetAssembler*)BarrierSet::barrier_set()->barrier_set_assembler();
+    bs->generate_c1_tag_resolve_runtime_stub(sasm);
+    return nullptr;
+  }
+};
+
 void G1BarrierSetC1::generate_c1_runtime_stubs(BufferBlob* buffer_blob) {
   C1G1PreBarrierCodeGenClosure pre_code_gen_cl;
   C1G1PostBarrierCodeGenClosure post_code_gen_cl;
+  C1G1TagResolveCodeGenClosure tag_resolve_code_gen_cl;
   _pre_barrier_c1_runtime_code_blob = Runtime1::generate_blob(buffer_blob, -1, "g1_pre_barrier_slow",
                                                               false, &pre_code_gen_cl);
   _post_barrier_c1_runtime_code_blob = Runtime1::generate_blob(buffer_blob, -1, "g1_post_barrier_slow",
                                                                false, &post_code_gen_cl);
+  _tag_resolve_c1_runtime_code_blob = Runtime1::generate_blob(buffer_blob, -1, "g1_tag_resolve_slow",
+                                                              false, &tag_resolve_code_gen_cl);
 }
