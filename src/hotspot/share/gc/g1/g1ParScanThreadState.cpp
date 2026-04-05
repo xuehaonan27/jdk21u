@@ -26,7 +26,6 @@
 #include "gc/g1/g1Allocator.inline.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
-#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1CollectionSet.hpp"
 #include "gc/g1/g1EvacFailureRegions.inline.hpp"
 #include "gc/g1/g1OopClosures.inline.hpp"
@@ -728,85 +727,42 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         uintptr_t existing_cls = mw.remote_class();
 
         if (existing_cls == markWord::remote_class_shared) {
-          // Already SHARED from a previous GC cycle. Don't re-classify.
-          // But we must re-tag ref-sites: GC evacuation writes clean oops,
-          // stripping our Shared OOP tags. Also fixes stale Unique OOPs
-          // from between-GC Unique→Shared upgrades (the "pending_upgrades"
-          // problem — Section 4.6).
-          G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
-          RemoteHandle* h = rmm->handle_for(obj);
-          if (h != nullptr) {
-            // Tag first ref-site
-            if (!info.first_site._is_narrow) {
-              oop* p = (oop*)info.first_site._ref_site;
-              *p = g1_make_shared_oop((void*)h);
-            }
-            // Tag extra ref-sites
-            for (int i = 0; i < info.extra_count; i++) {
-              if (!info.extra_sites[i]._is_narrow) {
-                oop* p = (oop*)info.extra_sites[i]._ref_site;
-                *p = g1_make_shared_oop((void*)h);
-              }
-            }
-          }
+          // Already SHARED from a previous cycle. Check if RC changed.
+          // Ref-sites are NOT tagged here — heap slots must stay CLEAN.
+          // (MethodHandle adapters, constant pool resolution, and other JVM
+          // internals read oop fields via raw movptr without the load barrier.
+          // Writing tagged oops here would crash those paths.)
+          // The write barrier (resolve_managed_store) tags NEW stores.
           goto next_entry;
         }
 
         if (existing_cls == markWord::remote_class_unique) {
-          // Already UNIQUE from a previous GC cycle. Re-tag the ref-site:
-          // evacuation closures write clean oops (forwarded address), stripping
-          // the Unique OOP tag. Re-apply it.
-          if (info.count == 1 && !info.first_site._is_narrow) {
-            oop* p = (oop*)info.first_site._ref_site;
-            *p = g1_make_unique_oop(obj);
-          } else if (info.count > 1) {
-            // RC increased since last classification — upgrade to Shared now.
-            RemoteHandle* h = _g1h->remote_memory_manager()->create_handle_for(obj, &hab);
+          // Already UNIQUE. If RC increased, upgrade to Shared.
+          if (info.count > 1) {
             obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
-            if (!info.first_site._is_narrow) {
-              oop* p = (oop*)info.first_site._ref_site;
-              *p = g1_make_shared_oop((void*)h);
-            }
-            for (int i = 0; i < info.extra_count; i++) {
-              if (!info.extra_sites[i]._is_narrow) {
-                oop* p = (oop*)info.extra_sites[i]._ref_site;
-                *p = g1_make_shared_oop((void*)h);
-              }
-            }
             shared_count++;
           }
+          // Ref-sites stay clean — tagging is write-barrier's job.
           goto next_entry;
         }
 
         // New classification for this object.
+        // ONLY set mark word bits — do NOT write tagged oops into heap slots.
+        // Heap slots must remain clean oops at all times because non-barrier
+        // code paths (MethodHandle adapters, constant pool, aload, load_klass)
+        // read them via raw movptr without testptr+js resolution.
+        // The write barrier tags oops at store time; the load barrier resolves
+        // them on getfield/aaload.
         if (info.count == 1) {
-          // RC=1 -> Unique: set mark word + tag ref-site as Unique OOP.
-          // Plain store safe during STW (no concurrent mutator CAS).
+          // RC=1 -> Unique: mark word only.
           obj->set_mark(mw.set_remote_class(markWord::remote_class_unique));
           dest->set_has_classified_objects();
-          // Tag the single ref-site as Unique OOP
-          if (!info.first_site._is_narrow) {
-            oop* p = (oop*)info.first_site._ref_site;
-            *p = g1_make_unique_oop(obj);
-          }
           unique_count++;
         } else {
-          // RC>1 -> Shared: set mark word + allocate Handle + tag ALL ref-sites.
-          RemoteHandle* h = _g1h->remote_memory_manager()->create_handle_for(obj, &hab);
+          // RC>1 -> Shared: mark word only. Handle allocated on demand
+          // (at eviction time or write barrier upgrade time, not here).
           obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
           dest->set_has_classified_objects();
-          // Tag first ref-site
-          if (!info.first_site._is_narrow) {
-            oop* p = (oop*)info.first_site._ref_site;
-            *p = g1_make_shared_oop((void*)h);
-          }
-          // Tag extra ref-sites
-          for (int i = 0; i < info.extra_count; i++) {
-            if (!info.extra_sites[i]._is_narrow) {
-              oop* p = (oop*)info.extra_sites[i]._ref_site;
-              *p = g1_make_shared_oop((void*)h);
-            }
-          }
           shared_count++;
         }
       }
