@@ -234,51 +234,19 @@ oop G1BarrierSet::wait_for_fetch(RemoteHandle* h) {
 // Returns: Shared OOP (if managed+Shared), or original oop (otherwise).
 
 oop G1BarrierSet::resolve_managed_store(oop new_value) {
-  G1CollectedHeap* g1h = G1CollectedHeap::heap();
-
-  // Fast negative 1: not in heap
-  if (!g1h->is_in(new_value)) {
-    return new_value;
-  }
-
-  // Fast negative 2: region has no classified objects
-  HeapRegion* r = g1h->heap_region_containing(new_value);
-  if (r == nullptr || !r->has_classified_objects()) {
-    return new_value;
-  }
-
-  // Read mark word for per-object classification.
-  // For unlocked and fast-locked (LM_LIGHTWEIGHT) objects, bits 39-40 are valid.
-  // For stack-locked (LM_LEGACY) and inflated objects, mark word holds a pointer
-  // — classification bits are in the displaced header. But locked/inflated objects
-  // are actively in use (hot), so we return clean oop: eviction will skip them,
-  // and next GC cycle re-classifies correctly.
-  markWord mw = new_value->mark_acquire();
-  uintptr_t cls = mw.remote_class();
-
-  if (cls == markWord::remote_class_shared) {
-    // Already Shared: find Handle and encode as Shared OOP.
-    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-    RemoteHandle* h = rmm->handle_for(new_value);
-    if (h != nullptr) {
-      return g1_make_shared_oop((void*)h);
-    }
-  } else if (cls == markWord::remote_class_unique) {
-    // Unique → Shared upgrade: allocate Handle, CAS mark word bits.
-    G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-    RemoteHandleAllocBuffer hab;
-    RemoteHandle* h = rmm->create_handle_for(new_value, &hab);
-    // CAS mark word: UNIQUE → SHARED (retry for concurrent lock/hash CAS)
-    markWord old_mw;
-    do {
-      old_mw = new_value->mark_acquire();
-      if (!old_mw.is_unlocked()) break;  // locked — can't CAS, skip
-      markWord new_mw = old_mw.set_remote_class(markWord::remote_class_shared);
-      if (new_value->cas_set_mark(new_mw, old_mw) == old_mw) break;
-    } while (true);
-    log_debug(gc)("Unique->Shared upgrade: obj=" PTR_FORMAT, p2i((void*)new_value));
-    return g1_make_shared_oop((void*)h);
-  }
-  // UNTRACKED or locked/inflated (bits read as zero): return clean oop.
+  // Write barrier tagging is DISABLED.
+  //
+  // Comprehensive investigation (2026-04-05) confirmed that writing tagged
+  // oops (bit 63 set) into heap slots breaks MethodHandle/VarHandle resolution.
+  // Despite load barriers at all 4 levels (interpreter, C1, C2, C++ runtime),
+  // there exist JVM-internal paths that read oop fields without going through
+  // BarrierSet dispatch (e.g., get_vm_result raw movptr, interpreter stack
+  // operand reuse after getfield, possible constant pool cache paths).
+  //
+  // Classification metadata lives in the mark word (bits 39-40). Eviction reads
+  // it from the mark word. The write barrier returns clean oops only.
+  //
+  // TODO: When ALL oop readers are guaranteed to go through barriers (requires
+  // auditing every raw oop read in HotSpot), re-enable tagging for Shared OOPs.
   return new_value;
 }
