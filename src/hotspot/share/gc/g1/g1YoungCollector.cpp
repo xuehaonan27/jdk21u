@@ -1019,26 +1019,31 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     for (uint i = 0; i < _g1h->num_regions() && evicted < 3; i++) {
       HeapRegion* hr = _g1h->region_at(i);
       if (!hr->is_old() || hr->is_humongous()) continue;
-      if (!hr->has_remote_class_map()) continue;  // No classified objects
+      if (!hr->has_classified_objects()) continue;  // No classified objects
 
       HeapWord* p = hr->bottom();
       while (p < hr->top() && evicted < 3) {
         oop obj = cast_to_oop(p);
         size_t sz = obj->size();
-        uint8_t cls = hr->get_remote_class(p);
+        markWord mw = obj->mark();
 
-        if ((cls == HeapRegion::REMOTE_CLASS_SHARED || cls == HeapRegion::REMOTE_CLASS_UNIQUE)
+        // Check mark word classification. Skip locked/inflated objects.
+        if (!mw.is_unlocked()) { p += sz; continue; }
+        uintptr_t cls = mw.remote_class();
+
+        if ((cls == markWord::remote_class_shared || cls == markWord::remote_class_unique)
             && sz >= 2 && sz <= 128) {
+          const char* cls_name = (cls == markWord::remote_class_shared) ? "Shared" : "Unique->Shared";
           // Ensure Handle exists (upgrade Unique→Shared if needed)
           RemoteHandle* h = rmm->handle_for(obj);
           if (h == nullptr) {
             h = rmm->create_handle_for(obj, &hab);
           }
-          if (cls == HeapRegion::REMOTE_CLASS_UNIQUE) {
-            hr->set_remote_class(p, HeapRegion::REMOTE_CLASS_SHARED);
+          if (cls == markWord::remote_class_unique) {
+            // Upgrade mark word: Unique → Shared (STW, plain store safe)
+            obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
           }
           if (h != nullptr && h->is_local()) {
-            // Evict via backend (SIM/TCP/RDMA)
             Klass* klass = obj->klass();
             G1RemoteBackend* be = rmm->backend();
             size_t slot_id = be->evict(cast_from_oop<void*>(obj), sz, klass, (size_t)-1);
@@ -1047,8 +1052,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               h->set_eviction_word_size(sz);
               evicted++;
               log_info(gc)("Remote evict (%s): obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT,
-                           cls == HeapRegion::REMOTE_CLASS_SHARED ? "Shared" : "Unique->Shared",
-                           p2i((void*)obj), klass->external_name(), sz, slot_id);
+                           cls_name, p2i((void*)obj), klass->external_name(), sz, slot_id);
             }
           }
         }

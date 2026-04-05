@@ -160,27 +160,55 @@ class markWord {
   // Fast-locking does not use INFLATING.
   static markWord INFLATING() { return zero(); }    // inflate-in-progress
 
-  // Remote memory metadata bits (bits 39-44, within the unused region 39-63).
-  // Uses lower bits to avoid the sign bit (63) and high bits that some runtime
-  // code paths may interpret differently. See g1RemoteOop.hpp for full documentation.
-  static const uintptr_t remote_metadata_mask = uintptr_t(0x3F) << 39;  // bits 39-44
+  // Remote memory classification bits (bits 39-40, within unused region 39-63).
+  // Encodes object classification for disaggregated memory management:
+  //   00 = UNTRACKED, 01 = UNIQUE (RC=1), 10 = SHARED (RC>1, has Handle)
+  //
+  // SAFETY: These bits are safe because ALL mark word CAS paths (locking,
+  // hash installation, inflation/deflation) preserve bits outside their
+  // respective fields. See RESEARCH_DESIGN_PLAN.md comprehensive analysis.
+  //
+  // Rules:
+  //   - Set bits ONLY when is_unlocked() (locked/inflated mark holds pointer)
+  //   - During STW classification fixup: plain store is safe (no concurrent CAS)
+  //   - During mutator write barrier upgrade: must use CAS-in-loop
+  //   - must_be_preserved() includes these bits so they survive evacuation failure
+  static const int       remote_class_shift   = 39;
+  static const uintptr_t remote_class_mask    = uintptr_t(0x3) << remote_class_shift;  // bits 39-40
+  // Keep the wider mask for has_remote_metadata() backward compat
+  static const uintptr_t remote_metadata_mask = remote_class_mask;
+
+  static const uintptr_t remote_class_untracked = uintptr_t(0) << remote_class_shift;
+  static const uintptr_t remote_class_unique    = uintptr_t(1) << remote_class_shift;
+  static const uintptr_t remote_class_shared    = uintptr_t(2) << remote_class_shift;
 
   bool has_remote_metadata() const {
-    // Only check remote metadata bits when mark is in normal (unlocked) state.
-    // In locked/monitor/marked states, the mark word holds a pointer, and
-    // bits 58-63 may be part of that pointer's address value.
-    return is_unlocked() && (value() & remote_metadata_mask) != 0;
+    // Only valid when mark is in normal (unlocked) state.
+    // In locked/monitor/marked states, the mark word holds a pointer.
+    return is_unlocked() && (value() & remote_class_mask) != 0;
   }
 
-  // NOTE: clear_remote_metadata() was removed. During forwarding, the mark word
-  // stores a real heap address in bits 2-63. Clearing any bits corrupts it.
-  // has_remote_metadata() guards against forwarding state via is_unlocked().
+  uintptr_t remote_class() const {
+    return value() & remote_class_mask;
+  }
 
-  // Should this header be preserved during GC?
+  markWord set_remote_class(uintptr_t cls) const {
+    return markWord((value() & ~remote_class_mask) | (cls & remote_class_mask));
+  }
+
+  bool is_remote_unique() const {
+    return is_unlocked() && remote_class() == remote_class_unique;
+  }
+
+  bool is_remote_shared() const {
+    return is_unlocked() && remote_class() == remote_class_shared;
+  }
+
+  // Should this header be preserved during GC (evacuation failure)?
   bool must_be_preserved(const oopDesc* obj) const {
-    // Note: has_remote_metadata() was removed from this check because all
-    // classification metadata is now in per-region bitmaps, not mark word bits.
-    return (!is_unlocked() || !has_no_hash());
+    // Preserve if: locked/inflated, has hash, OR has classification bits.
+    // Without this, init_mark() in g1EvacFailure.cpp would clear our bits.
+    return (!is_unlocked() || !has_no_hash() || (value() & remote_class_mask) != 0);
   }
 
   // WARNING: The following routines are used EXCLUSIVELY by

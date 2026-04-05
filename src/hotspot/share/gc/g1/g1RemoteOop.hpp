@@ -91,11 +91,19 @@ inline oop g1_make_unique_oop(oop obj) {
 // the sign bit (bit 63) and high bits that might be interpreted
 // differently by some runtime code paths (MethodHandles, monitors).
 //
-// All mark word metadata constants have been removed. Classification is stored
-// ENTIRELY in the per-region bitmap (HeapRegion::_remote_class_map).
-// Mark word bits are UNSAFE for custom metadata — HotSpot's synchronization
-// subsystem does full 64-bit CAS on the mark word, causing CAS conflicts
-// that crash MethodHandle adapters, monitor inflation, and hash installation.
+// Mark word classification bits (39-40) are used for per-object classification.
+// Comprehensive analysis (RESEARCH_DESIGN_PLAN.md) confirmed ALL HotSpot CAS
+// paths (locking, hash, inflation/deflation) preserve upper mark word bits.
+// Previous crashes were caused by plain stores racing with concurrent CAS —
+// NOT by fundamental bit unsafety. Fix: set via CAS or during STW.
+//
+// HeapRegion::_has_classified_objects flag is the fast-negative test for
+// write barrier. Mark word is the per-object authority.
+//
+// Mark word constants (aliases for markWord:: constants, for use in GC code):
+const uintptr_t G1_MW_CLASS_UNTRACKED = markWord::remote_class_untracked;
+const uintptr_t G1_MW_CLASS_UNIQUE    = markWord::remote_class_unique;
+const uintptr_t G1_MW_CLASS_SHARED    = markWord::remote_class_shared;
 
 
 // ============================================================

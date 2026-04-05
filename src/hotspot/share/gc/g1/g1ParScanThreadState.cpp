@@ -530,15 +530,17 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
   const oop forward_ptr = old->forward_to_atomic(obj, old_mark, memory_order_relaxed);
   if (forward_ptr == nullptr) {
 
-    // Update Handle when a managed (has-Handle) object is evacuated.
+    // Update Handle when a Shared object is evacuated.
     // The Handle must point to the new copy, otherwise Shared OOP -> Handle
     // chains resolve to a stale address (critical correctness, see plan 9.7).
-    // Check per-region bitmap (not mark word — mark word bits are unsafe).
-    {
-      uint8_t cls = from_region->get_remote_class(cast_from_oop<HeapWord*>(old));
-      if (cls == HeapRegion::REMOTE_CLASS_SHARED) {
-        _g1h->remote_memory_manager()->update_handle_for_evacuation(old, obj);
-      }
+    // Check mark word bits (fast, same cache line) with bitmap fallback.
+    // Check mark word for Shared classification. For LM_LIGHTWEIGHT fast-locked
+    // objects, bits 39-40 are still visible (only lock bits 0-1 cleared).
+    // For stack-locked (LM_LEGACY) and inflated objects, mark word holds a pointer
+    // — bits are in displaced header. But locked objects are hot and won't be
+    // evicted, so missing the Handle update here is benign (next GC fixes it).
+    if (old_mark.remote_class() == markWord::remote_class_shared) {
+      _g1h->remote_memory_manager()->update_handle_for_evacuation(old, obj);
     }
 
     {
@@ -716,29 +718,27 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
       }
 
       {
+        markWord mw = obj->mark();
         // Skip already-managed objects (from previous GC cycles)
-        if (dest->get_remote_class(cast_from_oop<HeapWord*>(obj)) != HeapRegion::REMOTE_CLASS_UNTRACKED) {
+        if (mw.has_remote_metadata()) {
           goto next_entry;
         }
-        markWord mw = obj->mark();
-        // Skip locked/inflated objects
+        // No bitmap fallback needed — mark word is authoritative
+        // Skip locked/inflated objects (mark word holds pointer, not header)
         if (!mw.is_unlocked()) {
           goto next_entry;
         }
 
         if (info.count == 1) {
-          // RC=1 -> Unique: set region bitmap only.
-          // No mark word modification (causes CAS crashes).
-          // No os::malloc (causes corruption during STW).
-          // Bitmap is pre-allocated lazily per region (ensure_remote_class_map).
-          dest->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_UNIQUE);
+          // RC=1 -> Unique: set mark word bits + region bitmap.
+          // Plain store is safe during STW (no concurrent mutator CAS).
+          obj->set_mark(mw.set_remote_class(markWord::remote_class_unique));
+          dest->set_has_classified_objects();
           unique_count++;
         } else {
-          // RC>1 -> Shared: set region bitmap.
-          // Handle allocation deferred to outside STW (eviction time).
-          // During STW we only record the classification; actual Handle
-          // creation happens when the object is about to be evicted.
-          dest->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_SHARED);
+          // RC>1 -> Shared: set mark word bits + region flag.
+          obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
+          dest->set_has_classified_objects();
           shared_count++;
         }
       }

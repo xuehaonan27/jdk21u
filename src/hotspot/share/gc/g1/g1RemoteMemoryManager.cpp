@@ -158,11 +158,18 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
   h->set_remote(slot_id);
   h->set_eviction_word_size(word_size);
 
-  // 4. Set classification in per-region bitmap (NOT mark word — mark word bits
-  //    cause CAS conflicts in synchronizer.cpp, see lessons learned).
+  // 4. Set classification in mark word + per-region bitmap.
+  //    Mark word: fast per-object check for mutators (same cache line as header)
+  //    Bitmap: region-level iteration for GC
+  //    Re-read mark word (it may have changed since our earlier is_unlocked check,
+  //    though during STW eviction trigger this is unlikely).
+  mw = obj->mark();
+  if (mw.is_unlocked()) {
+    obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
+  }
   HeapRegion* hr = _g1h->heap_region_containing(obj);
   if (hr != nullptr) {
-    hr->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_SHARED);
+    hr->set_has_classified_objects();
   }
 
   log_info(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT,
@@ -278,12 +285,12 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
           }
 
           if (is_dead) {
-            // Clear region bitmap classification
+            // Clear mark word classification bits for dead object
             oop obj = cast_to_oop(entry->_obj_addr);
             if (_g1h->is_in(obj)) {
-              HeapRegion* hr = _g1h->heap_region_containing(obj);
-              if (hr != nullptr && hr->has_remote_class_map()) {
-                hr->set_remote_class(cast_from_oop<HeapWord*>(obj), HeapRegion::REMOTE_CLASS_UNTRACKED);
+              markWord mw = obj->mark();
+              if (mw.is_unlocked() && mw.has_remote_metadata()) {
+                obj->set_mark(mw.set_remote_class(markWord::remote_class_untracked));
               }
             }
 

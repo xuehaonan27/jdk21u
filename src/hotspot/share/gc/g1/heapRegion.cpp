@@ -130,47 +130,10 @@ void HeapRegion::hr_clear(bool clear_space) {
   reset_pre_dummy_top();
 
   rem_set()->clear();
-  free_remote_class_map();
+  _has_classified_objects = false;
 
   init_top_at_mark_start();
   if (clear_space) clear(SpaceDecorator::Mangle);
-}
-
-// Remote memory classification bitmap implementation.
-// 2 bits per MinObjAlignmentInBytes slot, packed 4 slots per byte.
-// Total size: (GrainBytes / MinObjAlignmentInBytes) / 4 bytes.
-
-void HeapRegion::ensure_remote_class_map() {
-  if (_remote_class_map != nullptr) return;
-  _remote_class_map_size = (GrainBytes / MinObjAlignmentInBytes + 3) / 4;
-  _remote_class_map = (uint8_t*)os::malloc(_remote_class_map_size, mtGC);
-  memset(_remote_class_map, 0, _remote_class_map_size);
-}
-
-void HeapRegion::free_remote_class_map() {
-  if (_remote_class_map != nullptr) {
-    os::free(_remote_class_map);
-    _remote_class_map = nullptr;
-    _remote_class_map_size = 0;
-  }
-}
-
-void HeapRegion::set_remote_class(HeapWord* obj_addr, uint8_t cls) {
-  ensure_remote_class_map();
-  size_t offset = pointer_delta(obj_addr, bottom()) / (MinObjAlignmentInBytes / HeapWordSize);
-  size_t byte_idx = offset / 4;
-  size_t bit_shift = (offset % 4) * 2;
-  assert(byte_idx < _remote_class_map_size, "out of bounds");
-  _remote_class_map[byte_idx] = (_remote_class_map[byte_idx] & ~(0x3 << bit_shift)) | (cls << bit_shift);
-}
-
-uint8_t HeapRegion::get_remote_class(HeapWord* obj_addr) const {
-  if (_remote_class_map == nullptr) return REMOTE_CLASS_UNTRACKED;
-  size_t offset = pointer_delta(obj_addr, bottom()) / (MinObjAlignmentInBytes / HeapWordSize);
-  size_t byte_idx = offset / 4;
-  size_t bit_shift = (offset % 4) * 2;
-  if (byte_idx >= _remote_class_map_size) return REMOTE_CLASS_UNTRACKED;
-  return (_remote_class_map[byte_idx] >> bit_shift) & 0x3;
 }
 
 void HeapRegion::clear_cardtable() {
@@ -283,8 +246,7 @@ HeapRegion::HeapRegion(uint hrm_index,
   _surv_rate_group(nullptr),
   _age_index(G1SurvRateGroup::InvalidAgeIndex),
   _node_index(G1NUMA::UnknownNodeIndex),
-  _remote_class_map(nullptr),
-  _remote_class_map_size(0)
+  _has_classified_objects(false)
 {
   assert(Universe::on_page_boundary(mr.start()) && Universe::on_page_boundary(mr.end()),
          "invalid space boundaries");
