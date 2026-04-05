@@ -167,8 +167,29 @@ template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_in_heap_at(oop base, ptrdiff_t offset) {
   oop value = ModRef::oop_load_in_heap_at(base, offset);
-  // Resolve tag bits before SATB enqueue — SATB queue requires clean oops
-  value = resolve_oop_raw(value);
+  // Resolve tagged oops — same full barrier as oop_load_in_heap.
+  // Must handle REMOTE (trigger fetch), not just strip tags.
+  uintptr_t v = cast_from_oop<uintptr_t>(value);
+  if ((v & G1_OOP_TAG_MASK) != 0) {
+    if (v & G1_OOP_INDIRECT_BIT) {
+      RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) {
+        value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+      } else if (state == REMOTE_HANDLE_REMOTE) {
+        if (h->cas_remote_to_fetching()) {
+          value = G1BarrierSet::resolve_remote_fetch(h);
+        } else {
+          value = G1BarrierSet::wait_for_fetch(h);
+        }
+      } else {
+        value = G1BarrierSet::wait_for_fetch(h);
+      }
+    } else {
+      value = cast_to_oop(v & G1_OOP_ADDR_MASK);
+    }
+  }
   enqueue_preloaded_if_weak(AccessBarrierSupport::resolve_possibly_unknown_oop_ref_strength<decorators>(base, offset), value);
   return value;
 }
