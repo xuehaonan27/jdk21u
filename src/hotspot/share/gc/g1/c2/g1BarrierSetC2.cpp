@@ -61,24 +61,40 @@ Register G1TagResolveStubC2::ref() const { return _ref; }
 
 void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   masm.bind(_entry);
-  // Save rbx (callee-saved) — we'll use it to stash the result across
-  // pop_call_clobbered_registers, which restores ALL call-clobbered regs
-  // including the one holding the tagged oop.
+  Label leaf_ok;
+  // Save rbx (callee-saved) for stashing results
   masm.push(rbx);
-  // Save all call-clobbered registers (no FPU — oop resolution is integer-only)
+  // Save all call-clobbered registers
   masm.push_call_clobbered_registers(false /* save_fpu */);
-  // Move tagged oop into c_rarg0 for the runtime call
+
+  // Phase 1: Leaf call (handles LOCAL + Unique)
   if (_ref != c_rarg0) {
     masm.movptr(c_rarg0, _ref);
   }
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop)));
-  // Stash resolved oop in rbx (callee-saved, won't be clobbered by pop)
-  masm.movptr(rbx, rax);
-  // Restore all call-clobbered registers (this restores _ref to the old tagged value)
-  masm.pop_call_clobbered_registers(false /* save_fpu */);
-  // Now put the resolved oop into the destination register
+  // Check: did leaf resolve? (bit 63 clear = resolved)
+  masm.testptr(rax, rax);
+  masm.jcc(Assembler::positive, leaf_ok);
+
+  // Phase 2: Slow path — leaf returned tagged oop (REMOTE/FETCHING).
+  // Need JRT_ENTRY call. Pop saved state first, then call_VM.
+  // Save the original tagged oop in rbx for the slow call.
+  masm.movptr(rbx, rax);  // rbx = still-tagged oop (sentinel)
+  masm.pop_call_clobbered_registers(false);
+  // rbx still has the tagged oop (callee-saved, survived pop)
+  // Call slow path (same convention as leaf — single oopDesc* arg)
+  masm.movptr(c_rarg0, rbx);
+  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
+  // Result in rax. Put into _ref and rbx.
+  masm.movptr(_ref, rax);
+  masm.pop(rbx);  // restore original rbx
+  masm.jmp(_continuation);
+
+  // Leaf resolved fast path
+  masm.bind(leaf_ok);
+  masm.movptr(rbx, rax);  // stash resolved oop
+  masm.pop_call_clobbered_registers(false);
   masm.movptr(_ref, rbx);
-  // Restore original rbx
   masm.pop(rbx);
   masm.jmp(_continuation);
 }

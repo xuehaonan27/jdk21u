@@ -57,7 +57,9 @@ public:
   //     safepoint-aware via ThreadBlockInVM). Called when the leaf returns
   //     a still-tagged result.
   static oopDesc* resolve_tagged_oop(oopDesc* tagged);
-  static oopDesc* resolve_tagged_oop_slow(JavaThread* current, oopDesc* tagged);
+  // Non-leaf slow path: gets JavaThread internally, handles VM transition.
+  // Same C calling convention as resolve_tagged_oop for simplicity.
+  static oopDesc* resolve_tagged_oop_slow(oopDesc* tagged);
 };
 
 #endif // SHARE_GC_G1_G1BARRIERSETRUNTIME_HPP

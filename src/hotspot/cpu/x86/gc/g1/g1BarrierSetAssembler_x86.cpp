@@ -134,16 +134,25 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
   // Fast path: test + js = 2 instructions, 5 bytes. Same as ZGC.
   // ================================================================
   if (on_oop) {
-    Label done;
+    Label done, leaf_ok;
+    // Phase 1: test sign bit. Clean oops / null skip entirely.
     __ testptr(dst, dst);
     __ jcc(Assembler::positive, done);
-    if (dst != c_rarg0) {
-      __ mov(c_rarg0, dst);
-    }
+    // Phase 2: leaf call (handles LOCAL + Unique)
+    __ push(dst);                          // save tagged oop for slow retry
+    if (dst != c_rarg0) __ mov(c_rarg0, dst);
     __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
-    if (dst != rax) {
-      __ mov(dst, rax);
-    }
+    // Check: did the leaf resolve it? (bit 63 clear = resolved)
+    __ testptr(rax, rax);
+    __ jcc(Assembler::positive, leaf_ok);
+    // Phase 3: slow path — handles REMOTE fetch (blocking I/O)
+    __ pop(c_rarg0);                       // recover original tagged oop
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow), c_rarg0);
+    if (dst != rax) __ mov(dst, rax);
+    __ jmp(done);
+    __ bind(leaf_ok);
+    __ addptr(rsp, wordSize);              // discard saved tagged oop
+    if (dst != rax) __ mov(dst, rax);
     __ bind(done);
   }
 
@@ -197,26 +206,31 @@ void G1BarrierSetAssembler::copy_load_at(MacroAssembler* masm, DecoratorSet deco
 
   // Only apply the tag-resolve barrier to reference types.
   if (is_reference_type(type)) {
-    Label done;
-    // test dst, dst: sets SF if bit 63 is set (tagged oop)
+    Label done, leaf_ok;
     __ testptr(dst, dst);
     __ jcc(Assembler::positive, done);
-    // Slow path: resolve tagged oop via runtime call (JRT_LEAF).
-    // Save all call-clobbered registers so the arraycopy stub's state
-    // is preserved.  We use push/pop_call_clobbered_registers(false) to
-    // skip FPU saves (arraycopy oop loops don't use XMM for oop moves).
-    // Use rbx (callee-saved) to stash the result across pop.
-    __ push(rbx);  // save rbx first (below clobbered regs on stack)
+    // Save state for two-phase resolution
+    __ push(rbx);
     __ push_call_clobbered_registers(false /* save_fpu */);
-    if (dst != c_rarg0) {
-      __ mov(c_rarg0, dst);
-    }
+    if (dst != c_rarg0) __ mov(c_rarg0, dst);
+    // Phase 1: Leaf call
     __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
-    // Result is in rax.  Stash it in rbx before restoring clobbered regs.
+    __ testptr(rax, rax);
+    __ jcc(Assembler::positive, leaf_ok);
+    // Phase 2: Slow path — REMOTE fetch
+    __ movptr(rbx, rax);   // rbx = still-tagged (callee-saved)
+    __ pop_call_clobbered_registers(false);
+    __ movptr(c_rarg0, rbx);
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow), c_rarg0);
+    __ movptr(dst, rax);
+    __ pop(rbx);
+    __ jmp(done);
+    // Leaf resolved
+    __ bind(leaf_ok);
     __ movptr(rbx, rax);
-    __ pop_call_clobbered_registers(false /* save_fpu */);
+    __ pop_call_clobbered_registers(false);
     __ movptr(dst, rbx);
-    __ pop(rbx);  // restore original rbx
+    __ pop(rbx);
     __ bind(done);
   }
 }

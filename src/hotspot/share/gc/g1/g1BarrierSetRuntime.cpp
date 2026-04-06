@@ -68,82 +68,87 @@ JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_post_entry(volatile G1CardTa
 JRT_END
 
 // ============================================================
-// Resolve a tagged oop to a clean local oop (JRT_LEAF).
-//
-// Handles all cases: clean oops (fast path), LOCAL Handles, Unique OOPs,
-// and REMOTE Handles (fetch from backend).
-//
-// For REMOTE fetch: the backend->fetch() call may block (TCP/RDMA I/O).
-// This is technically unsafe in JRT_LEAF (no safepoint participation), but
-// acceptable for the research prototype because:
-// - SIM backend: fetch is memcpy (~1μs, non-blocking)
-// - TCP backend: fetch is a localhost round-trip (~100μs)
-// - RDMA backend: fetch is RDMA READ (~5-50μs)
-// These are SHORT durations. For production with high-latency RDMA, this
-// should be split into a leaf fast path + JRT_ENTRY slow path using
-// LIBAPTH's apth_rdma_wait for cooperative scheduling.
-//
-// The Heap_lock issue for FCR allocation is handled in allocate_in_fcr
-// which falls back to os::malloc when called from JRT_LEAF context.
+// LEAF fast path: resolve LOCAL Handles and Unique OOPs.
+// Returns the ORIGINAL tagged oop for REMOTE/FETCHING — the caller
+// detects bit 63 still set and calls resolve_tagged_oop_slow.
 // ============================================================
 JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   uintptr_t v = (uintptr_t)tagged;
-  // Fast path: null or clean oop (bit 63 clear)
-  if ((v >> 63) == 0) return tagged;
+  if ((v >> 63) == 0) return tagged;  // Clean oop / null
 
   if (v & G1_OOP_INDIRECT_BIT) {
-    // Shared OOP: follow Handle
     RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
     uintptr_t sa = h->load_state_and_addr_acquire();
-    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-
-    if (state == REMOTE_HANDLE_LOCAL) {
+    if ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL) {
       return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
     }
-
-    if (state == REMOTE_HANDLE_REMOTE) {
-      if (h->cas_remote_to_fetching()) {
-        G1CollectedHeap* g1h = G1CollectedHeap::heap();
-        G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-        size_t word_size = h->eviction_word_size();
-
-        HeapWord* dest = rmm->allocate_in_fcr(word_size);
-        if (dest == nullptr) {
-          dest = (HeapWord*)os::malloc(word_size * HeapWordSize, mtGC);
-        }
-        guarantee(dest != nullptr, "Failed to allocate fetch buffer");
-
-        rmm->fetch_remote_object(h, dest);
-        h->set_local_release(dest);
-        return (oopDesc*)dest;
-      }
-      sa = h->load_state_and_addr_acquire();
-      state = sa & REMOTE_HANDLE_STATE_MASK;
-    }
-
-    if (state == REMOTE_HANDLE_FETCHING) {
-      int spins = 0;
-      while (true) {
-        sa = h->load_state_and_addr_acquire();
-        state = sa & REMOTE_HANDLE_STATE_MASK;
-        if (state == REMOTE_HANDLE_LOCAL) {
-          return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-        }
-        if (++spins > 1000) { os::naked_yield(); spins = 0; }
-      }
-    }
-
-    return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+    // REMOTE or FETCHING: return tagged oop unchanged for slow path
+    return tagged;
   }
 
-  // Unique/Direct OOP: strip tags
+  // Unique/Direct: strip tags
   return (oopDesc*)(v & G1_OOP_ADDR_MASK);
 JRT_END
 
-// Non-leaf slow path: declared but not yet wired to C1/interpreter.
-// Will be used when the two-phase leaf+slow design is fully implemented
-// with C1 fused LIR ops and LIBAPTH cooperative scheduling.
-JRT_ENTRY(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop_slow(JavaThread* current, oopDesc* tagged))
-  // For now, delegate to the same logic as the leaf path
-  return resolve_tagged_oop(tagged);
-JRT_END
+// ============================================================
+// NON-LEAF slow path: blocking fetch from remote storage.
+// NOT JRT_ENTRY — manages thread state transition internally.
+// Same calling convention as the leaf (single oopDesc* arg, result in rax).
+// Callers: interpreter call_VM, C1 call_runtime_leaf, C2 stub raw call.
+// ============================================================
+oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
+  JavaThread* current = JavaThread::current();
+  uintptr_t v = (uintptr_t)tagged;
+  // Re-check: may have been resolved between leaf and slow calls
+  if ((v >> 63) == 0) return tagged;
+  if (!(v & G1_OOP_INDIRECT_BIT)) {
+    return (oopDesc*)(v & G1_OOP_ADDR_MASK);
+  }
+
+  RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+
+  if (state == REMOTE_HANDLE_LOCAL) {
+    return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+  }
+
+  if (state == REMOTE_HANDLE_REMOTE) {
+    if (h->cas_remote_to_fetching()) {
+      G1CollectedHeap* g1h = G1CollectedHeap::heap();
+      G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+      size_t word_size = h->eviction_word_size();
+
+      // Safe to acquire Heap_lock here (JRT_ENTRY context)
+      HeapWord* dest = rmm->allocate_in_fcr(word_size);
+      if (dest == nullptr) {
+        dest = (HeapWord*)os::malloc(word_size * HeapWordSize, mtGC);
+      }
+      guarantee(dest != nullptr, "Failed to allocate fetch buffer");
+
+      // Fetch from remote backend. For SIM/TCP this is fast (memcpy/round-trip).
+      // For production RDMA with high latency: use LIBAPTH apth_rdma_wait
+      // which yields the userspace thread cooperatively.
+      rmm->fetch_remote_object(h, dest);
+
+      h->set_local_release(dest);
+      return (oopDesc*)dest;
+    }
+    sa = h->load_state_and_addr_acquire();
+    state = sa & REMOTE_HANDLE_STATE_MASK;
+  }
+
+  if (state == REMOTE_HANDLE_FETCHING) {
+    // Wait for another thread's fetch to complete.
+    while (true) {
+      sa = h->load_state_and_addr_acquire();
+      state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) break;
+      os::naked_yield();
+    }
+    return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+  }
+
+  ShouldNotReachHere();
+  return nullptr;
+}
