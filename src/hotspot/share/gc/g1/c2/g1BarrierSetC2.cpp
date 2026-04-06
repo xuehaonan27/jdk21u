@@ -82,10 +82,12 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   masm.movptr(rbx, rax);  // rbx = still-tagged oop (sentinel)
   masm.pop_call_clobbered_registers(false);
   // rbx still has the tagged oop (callee-saved, survived pop)
-  // Call slow path (same convention as leaf — single oopDesc* arg)
-  masm.movptr(c_rarg0, rbx);
+  // Call slow path (single-arg, does ThreadInVMfromJava internally)
+  masm.set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
+  masm.movptr(c_rarg0, rbx);          // tagged oop (single arg)
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
-  // Result in rax. Put into _ref and rbx.
+  masm.reset_last_Java_frame(r15_thread, false);
+  // Result in rax. Put into _ref.
   masm.movptr(_ref, rax);
   masm.pop(rbx);  // restore original rbx
   masm.jmp(_continuation);

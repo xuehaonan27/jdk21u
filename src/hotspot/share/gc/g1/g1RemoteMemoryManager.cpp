@@ -327,9 +327,7 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
 }
 
 HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
-  // Try allocating in the current FCR region (CAS-based, thread-safe).
-  // This fast path is safe from JRT_LEAF (no locks needed — par_allocate
-  // uses CAS on the existing FCR region's bump pointer).
+  // Fast path: try CAS bump pointer on existing FCR region (lock-free).
   HeapRegion* fcr = _current_fcr;
   if (fcr != nullptr) {
     size_t actual = 0;
@@ -339,26 +337,10 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
     }
   }
 
-  // Current FCR is full or doesn't exist. Allocating a NEW FCR region
-  // requires Heap_lock, which CANNOT be acquired from JRT_LEAF contexts
-  // (resolve_tagged_oop, C1/C2 load barrier slow paths).
-  //
-  // Check if we're in a leaf context by testing if Heap_lock is available.
-  // If not at a safepoint and don't own Heap_lock, skip allocation —
-  // the caller falls back to os::malloc.
-  if (!SafepointSynchronize::is_at_safepoint() &&
-      !Heap_lock->owned_by_self()) {
-    // Try double-check on current FCR first (another thread may have allocated)
-    fcr = _current_fcr;
-    if (fcr != nullptr) {
-      size_t actual = 0;
-      HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
-      if (result != nullptr) return result;
-    }
-    return nullptr;  // Caller will use os::malloc fallback
-  }
-
-  // We're at a safepoint or own Heap_lock — safe to allocate a new FCR.
+  // Current FCR full or doesn't exist. Allocate a new FCR region.
+  // Requires Heap_lock. The caller MUST be in _thread_in_vm state
+  // (JRT_ENTRY context from resolve_tagged_oop_slow, or GC STW).
+  // No os::malloc fallback — all fetched objects go into proper G1 regions.
   fcr_lock();
   if (_current_fcr != fcr) {
     fcr = _current_fcr;

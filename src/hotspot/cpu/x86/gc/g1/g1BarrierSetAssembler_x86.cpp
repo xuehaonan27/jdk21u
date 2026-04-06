@@ -145,10 +145,10 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
     // Check: did the leaf resolve it? (bit 63 clear = resolved)
     __ testptr(rax, rax);
     __ jcc(Assembler::positive, leaf_ok);
-    // Phase 3: slow path — handles REMOTE fetch (blocking I/O)
-    __ pop(c_rarg0);                       // recover original tagged oop
-    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow), c_rarg0);
-    if (dst != rax) __ mov(dst, rax);
+    // Phase 3: slow path via call_VM (JRT_ENTRY — proper oop map, GC-safe)
+    // call_VM passes JavaThread* as first arg automatically.
+    __ pop(c_rarg1);                       // recover original tagged oop → arg1
+    __ call_VM(dst, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow_vm), c_rarg1);
     __ jmp(done);
     __ bind(leaf_ok);
     __ addptr(rsp, wordSize);              // discard saved tagged oop
@@ -217,11 +217,13 @@ void G1BarrierSetAssembler::copy_load_at(MacroAssembler* masm, DecoratorSet deco
     __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
     __ testptr(rax, rax);
     __ jcc(Assembler::positive, leaf_ok);
-    // Phase 2: Slow path — REMOTE fetch
+    // Phase 2: Slow path (single-arg, ThreadInVMfromJava internal)
     __ movptr(rbx, rax);   // rbx = still-tagged (callee-saved)
     __ pop_call_clobbered_registers(false);
-    __ movptr(c_rarg0, rbx);
-    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow), c_rarg0);
+    __ set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
+    __ movptr(c_rarg0, rbx);           // tagged oop (single arg)
+    __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
+    __ reset_last_Java_frame(r15_thread, false);
     __ movptr(dst, rax);
     __ pop(rbx);
     __ jmp(done);

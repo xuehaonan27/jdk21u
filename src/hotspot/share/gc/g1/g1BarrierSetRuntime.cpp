@@ -96,8 +96,16 @@ JRT_END
 // Same calling convention as the leaf (single oopDesc* arg, result in rax).
 // Callers: interpreter call_VM, C1 call_runtime_leaf, C2 stub raw call.
 // ============================================================
+// Non-leaf slow path for REMOTE Handle fetch.
+// Same C calling convention as the leaf (single oopDesc* arg) for uniform
+// calling from all tiers (interpreter, C1, C2, arraycopy).
+// Internally transitions _thread_in_Java → _thread_in_vm via ThreadInVMfromJava.
+// This enables Heap_lock acquisition for FCR allocation and ThreadBlockInVM
+// for safepoint-aware blocking I/O.
+// Requires: caller has set last_Java_frame (for stack walking during safepoint).
 oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   JavaThread* current = JavaThread::current();
+  ThreadInVMfromJava tiv(current);
   uintptr_t v = (uintptr_t)tagged;
   // Re-check: may have been resolved between leaf and slow calls
   if ((v >> 63) == 0) return tagged;
@@ -119,17 +127,18 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
       G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
       size_t word_size = h->eviction_word_size();
 
-      // Safe to acquire Heap_lock here (JRT_ENTRY context)
+      // Allocate in FCR — JRT_ENTRY context can acquire Heap_lock.
+      // No os::malloc fallback: all fetched objects go into proper G1 regions.
       HeapWord* dest = rmm->allocate_in_fcr(word_size);
-      if (dest == nullptr) {
-        dest = (HeapWord*)os::malloc(word_size * HeapWordSize, mtGC);
-      }
-      guarantee(dest != nullptr, "Failed to allocate fetch buffer");
+      guarantee(dest != nullptr, "FCR allocation failed for fetch");
 
-      // Fetch from remote backend. For SIM/TCP this is fast (memcpy/round-trip).
-      // For production RDMA with high latency: use LIBAPTH apth_rdma_wait
-      // which yields the userspace thread cooperatively.
-      rmm->fetch_remote_object(h, dest);
+      // Fetch from remote backend with safepoint awareness.
+      // ThreadBlockInVM allows the thread to participate in safepoints
+      // during blocking I/O (TCP round-trip / RDMA READ).
+      {
+        ThreadBlockInVM tbivm(current);
+        rmm->fetch_remote_object(h, dest);
+      }
 
       h->set_local_release(dest);
       return (oopDesc*)dest;
@@ -139,7 +148,8 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   }
 
   if (state == REMOTE_HANDLE_FETCHING) {
-    // Wait for another thread's fetch to complete.
+    // Wait with safepoint awareness
+    ThreadBlockInVM tbivm(current);
     while (true) {
       sa = h->load_state_and_addr_acquire();
       state = sa & REMOTE_HANDLE_STATE_MASK;
@@ -152,3 +162,8 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   ShouldNotReachHere();
   return nullptr;
 }
+
+// JRT_ENTRY wrapper for interpreter call_VM (proper oop map + frame anchor).
+JRT_ENTRY(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop_slow_vm(JavaThread* current, oopDesc* tagged))
+  return resolve_tagged_oop_slow(tagged);
+JRT_END

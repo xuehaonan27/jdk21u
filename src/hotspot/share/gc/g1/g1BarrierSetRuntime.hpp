@@ -56,10 +56,12 @@ public:
   //   resolve_tagged_oop_slow (JRT_ENTRY): handles REMOTE fetch (blocking I/O,
   //     safepoint-aware via ThreadBlockInVM). Called when the leaf returns
   //     a still-tagged result.
+  // Leaf fast path: handles LOCAL + Unique. Returns tagged oop for REMOTE.
   static oopDesc* resolve_tagged_oop(oopDesc* tagged);
-  // Non-leaf slow path: gets JavaThread internally, handles VM transition.
-  // Same C calling convention as resolve_tagged_oop for simplicity.
-  static oopDesc* resolve_tagged_oop_slow(oopDesc* tagged);
+  // Non-leaf slow path: handles REMOTE fetch with Heap_lock + ThreadBlockInVM.
+  // Two entry points for different calling conventions:
+  static oopDesc* resolve_tagged_oop_slow(oopDesc* tagged);           // C1/C2/arraycopy: plain + ThreadInVMfromJava
+  static oopDesc* resolve_tagged_oop_slow_vm(JavaThread* current, oopDesc* tagged); // interpreter: JRT_ENTRY via call_VM
 };
 
 #endif // SHARE_GC_G1_G1BARRIERSETRUNTIME_HPP

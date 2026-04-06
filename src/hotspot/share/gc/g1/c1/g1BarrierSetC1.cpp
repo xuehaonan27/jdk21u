@@ -249,50 +249,26 @@ void G1BarrierSetC1::load_at_resolved(LIRAccess& access, LIR_Opr result) {
 
   // Step 2: disaggregated memory tag-resolve barrier (uncompressed oops only).
   //
-  // Two-phase resolution:
-  //   Phase A: call_runtime_leaf(resolve_tagged_oop) — handles LOCAL + Unique
-  //   Phase B: call_runtime(resolve_tagged_oop_slow) — handles REMOTE with
-  //            ThreadBlockInVM for safepoint-aware blocking I/O
+  // Single unconditional call to resolve_tagged_oop_slow for every C1 oop load.
+  // This function handles ALL cases: clean oops, LOCAL, Unique, and REMOTE fetch.
+  // It does ThreadInVMfromJava + ThreadBlockInVM internally for REMOTE fetch.
   //
-  // Both calls receive `result` as input and produce result in rax.
-  // call_runtime_leaf and call_runtime both use the C calling convention
-  // with the result in a fixed physical register (rax). No register
-  // splitting issue because both calls' results are in the same register.
-  //
-  // The slow path's call_runtime is a JRT_ENTRY call that resolve_tagged_oop_slow
-  // returns immediately from if the input is already clean (fast-path inside).
+  // We cannot use the two-phase (leaf + slow) approach in C1 because C1's
+  // register allocator splits intervals between separate call_runtime_leaf ops,
+  // causing the second call to receive a different register's value.
   if (access.is_oop() && !UseCompressedOops) {
-    // Phase A: Leaf fast path
-    BasicTypeArray sig_leaf;
-    sig_leaf.append(T_OBJECT);
-    LIR_OprList args_leaf;
-    args_leaf.append(result);
-    address entry_leaf = CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop);
-    CallingConvention* cc_leaf = gen->frame_map()->c_calling_convention(&sig_leaf);
-    for (int i = 0; i < args_leaf.length(); i++) {
-      LIR_Opr loc = cc_leaf->at(i);
-      if (loc->is_register()) __ move(args_leaf.at(i), loc);
+    BasicTypeArray sig;
+    sig.append(T_OBJECT);
+    LIR_OprList args;
+    args.append(result);
+    address entry = CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow);
+    CallingConvention* cc = gen->frame_map()->c_calling_convention(&sig);
+    for (int i = 0; i < args.length(); i++) {
+      LIR_Opr loc = cc->at(i);
+      if (loc->is_register()) __ move(args.at(i), loc);
     }
     LIR_Opr phys_result = FrameMap::as_oop_opr(rax);
-    __ call_runtime_leaf(entry_leaf, gen->getThreadTemp(), phys_result, cc_leaf->args());
-    __ move(phys_result, result);
-
-    // Phase B: Slow path (handles REMOTE with ThreadBlockInVM).
-    // resolve_tagged_oop_slow has the SAME calling convention as the leaf
-    // (single oopDesc* arg, result in rax). It gets JavaThread* internally.
-    // Called unconditionally — fast-path inside returns immediately for
-    // already-resolved oops (< 10ns overhead).
-    BasicTypeArray sig_slow;
-    sig_slow.append(T_OBJECT);
-    LIR_OprList args_slow;
-    args_slow.append(result);
-    address entry_slow = CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow);
-    CallingConvention* cc_slow = gen->frame_map()->c_calling_convention(&sig_slow);
-    for (int i = 0; i < args_slow.length(); i++) {
-      LIR_Opr loc = cc_slow->at(i);
-      if (loc->is_register()) __ move(args_slow.at(i), loc);
-    }
-    __ call_runtime_leaf(entry_slow, gen->getThreadTemp(), phys_result, cc_slow->args());
+    __ call_runtime_leaf(entry, gen->getThreadTemp(), phys_result, cc->args());
     __ move(phys_result, result);
   }
 

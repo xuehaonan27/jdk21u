@@ -191,12 +191,9 @@ oop G1BarrierSet::resolve_remote_fetch(RemoteHandle* h) {
   // Read object size from Handle metadata (stored at eviction time)
   size_t word_size = h->eviction_word_size();
 
-  // Allocate in FCR region (GC-managed, proper lifecycle).
+  // Allocate in FCR — proper G1 heap region, no os::malloc fallback.
   HeapWord* dest = rmm->allocate_in_fcr(word_size);
-  if (dest == nullptr) {
-    dest = (HeapWord*)os::malloc(word_size * HeapWordSize, mtGC);
-  }
-  guarantee(dest != nullptr, "Failed to allocate fetch buffer");
+  guarantee(dest != nullptr, "FCR allocation failed for fetch");
 
   // Fetch object bytes from remote via backend (SIM/TCP/RDMA)
   rmm->fetch_remote_object(h, dest);
