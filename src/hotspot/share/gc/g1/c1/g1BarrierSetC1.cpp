@@ -249,12 +249,10 @@ void G1BarrierSetC1::load_at_resolved(LIRAccess& access, LIR_Opr result) {
 
   // Step 2: disaggregated memory tag-resolve barrier (uncompressed oops only).
   //
-  // UNCONDITIONAL call to resolve_tagged_oop for EVERY loaded oop.
+  // Unconditional call to resolve_tagged_oop (JRT_LEAF) for every loaded oop.
   // C1's register allocator splits intervals between separate LIR ops,
-  // making test+branch barriers unreliable. Calling the runtime for every
-  // load avoids the register mismatch. resolve_tagged_oop has a fast-path
-  // (bit 63 clear → immediate return) so clean oop overhead is ~5ns.
-  // TODO: Fuse load+barrier into a single LIR op to avoid call overhead.
+  // making test+branch barriers unreliable. The leaf call handles all cases
+  // including REMOTE fetch (blocking I/O acceptable for research prototype).
   if (access.is_oop() && !UseCompressedOops) {
     BasicTypeArray sig;
     sig.append(T_OBJECT);

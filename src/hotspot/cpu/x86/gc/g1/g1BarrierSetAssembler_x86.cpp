@@ -135,11 +135,8 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
   // ================================================================
   if (on_oop) {
     Label done;
-    // test dst, dst: sets SF if bit 63 is set (tagged oop)
     __ testptr(dst, dst);
-    // If positive (clean oop) or null: skip slow path
     __ jcc(Assembler::positive, done);
-    // Slow path: resolve tagged oop via runtime call (JRT_LEAF)
     if (dst != c_rarg0) {
       __ mov(c_rarg0, dst);
     }

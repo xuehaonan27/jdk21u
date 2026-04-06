@@ -1053,6 +1053,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               evicted++;
               log_info(gc)("Remote evict (%s): obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT,
                            cls_name, p2i((void*)obj), klass->external_name(), sz, slot_id);
+              // Overwrite local bytes with filler to poison stale clean oops.
+              // Any stale oop that bypassed Handle-based access will see a
+              // filler object (int[] or java.lang.Object), causing a visible
+              // crash rather than silent data corruption.
+              CollectedHeap::fill_with_object(p, sz, false /* zap */);
             }
           }
         }

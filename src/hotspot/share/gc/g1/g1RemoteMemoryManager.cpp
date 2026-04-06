@@ -12,6 +12,7 @@
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1NUMA.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
+#include "gc/shared/collectedHeap.hpp"
 #include "logging/log.hpp"
 #include "oops/oop.inline.hpp"
 #include "runtime/os.hpp"
@@ -174,7 +175,12 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
     hr->set_has_classified_objects();
   }
 
-  log_info(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT,
+  // 5. Overwrite local bytes with filler to poison stale clean oops.
+  //    After this, any reference that bypassed Handle-based access will see
+  //    a filler object, causing a visible crash instead of silent corruption.
+  CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(obj), word_size, false);
+
+  log_info(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT " (filled)",
                p2i((void*)obj), klass->external_name(), word_size, slot_id);
 
   return true;

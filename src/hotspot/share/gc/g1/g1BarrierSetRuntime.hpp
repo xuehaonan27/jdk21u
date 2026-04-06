@@ -48,9 +48,16 @@ public:
   static void write_ref_field_post_entry(volatile CardValue* card_addr, JavaThread* thread);
 
   // Disaggregated memory: resolve a tagged oop to a clean oop.
-  // Called from the assembler-level load barrier when bit 63 (sign bit) is set.
-  // This is a leaf call (no safepoint, no blocking) for local resolution.
+  //
+  // Two-phase design:
+  //   resolve_tagged_oop (JRT_LEAF): handles LOCAL + Unique (fast, no blocking).
+  //     Returns the ORIGINAL tagged oop unchanged if Handle is REMOTE/FETCHING
+  //     (caller detects bit 63 still set and calls the slow path).
+  //   resolve_tagged_oop_slow (JRT_ENTRY): handles REMOTE fetch (blocking I/O,
+  //     safepoint-aware via ThreadBlockInVM). Called when the leaf returns
+  //     a still-tagged result.
   static oopDesc* resolve_tagged_oop(oopDesc* tagged);
+  static oopDesc* resolve_tagged_oop_slow(JavaThread* current, oopDesc* tagged);
 };
 
 #endif // SHARE_GC_G1_G1BARRIERSETRUNTIME_HPP
