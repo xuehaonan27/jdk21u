@@ -15,6 +15,8 @@
 #include "logging/log.hpp"
 #include "oops/oop.inline.hpp"
 #include "runtime/os.hpp"
+#include "runtime/safepoint.hpp"
+#include "runtime/mutexLocker.hpp"
 #include "utilities/copy.hpp"
 
 // TCP client for remote executor communication
@@ -319,7 +321,9 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
 }
 
 HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
-  // Try allocating in the current FCR region (CAS-based, thread-safe)
+  // Try allocating in the current FCR region (CAS-based, thread-safe).
+  // This fast path is safe from JRT_LEAF (no locks needed — par_allocate
+  // uses CAS on the existing FCR region's bump pointer).
   HeapRegion* fcr = _current_fcr;
   if (fcr != nullptr) {
     size_t actual = 0;
@@ -329,11 +333,27 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
     }
   }
 
-  // Current FCR is full or doesn't exist. Try to get a new one.
-  // This path requires locks (cannot be called from JRT_LEAF).
-  // The caller must handle nullptr gracefully.
+  // Current FCR is full or doesn't exist. Allocating a NEW FCR region
+  // requires Heap_lock, which CANNOT be acquired from JRT_LEAF contexts
+  // (resolve_tagged_oop, C1/C2 load barrier slow paths).
+  //
+  // Check if we're in a leaf context by testing if Heap_lock is available.
+  // If not at a safepoint and don't own Heap_lock, skip allocation —
+  // the caller falls back to os::malloc.
+  if (!SafepointSynchronize::is_at_safepoint() &&
+      !Heap_lock->owned_by_self()) {
+    // Try double-check on current FCR first (another thread may have allocated)
+    fcr = _current_fcr;
+    if (fcr != nullptr) {
+      size_t actual = 0;
+      HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
+      if (result != nullptr) return result;
+    }
+    return nullptr;  // Caller will use os::malloc fallback
+  }
+
+  // We're at a safepoint or own Heap_lock — safe to allocate a new FCR.
   fcr_lock();
-  // Double-check: another thread might have allocated a new FCR
   if (_current_fcr != fcr) {
     fcr = _current_fcr;
     fcr_unlock();
@@ -342,7 +362,7 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
       HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
       if (result != nullptr) return result;
     }
-    return nullptr;  // Still full — give up for this call
+    return nullptr;
   }
 
   HeapRegion* new_fcr = allocate_new_fcr_region();
