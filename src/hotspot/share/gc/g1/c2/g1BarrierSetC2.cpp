@@ -88,16 +88,26 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
   masm.reset_last_Java_frame(r15_thread, false);
   // Result in rax. Put into _ref.
-  masm.movptr(_ref, rax);
-  masm.pop(rbx);  // restore original rbx
+  if (_ref == rbx) {
+    masm.movptr(rbx, rax);
+    masm.addptr(rsp, wordSize);  // discard saved rbx
+  } else {
+    masm.movptr(_ref, rax);
+    masm.pop(rbx);
+  }
   masm.jmp(_continuation);
 
   // Leaf resolved fast path
   masm.bind(leaf_ok);
   masm.movptr(rbx, rax);  // stash resolved oop
   masm.pop_call_clobbered_registers(false);
-  masm.movptr(_ref, rbx);
-  masm.pop(rbx);
+  if (_ref == rbx) {
+    // _ref IS rbx — result already in rbx, discard saved rbx
+    masm.addptr(rsp, wordSize);
+  } else {
+    masm.movptr(_ref, rbx);
+    masm.pop(rbx);
+  }
   masm.jmp(_continuation);
 }
 

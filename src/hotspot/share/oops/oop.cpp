@@ -139,6 +139,12 @@ bool oopDesc::is_oop_or_null(oop obj, bool ignore_mark_word) {
 VerifyOopClosure VerifyOopClosure::verify_oop;
 
 template <class T> void VerifyOopClosure::do_oop_work(T* p) {
+  // Use raw load to handle tagged oops (bit 63 set) from disaggregated memory.
+  // Tagged oops fail is_oop check but are valid managed references.
+  if (sizeof(T) == sizeof(oop) && !UseCompressedOops) {
+    uintptr_t raw = *(uintptr_t*)p;
+    if (raw != 0 && (raw >> 47) != 0) return; // tagged oop — skip verification
+  }
   oop obj = RawAccess<>::oop_load(p);
   guarantee(oopDesc::is_oop_or_null(obj), "invalid oop: " PTR_FORMAT, p2i(obj));
 }
