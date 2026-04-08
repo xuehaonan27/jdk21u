@@ -727,41 +727,64 @@ void G1BarrierSetAssembler::generate_c1_post_barrier_runtime_stub(StubAssembler*
 void G1BarrierSetAssembler::generate_c1_tag_resolve_runtime_stub(StubAssembler* sasm) {
   __ prologue("g1_tag_resolve", false);
 
-  // Save rbx (callee-saved) so we can use it to stash the result across
-  // pop_call_clobbered_registers.  Push it first (below the clobbered regs)
-  // so the stack layout is:
-  //   [rbp frame from prologue]
-  //   [saved rbx]              <-- pushed first, popped last
-  //   [clobbered regs]         <-- pushed second, popped first
-  __ push(rbx);
+  // Two-phase resolve for C1 load barrier.
+  //
+  // Phase 1 (leaf): resolve_tagged_oop handles LOCAL Handles + Unique OOPs.
+  //   For REMOTE/FETCHING, returns the tagged oop unchanged.
+  //   JRT_LEAF: no safepoint, no thread transition, no GC.
+  //
+  // Phase 2 (slow): resolve_tagged_oop_slow handles REMOTE fetch with
+  //   ThreadInVMfromJava + ThreadBlockInVM for blocking I/O.
+  //   Requires set_last_Java_frame for GC stack walking.
+  //
+  // Register protocol:
+  //   - rbx (callee-saved) stashes results across push/pop
+  //   - r12 (callee-saved) saves original tagged oop for phase 2
+  //   - All call-clobbered registers saved/restored around both calls
 
-  // Save all call-clobbered registers so C1's live values are preserved.
+  Label leaf_resolved;
+
+  __ push(rbx);
+  __ push(r12);
   __ push_call_clobbered_registers();
 
-  // Load the tagged oop from the parameter area.
-  // load_parameter(0, reg) reads from [rbp + (0+2)*8] = [rbp+16].
-  // rbp was saved by prologue, so the parameter area is still accessible
-  // even after all the pushes.
+  // Load tagged oop from parameter area: [rbp + (0+2)*8] = [rbp+16]
   __ load_parameter(0, c_rarg0);
+  __ movptr(r12, c_rarg0);  // save original tagged oop for phase 2
 
-  // Call G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged) -> oopDesc*
-  // This is a JRT_LEAF: no safepoint, no thread transition, no GC.
-  // Result is returned in rax.
+  // Phase 1: leaf call
   __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
 
-  // Stash the resolved oop in rbx (callee-saved, not in the clobbered set).
-  __ movptr(rbx, rax);
+  // Check: did leaf resolve? (bit 63 clear = resolved)
+  __ testptr(rax, rax);
+  __ jcc(Assembler::positive, leaf_resolved);
 
-  // Restore all call-clobbered registers (rax gets the old tagged value, etc).
+  // Phase 2: slow path — still tagged (REMOTE/FETCHING).
+  // Restore C1 state first, then call with proper frame anchor.
+  __ movptr(rbx, r12);  // tagged oop (for the slow call argument)
   __ pop_call_clobbered_registers();
 
-  // Move the resolved oop from rbx into rax (the return register).
-  __ movptr(rax, rbx);
+  // set_last_Java_frame: enables GC to walk through this C1 frame
+  // during a safepoint inside resolve_tagged_oop_slow's ThreadInVMfromJava.
+  // Uses the same pattern as C2's G1TagResolveStubC2.
+  __ set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
+  __ movptr(c_rarg0, rbx);  // tagged oop argument
+  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
+  __ reset_last_Java_frame(r15_thread, false);
 
-  // Restore original rbx.
+  // Result in rax.
+  __ pop(r12);
   __ pop(rbx);
+  __ epilogue();
+  return;
 
-  // epilogue does: leave; ret  -- rax holds the resolved oop.
+  // --- Leaf resolved fast path ---
+  __ bind(leaf_resolved);
+  __ movptr(rbx, rax);  // stash resolved oop
+  __ pop_call_clobbered_registers();
+  __ movptr(rax, rbx);
+  __ pop(r12);
+  __ pop(rbx);
   __ epilogue();
 }
 
