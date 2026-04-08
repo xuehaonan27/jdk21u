@@ -139,31 +139,40 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
     __ testptr(dst, dst);
     __ jcc(Assembler::positive, done);
 
-    // Phase 2: resolve tagged oop via direct call to JRT_LEAF function.
+    // Phase 2: resolve tagged oop via JRT_LEAF call with register preservation.
     //
-    // CRITICAL: Do NOT use call_VM_leaf or call_VM here.
-    //   - call_VM_leaf asserts last_sp==null (fails in interpreter after call_VM)
-    //   - call_VM writes to [rbp-16] (last_sp) which corrupts non-interpreter frames
-    //   - load_at is called from BOTH interpreter and non-interpreter contexts
+    // Must save/restore ALL caller-saved GP registers — load_at is called
+    // from interpreter templates (getfield, aaload, resolved reference load)
+    // and other contexts where any register may be live.
     //
-    // Instead: use a raw call. resolve_tagged_oop is JRT_LEAF (no GC, no safepoint).
-    // It handles LOCAL Handles + Unique OOPs. For REMOTE (evicted), it returns
-    // the tagged oop unchanged; the caller must handle that via slow path.
+    // Use MacroAssembler::call_VM_leaf_base (qualified to bypass the
+    // InterpreterMacroAssembler override that checks last_sp).
     //
-    // resolve_tagged_oop is JRT_LEAF: no GC, no safepoint.
-    // Use MacroAssembler::call_VM_leaf (NOT InterpreterMacroAssembler's
-    // override which checks last_sp). The base class version just does
-    // the call with proper C calling convention.
-    //
-    // call_VM_leaf clobbers caller-saved registers. We only need to
-    // preserve the result in dst. The interpreter will re-load anything
-    // else it needs after our barrier returns.
+    // Register save strategy: 9 GP caller-saved regs (rax,rcx,rdx,rsi,rdi,
+    // r8-r11) + rbx for result stash = 10 pushes = 80 bytes. Even number of
+    // pushes means RSP alignment parity is preserved → call_VM_leaf_base
+    // handles final alignment internally.
+    __ push(rbx);  // callee-saved scratch for result stash
+    // Save all caller-saved GP registers
+    __ push(rax); __ push(rcx); __ push(rdx); __ push(rsi); __ push(rdi);
+    __ push(r8);  __ push(r9);  __ push(r10); __ push(r11);
+    // 10 pushes total. Set up argument and call.
     if (dst != c_rarg0) __ mov(c_rarg0, dst);
-    // Bypass InterpreterMacroAssembler::call_VM_leaf_base (checks last_sp)
-    // by calling MacroAssembler::call_VM_leaf_base directly (no last_sp check).
-    // call_VM_leaf_base is virtual — qualified call suppresses virtual dispatch.
-    masm->MacroAssembler::call_VM_leaf_base(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), 1);
-    if (dst != rax) __ mov(dst, rax);
+    masm->MacroAssembler::call_VM_leaf_base(
+        CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), 1);
+    // rax = resolved oop. Stash in rbx (callee-saved, survives pops).
+    __ mov(rbx, rax);
+    // Restore caller-saved GP registers (reverse order)
+    __ pop(r11); __ pop(r10); __ pop(r9);  __ pop(r8);
+    __ pop(rdi); __ pop(rsi); __ pop(rdx); __ pop(rcx); __ pop(rax);
+    // Move resolved oop from rbx to dst, restore original rbx
+    if (dst == rbx) {
+      // dst IS rbx — result already there, just discard saved rbx
+      __ addptr(rsp, wordSize);
+    } else {
+      __ mov(dst, rbx);
+      __ pop(rbx);
+    }
 
     __ bind(done);
 #ifdef ASSERT
