@@ -134,6 +134,14 @@ class G1BarrierSet: public CardTableBarrierSet {
     template <typename T>
     static void oop_store_in_heap(T* addr, oop new_value);
     static void oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value);
+
+    // Override arraycopy to resolve tagged oops in source elements.
+    // The default ModRefBarrierSet::oop_arraycopy_in_heap does a raw copy
+    // which propagates tagged oop bytes without resolution.
+    template <typename T>
+    static bool oop_arraycopy_in_heap(arrayOop src_obj, size_t src_offset_in_bytes, T* src_raw,
+                                      arrayOop dst_obj, size_t dst_offset_in_bytes, T* dst_raw,
+                                      size_t length);
   };
 };
 

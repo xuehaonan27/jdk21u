@@ -280,6 +280,10 @@
   develop(bool, G1VerifyBitmaps, false,                                     \
           "Verifies the consistency of the marking bitmaps")                \
                                                                             \
+  product(bool, G1TagRefSites, false, DIAGNOSTIC,                            \
+          "During STW classification, write tagged oops into ref-site "     \
+          "heap slots. Diagnostic flag for barrier coverage testing.")      \
+                                                                            \
   product(bool, G1SimulateRemoteEviction, false, DIAGNOSTIC,                \
           "After each GC, simulate evicting a few old objects to remote "   \
           "memory. For testing disaggregated memory infrastructure.")       \

@@ -26,6 +26,7 @@
 #include "gc/g1/g1Allocator.inline.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1CollectionSet.hpp"
 #include "gc/g1/g1EvacFailureRegions.inline.hpp"
 #include "gc/g1/g1OopClosures.inline.hpp"
@@ -151,7 +152,7 @@ void G1ParScanThreadState::rc_buffer_ensure_capacity() {
     size_t new_cap = (_rc_buffer_capacity == 0) ? RC_BUFFER_INITIAL_CAPACITY : _rc_buffer_capacity * 2;
     RCRefSite* new_buf = NEW_C_HEAP_ARRAY(RCRefSite, new_cap, mtGC);
     if (_rc_buffer != nullptr) {
-      memcpy(new_buf, _rc_buffer, _rc_buffer_size * sizeof(RCRefSite));
+      for (size_t i = 0; i < _rc_buffer_size; i++) new_buf[i] = _rc_buffer[i];
       FREE_C_HEAP_ARRAY(RCRefSite, _rc_buffer);
     }
     _rc_buffer = new_buf;
@@ -239,9 +240,13 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);
 
   // Phase 2: Record reference site for RC counting if target was promoted to Old.
+  // CRITICAL: only record ref-sites that are WITHIN the Java heap.
+  // During root scanning, p can be a stack slot, JNI handle, CLD oop, etc.
+  // Writing tagged oops into non-heap slots crashes because aload, JNI access,
+  // and CLD access paths do NOT go through the G1 load barrier.
   {
     HeapRegion* dest = _g1h->heap_region_containing(obj);
-    if (dest != nullptr && dest->is_old()) {
+    if (dest != nullptr && dest->is_old() && _g1h->is_in((void*)p)) {
       record_rc_ref_site(obj, (void*)p, sizeof(T) == sizeof(narrowOop));
     }
   }
@@ -656,6 +661,8 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
   size_t total_sites = 0;
   size_t unique_count = 0;
   size_t shared_count = 0;
+  size_t stale_skip = 0;
+  size_t tag_skip = 0;  // objects skipped from tagging due to unsafe klass
 
   // Collect from all workers
   for (uint wid = 0; wid < _num_workers; wid++) {
@@ -690,7 +697,7 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
           int new_cap = (e->info.extra_capacity == 0) ? 4 : e->info.extra_capacity * 2;
           auto* new_arr = NEW_C_HEAP_ARRAY(G1ParScanThreadState::RCRefSite, new_cap, mtGC);
           if (e->info.extra_sites != nullptr) {
-            memcpy(new_arr, e->info.extra_sites, e->info.extra_count * sizeof(G1ParScanThreadState::RCRefSite));
+            for (int j = 0; j < e->info.extra_count; j++) new_arr[j] = e->info.extra_sites[j];
             FREE_C_HEAP_ARRAY(G1ParScanThreadState::RCRefSite, e->info.extra_sites);
           }
           e->info.extra_sites = new_arr;
@@ -704,7 +711,6 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
 
   // Step 2: Classify and tag
   RemoteHandleAllocBuffer hab;
-
   for (size_t idx = 0; idx < MAP_SIZE; idx++) {
     MapEntry* e = map[idx];
     while (e != nullptr) {
@@ -727,42 +733,84 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         uintptr_t existing_cls = mw.remote_class();
 
         if (existing_cls == markWord::remote_class_shared) {
-          // Already SHARED from a previous cycle. Check if RC changed.
-          // Ref-sites are NOT tagged here — heap slots must stay CLEAN.
-          // (MethodHandle adapters, constant pool resolution, and other JVM
-          // internals read oop fields via raw movptr without the load barrier.
-          // Writing tagged oops here would crash those paths.)
-          // The write barrier (resolve_managed_store) tags NEW stores.
+          // Already SHARED. No re-tagging — heap slots stay as-is.
+          // Re-tagging without stale validation caused SIGSEGV in release builds.
           goto next_entry;
         }
 
         if (existing_cls == markWord::remote_class_unique) {
-          // Already UNIQUE. If RC increased, upgrade to Shared.
+          // Already UNIQUE. If RC increased, upgrade to Shared (mark word only).
           if (info.count > 1) {
             obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
             shared_count++;
           }
-          // Ref-sites stay clean — tagging is write-barrier's job.
           goto next_entry;
         }
 
         // New classification for this object.
-        // ONLY set mark word bits — do NOT write tagged oops into heap slots.
-        // Heap slots must remain clean oops at all times because non-barrier
-        // code paths (MethodHandle adapters, constant pool, aload, load_klass)
-        // read them via raw movptr without testptr+js resolution.
-        // The write barrier tags oops at store time; the load barrier resolves
-        // them on getfield/aaload.
+        // Determine if tagging is safe: skip arrays and JVM-internal types
+        // that are accessed by non-barrier paths (arraycopy, MH dispatch).
+        bool safe_to_tag = G1TagRefSites;
+        if (safe_to_tag) {
+          Klass* k = obj->klass();
+          if (k->is_array_klass()) { safe_to_tag = false; tag_skip++; }
+        }
+
         if (info.count == 1) {
-          // RC=1 -> Unique: mark word only.
           obj->set_mark(mw.set_remote_class(markWord::remote_class_unique));
           dest->set_has_classified_objects();
+          if (safe_to_tag && !info.first_site._is_narrow) {
+            oop* p = (oop*)info.first_site._ref_site;
+            // Verify ref-site before writing
+            if (_g1h->is_in((void*)p)) {
+              // Load raw to avoid debug oop constructor check for tagged values.
+              oop resolved = resolve_oop_raw(cast_to_oop(*(uintptr_t*)p));
+              if (resolved == obj) {
+                *p = g1_make_unique_oop(obj);
+              } else {
+                // Stale ref-site: value doesn't match expected object.
+                // This ref-site was recorded during evacuation but the slot
+                // was subsequently updated. Do NOT tag — would corrupt data.
+                log_warning(gc)("TagRefSite SKIP stale UNIQUE: p=" PTR_FORMAT
+                  " expected=" PTR_FORMAT " resolved=" PTR_FORMAT,
+                  p2i(p), p2i((void*)obj), p2i((void*)resolved));
+                stale_skip++;
+              }
+            }
+          }
           unique_count++;
         } else {
-          // RC>1 -> Shared: mark word only. Handle allocated on demand
-          // (at eviction time or write barrier upgrade time, not here).
           obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
           dest->set_has_classified_objects();
+          if (safe_to_tag) {
+            RemoteHandle* h = _g1h->remote_memory_manager()->create_handle_for(obj, &hab);
+            if (!info.first_site._is_narrow) {
+              oop* p = (oop*)info.first_site._ref_site;
+              if (_g1h->is_in((void*)p)) {
+                oop resolved = resolve_oop_raw(cast_to_oop(*(uintptr_t*)p));
+                if (resolved == obj) {
+                  *p = g1_make_shared_oop((void*)h);
+                } else {
+                  log_warning(gc)("TagRefSite SKIP stale SHARED: p=" PTR_FORMAT
+                    " expected=" PTR_FORMAT " resolved=" PTR_FORMAT, p2i(p), p2i((void*)obj), p2i((void*)resolved));
+                  stale_skip++;
+                }
+              }
+            }
+            for (int i = 0; i < info.extra_count; i++) {
+              if (!info.extra_sites[i]._is_narrow) {
+                oop* p = (oop*)info.extra_sites[i]._ref_site;
+                if (_g1h->is_in((void*)p)) {
+                  oop resolved = resolve_oop_raw(cast_to_oop(*(uintptr_t*)p));
+                  if (resolved == obj) {
+                    *p = g1_make_shared_oop((void*)h);
+                  } else {
+                    stale_skip++;
+                  }
+                }
+              }
+            }
+          }
           shared_count++;
         }
       }
@@ -780,8 +828,9 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
 
   if (unique_count > 0 || shared_count > 0) {
     log_info(gc)("OOP Classification: " SIZE_FORMAT " sites, " SIZE_FORMAT " Unique, "
-                 SIZE_FORMAT " Shared promoted Old objects",
-                 total_sites, unique_count, shared_count);
+                 SIZE_FORMAT " Shared promoted Old objects"
+                 " (stale_skip=" SIZE_FORMAT " tag_skip=" SIZE_FORMAT ")",
+                 total_sites, unique_count, shared_count, stale_skip, tag_skip);
   }
 }
 

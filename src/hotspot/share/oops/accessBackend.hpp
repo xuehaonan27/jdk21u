@@ -357,11 +357,17 @@ public:
 
   template <typename T>
   static void store_at(oop base, ptrdiff_t offset, T value) {
+    assert(base == nullptr || (cast_from_oop<uintptr_t>(base) >> 47) == 0,
+           "RawAccessBarrier::store_at: tagged base " PTR_FORMAT " off=" INTX_FORMAT,
+           cast_from_oop<uintptr_t>(base), (intx)offset);
     store(field_addr(base, offset), value);
   }
 
   template <typename T>
   static T load_at(oop base, ptrdiff_t offset) {
+    assert(base == nullptr || (cast_from_oop<uintptr_t>(base) >> 47) == 0,
+           "RawAccessBarrier::load_at: tagged base " PTR_FORMAT " off=" INTX_FORMAT,
+           cast_from_oop<uintptr_t>(base), (intx)offset);
     return load<T>(field_addr(base, offset));
   }
 

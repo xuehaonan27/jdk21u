@@ -159,6 +159,11 @@ oop_load_in_heap(T* addr) {
     }
   }
 
+  // Post-resolution guarantee: result must be clean (no tag bits).
+  guarantee(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
+            "oop_load_in_heap: barrier returned tagged value " PTR_FORMAT " from addr " PTR_FORMAT,
+            cast_from_oop<uintptr_t>(value), p2i(addr));
+
   enqueue_preloaded_if_weak(decorators, value);
   return value;
 }
@@ -166,6 +171,11 @@ oop_load_in_heap(T* addr) {
 template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_in_heap_at(oop base, ptrdiff_t offset) {
+  // Diagnostic: catch tagged base oops — means someone passed an unresolved
+  // tagged oop as an object base for field access.
+  guarantee((cast_from_oop<uintptr_t>(base) >> 47) == 0,
+            "oop_load_in_heap_at: tagged base oop " PTR_FORMAT " at offset " INTX_FORMAT,
+            cast_from_oop<uintptr_t>(base), (intx)offset);
   oop value = ModRef::oop_load_in_heap_at(base, offset);
   // Resolve tagged oops — same full barrier as oop_load_in_heap.
   // Must handle REMOTE (trigger fetch), not just strip tags.
@@ -190,8 +200,38 @@ oop_load_in_heap_at(oop base, ptrdiff_t offset) {
       value = cast_to_oop(v & G1_OOP_ADDR_MASK);
     }
   }
+  assert(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
+         "oop_load_in_heap_at: barrier returned tagged " PTR_FORMAT " base=" PTR_FORMAT " off=" INTX_FORMAT,
+         cast_from_oop<uintptr_t>(value), cast_from_oop<uintptr_t>(base), (intx)offset);
   enqueue_preloaded_if_weak(AccessBarrierSupport::resolve_possibly_unknown_oop_ref_strength<decorators>(base, offset), value);
   return value;
+}
+
+// Override arraycopy: resolve tagged oops in source elements before raw copy.
+// Without this, System.arraycopy / Arrays.copyOfRange propagates tagged oop
+// bytes via Raw::oop_arraycopy, bypassing ALL load barriers.
+template <DecoratorSet decorators, typename BarrierSetT>
+template <typename T>
+inline bool G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
+oop_arraycopy_in_heap(arrayOop src_obj, size_t src_offset_in_bytes, T* src_raw,
+                      arrayOop dst_obj, size_t dst_offset_in_bytes, T* dst_raw,
+                      size_t length) {
+  if (!UseCompressedOops && sizeof(T) == sizeof(oop)) {
+    // Resolve any tagged oops in the source array before copying.
+    // Only needed for wide oops (UseCompressedOops=false).
+    oop* src = (oop*)arrayOopDesc::obj_offset_to_raw(src_obj, src_offset_in_bytes, (oop*)src_raw);
+    for (size_t i = 0; i < length; i++) {
+      uintptr_t v = cast_from_oop<uintptr_t>(src[i]);
+      if ((v & G1_OOP_TAG_MASK) != 0) {
+        // Tagged oop — resolve in place before the bulk copy.
+        src[i] = resolve_oop_raw(src[i]);
+      }
+    }
+  }
+  // Delegate to parent which does the actual copy + write barriers.
+  return ModRef::oop_arraycopy_in_heap(src_obj, src_offset_in_bytes, src_raw,
+                                       dst_obj, dst_offset_in_bytes, dst_raw,
+                                       length);
 }
 
 template <DecoratorSet decorators, typename BarrierSetT>

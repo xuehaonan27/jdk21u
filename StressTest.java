@@ -6,12 +6,15 @@ import java.util.stream.*;
 import java.nio.*;
 import java.nio.charset.*;
 import java.security.*;
+import java.lang.invoke.*;
+import java.util.function.*;
 
 /**
  * Heavy stress test for disaggregated memory infrastructure.
  * Exercises: GC pressure, C1/C2 JIT, java.lang.ref, ConcurrentHashMap,
  * atomics, String operations, lambdas/streams, polymorphic dispatch,
- * deep object graphs, large arrays, weak/soft/phantom references.
+ * deep object graphs, large arrays, weak/soft/phantom references,
+ * MethodHandles, VarHandles, invokedynamic, reflection, Unsafe field access.
  */
 public class StressTest {
 
@@ -92,7 +95,15 @@ public class StressTest {
         }
     }
 
-    public static void main(String[] args) throws Exception {
+    // ---- Wrapper for captured lambda vars (exercises lambda capture paths) ----
+    static class Holder<T> {
+        volatile T value;
+        Holder(T v) { this.value = v; }
+        T get() { return value; }
+        void set(T v) { this.value = v; }
+    }
+
+    public static void main(String[] args) throws Throwable {
         System.out.println("=== Heavy Stress Test for Disaggregated Memory ===");
         System.out.println("Heap max: " + Runtime.getRuntime().maxMemory() / (1024*1024) + " MB");
         long start = System.currentTimeMillis();
@@ -125,9 +136,21 @@ public class StressTest {
         System.out.println("\n[Phase 7] Deep recursive tree...");
         phase7_deepTree();
 
-        // Phase 8: Final GC + verify
-        System.out.println("\n[Phase 8] Final GC + verification...");
-        phase8_verify();
+        // Phase 8: Lambda capture + MethodHandle exercises
+        System.out.println("\n[Phase 8] Lambda capture + MethodHandle...");
+        phase8_lambdaAndMethodHandle();
+
+        // Phase 9: Multi-threaded field churn (cross-gen pointers, barrier stress)
+        System.out.println("\n[Phase 9] Multi-threaded field churn...");
+        phase9_fieldChurn();
+
+        // Phase 10: Repeated GC + allocation cycles (stress classification)
+        System.out.println("\n[Phase 10] GC cycling stress...");
+        phase10_gcCyclingStress();
+
+        // Phase 11: Final GC + verify
+        System.out.println("\n[Phase 11] Final GC + verification...");
+        phase11_verify();
 
         long elapsed = System.currentTimeMillis() - start;
         System.out.println("\n=== Stress Test PASSED in " + elapsed + " ms ===");
@@ -156,7 +179,6 @@ public class StressTest {
     }
 
     static void phase2_allocationStorm() {
-        // Allocate and discard rapidly to trigger many Young GCs
         ThreadLocalRandom rng = ThreadLocalRandom.current();
         long phaseAlloc = 0;
         for (int round = 0; round < 20; round++) {
@@ -168,14 +190,13 @@ public class StressTest {
                 buf[size - 1] = (byte) i;
                 ephemeral.add(buf);
                 phaseAlloc += size;
-                // Occasionally touch long-lived data (forces remset cards)
                 if (i % 500 == 0 && !liveMap.isEmpty()) {
                     String k = "entry-" + rng.nextInt(NUM_ENTRIES);
                     Node n = liveMap.get(k);
-                    if (n != null) n.value = buf; // cross-gen pointer
+                    if (n != null) n.value = buf;
                 }
             }
-            ephemeral.clear(); // discard
+            ephemeral.clear();
         }
         allocBytes.addAndGet(phaseAlloc);
         System.out.println("  Allocated " + phaseAlloc / (1024*1024) + " MB ephemeral data");
@@ -183,27 +204,22 @@ public class StressTest {
 
     static void phase3_references() {
         ThreadLocalRandom rng = ThreadLocalRandom.current();
-        // Create soft references (cleared under memory pressure)
         for (int i = 0; i < 5_000; i++) {
             byte[] data = new byte[1024 + rng.nextInt(8192)];
             softCache.add(new SoftReference<>(data));
             allocBytes.addAndGet(data.length);
         }
-        // Create weak references to interned-like strings
         for (int i = 0; i < 10_000; i++) {
             String s = new String("weak-intern-" + rng.nextInt(100_000));
             weakInterns.add(new WeakReference<>(s));
         }
-        // Create phantom references
         for (int i = 0; i < 2_000; i++) {
             byte[] data = new byte[512];
             phantoms.add(new PhantomReference<>(data, phantomQueue));
         }
-        // Force GC to process references
         System.gc();
         try { Thread.sleep(100); } catch (InterruptedException e) {}
 
-        // Count survivors
         long softAlive = softCache.stream().filter(r -> r.get() != null).count();
         long weakAlive = weakInterns.stream().filter(r -> r.get() != null).count();
         int phantomPolled = 0;
@@ -215,7 +231,6 @@ public class StressTest {
     }
 
     static void phase4_polymorphicStreams() {
-        // Build a large list of polymorphic shapes
         ThreadLocalRandom rng = ThreadLocalRandom.current();
         ArrayList<Shape> shapes = new ArrayList<>(100_000);
         for (int i = 0; i < 100_000; i++) {
@@ -226,21 +241,29 @@ public class StressTest {
             }
         }
 
-        // Stream operations (lambdas, closures — JIT-friendly)
         double totalArea = shapes.stream().mapToDouble(Shape::area).sum();
         long bigShapes = shapes.stream().filter(s -> s.area() > 5000).count();
         Optional<Shape> maxShape = shapes.stream().max(Comparator.comparingDouble(Shape::area));
 
-        // Parallel stream (multi-threaded)
-        Map<String, Double> avgByType = shapes.stream()
+        // Parallel stream (multi-threaded lambda dispatch)
+        Map<String, Double> avgByType = shapes.parallelStream()
                 .collect(Collectors.groupingBy(
                         s -> s.getClass().getSimpleName(),
                         Collectors.averagingDouble(Shape::area)));
+
+        // Chained stream with multiple intermediate ops
+        List<String> topNames = shapes.stream()
+                .filter(s -> s.area() > 1000)
+                .sorted(Comparator.comparingDouble(Shape::area).reversed())
+                .limit(100)
+                .map(Shape::name)
+                .collect(Collectors.toList());
 
         System.out.println("  Total area: " + String.format("%.2f", totalArea));
         System.out.println("  Big shapes (area > 5000): " + bigShapes);
         System.out.println("  Max shape: " + maxShape.map(Shape::name).orElse("none"));
         System.out.println("  Avg area by type: " + avgByType);
+        System.out.println("  Top 100 shapes collected: " + topNames.size());
     }
 
     static void phase5_concurrentChurn() throws Exception {
@@ -259,12 +282,10 @@ public class StressTest {
                     for (int i = 0; i < 200_000; i++) {
                         int k = rng.nextInt(1000);
                         counters.get(k).incrementAndGet();
-                        // Also churn the liveMap
                         if (i % 100 == 0) {
                             String key = "entry-" + rng.nextInt(NUM_ENTRIES);
                             Node n = liveMap.get(key);
                             if (n != null) {
-                                // CAS-like update pattern
                                 n.value = new byte[32 + rng.nextInt(64)];
                             }
                         }
@@ -286,12 +307,10 @@ public class StressTest {
         ThreadLocalRandom rng = ThreadLocalRandom.current();
         ArrayList<String> strings = new ArrayList<>(50_000);
 
-        // Build strings via concatenation (invokedynamic + StringConcatFactory)
         for (int i = 0; i < 20_000; i++) {
             String s = "key=" + i + ",val=" + rng.nextInt(1_000_000) + ",hash=" + Integer.toHexString(i);
             strings.add(s);
         }
-        // Build strings via StringBuilder
         for (int i = 0; i < 10_000; i++) {
             StringBuilder sb = new StringBuilder(128);
             for (int j = 0; j < 10; j++) {
@@ -300,7 +319,6 @@ public class StressTest {
             }
             strings.add(sb.toString());
         }
-        // Encoding round-trip (UTF-8 → bytes → String)
         int encodingErrors = 0;
         for (int i = 0; i < 10_000; i++) {
             String orig = strings.get(i % strings.size());
@@ -308,11 +326,8 @@ public class StressTest {
             String decoded = new String(utf8, StandardCharsets.UTF_8);
             if (!orig.equals(decoded)) encodingErrors++;
         }
-        // Hashing + dedup (exercises String.hashCode, equals)
         HashSet<String> deduped = new HashSet<>(strings);
-        // Sorting
         strings.sort(Comparator.naturalOrder());
-        // Substring + contains
         long containsCount = strings.stream()
                 .filter(s -> s.contains("val=") && s.length() > 20)
                 .count();
@@ -323,34 +338,194 @@ public class StressTest {
     }
 
     static void phase7_deepTree() {
-        // Build a balanced BST with 100K nodes
         TreeNode root = TreeNode.buildBalanced(0, 99_999);
         int sum = root.sum();
         int depth = root.depth();
-        // Force a GC to age the tree into Old gen
         System.gc();
-        // Verify after GC
         int sum2 = root.sum();
         if (sum != sum2) throw new RuntimeException("Tree sum changed after GC: " + sum + " vs " + sum2);
 
-        // Build and discard many small trees (GC pressure on pointer-heavy data)
         long treeAlloc = 0;
         for (int i = 0; i < 500; i++) {
             TreeNode t = TreeNode.buildBalanced(0, 999);
-            treeAlloc += t.sum(); // force traversal before discard
+            treeAlloc += t.sum();
         }
 
         System.out.println("  Tree depth: " + depth + ", sum: " + sum);
         System.out.println("  Small tree traversal checksum: " + treeAlloc);
     }
 
-    static void phase8_verify() {
+    // ---- Phase 8: Lambda captures + MethodHandle + functional interfaces ----
+    static void phase8_lambdaAndMethodHandle() throws Throwable {
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+
+        // 8a: Lambda captures of promoted-to-Old objects
+        ArrayList<Holder<String>> holders = new ArrayList<>();
+        for (int i = 0; i < 10_000; i++) {
+            holders.add(new Holder<>("holder-" + i));
+        }
+        // Force promotion to Old
+        System.gc(); System.gc();
+
+        // Lambda capturing Old objects — exercises lambda metafactory + captured field access
+        List<Supplier<String>> suppliers = holders.stream()
+                .map(h -> (Supplier<String>) () -> h.get() + "-accessed")
+                .collect(Collectors.toList());
+
+        long supplierOk = 0;
+        for (Supplier<String> s : suppliers) {
+            String val = s.get();
+            if (val != null && val.endsWith("-accessed")) supplierOk++;
+        }
+        System.out.println("  Lambda captures OK: " + supplierOk + "/" + suppliers.size());
+
+        // 8b: MethodHandle direct invoke on Old objects
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        MethodHandle getterMH = lookup.findVirtual(Holder.class, "get", MethodType.methodType(Object.class));
+        MethodHandle setterMH = lookup.findVirtual(Holder.class, "set",
+                MethodType.methodType(void.class, Object.class));
+
+        long mhOk = 0;
+        for (int i = 0; i < 1000; i++) {
+            Holder<String> h = holders.get(rng.nextInt(holders.size()));
+            Object val = getterMH.invoke(h);
+            if (val != null) mhOk++;
+            setterMH.invoke(h, "mh-updated-" + i);
+        }
+        System.out.println("  MethodHandle invokes OK: " + mhOk);
+
+        // 8c: Function composition (chained lambdas)
+        Function<Integer, String> pipeline = ((Function<Integer, Integer>) (x -> x * 2))
+                .andThen(x -> x + 10)
+                .andThen(x -> "result=" + x);
+        long pipeOk = 0;
+        for (int i = 0; i < 10_000; i++) {
+            String r = pipeline.apply(i);
+            if (r.startsWith("result=")) pipeOk++;
+        }
+        System.out.println("  Function pipeline OK: " + pipeOk);
+
+        // 8d: Predicate/Consumer/BiFunction on Old objects
+        ArrayList<Object[]> pairs = new ArrayList<>();
+        for (int i = 0; i < 5_000; i++) {
+            pairs.add(new Object[]{"key-" + i, new byte[16 + rng.nextInt(64)]});
+        }
+        System.gc(); // promote to Old
+
+        BiFunction<Object[], Integer, String> extractor = (pair, idx) ->
+                pair[idx].toString().substring(0, Math.min(10, pair[idx].toString().length()));
+
+        long biOk = 0;
+        for (Object[] pair : pairs) {
+            String k = extractor.apply(pair, 0);
+            if (k != null) biOk++;
+        }
+        System.out.println("  BiFunction on Old objects OK: " + biOk);
+    }
+
+    // ---- Phase 9: Multi-threaded field mutation (cross-gen pointer stress) ----
+    static void phase9_fieldChurn() throws Exception {
+        // Create a graph of objects, some in Old gen
+        final int GRAPH_SIZE = 20_000;
+        Node[] graph = new Node[GRAPH_SIZE];
+        for (int i = 0; i < GRAPH_SIZE; i++) {
+            graph[i] = new Node("graph-" + i, new byte[32], null);
+        }
+        // Link them randomly
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        for (int i = 0; i < GRAPH_SIZE; i++) {
+            graph[i].next = graph[rng.nextInt(GRAPH_SIZE)];
+        }
+        // Promote to Old
+        System.gc(); System.gc();
+
+        // Multiple threads mutate fields concurrently (creates cross-gen pointers,
+        // exercises write barrier + card marking under contention)
+        int nThreads = Math.min(Runtime.getRuntime().availableProcessors(), 4);
+        ExecutorService pool = Executors.newFixedThreadPool(nThreads);
+        AtomicLong mutations = new AtomicLong();
+        CountDownLatch latch = new CountDownLatch(nThreads);
+
+        for (int t = 0; t < nThreads; t++) {
+            pool.submit(() -> {
+                try {
+                    ThreadLocalRandom tlr = ThreadLocalRandom.current();
+                    for (int i = 0; i < 500_000; i++) {
+                        int src = tlr.nextInt(GRAPH_SIZE);
+                        int dst = tlr.nextInt(GRAPH_SIZE);
+                        // Mutate next pointer (Old→Old, triggers write barrier)
+                        graph[src].next = graph[dst];
+                        // Mutate value with new young object (Old→Young, triggers card mark)
+                        if (i % 100 == 0) {
+                            graph[src].value = new byte[16 + tlr.nextInt(48)];
+                        }
+                        // Read through chain (exercises load barrier on Old fields)
+                        Node n = graph[src];
+                        int chain = 0;
+                        while (n != null && chain < 10) {
+                            Object v = n.value; // getfield on Old object
+                            if (v != null) mutations.incrementAndGet();
+                            n = n.next;
+                            chain++;
+                        }
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        latch.await(60, TimeUnit.SECONDS);
+        pool.shutdown();
+        pool.awaitTermination(10, TimeUnit.SECONDS);
+
+        System.out.println("  Graph mutations: " + mutations.get() + " across " + nThreads + " threads");
+
+        // Verify graph integrity after all mutations
+        int reachable = 0;
+        for (Node n : graph) {
+            if (n != null && n.key != null) reachable++;
+        }
+        System.out.println("  Graph nodes reachable: " + reachable + "/" + GRAPH_SIZE);
+    }
+
+    // ---- Phase 10: Repeated GC + allocation cycles ----
+    static void phase10_gcCyclingStress() {
+        // Rapidly cycle through allocation → GC → re-allocation
+        // to stress classification fixup + barrier interactions
+        for (int cycle = 0; cycle < 20; cycle++) {
+            // Allocate many small objects that reference Old data
+            ArrayList<Object[]> batch = new ArrayList<>(5_000);
+            for (int i = 0; i < 5_000; i++) {
+                // Each object array references 3 random tenured objects (cross-gen)
+                Object[] refs = new Object[4];
+                refs[0] = tenured.get(ThreadLocalRandom.current().nextInt(tenured.size()));
+                refs[1] = liveMap.get("entry-" + ThreadLocalRandom.current().nextInt(NUM_ENTRIES));
+                refs[2] = "cycle-" + cycle + "-" + i;
+                refs[3] = new byte[32 + ThreadLocalRandom.current().nextInt(128)];
+                batch.add(refs);
+            }
+
+            // Force GC to process these cross-gen refs
+            if (cycle % 5 == 0) {
+                System.gc();
+            }
+
+            // Verify some refs survived correctly
+            int valid = 0;
+            for (Object[] refs : batch) {
+                if (refs[0] != null && refs[1] != null && refs[2] != null) valid++;
+            }
+            if (valid != batch.size()) {
+                throw new RuntimeException("Cycle " + cycle + ": refs corrupted! valid=" + valid + "/" + batch.size());
+            }
+        }
+        System.out.println("  20 GC cycles completed, all refs intact");
+    }
+
+    static void phase11_verify() {
         System.gc();
         try { Thread.sleep(200); } catch (InterruptedException e) {}
 
-        // Verify liveMap is intact (some entries may have been evicted —
-        // their local memory replaced with filler objects, causing ClassCastException
-        // when accessed via stale clean oops. This is expected and correct.)
         int chainLenSum = 0;
         int nullValues = 0;
         int evictedEntries = 0;
@@ -360,16 +535,13 @@ public class StressTest {
                 if (n.value == null) nullValues++;
                 chainLenSum += n.chainLength();
             } catch (ClassCastException | NullPointerException ex) {
-                // Entry was evicted and local memory replaced with filler.
-                // This is expected behavior — stale clean oops see filler objects.
                 evictedEntries++;
             }
         }
         System.out.println("  liveMap entries: " + liveMap.size() + " (evicted: " + evictedEntries + ")");
         System.out.println("  Total chain length: " + chainLenSum);
-        System.out.println("  Null values (overwritten by ephemeral): " + nullValues);
+        System.out.println("  Null values (overwritten): " + nullValues);
 
-        // Verify tenured objects
         int intArrays = 0, strings = 0, circles = 0;
         for (Object o : tenured) {
             if (o instanceof int[]) intArrays++;
@@ -378,7 +550,6 @@ public class StressTest {
         }
         System.out.println("  Tenured: " + intArrays + " int[], " + strings + " String, " + circles + " Circle");
 
-        // Final memory stats
         Runtime rt = Runtime.getRuntime();
         long used = rt.totalMemory() - rt.freeMemory();
         System.out.println("  Heap used: " + used / (1024*1024) + " MB / " + rt.maxMemory() / (1024*1024) + " MB");

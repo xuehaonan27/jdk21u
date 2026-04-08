@@ -151,10 +151,20 @@ inline oop resolve_oop_raw(oop tagged) {
 
 template <DecoratorSet decorators = DECORATORS_NONE, typename T>
 inline oop g1_resolved_load(T* p) {
-  T raw = RawAccess<decorators>::oop_load(p);
-  if (CompressedOops::is_null(raw)) return nullptr;
-  oop obj = CompressedOops::decode_not_null(raw);
-  return resolve_oop_raw(obj);
+  if (sizeof(T) == sizeof(narrowOop)) {
+    // Narrow oop path: tags don't apply. Use normal decode.
+    T raw = RawAccess<decorators>::oop_load(p);
+    if (CompressedOops::is_null(raw)) return nullptr;
+    return CompressedOops::decode_not_null(raw);
+  }
+  // Wide oop path: value may be tagged (bit 63 set).
+  // Load as raw uintptr_t to avoid debug oop constructor check_oop
+  // which asserts heap range and fails for tagged oops.
+  uintptr_t raw = *(uintptr_t*)p;
+  if (raw == 0) return nullptr;
+  // resolve_oop_raw handles tagged (strips bits / follows Handle) and
+  // clean oops (returns as-is). Result is always a valid heap oop or nullptr.
+  return resolve_oop_raw(cast_to_oop(raw));
 }
 
 #endif // SHARE_GC_G1_G1REMOTEOOP_HPP

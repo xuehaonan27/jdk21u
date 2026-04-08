@@ -79,10 +79,17 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   if (v & G1_OOP_INDIRECT_BIT) {
     RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
     uintptr_t sa = h->load_state_and_addr_acquire();
-    if ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL) {
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    if (state == REMOTE_HANDLE_LOCAL) {
       return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
     }
-    // REMOTE or FETCHING: return tagged oop unchanged for slow path
+    // REMOTE or FETCHING: return tagged oop unchanged for slow path.
+    // With G1TagRefSites (no eviction), this should never happen.
+    // If it does, the Handle was created incorrectly.
+    guarantee(!G1TagRefSites || state == REMOTE_HANDLE_LOCAL,
+              "resolve_tagged_oop: Shared Handle not LOCAL! tagged=" PTR_FORMAT
+              " handle=" PTR_FORMAT " state_and_addr=" PTR_FORMAT " state=%lu",
+              v, p2i(h), sa, state);
     return tagged;
   }
 

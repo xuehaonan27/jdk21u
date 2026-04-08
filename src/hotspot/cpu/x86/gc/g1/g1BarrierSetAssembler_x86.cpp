@@ -134,26 +134,48 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
   // Fast path: test + js = 2 instructions, 5 bytes. Same as ZGC.
   // ================================================================
   if (on_oop) {
-    Label done, leaf_ok;
+    Label done;
     // Phase 1: test sign bit. Clean oops / null skip entirely.
     __ testptr(dst, dst);
     __ jcc(Assembler::positive, done);
-    // Phase 2: leaf call (handles LOCAL + Unique)
-    __ push(dst);                          // save tagged oop for slow retry
+
+    // Phase 2: resolve tagged oop via direct call to JRT_LEAF function.
+    //
+    // CRITICAL: Do NOT use call_VM_leaf or call_VM here.
+    //   - call_VM_leaf asserts last_sp==null (fails in interpreter after call_VM)
+    //   - call_VM writes to [rbp-16] (last_sp) which corrupts non-interpreter frames
+    //   - load_at is called from BOTH interpreter and non-interpreter contexts
+    //
+    // Instead: use a raw call. resolve_tagged_oop is JRT_LEAF (no GC, no safepoint).
+    // It handles LOCAL Handles + Unique OOPs. For REMOTE (evicted), it returns
+    // the tagged oop unchanged; the caller must handle that via slow path.
+    //
+    // resolve_tagged_oop is JRT_LEAF: no GC, no safepoint.
+    // Use MacroAssembler::call_VM_leaf (NOT InterpreterMacroAssembler's
+    // override which checks last_sp). The base class version just does
+    // the call with proper C calling convention.
+    //
+    // call_VM_leaf clobbers caller-saved registers. We only need to
+    // preserve the result in dst. The interpreter will re-load anything
+    // else it needs after our barrier returns.
     if (dst != c_rarg0) __ mov(c_rarg0, dst);
-    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
-    // Check: did the leaf resolve it? (bit 63 clear = resolved)
-    __ testptr(rax, rax);
-    __ jcc(Assembler::positive, leaf_ok);
-    // Phase 3: slow path via call_VM (JRT_ENTRY — proper oop map, GC-safe)
-    // call_VM passes JavaThread* as first arg automatically.
-    __ pop(c_rarg1);                       // recover original tagged oop → arg1
-    __ call_VM(dst, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow_vm), c_rarg1);
-    __ jmp(done);
-    __ bind(leaf_ok);
-    __ addptr(rsp, wordSize);              // discard saved tagged oop
+    // Bypass InterpreterMacroAssembler::call_VM_leaf_base (checks last_sp)
+    // by calling MacroAssembler::call_VM_leaf_base directly (no last_sp check).
+    // call_VM_leaf_base is virtual — qualified call suppresses virtual dispatch.
+    masm->MacroAssembler::call_VM_leaf_base(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), 1);
     if (dst != rax) __ mov(dst, rax);
+
     __ bind(done);
+#ifdef ASSERT
+    // Verify barrier produced a clean oop.
+    {
+      Label clean;
+      __ testptr(dst, dst);
+      __ jcc(Assembler::positive, clean);
+      __ stop("G1 load_at barrier: tagged oop leaked (bit 63 set after resolve)");
+      __ bind(clean);
+    }
+#endif
   }
 
   if (on_oop && on_reference) {

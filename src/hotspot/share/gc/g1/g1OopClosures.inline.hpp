@@ -57,9 +57,10 @@ inline void G1ScanClosureBase::prefetch_and_push(T* p, const oop obj) {
   // slightly paranoid test; I'm trying to catch potential
   // problems before we go into push_on_queue to know where the
   // problem is coming from
-  assert((obj == RawAccess<>::oop_load(p)) ||
+  // Note: use g1_resolved_load instead of RawAccess to handle tagged oops.
+  assert((obj == g1_resolved_load(p)) ||
          (obj->is_forwarded() &&
-         obj->forwardee() == RawAccess<>::oop_load(p)),
+         obj->forwardee() == g1_resolved_load(p)),
          "p should still be pointing to obj or to its forwardee");
 
   _par_scan_state->push_on_queue(ScannerTask(p));
