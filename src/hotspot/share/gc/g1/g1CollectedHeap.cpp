@@ -35,6 +35,7 @@
 #include "gc/g1/g1BarrierSet.hpp"
 #include "gc/g1/g1BatchedTask.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1CollectionSet.hpp"
 #include "gc/g1/g1CollectionSetCandidates.hpp"
 #include "gc/g1/g1CollectorState.hpp"
@@ -3087,9 +3088,8 @@ public:
     _g1h(g1h), _nm(nm) {}
 
   void do_oop(oop* p) {
-    oop heap_oop = RawAccess<>::oop_load(p);
-    if (!CompressedOops::is_null(heap_oop)) {
-      oop obj = CompressedOops::decode_not_null(heap_oop);
+    oop obj = g1_resolved_load(p);
+    if (obj != nullptr && _g1h->is_in(obj)) {
       HeapRegion* hr = _g1h->heap_region_containing(obj);
       assert(!hr->is_continues_humongous(),
              "trying to add code root " PTR_FORMAT " in continuation of humongous region " HR_FORMAT

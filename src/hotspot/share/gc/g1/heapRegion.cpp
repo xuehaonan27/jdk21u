@@ -32,6 +32,7 @@
 #include "gc/g1/g1HeapRegionTraceType.hpp"
 #include "gc/g1/g1NUMA.hpp"
 #include "gc/g1/g1OopClosures.inline.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
 #include "gc/g1/heapRegionBounds.inline.hpp"
 #include "gc/g1/heapRegionManager.inline.hpp"
@@ -317,13 +318,11 @@ class VerifyCodeRootOopClosure: public OopClosure {
   bool _has_oops_in_region;
 
   template <class T> void do_oop_work(T* p) {
-    T heap_oop = RawAccess<>::oop_load(p);
-    if (!CompressedOops::is_null(heap_oop)) {
-      oop obj = CompressedOops::decode_not_null(heap_oop);
-
+    oop obj = g1_resolved_load(p);
+    if (obj != nullptr) {
       // Note: not all the oops embedded in the nmethod are in the
       // current region. We only look at those which are.
-      if (_hr->is_in(obj)) {
+      if (G1CollectedHeap::heap()->is_in(obj) && _hr->is_in(obj)) {
         // Object is in the region. Check that its less than top
         if (_hr->top() <= cast_from_oop<HeapWord*>(obj)) {
           // Object is above top
@@ -616,14 +615,10 @@ class G1VerifyLiveAndRemSetClosure : public BasicOopIterateClosure {
       return;
     }
 
-    T heap_oop = RawAccess<>::oop_load(p);
-    if (CompressedOops::is_null(heap_oop)) {
-      return;
-    }
-    oop obj = CompressedOops::decode_not_null(heap_oop);
-    // Resolve tagged oops for managed objects (disaggregated memory).
-    // Without this, tagged Shared OOPs would fail is_in() checks.
-    obj = resolve_oop_raw(obj);
+    // Use g1_resolved_load to handle tagged oops (bit 63 set).
+    // RawAccess::oop_load + CompressedOops::decode_not_null both trigger
+    // debug assertions for tagged values.
+    oop obj = g1_resolved_load(p);
     // Skip remote objects (resolved to non-heap slot_id)
     if (!G1CollectedHeap::heap()->is_in(obj)) {
       return;

@@ -28,6 +28,7 @@
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1ConcurrentMarkThread.hpp"
 #include "gc/g1/g1HeapVerifier.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1Policy.hpp"
 #include "gc/g1/g1RemSet.hpp"
 #include "gc/g1/g1RootProcessor.hpp"
@@ -61,9 +62,9 @@ public:
   bool failures() { return _failures; }
 
   template <class T> void do_oop_work(T* p) {
-    T heap_oop = RawAccess<>::oop_load(p);
-    if (!CompressedOops::is_null(heap_oop)) {
-      oop obj = CompressedOops::decode_not_null(heap_oop);
+    oop obj = g1_resolved_load(p);
+    if (obj != nullptr) {
+      if (!_g1h->is_in(obj)) return; // skip remote/non-heap
       if (_g1h->is_obj_dead_cond(obj, _vo)) {
         Log(gc, verify) log;
         log.error("Root location " PTR_FORMAT " points to dead obj " PTR_FORMAT " in region " HR_FORMAT,
@@ -105,10 +106,9 @@ class G1VerifyCodeRootOopClosure: public OopClosure {
     // in the code root list of the heap region containing the
     // object referenced by p.
 
-    T heap_oop = RawAccess<>::oop_load(p);
-    if (!CompressedOops::is_null(heap_oop)) {
-      oop obj = CompressedOops::decode_not_null(heap_oop);
-
+    oop obj = g1_resolved_load(p);
+    if (obj != nullptr) {
+      if (!_g1h->is_in(obj)) return; // skip remote/non-heap
       // Now fetch the region containing the object
       HeapRegion* hr = _g1h->heap_region_containing(obj);
       HeapRegionRemSet* hrrs = hr->rem_set();
@@ -190,8 +190,8 @@ public:
   void do_oop(      oop *p) { do_oop_work(p); }
 
   template <class T> void do_oop_work(T *p) {
-    oop obj = RawAccess<>::oop_load(p);
-    guarantee(obj == nullptr || !_g1h->is_obj_dead_cond(obj, _vo),
+    oop obj = g1_resolved_load(p);
+    guarantee(obj == nullptr || !_g1h->is_in(obj) || !_g1h->is_obj_dead_cond(obj, _vo),
               "Dead object referenced by a not dead object");
   }
 };
