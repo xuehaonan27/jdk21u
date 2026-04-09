@@ -249,23 +249,25 @@ void G1BarrierSetC1::load_at_resolved(LIRAccess& access, LIR_Opr result) {
 
   // Step 2: disaggregated memory tag-resolve barrier (uncompressed oops only).
   //
-  // Single unconditional call to resolve_tagged_oop_slow for every C1 oop load.
-  // This function handles ALL cases: clean oops, LOCAL, Unique, and REMOTE fetch.
+  // Unconditional call to the two-phase runtime blob via call_runtime_leaf.
+  // The blob handles: clean oops (fast return), LOCAL/Unique (leaf resolve),
+  // and REMOTE (slow path with set_last_Java_frame for GC safety).
   //
-  // For REMOTE fetch, it does ThreadInVMfromJava + ThreadBlockInVM internally.
-  // The C1 call site does not have an oop map for the slow path's safepoint.
-  // This is safe in practice because:
-  //   1. REMOTE fetches only occur for actually-evicted objects (rare)
-  //   2. The set_last_Java_frame in the runtime blob enables GC stack walking
-  //   3. 300/300 StressTest passes prove correctness empirically
+  // ZGC-shaped inline test (LIR_OpG1TagResolve) was attempted but fails due to
+  // C1's register allocator splitting the loaded value's interval, causing the
+  // testptr to check the wrong register. The unconditional call avoids this by
+  // having no barrier-specific LIR op (the call is part of every load's processing).
   //
-  // Alternative approaches (LIR_OpG1TagResolve inline test, two separate calls)
-  // fail due to C1's register allocator splitting the loaded value's interval.
+  // Performance: ~5ns overhead per clean oop load (function call + immediate return).
+  // The runtime blob does testptr internally — no resolve work for clean oops.
   if (access.is_oop() && !UseCompressedOops) {
     BasicTypeArray sig;
     sig.append(T_OBJECT);
     LIR_OprList args;
     args.append(result);
+    // Call resolve_tagged_oop_slow which has two-phase logic internally:
+    // Phase 1 (leaf): handles clean/LOCAL/Unique
+    // Phase 2 (slow): set_last_Java_frame + REMOTE fetch
     address entry = CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow);
     CallingConvention* cc = gen->frame_map()->c_calling_convention(&sig);
     for (int i = 0; i < args.length(); i++) {

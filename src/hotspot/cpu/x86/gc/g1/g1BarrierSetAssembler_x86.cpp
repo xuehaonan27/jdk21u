@@ -558,17 +558,43 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_stub(LIR_Assembler* ce, G1Ta
   G1BarrierSetC1* bs = (G1BarrierSetC1*)BarrierSet::barrier_set()->barrier_set_c1();
   __ bind(*stub->entry());
 
-  assert(stub->ref()->is_register(), "Precondition.");
-  Register ref_reg = stub->ref()->as_register();
+  Register ref = stub->ref()->as_register();
+  Register ref_addr = noreg;
+  Register tmp = noreg;
 
+  // ZGC pattern: re-read the oop from the original memory address.
+  // The inline fast-path's testptr may have used a different physical register
+  // (due to C1 register allocator interval splitting), so we can't rely on
+  // the register value. Re-reading from memory is always correct.
+  __ movptr(ref, ce->as_Address(stub->ref_addr()->as_address_ptr()));
 
-  // Pass the tagged oop to the runtime blob via the parameter area on the stack.
-  ce->store_parameter(ref_reg, 0);
-  __ call(RuntimeAddress(bs->tag_resolve_c1_runtime_code_blob()->code_begin()));
-  // The runtime blob returns the resolved oop in rax.
-  if (ref_reg != rax) {
-    __ mov(ref_reg, rax);
+  // Compute the effective address for the runtime call argument
+  if (stub->tmp()->is_valid()) {
+    ce->leal(stub->ref_addr(), stub->tmp());
+    ref_addr = tmp = stub->tmp()->as_pointer_register();
+  } else {
+    ref_addr = stub->ref_addr()->as_address_ptr()->base()->as_pointer_register();
   }
+
+  // Save rax unless it is the result or tmp register
+  if (ref != rax && tmp != rax) {
+    __ push(rax);
+  }
+
+  // Pass tagged oop to the runtime blob via parameter area
+  ce->store_parameter(ref, 0);
+  __ call(RuntimeAddress(bs->tag_resolve_c1_runtime_code_blob()->code_begin()));
+
+  // Move result into ref register
+  if (ref != rax) {
+    __ movptr(ref, rax);
+  }
+
+  // Restore rax if saved
+  if (ref != rax && tmp != rax) {
+    __ pop(rax);
+  }
+
   __ jmp(*stub->continuation());
 }
 
@@ -776,7 +802,6 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_runtime_stub(StubAssembler* 
   __ pop(r12);
   __ pop(rbx);
   __ epilogue();
-  return;
 
   // --- Leaf resolved fast path ---
   __ bind(leaf_resolved);

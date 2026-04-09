@@ -116,17 +116,30 @@ JRT_END
 // all callers (interpreter templates, C1 compiled code, C2 stubs) maintain
 // proper frame pointers.
 oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
-  JavaThread* current = JavaThread::current();
-  // NOTE: C1 calls this via call_runtime_leaf without last_Java_frame.
-  // For REMOTE fetch (blocking I/O), GC stack walking during safepoint
-  // may not fully walk through the C1 frame. This is acceptable because:
-  //   1. REMOTE fetches only occur with actual eviction (not G1TagRefSites)
-  //   2. The interpreter and C2 set last_Java_frame before calling here
-  //   3. C1 can be improved to use a two-phase approach in the future
-  ThreadInVMfromJava tiv(current);
   uintptr_t v = (uintptr_t)tagged;
-  // Re-check: may have been resolved between leaf and slow calls
+
+  // Fast path: clean oop / null — no thread transition needed.
   if ((v >> 63) == 0) return tagged;
+
+  // Leaf resolve: handles LOCAL Handles + Unique OOPs without ThreadInVMfromJava.
+  // This is the common case (99.99%) — no safepoint, no blocking.
+  if (!(v & G1_OOP_INDIRECT_BIT)) {
+    // Unique/Direct: strip tags
+    return (oopDesc*)(v & G1_OOP_ADDR_MASK);
+  }
+  // Shared: follow Handle
+  RemoteHandle* h_fast = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+  uintptr_t sa_fast = h_fast->load_state_and_addr_acquire();
+  if ((sa_fast & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL) {
+    return (oopDesc*)(sa_fast & REMOTE_HANDLE_ADDR_MASK);
+  }
+
+  // Slow path: REMOTE/FETCHING — requires ThreadInVMfromJava for blocking I/O.
+  // This path is rare (only for actually-evicted objects).
+  JavaThread* current = JavaThread::current();
+  ThreadInVMfromJava tiv(current);
+  v = (uintptr_t)tagged; // re-read (stable since tagged value doesn't change)
+  // Re-check after transition (Handle may have been resolved by another thread)
   if (!(v & G1_OOP_INDIRECT_BIT)) {
     return (oopDesc*)(v & G1_OOP_ADDR_MASK);
   }

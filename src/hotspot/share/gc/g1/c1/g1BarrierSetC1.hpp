@@ -120,29 +120,51 @@ class G1PostBarrierStub: public CodeStub {
 };
 
 // Disaggregated memory: C1 out-of-line stub for resolving tagged oops.
-// When bit 63 of a loaded oop is set (tagged/remote oop), the inline fast
-// path branches here.  The stub calls G1BarrierSetRuntime::resolve_tagged_oop
-// via a pre-generated runtime blob and jumps back to the continuation.
+// ZGC-shaped: carries both the result register AND the memory address.
+// The stub re-reads the oop from memory to avoid register allocator
+// interval splitting issues.
+//
+// Inline fast path: testptr(ref, ref) + jcc(negative, stub)
+// Out-of-line stub: re-reads from ref_addr, calls runtime blob
 class G1TagResolveStub: public CodeStub {
   friend class G1BarrierSetC1;
  private:
-  // The output register from LIR_OpG1TagResolve — holds the oop to resolve.
-  LIR_Opr _ref;
+  LIR_Opr _ref;       // result register (loaded oop / resolved oop)
+  LIR_Opr _ref_addr;  // memory address to re-read from (ZGC pattern)
+  LIR_Opr _tmp;       // temp register for complex addresses
 
  public:
-  G1TagResolveStub(LIR_Opr ref) : _ref(ref) {
+  G1TagResolveStub(LIRAccess& access, LIR_Opr ref)
+    : _ref(ref),
+      _ref_addr(access.resolved_addr()),
+      _tmp(LIR_OprFact::illegalOpr) {
     assert(_ref->is_register(), "must be a register");
+    assert(_ref_addr->is_address(), "must be an address");
+
+    // Allocate tmp register if address has index or displacement
+    if (_ref_addr->as_address_ptr()->index()->is_valid() ||
+        _ref_addr->as_address_ptr()->disp() != 0) {
+      _tmp = access.gen()->new_pointer_register();
+    }
+
     FrameMap* f = Compilation::current()->frame_map();
     f->update_reserved_argument_area_size(2 * BytesPerWord);
   }
 
   LIR_Opr ref() const { return _ref; }
-  // Called by LIR_OpG1TagResolve to update after register allocation
+  LIR_Opr ref_addr() const { return _ref_addr; }
+  LIR_Opr tmp() const { return _tmp; }
   void set_ref(LIR_Opr ref) { _ref = ref; }
 
   virtual void emit_code(LIR_Assembler* e);
   virtual void visit(LIR_OpVisitState* visitor) {
     visitor->do_slow_case();
+    visitor->do_input(_ref_addr);  // keep address live for re-read
+    visitor->do_input(_ref);       // input: loaded (possibly tagged) oop
+    visitor->do_output(_ref);      // output: resolved (clean) oop
+    if (_tmp->is_valid()) {
+      visitor->do_temp(_tmp);
+    }
   }
 #ifndef PRODUCT
   virtual void print_name(outputStream* out) const { out->print("G1TagResolveStub"); }
