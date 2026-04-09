@@ -58,54 +58,53 @@ void G1TagResolveStub::emit_code(LIR_Assembler* ce) {
   bs->generate_c1_tag_resolve_stub(ce, this);
 }
 
-// Custom LIR op for the disaggregated memory load barrier.
-// Emits raw testptr + jcc during codegen, bypassing C1's type-aware
-// comparison optimizations (which would eliminate "oop < 0" as always-false).
+// Fused load+barrier LIR op for disaggregated memory.
 //
-// Uses SEPARATE input and output operand fields (Codex-found bug: a single
-// shared field gets overwritten by C1's assign_reg_nums which colors input
-// before output). Also explicitly appends the stub via ce->append_code_stub
-// (Codex-found bug: without this, the stub's entry label is never bound,
-// making the jcc branch a no-op).
-class LIR_OpG1TagResolve : public LIR_Op {
+// Performs movptr(result, [addr]) + testptr(result, result) + jcc(negative, stub)
+// as a SINGLE LIR operation. This prevents C1's register allocator from
+// splitting the interval between the load and the barrier test — which caused
+// the testptr to check the wrong register in previous implementations.
+//
+// The register allocator sees:
+//   - _addr: memory input (decomposed to base+index registers)
+//   - _result (inherited from LIR_Op): register output
+// Since load and test are in the same emit_code(), the result register is
+// guaranteed to hold the loaded value when testptr runs.
+class LIR_OpG1FusedLoadBarrier : public LIR_Op {
 private:
-  LIR_Opr                 _ref_in;   // input: the loaded (possibly tagged) oop
-  LIR_Opr                 _ref_out;  // output: the resolved (clean) oop
+  LIR_Opr                 _addr;   // memory address to load from
   G1TagResolveStub* const _stub;
 
 public:
-  LIR_OpG1TagResolve(LIR_Opr ref, G1TagResolveStub* stub)
-    : LIR_Op(), _ref_in(ref), _ref_out(ref), _stub(stub) {}
+  LIR_OpG1FusedLoadBarrier(LIR_Opr addr, LIR_Opr result, G1TagResolveStub* stub)
+    : LIR_Op(lir_none, result, nullptr), _addr(addr), _stub(stub) {}
+
+  LIR_Opr addr() const { return _addr; }
 
   virtual void visit(LIR_OpVisitState* state) {
-    state->do_input(_ref_in);
-    state->do_output(_ref_out);
+    state->do_input(_addr);     // memory address → base+index as inputs
+    state->do_output(_result);  // register output (the loaded & resolved oop)
     state->do_stub(_stub);
   }
 
   virtual void emit_code(LIR_Assembler* ce) {
     auto* masm = ce->masm();
-    Register in_reg  = _ref_in->as_register();
-    Register out_reg = _ref_out->as_register();
-    // Copy input to output if register allocator assigned different registers
-    if (in_reg != out_reg) {
-      masm->movptr(out_reg, in_reg);
-    }
-    // Update stub to use the output register (after register allocation)
-    _stub->set_ref(_ref_out);
-    // Inline fast path: test bit 63 (sign bit). Clean oops are positive.
-    masm->testptr(out_reg, out_reg);
+    Register result_reg = _result->as_register();
+    // Update stub to use the allocated output register
+    _stub->set_ref(_result);
+    // Fused: load + test + conditional branch (all in one op)
+    masm->movptr(result_reg, ce->as_Address(_addr->as_address_ptr()));
+    masm->testptr(result_reg, result_reg);
     masm->jcc(Assembler::negative, *_stub->entry());
     masm->bind(*_stub->continuation());
-    // CRITICAL: append the stub so it gets emitted out-of-line.
-    // Without this, the stub's entry label is never bound and the jcc
-    // branches to garbage (effectively a no-op).
     ce->append_code_stub(_stub);
   }
 
-  virtual void print_instr(outputStream* out) const { _ref_out->print(out); }
+  virtual void print_instr(outputStream* out) const {
+    _addr->print(out); out->print(" -> "); _result->print(out);
+  }
 #ifndef PRODUCT
-  virtual const char* name() const { return "g1_tag_resolve"; }
+  virtual const char* name() const { return "g1_fused_load_barrier"; }
 #endif
 };
 
@@ -244,39 +243,24 @@ void G1BarrierSetC1::load_at_resolved(LIRAccess& access, LIR_Opr result) {
   bool is_anonymous = (decorators & ON_UNKNOWN_OOP_REF) != 0;
   LIRGenerator *gen = access.gen();
 
-  // Step 1: emit the raw load via the base class
-  BarrierSetC1::load_at_resolved(access, result);
-
-  // Step 2: disaggregated memory tag-resolve barrier (uncompressed oops only).
+  // Disaggregated memory: fused load + tag-resolve barrier.
   //
-  // Unconditional call to the two-phase runtime blob via call_runtime_leaf.
-  // The blob handles: clean oops (fast return), LOCAL/Unique (leaf resolve),
-  // and REMOTE (slow path with set_last_Java_frame for GC safety).
+  // For oop loads with !UseCompressedOops, replace the base class load with a
+  // single fused LIR op that does: movptr(result, [addr]) + testptr + jcc.
+  // The fused op prevents C1's register allocator from splitting the interval
+  // between load and test (which caused previous barrier implementations to
+  // test the wrong register).
   //
-  // ZGC-shaped inline test (LIR_OpG1TagResolve) was attempted but fails due to
-  // C1's register allocator splitting the loaded value's interval, causing the
-  // testptr to check the wrong register. The unconditional call avoids this by
-  // having no barrier-specific LIR op (the call is part of every load's processing).
-  //
-  // Performance: ~5ns overhead per clean oop load (function call + immediate return).
-  // The runtime blob does testptr internally — no resolve work for clean oops.
+  // For non-oop loads or CompressedOops, use the base class load (no barrier).
   if (access.is_oop() && !UseCompressedOops) {
-    BasicTypeArray sig;
-    sig.append(T_OBJECT);
-    LIR_OprList args;
-    args.append(result);
-    // Call resolve_tagged_oop_slow which has two-phase logic internally:
-    // Phase 1 (leaf): handles clean/LOCAL/Unique
-    // Phase 2 (slow): set_last_Java_frame + REMOTE fetch
-    address entry = CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow);
-    CallingConvention* cc = gen->frame_map()->c_calling_convention(&sig);
-    for (int i = 0; i < args.length(); i++) {
-      LIR_Opr loc = cc->at(i);
-      if (loc->is_register()) __ move(args.at(i), loc);
-    }
-    LIR_Opr phys_result = FrameMap::as_oop_opr(rax);
-    __ call_runtime_leaf(entry, gen->getThreadTemp(), phys_result, cc->args());
-    __ move(phys_result, result);
+    // Create stub for the out-of-line slow path (re-reads from addr + calls blob)
+    G1TagResolveStub* stub = new G1TagResolveStub(access, result);
+    // Emit fused load+barrier as a single LIR op.
+    // This REPLACES the base class load — the fused op does the movptr itself.
+    __ append(new LIR_OpG1FusedLoadBarrier(access.resolved_addr(), result, stub));
+  } else {
+    // Non-oop or compressed: use standard load (no barrier needed)
+    BarrierSetC1::load_at_resolved(access, result);
   }
 
   // Step 3: SATB keepalive for weak/phantom/anonymous refs
