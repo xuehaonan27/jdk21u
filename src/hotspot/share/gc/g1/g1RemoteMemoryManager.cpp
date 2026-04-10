@@ -320,6 +320,65 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
 }
 
 // ============================================================
+// Post-Fetch Field Patching
+// ============================================================
+// After fetching remote bytes into FCR, patch oop fields using the
+// sidecar edge table. The fetched bytes contain oop values from eviction
+// time — targets may have moved or died since then. The edge table maps
+// each oop field offset to the target's Handle, which tracks the
+// current address.
+//
+// Must be called BEFORE set_local_release() — the fetched object must
+// not be visible to other threads until all fields are patched.
+
+void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, HeapWord* dest) {
+  ObjectEdgeTable* et = edge_table_for(source_handle);
+  if (et == nullptr) {
+    // No edge table — object had no oop fields at eviction time.
+    // Or edge table was already cleaned up. Nothing to patch.
+    return;
+  }
+
+  uintptr_t base = (uintptr_t)dest;
+  int patched = 0;
+
+  for (uint32_t i = 0; i < et->_entry_count; i++) {
+    EdgeEntry& edge = et->_entries[i];
+    uintptr_t* field_addr = (uintptr_t*)(base + edge._field_offset);
+    RemoteHandle* target = edge._target_handle;
+
+    uintptr_t sa = target->load_state_and_addr_acquire();
+    uintptr_t target_state = sa & REMOTE_HANDLE_STATE_MASK;
+
+    if (target_state == REMOTE_HANDLE_LOCAL) {
+      // Target is local — patch to clean oop (current address)
+      *field_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      patched++;
+    } else if (target_state == REMOTE_HANDLE_REMOTE ||
+               target_state == REMOTE_HANDLE_FETCHING) {
+      // Target is still remote — patch to shared_oop(target_handle)
+      // so the load barrier will trigger fetch when this field is read
+      *field_addr = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)target;
+      patched++;
+    } else if (target_state == REMOTE_HANDLE_DEAD) {
+      // Target was collected — null the field
+      *field_addr = 0;
+      patched++;
+    }
+
+    // Decrement remote refcount — this object is now local, its fields
+    // no longer represent remote-stored references
+    target->decrement_remote_refcount();
+  }
+
+  log_debug(gc)("Fetch patch: handle=" PTR_FORMAT " dest=" PTR_FORMAT " patched=%d/%u fields",
+                p2i(source_handle), p2i(dest), patched, et->_entry_count);
+
+  // Remove edge table — no longer needed after fetch
+  remove_edge_table(source_handle);
+}
+
+// ============================================================
 // Fetch Cache Region (FCR) Allocation
 // ============================================================
 

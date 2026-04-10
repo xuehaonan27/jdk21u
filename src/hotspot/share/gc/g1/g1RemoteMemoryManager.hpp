@@ -485,6 +485,16 @@ public:
   // 3. Updates Handle to LOCAL
   // Returns the fetched object's Klass pointer.
   Klass* fetch_remote_object(RemoteHandle* h, void* dest);
+
+  // Patch fetched object's oop fields using sidecar edge table.
+  // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
+  // For each edge entry:
+  //   - target LOCAL  → patch field to clean oop(current_addr)
+  //   - target REMOTE → patch field to shared_oop(target_handle)
+  //   - target DEAD   → patch field to null
+  // Decrements remote_refcount on each target Handle.
+  // Removes the edge table after patching.
+  void patch_fetched_fields(RemoteHandle* source_handle, HeapWord* dest);
 };
 
 #endif // SHARE_GC_G1_G1REMOTEMEMORYMANAGER_HPP

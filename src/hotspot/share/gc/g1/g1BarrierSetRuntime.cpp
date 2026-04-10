@@ -171,6 +171,12 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
         rmm->fetch_remote_object(h, dest);
       }
 
+      // Patch fetched object's oop fields BEFORE publishing.
+      // The fetched bytes contain oop values from eviction time — targets
+      // may have moved since then. The sidecar edge table maps each field
+      // to the target's Handle (which tracks current address).
+      rmm->patch_fetched_fields(h, dest);
+
       h->set_local_release(dest);
       return (oopDesc*)dest;
     }
