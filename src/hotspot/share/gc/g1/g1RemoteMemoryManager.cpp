@@ -29,7 +29,9 @@
 #include <errno.h>
 
 G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
-  : _g1h(g1h), _backend(nullptr), _handle_allocator(), _table_lock(0),
+  : _g1h(g1h), _backend(nullptr), _handle_allocator(),
+    _entry_chunks(nullptr), _entry_free_list(nullptr), _entry_chunk_top(ENTRY_CHUNK_CAPACITY),
+    _table_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0),
     _current_fcr(nullptr), _fcr_lock(0),
@@ -83,16 +85,15 @@ void G1RemoteMemoryManager::initialize_backend() {
 }
 
 G1RemoteMemoryManager::~G1RemoteMemoryManager() {
-  // Free all HandleEntry objects in the table
-  for (size_t i = 0; i < TABLE_SIZE; i++) {
-    HandleEntry* e = _table[i];
-    while (e != nullptr) {
-      HandleEntry* next = e->_next;
-      delete e;
-      e = next;
-    }
-    _table[i] = nullptr;
+  // Free HandleEntry chunks (entries are pool-managed, not individually freed)
+  HandleEntryChunk* ec = _entry_chunks;
+  while (ec != nullptr) {
+    HandleEntryChunk* next = ec->_next;
+    delete ec;
+    ec = next;
   }
+  memset(_table, 0, sizeof(_table));
+
   // Free simulated remote slot data
   for (size_t i = 0; i < SIM_REMOTE_MAX_SLOTS; i++) {
     if (_sim_remote_slots[i]._data != nullptr) {
@@ -302,9 +303,9 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
               }
             }
 
-            // Remove Handle entry from table
+            // Remove Handle entry from table, return to pool
             *pp = entry->_next;
-            os::free(entry);
+            free_entry(entry);
             collected++;
             continue;
           }

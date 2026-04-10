@@ -4,14 +4,24 @@
  * Handle table for G1 disaggregated memory support.
  *
  * Each RemoteHandle is 16 bytes, tracking the location (local or remote)
- * of a managed Old object. Handles are allocated lazily — only for Shared
- * objects (RC>1) or during Unique-to-Shared upgrade.
+ * of a managed object. Handles serve three roles:
  *
- * Phase 1 simplification: ALL remote-participating objects are Shared
- * (always get a Handle). The Unique optimization comes in Phase 2.
+ * 1. Evicted objects: Handle tracks LOCAL/REMOTE/FETCHING state for load barrier.
+ *    Incoming local refs use shared_oop(handle) for barrier detection.
+ *
+ * 2. Dormant anchors: Handle tracks current address of a local object that is
+ *    referenced by a remote object's fields. Local oop fields stay CLEAN (no
+ *    shared_oop). The Handle provides stable identity for relocation tracking,
+ *    GC liveness rooting, and fetch-time field patching via sidecar edge tables.
+ *
+ * 3. Fetched-back objects: Handle transitions REMOTE → LOCAL. Subject to
+ *    de-handleification ladder (shared_oop → unique_oop → clean oop) when hot.
+ *
+ * Handles are decoupled from classification (UNIQUE/SHARED mark word bits).
+ * An object can have a Handle without being classified, and vice versa.
  *
  * Fetch deduplication: the state_and_addr field uses bits 63:62 for a
- * state machine (LOCAL / REMOTE / FETCHING) with release/acquire semantics.
+ * state machine (LOCAL / REMOTE / FETCHING / DEAD) with release/acquire semantics.
  */
 
 #ifndef SHARE_GC_G1_G1REMOTEHANDLE_HPP
@@ -33,10 +43,15 @@ const uintptr_t REMOTE_HANDLE_ADDR_MASK     = (uintptr_t(1) << 48) - 1;
 const uintptr_t REMOTE_HANDLE_LOCAL         = uintptr_t(0) << REMOTE_HANDLE_STATE_SHIFT;
 const uintptr_t REMOTE_HANDLE_REMOTE        = uintptr_t(1) << REMOTE_HANDLE_STATE_SHIFT;
 const uintptr_t REMOTE_HANDLE_FETCHING      = uintptr_t(2) << REMOTE_HANDLE_STATE_SHIFT;
+const uintptr_t REMOTE_HANDLE_DEAD          = uintptr_t(3) << REMOTE_HANDLE_STATE_SHIFT;
+
+// Handle flags (stored in _flags field)
+const uint32_t REMOTE_HANDLE_FLAG_DORMANT   = 0x1;  // Dormant anchor (local obj referenced by remote)
 
 struct RemoteHandle {
-  volatile uintptr_t _state_and_addr;  // [63:62]=state, [47:0]=addr or remote_id
-  uintptr_t          _reserved;        // Reserved for future use (back_ref, etc.)
+  volatile uintptr_t _state_and_addr;  // [63:62]=state, [47:0]=addr or remote_loc
+  uint32_t           _remote_refcount; // Count of remote oop fields pointing to this Handle
+  uint32_t           _flags;           // REMOTE_HANDLE_FLAG_* bits
 
   // State queries (non-atomic, for use under lock or single-threaded)
   uintptr_t state() const { return _state_and_addr & REMOTE_HANDLE_STATE_MASK; }
@@ -45,6 +60,8 @@ struct RemoteHandle {
   bool is_local()    const { return state() == REMOTE_HANDLE_LOCAL; }
   bool is_remote()   const { return state() == REMOTE_HANDLE_REMOTE; }
   bool is_fetching() const { return state() == REMOTE_HANDLE_FETCHING; }
+  bool is_dead()     const { return state() == REMOTE_HANDLE_DEAD; }
+  bool is_dormant()  const { return (_flags & REMOTE_HANDLE_FLAG_DORMANT) != 0; }
 
   // Atomic state queries (for concurrent access)
   uintptr_t load_state_and_addr_acquire() const {
@@ -57,9 +74,9 @@ struct RemoteHandle {
     return (void*)addr();
   }
 
-  // Get remote id (valid when state == REMOTE or FETCHING)
+  // Get remote id/location (valid when state == REMOTE or FETCHING)
   uintptr_t remote_id() const {
-    assert(!is_local(), "must be remote or fetching");
+    assert(!is_local() && !is_dead(), "must be remote or fetching");
     return addr();
   }
 
@@ -85,21 +102,52 @@ struct RemoteHandle {
     _state_and_addr = REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK);
   }
 
-  // Set to local (used during Handle creation for locally-present objects)
+  // Set to local (used during Handle creation and GC evacuation)
   void set_local(void* obj_addr) {
     _state_and_addr = REMOTE_HANDLE_LOCAL | (uintptr_t(obj_addr) & REMOTE_HANDLE_ADDR_MASK);
   }
 
-  // Store/retrieve eviction metadata in _reserved field.
-  // word_size is set at eviction time so the fetch path can allocate
-  // the correct FCR buffer size without querying the (possibly remote) backend.
-  void set_eviction_word_size(size_t ws) { _reserved = (uintptr_t)ws; }
-  size_t eviction_word_size() const      { return (size_t)_reserved; }
+  // Set to dead (used when referent object dies)
+  void set_dead() {
+    _state_and_addr = REMOTE_HANDLE_DEAD;
+  }
+
+  // Remote refcount: tracks how many oop fields in remote objects reference this Handle.
+  // Used to determine when de-handleification is safe (refcount == 0 → no remote refs).
+  void increment_remote_refcount() { _remote_refcount++; }
+  void decrement_remote_refcount() {
+    assert(_remote_refcount > 0, "underflow");
+    _remote_refcount--;
+  }
+  uint32_t remote_refcount() const { return _remote_refcount; }
+
+  // Flags
+  void set_dormant()   { _flags |= REMOTE_HANDLE_FLAG_DORMANT; }
+  void clear_dormant() { _flags &= ~REMOTE_HANDLE_FLAG_DORMANT; }
+
+  // Store/retrieve eviction metadata.
+  // word_size is needed at fetch time for FCR allocation (without querying backend).
+  // Packed into _flags upper 16 bits (max 64K words = 512KB object, sufficient).
+  void set_eviction_word_size(size_t ws) {
+    assert(ws <= 0xFFFF, "object too large for packed word_size");
+    _flags = (_flags & 0xFFFF) | ((uint32_t)ws << 16);
+  }
+  size_t eviction_word_size() const {
+    return (size_t)(_flags >> 16);
+  }
 
   // Initialize a fresh Handle
   void initialize(void* obj_addr) {
     set_local(obj_addr);
-    _reserved = 0;
+    _remote_refcount = 0;
+    _flags = 0;
+  }
+
+  // Initialize as dormant anchor (local object referenced by remote)
+  void initialize_dormant(void* obj_addr) {
+    set_local(obj_addr);
+    _remote_refcount = 0;
+    _flags = REMOTE_HANDLE_FLAG_DORMANT;
   }
 };
 

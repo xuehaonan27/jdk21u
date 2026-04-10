@@ -42,27 +42,60 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   // Handle allocator (global chunk pool + per-thread HABs)
   RemoteHandleAllocator _handle_allocator;
 
-  // Object -> Handle mapping.
-  // Used by write barrier (to find Handle for managed objects) and
-  // by GC (to update Handle during evacuation).
-  // Key: object address (oop cast to uintptr_t)
-  // Value: RemoteHandle pointer
-  //
-  // This is a simple concurrent hash table.  In Phase 1 with manual
-  // eviction the table is small.  Phase 2+ can switch to a more
-  // efficient structure if needed.
-  struct HandleEntry : public CHeapObj<mtGC> {
-    uintptr_t     _obj_addr;   // key: object address
-    RemoteHandle* _handle;     // value: Handle pointer (nullptr for Unique)
-    bool          _is_shared;  // true = Shared (RC>1), false = Unique (RC=1)
+  // ============================================================
+  // Handle table: secondary index (current_local_addr → Handle)
+  // ============================================================
+  // The primary index is the Handle pointer itself (handle_id = RemoteHandle*).
+  // This secondary index maps current local object addresses to Handles.
+  // Rekeyed on every evacuation move and every fetch localization.
+
+  struct HandleEntry {
+    uintptr_t     _obj_addr;   // key: current local object address
+    RemoteHandle* _handle;     // value: Handle pointer
     HandleEntry*  _next;       // chaining
 
-    HandleEntry(uintptr_t addr, RemoteHandle* h, bool shared, HandleEntry* next)
-      : _obj_addr(addr), _handle(h), _is_shared(shared), _next(next) {}
+    void init(uintptr_t addr, RemoteHandle* h, HandleEntry* next) {
+      _obj_addr = addr;
+      _handle = h;
+      _next = next;
+    }
   };
 
-  // Simple hash table for object->Handle mapping.
-  // Low contention in Phase 1 (manual eviction, few managed objects).
+  // Chunked pool allocator for HandleEntry (no os::malloc during STW).
+  static const size_t ENTRY_CHUNK_CAPACITY = 256; // 256 * 24B ≈ 6KB per chunk
+  struct HandleEntryChunk : public CHeapObj<mtGC> {
+    HandleEntry      _entries[ENTRY_CHUNK_CAPACITY];
+    HandleEntryChunk* _next;
+    HandleEntryChunk() : _next(nullptr) {}
+  };
+
+  HandleEntryChunk* _entry_chunks;     // all allocated entry chunks
+  HandleEntry*      _entry_free_list;  // free entry list for reuse
+  size_t            _entry_chunk_top;  // next free slot in current chunk
+
+  HandleEntry* alloc_entry() {
+    // Reuse from free list first
+    if (_entry_free_list != nullptr) {
+      HandleEntry* e = _entry_free_list;
+      _entry_free_list = e->_next;
+      return e;
+    }
+    // Allocate from current chunk
+    if (_entry_chunks == nullptr || _entry_chunk_top >= ENTRY_CHUNK_CAPACITY) {
+      HandleEntryChunk* chunk = new HandleEntryChunk();
+      chunk->_next = _entry_chunks;
+      _entry_chunks = chunk;
+      _entry_chunk_top = 0;
+    }
+    return &_entry_chunks->_entries[_entry_chunk_top++];
+  }
+
+  void free_entry(HandleEntry* e) {
+    e->_next = _entry_free_list;
+    _entry_free_list = e;
+  }
+
+  // Hash table for secondary index
   static const size_t TABLE_SIZE = 1024;
   HandleEntry* _table[TABLE_SIZE];
   volatile int _table_lock;
@@ -88,46 +121,79 @@ public:
   // Handle management
   // ============================================================
 
-  // Register an object as managed (Unique, no Handle).
-  // Used by Phase 2 fixup for RC=1 objects.
-  HandleEntry* alloc_entry(uintptr_t addr, RemoteHandle* h, bool shared, HandleEntry* next) {
-    HandleEntry* e = (HandleEntry*)os::malloc(sizeof(HandleEntry), mtGC);
-    e->_obj_addr = addr;
-    e->_handle = h;
-    e->_is_shared = shared;
-    e->_next = next;
-    return e;
-  }
+  // ============================================================
+  // Handle management — ensure_handle_for() is the primary API
+  // ============================================================
 
-  void register_unique(oop obj) {
+  // Ensure an object has a Handle. Returns existing Handle if already present
+  // (dedup), or creates a new one. This is the only way to create Handles.
+  // STW-safe: uses chunked allocators, no os::malloc.
+  RemoteHandle* ensure_handle_for(oop obj, RemoteHandleAllocBuffer* hab) {
     uintptr_t addr = cast_from_oop<uintptr_t>(obj);
     size_t idx = hash_obj(addr);
 
     table_lock();
-    _table[idx] = alloc_entry(addr, nullptr, false, _table[idx]);
-    table_unlock();
-  }
-
-  RemoteHandle* create_handle_for(oop obj, RemoteHandleAllocBuffer* hab) {
+    // Check for existing entry (dedup)
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      if (e->_obj_addr == addr) {
+        RemoteHandle* existing = e->_handle;
+        table_unlock();
+        return existing;
+      }
+      e = e->_next;
+    }
+    // Not found — create new Handle and entry
     RemoteHandle* h = _handle_allocator.allocate_handle(hab);
     h->initialize(cast_from_oop<void*>(obj));
 
+    HandleEntry* entry = alloc_entry();
+    entry->init(addr, h, _table[idx]);
+    _table[idx] = entry;
+    table_unlock();
+    return h;
+  }
+
+  // Ensure a dormant anchor Handle for a local object referenced by remote.
+  // Like ensure_handle_for() but sets the DORMANT flag on new Handles.
+  RemoteHandle* ensure_dormant_anchor_for(oop obj, RemoteHandleAllocBuffer* hab) {
     uintptr_t addr = cast_from_oop<uintptr_t>(obj);
     size_t idx = hash_obj(addr);
 
     table_lock();
-    _table[idx] = alloc_entry(addr, h, true, _table[idx]);
-    table_unlock();
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      if (e->_obj_addr == addr) {
+        RemoteHandle* existing = e->_handle;
+        // Existing handle might not be dormant yet; mark it
+        existing->set_dormant();
+        table_unlock();
+        return existing;
+      }
+      e = e->_next;
+    }
+    RemoteHandle* h = _handle_allocator.allocate_handle(hab);
+    h->initialize_dormant(cast_from_oop<void*>(obj));
 
+    HandleEntry* entry = alloc_entry();
+    entry->init(addr, h, _table[idx]);
+    _table[idx] = entry;
+    table_unlock();
     return h;
   }
 
-  // Look up Handle for an object. Returns nullptr if not managed.
+  // Legacy API: create_handle_for (delegates to ensure_handle_for).
+  // Kept for backward compatibility with existing eviction/classification code.
+  RemoteHandle* create_handle_for(oop obj, RemoteHandleAllocBuffer* hab) {
+    return ensure_handle_for(obj, hab);
+  }
+
+  // Look up Handle for an object by current local address.
+  // Returns nullptr if object has no Handle.
   RemoteHandle* handle_for(oop obj) const {
     uintptr_t addr = cast_from_oop<uintptr_t>(obj);
     size_t idx = hash_obj(addr);
 
-    // No lock needed for read (single-writer in Phase 1)
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
       if (e->_obj_addr == addr) return e->_handle;
@@ -136,15 +202,20 @@ public:
     return nullptr;
   }
 
+  // Check if an object has a Handle (fast negative via table lookup).
+  bool has_handle(oop obj) const {
+    return handle_for(obj) != nullptr;
+  }
+
   // Update the mapping when an object is evacuated to a new address.
-  // Called from do_copy_to_survivor_space() during STW.
+  // Called from do_copy_to_survivor_space() during STW for ANY object
+  // with a Handle (not just SHARED — also dormant anchors).
   void update_handle_for_evacuation(oop old_obj, oop new_obj) {
     uintptr_t old_addr = cast_from_oop<uintptr_t>(old_obj);
     uintptr_t new_addr = cast_from_oop<uintptr_t>(new_obj);
     size_t old_idx = hash_obj(old_addr);
 
     table_lock();
-    // Find and remove old entry
     HandleEntry** pp = &_table[old_idx];
     while (*pp != nullptr) {
       if ((*pp)->_obj_addr == old_addr) {
@@ -166,10 +237,12 @@ public:
       pp = &((*pp)->_next);
     }
     table_unlock();
-    // Not found — object was not managed (OK, not all old objects have Handles)
+    // Not found — object has no Handle (OK, not all objects have Handles)
   }
 
-  // Remove Handle mapping for a dead object (called during GC cleanup).
+  // Remove Handle mapping and return entry to free list.
+  // Handle is NOT freed (chunks are pool-managed). Handle state should be set
+  // to DEAD by caller before removing.
   void remove_handle_for(oop obj) {
     uintptr_t addr = cast_from_oop<uintptr_t>(obj);
     size_t idx = hash_obj(addr);
@@ -180,13 +253,19 @@ public:
       if ((*pp)->_obj_addr == addr) {
         HandleEntry* entry = *pp;
         *pp = entry->_next;
-        delete entry;
+        free_entry(entry);
         table_unlock();
         return;
       }
       pp = &((*pp)->_next);
     }
     table_unlock();
+  }
+
+  // Legacy: register_unique (no longer needed, but kept for compat)
+  void register_unique(oop obj) {
+    // In the new design, Unique objects don't need Handle table entries.
+    // Classification is in the mark word only.
   }
 
   // ============================================================
