@@ -37,6 +37,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _current_fcr(nullptr), _fcr_lock(0),
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
   memset(_table, 0, sizeof(_table));
+  memset(_edge_tables, 0, sizeof(_edge_tables));
   memset(_sim_remote_slots, 0, sizeof(_sim_remote_slots));
 
   // Create remote storage backend.
@@ -94,6 +95,12 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
   }
   memset(_table, 0, sizeof(_table));
 
+  // Free edge tables
+  for (size_t i = 0; i < EDGE_TABLE_SIZE; i++) {
+    ObjectEdgeTable::free(_edge_tables[i]);
+    _edge_tables[i] = nullptr;
+  }
+
   // Free simulated remote slot data
   for (size_t i = 0; i < SIM_REMOTE_MAX_SLOTS; i++) {
     if (_sim_remote_slots[i]._data != nullptr) {
@@ -131,6 +138,102 @@ Klass* G1RemoteMemoryManager::sim_remote_fetch(size_t slot_id, void* dest, size_
   return _sim_remote_slots[slot_id]._klass;
 }
 
+// ============================================================
+// Edge Table Construction
+// ============================================================
+// Closure that scans an object's oop fields and builds an edge table.
+// For each non-null oop field, creates a dormant anchor Handle for the
+// target and records the edge (field_offset → target_handle).
+
+class EdgeTableBuildClosure : public BasicOopIterateClosure {
+  G1RemoteMemoryManager* _rmm;
+  G1CollectedHeap*       _g1h;
+  RemoteHandleAllocBuffer* _hab;
+  oop                    _base_obj;
+
+  // Temporary edge buffer (stack-allocated, fixed capacity)
+  static const int MAX_EDGES = 256;
+  G1RemoteMemoryManager::EdgeEntry _edges[MAX_EDGES];
+  int _count;
+
+public:
+  EdgeTableBuildClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
+                        RemoteHandleAllocBuffer* hab, oop base)
+    : _rmm(rmm), _g1h(g1h), _hab(hab), _base_obj(base), _count(0) {}
+
+  virtual void do_oop(oop* p) {
+    if (_count >= MAX_EDGES) return;  // safety cap
+
+    // Read field as raw uintptr_t to avoid debug oop constructor checks on tagged values
+    uintptr_t raw = *(uintptr_t*)p;
+    if (raw == 0) return;  // null
+
+    // If already tagged (bit 63 set), the field already has a Handle reference.
+    // Extract the Handle directly.
+    if ((raw >> 63) != 0) {
+      if (raw & G1_OOP_INDIRECT_BIT) {
+        // Shared OOP → already points to a Handle
+        RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+        uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
+        _edges[_count]._field_offset = offset;
+        _edges[_count]._target_handle = h;
+        _count++;
+        h->increment_remote_refcount();
+      }
+      // Unique OOP → strip tags, get target, create dormant anchor
+      else {
+        oop target = (oop)(raw & G1_OOP_ADDR_MASK);
+        if (_g1h->is_in(target)) {
+          RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, _hab);
+          uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
+          _edges[_count]._field_offset = offset;
+          _edges[_count]._target_handle = h;
+          _count++;
+          h->increment_remote_refcount();
+        }
+      }
+      return;
+    }
+
+    // Clean oop — create dormant anchor for the target
+    oop target = cast_to_oop(raw);
+    if (_g1h->is_in(target)) {
+      RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, _hab);
+      uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
+      _edges[_count]._field_offset = offset;
+      _edges[_count]._target_handle = h;
+      _count++;
+      h->increment_remote_refcount();
+    }
+  }
+
+  virtual void do_oop(narrowOop* p) {
+    // Narrow oops: not used (UseCompressedOops=false in our config)
+  }
+
+  int count() const { return _count; }
+  const G1RemoteMemoryManager::EdgeEntry* edges() const { return _edges; }
+};
+
+G1RemoteMemoryManager::ObjectEdgeTable*
+G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
+                                        RemoteHandleAllocBuffer* hab) {
+  EdgeTableBuildClosure cl(this, _g1h, hab, obj);
+  obj->oop_iterate(&cl);
+
+  // Allocate and populate the edge table
+  ObjectEdgeTable* et = ObjectEdgeTable::allocate(cl.count());
+  et->_source_handle = obj_handle;
+  et->_eviction_word_size = obj->size();
+  for (int i = 0; i < cl.count(); i++) {
+    et->add(cl.edges()[i]._field_offset, cl.edges()[i]._target_handle);
+  }
+
+  log_debug(gc)("Edge table built: obj=" PTR_FORMAT " edges=%d",
+                p2i((void*)obj), cl.count());
+  return et;
+}
+
 bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) {
   // Safety checks
   if (obj == nullptr) return false;
@@ -151,18 +254,23 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
     h = create_handle_for(obj, hab);
   }
 
-  // 2. Evict object bytes via backend (SIM/TCP/RDMA)
+  // 2. Build sidecar edge table BEFORE eviction (object bytes still readable).
+  //    Scans oop fields, creates dormant anchors for targets, records edges.
+  ObjectEdgeTable* et = build_edge_table(obj, h, hab);
+  store_edge_table(et);
+
+  // 3. Evict object bytes via backend (SIM/TCP/RDMA)
   size_t slot_id = _backend->evict(cast_from_oop<void*>(obj), word_size, klass, (size_t)-1);
   if (slot_id == (size_t)-1) {
     log_warning(gc)("Remote evict failed for obj=" PTR_FORMAT, p2i((void*)obj));
     return false;
   }
 
-  // 3. Set Handle to REMOTE with slot_id + store word_size for fetch-time allocation
+  // 4. Set Handle to REMOTE with slot_id + store word_size for fetch-time allocation
   h->set_remote(slot_id);
   h->set_eviction_word_size(word_size);
 
-  // 4. Set classification in mark word + per-region bitmap.
+  // 5. Set classification in mark word + per-region bitmap.
   //    Mark word: fast per-object check for mutators (same cache line as header)
   //    Bitmap: region-level iteration for GC
   //    Re-read mark word (it may have changed since our earlier is_unlocked check,
@@ -176,13 +284,13 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
     hr->set_has_classified_objects();
   }
 
-  // 5. Overwrite local bytes with filler to poison stale clean oops.
+  // 6. Overwrite local bytes with filler to poison stale clean oops.
   //    After this, any reference that bypassed Handle-based access will see
   //    a filler object, causing a visible crash instead of silent corruption.
   CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(obj), word_size, false);
 
-  log_info(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT " (filled)",
-               p2i((void*)obj), klass->external_name(), word_size, slot_id);
+  log_info(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT " edges=%u (filled)",
+               p2i((void*)obj), klass->external_name(), word_size, slot_id, et->_entry_count);
 
   return true;
 }

@@ -269,6 +269,115 @@ public:
   }
 
   // ============================================================
+  // Sidecar Edge Tables (P3)
+  // ============================================================
+  // Per-evicted-object edge tables recording outgoing oop field references.
+  // Used by:
+  //   - Executor: remote GC tracing (follows handle_ids to find reachable objects)
+  //   - Compute node: fetch-time field patching (translates stale fields to current addresses)
+  //
+  // Built at eviction time by scanning the evicted object's oop fields.
+  // Each entry maps a field offset to the target's Handle (stable identity).
+
+  struct EdgeEntry {
+    uint32_t  _field_offset;      // byte offset of oop field within object
+    RemoteHandle* _target_handle; // stable Handle of the referenced object
+  };
+
+  // Variable-length edge table for one evicted object.
+  // Allocated from a chunked pool (no os::malloc during STW).
+  struct ObjectEdgeTable : public CHeapObj<mtGC> {
+    RemoteHandle* _source_handle;  // Handle of the evicted object
+    size_t        _eviction_word_size; // object size for FCR allocation at fetch time
+    uint32_t      _entry_count;
+    uint32_t      _capacity;
+    EdgeEntry     _entries[1];     // flexible array (actual size = _capacity)
+
+    static ObjectEdgeTable* allocate(uint32_t capacity) {
+      size_t sz = sizeof(ObjectEdgeTable) + (capacity > 0 ? (capacity - 1) : 0) * sizeof(EdgeEntry);
+      ObjectEdgeTable* t = (ObjectEdgeTable*)os::malloc(sz, mtGC);
+      t->_source_handle = nullptr;
+      t->_eviction_word_size = 0;
+      t->_entry_count = 0;
+      t->_capacity = capacity;
+      return t;
+    }
+
+    void add(uint32_t field_offset, RemoteHandle* target) {
+      assert(_entry_count < _capacity, "edge table full");
+      _entries[_entry_count]._field_offset = field_offset;
+      _entries[_entry_count]._target_handle = target;
+      _entry_count++;
+    }
+
+    static void free(ObjectEdgeTable* t) {
+      if (t != nullptr) os::free(t);
+    }
+  };
+
+  // Edge table storage: maps evicted object Handle → edge table.
+  // Simple hash table (same pattern as _table). Low contention: only
+  // written during STW eviction, read during fetch.
+  static const size_t EDGE_TABLE_SIZE = 256;
+  ObjectEdgeTable* _edge_tables[EDGE_TABLE_SIZE];
+
+  static size_t hash_handle(RemoteHandle* h) {
+    return ((uintptr_t)h >> 4) % EDGE_TABLE_SIZE;
+  }
+
+public:
+  // Store an edge table for an evicted object.
+  void store_edge_table(ObjectEdgeTable* et) {
+    size_t idx = hash_handle(et->_source_handle);
+    // Simple linear chain: store as linked list would be better, but for
+    // prototype with few evictions, just use first-empty-slot probing.
+    // Actually, use the _source_handle as key with linear probing.
+    for (size_t i = 0; i < EDGE_TABLE_SIZE; i++) {
+      size_t slot = (idx + i) % EDGE_TABLE_SIZE;
+      if (_edge_tables[slot] == nullptr) {
+        _edge_tables[slot] = et;
+        return;
+      }
+    }
+    // Table full — should not happen with few evictions
+    assert(false, "edge table storage full");
+  }
+
+  // Look up edge table for a Handle (used at fetch time).
+  ObjectEdgeTable* edge_table_for(RemoteHandle* h) const {
+    size_t idx = hash_handle(h);
+    for (size_t i = 0; i < EDGE_TABLE_SIZE; i++) {
+      size_t slot = (idx + i) % EDGE_TABLE_SIZE;
+      ObjectEdgeTable* et = _edge_tables[slot];
+      if (et == nullptr) return nullptr;  // not found (empty slot = end of probe)
+      if (et->_source_handle == h) return et;
+    }
+    return nullptr;
+  }
+
+  // Remove edge table for a Handle (called on fetch or discard).
+  void remove_edge_table(RemoteHandle* h) {
+    size_t idx = hash_handle(h);
+    for (size_t i = 0; i < EDGE_TABLE_SIZE; i++) {
+      size_t slot = (idx + i) % EDGE_TABLE_SIZE;
+      ObjectEdgeTable* et = _edge_tables[slot];
+      if (et == nullptr) return;
+      if (et->_source_handle == h) {
+        ObjectEdgeTable::free(et);
+        _edge_tables[slot] = nullptr;
+        return;
+      }
+    }
+  }
+
+  // Build edge table for an object about to be evicted.
+  // Scans all oop fields, creates dormant anchors for targets, records edges.
+  // Must be called BEFORE eviction (object bytes still readable locally).
+  ObjectEdgeTable* build_edge_table(oop obj, RemoteHandle* obj_handle,
+                                    RemoteHandleAllocBuffer* hab);
+
+private:
+  // ============================================================
   // Simulated Remote Memory (Phase 1, no actual RDMA)
   // ============================================================
   // A simple local buffer that pretends to be remote storage.
