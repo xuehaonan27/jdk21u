@@ -34,6 +34,7 @@
 #include "gc/g1/g1GCPhaseTimes.hpp"
 #include "gc/g1/g1ParScanThreadState.inline.hpp"
 #include "gc/g1/g1Policy.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RootClosures.hpp"
 #include "gc/g1/g1RootProcessor.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
@@ -74,6 +75,15 @@ void G1RootProcessor::evacuate_roots(G1ParScanThreadState* pss, uint worker_id) 
 
   // CodeCache is already processed in java roots
   _process_strong_tasks.all_tasks_claimed(G1RP_PS_CodeCache_oops_do);
+
+  // Dormant anchor Handles: local objects referenced by remote objects.
+  // Must be treated as strong roots to prevent collection.
+  if (_process_strong_tasks.try_claim_task(G1RP_PS_RemoteAnchors_oops_do)) {
+    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      rmm->oops_do_remote_anchors(closures->strong_oops());
+    }
+  }
 }
 
 // Adaptor to pass the closures to the strong roots in the VM.

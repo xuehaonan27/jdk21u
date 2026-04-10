@@ -486,6 +486,15 @@ public:
   // Returns the fetched object's Klass pointer.
   Klass* fetch_remote_object(RemoteHandle* h, void* dest);
 
+  // Iterate dormant anchor Handles (remote_refcount > 0) as strong GC roots.
+  // For each active anchor, calls closure->do_oop on a synthetic oop* pointing
+  // to the Handle's stored local address. This keeps referenced local objects
+  // alive during GC even if they're only reachable through remote objects.
+  //
+  // Called from G1RootProcessor::evacuate_roots() during STW.
+  template <typename OopClosureType>
+  void oops_do_remote_anchors(OopClosureType* cl);
+
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
   // For each edge entry:
@@ -496,5 +505,37 @@ public:
   // Removes the edge table after patching.
   void patch_fetched_fields(RemoteHandle* source_handle, HeapWord* dest);
 };
+
+// Template implementation — must be in header for instantiation.
+template <typename OopClosureType>
+void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
+  // Walk the Handle table. For each entry whose Handle is LOCAL and has
+  // remote_refcount > 0, it's a dormant anchor that must be rooted.
+  // We call cl->do_oop on a pointer to a stack-local oop variable
+  // holding the Handle's local address. If GC moves the object, the
+  // closure updates the oop — we then update the Handle to match.
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      RemoteHandle* h = e->_handle;
+      if (h != nullptr && h->is_local() && h->remote_refcount() > 0) {
+        // This is a dormant anchor — its target must stay alive.
+        oop obj = cast_to_oop(e->_obj_addr);
+        cl->do_oop(&obj);
+        // If GC moved the object, the closure updated obj.
+        // We need to update the Handle and table entry to match.
+        uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
+        if (new_addr != e->_obj_addr) {
+          h->set_local(cast_from_oop<void*>(obj));
+          // Note: table rekey happens in update_handle_for_evacuation,
+          // which is called separately from the evacuation path.
+          // Here we just update the Handle's stored address.
+          e->_obj_addr = new_addr;
+        }
+      }
+      e = e->_next;
+    }
+  }
+}
 
 #endif // SHARE_GC_G1_G1REMOTEMEMORYMANAGER_HPP

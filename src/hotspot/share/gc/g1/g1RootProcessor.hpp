@@ -56,6 +56,7 @@ class G1RootProcessor : public StackObj {
     G1RP_PS_ClassLoaderDataGraph_oops_do,
     G1RP_PS_CodeCache_oops_do,
     G1RP_PS_refProcessor_oops_do,
+    G1RP_PS_RemoteAnchors_oops_do,
     // Leave this one last.
     G1RP_PS_NumElements
   };
