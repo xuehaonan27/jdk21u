@@ -486,6 +486,12 @@ public:
   // Returns the fetched object's Klass pointer.
   Klass* fetch_remote_object(RemoteHandle* h, void* dest);
 
+  // Update all Handles after Full GC phase 3 (forwarding addresses computed).
+  // Walks the Handle table. For each LOCAL Handle, checks if the object has
+  // a forwarding address. If so, updates the Handle and rekeys the table entry.
+  // Must be called BEFORE phase 4 (compaction moves objects).
+  void update_handles_for_full_gc();
+
   // Iterate dormant anchor Handles (remote_refcount > 0) as strong GC roots.
   // For each active anchor, calls closure->do_oop on a synthetic oop* pointing
   // to the Handle's stored local address. This keeps referenced local objects

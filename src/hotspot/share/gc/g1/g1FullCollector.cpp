@@ -35,6 +35,7 @@
 #include "gc/g1/g1FullGCScope.hpp"
 #include "gc/g1/g1OopClosures.hpp"
 #include "gc/g1/g1Policy.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RegionMarkStatsCache.inline.hpp"
 #include "gc/shared/gcTraceTime.inline.hpp"
 #include "gc/shared/preservedMarks.inline.hpp"
@@ -213,6 +214,13 @@ void G1FullCollector::collect() {
 
   if (has_compaction_targets()) {
     phase3_adjust_pointers();
+
+    // Update Handles for all managed objects before compaction moves bytes.
+    // Forwarding addresses are now installed in mark words (phase 2/3).
+    G1RemoteMemoryManager* rmm = _heap->remote_memory_manager();
+    if (rmm != nullptr) {
+      rmm->update_handles_for_full_gc();
+    }
 
     phase4_do_compaction();
   } else {

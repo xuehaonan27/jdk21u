@@ -379,6 +379,81 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
 }
 
 // ============================================================
+// Full GC Handle Update
+// ============================================================
+// After Full GC phase 3 (adjust pointers), forwarding addresses are
+// installed in mark words. Walk the Handle table and update each
+// LOCAL Handle to point to the forwarded address. Must be called
+// before phase 4 (compaction) moves the bytes.
+
+void G1RemoteMemoryManager::update_handles_for_full_gc() {
+  int updated = 0;
+
+  table_lock();
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      HandleEntry* next = e->_next;
+      RemoteHandle* h = e->_handle;
+
+      if (h != nullptr && h->is_local()) {
+        // Verify the object address is still in the heap before accessing.
+        // During Full GC, dead objects may have been reclaimed.
+        if (!_g1h->is_in((void*)e->_obj_addr)) {
+          e = next;
+          continue;
+        }
+        oop obj = cast_to_oop(e->_obj_addr);
+        if (obj->is_forwarded()) {
+          oop new_obj = obj->forwardee();
+          uintptr_t new_addr = cast_from_oop<uintptr_t>(new_obj);
+
+          // Update Handle to new address
+          h->set_local(cast_from_oop<void*>(new_obj));
+
+          // Rekey table entry: unlink from old bucket, insert in new
+          // (we can't modify while iterating, so update in-place)
+          e->_obj_addr = new_addr;
+          updated++;
+        }
+      }
+      e = next;
+    }
+  }
+
+  // Rekey: some entries may now be in the wrong hash bucket.
+  // Rebuild the table from the entries (simple for prototype).
+  if (updated > 0) {
+    // Collect all entries
+    HandleEntry* all_entries = nullptr;
+    for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+      HandleEntry* e = _table[idx];
+      while (e != nullptr) {
+        HandleEntry* next = e->_next;
+        e->_next = all_entries;
+        all_entries = e;
+        e = next;
+      }
+      _table[idx] = nullptr;
+    }
+    // Re-insert all entries with new keys
+    HandleEntry* e = all_entries;
+    while (e != nullptr) {
+      HandleEntry* next = e->_next;
+      size_t new_idx = hash_obj(e->_obj_addr);
+      e->_next = _table[new_idx];
+      _table[new_idx] = e;
+      e = next;
+    }
+  }
+  table_unlock();
+
+  if (updated > 0) {
+    log_info(gc)("Full GC handle update: %d handles rekeyed", updated);
+  }
+}
+
+// ============================================================
 // Fetch Cache Region (FCR) Allocation
 // ============================================================
 

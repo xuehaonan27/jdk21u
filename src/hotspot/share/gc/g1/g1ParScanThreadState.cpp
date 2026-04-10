@@ -535,17 +535,27 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
   const oop forward_ptr = old->forward_to_atomic(obj, old_mark, memory_order_relaxed);
   if (forward_ptr == nullptr) {
 
-    // Update Handle when a Shared object is evacuated.
-    // The Handle must point to the new copy, otherwise Shared OOP -> Handle
-    // chains resolve to a stale address (critical correctness, see plan 9.7).
-    // Check mark word bits (fast, same cache line) with bitmap fallback.
-    // Check mark word for Shared classification. For LM_LIGHTWEIGHT fast-locked
-    // objects, bits 39-40 are still visible (only lock bits 0-1 cleared).
-    // For stack-locked (LM_LEGACY) and inflated objects, mark word holds a pointer
-    // — bits are in displaced header. But locked objects are hot and won't be
-    // evicted, so missing the Handle update here is benign (next GC fixes it).
-    if (old_mark.remote_class() == markWord::remote_class_shared) {
-      _g1h->remote_memory_manager()->update_handle_for_evacuation(old, obj);
+    // Update Handle when an object with a Handle is evacuated.
+    // Handles exist for: (1) evicted objects (SHARED classification),
+    // (2) dormant anchors (local objects referenced by remote objects — may
+    // have any classification including UNTRACKED), (3) fetched-back objects.
+    //
+    // Fast path: check mark word for SHARED/UNIQUE classification (same cache line).
+    // Slow path: for Old objects, check Handle table (dormant anchors may not
+    // have classification bits set).
+    {
+      bool has_handle = false;
+      uintptr_t cls = old_mark.is_unlocked() ? old_mark.remote_class() : 0;
+      if (cls == markWord::remote_class_shared || cls == markWord::remote_class_unique) {
+        has_handle = true;
+      } else if (from_region->is_old()) {
+        // Dormant anchors in Old regions may not have classification bits.
+        // Check Handle table (hash + chain walk, acceptable during STW).
+        has_handle = _g1h->remote_memory_manager()->has_handle(old);
+      }
+      if (has_handle) {
+        _g1h->remote_memory_manager()->update_handle_for_evacuation(old, obj);
+      }
     }
 
     {
