@@ -253,37 +253,25 @@ oop_store_not_in_heap(T* addr, oop new_value) {
 // the Handle, maintaining coherence for remote eviction.
 // ============================================================
 
-// Phase 2b: Write barrier with region-bitmap-based classification.
-// Checks per-region bitmap to determine if target is managed (Unique or Shared).
-// For Shared targets: encodes store as Shared OOP pointing to Handle.
-// For Unique targets: upgrades to Shared (allocate Handle, update bitmap).
-// For untracked: no special handling (standard store).
+// Write barrier: standard G1 oop store (SATB pre-barrier + card marking).
 //
-// Fast negative path: most regions have no bitmap → one null-pointer check.
+// In the invisible-handle design, local stores always write clean oops.
+// Handleification (shared_oop encoding) is reserved for explicit eviction-time
+// rewriting only. The old resolve_managed_store() path that re-encoded stores
+// as shared_oop(handle) is removed — it fought de-handleification by re-tagging
+// oops that had been intentionally converted back to clean.
 
 template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap(T* addr, oop new_value) {
-  oop store_value = new_value;
-
-  if (new_value != nullptr && Universe::heap() != nullptr) {
-    store_value = G1BarrierSet::resolve_managed_store(new_value);
-  }
-
-  ModRef::oop_store_in_heap(addr, store_value);
+  ModRef::oop_store_in_heap(addr, new_value);
 }
 
 template <DecoratorSet decorators, typename BarrierSetT>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
-  oop store_value = new_value;
-
-  if (new_value != nullptr && Universe::heap() != nullptr) {
-    store_value = G1BarrierSet::resolve_managed_store(new_value);
-  }
-
-  ModRef::oop_store_in_heap_at(base, offset, store_value);
+  ModRef::oop_store_in_heap_at(base, offset, new_value);
 }
 
 #endif // SHARE_GC_G1_G1BARRIERSET_INLINE_HPP

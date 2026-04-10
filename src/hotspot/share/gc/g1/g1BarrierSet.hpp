@@ -87,10 +87,11 @@ class G1BarrierSet: public CardTableBarrierSet {
   static oop resolve_remote_fetch(RemoteHandle* h);
   static oop wait_for_fetch(RemoteHandle* h);
 
-  // Disaggregated memory: write barrier classification check.
-  // Checks per-region bitmap for managed objects. If Shared, returns Shared OOP.
-  // If Unique, upgrades to Shared (allocates Handle, updates bitmap).
-  // If untracked, returns the original oop unchanged.
+  // DEPRECATED: resolve_managed_store was the write barrier that re-encoded
+  // clean oops as shared_oop(handle) on every store. Removed in the
+  // invisible-handle design — handleification is now eviction-time only.
+  // The implementation is kept in g1BarrierSet.cpp for reference but is
+  // no longer called from the write barrier path.
   static oop resolve_managed_store(oop new_value);
 
   virtual void on_thread_create(Thread* thread);
