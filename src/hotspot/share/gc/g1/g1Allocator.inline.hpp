@@ -49,6 +49,10 @@ inline OldGCAllocRegion* G1Allocator::old_gc_alloc_region() {
   return &_old_gc_alloc_region;
 }
 
+inline OldGCAllocRegion* G1Allocator::cold_old_gc_alloc_region() {
+  return &_cold_old_gc_alloc_region;
+}
+
 inline HeapWord* G1Allocator::attempt_allocation(uint node_index,
                                                  size_t min_word_size,
                                                  size_t desired_word_size,

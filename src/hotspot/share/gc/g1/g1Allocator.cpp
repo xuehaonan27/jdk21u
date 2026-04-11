@@ -42,11 +42,14 @@ G1Allocator::G1Allocator(G1CollectedHeap* heap) :
   _numa(heap->numa()),
   _survivor_is_full(false),
   _old_is_full(false),
+  _cold_old_is_full(false),
   _num_alloc_regions(_numa->num_active_nodes()),
   _mutator_alloc_regions(nullptr),
   _survivor_gc_alloc_regions(nullptr),
   _old_gc_alloc_region(heap->alloc_buffer_stats(G1HeapRegionAttr::Old)),
-  _retained_old_gc_alloc_region(nullptr) {
+  _cold_old_gc_alloc_region(heap->alloc_buffer_stats(G1HeapRegionAttr::ColdOld)),
+  _retained_old_gc_alloc_region(nullptr),
+  _retained_cold_old_gc_alloc_region(nullptr) {
 
   _mutator_alloc_regions = NEW_C_HEAP_ARRAY(MutatorAllocRegion, _num_alloc_regions, mtGC);
   _survivor_gc_alloc_regions = NEW_C_HEAP_ARRAY(SurvivorGCAllocRegion, _num_alloc_regions, mtGC);
@@ -128,6 +131,7 @@ void G1Allocator::init_gc_alloc_regions(G1EvacInfo* evacuation_info) {
 
   _survivor_is_full = false;
   _old_is_full = false;
+  _cold_old_is_full = false;
 
   for (uint i = 0; i < _num_alloc_regions; i++) {
     survivor_gc_alloc_region(i)->init();
@@ -137,6 +141,11 @@ void G1Allocator::init_gc_alloc_regions(G1EvacInfo* evacuation_info) {
   reuse_retained_old_region(evacuation_info,
                             &_old_gc_alloc_region,
                             &_retained_old_gc_alloc_region);
+
+  _cold_old_gc_alloc_region.init();
+  reuse_retained_old_region(evacuation_info,
+                            &_cold_old_gc_alloc_region,
+                            &_retained_cold_old_gc_alloc_region);
 }
 
 void G1Allocator::release_gc_alloc_regions(G1EvacInfo* evacuation_info) {
@@ -146,14 +155,17 @@ void G1Allocator::release_gc_alloc_regions(G1EvacInfo* evacuation_info) {
     survivor_gc_alloc_region(node_index)->release();
   }
   evacuation_info->set_allocation_regions(survivor_region_count +
-                                          old_gc_alloc_region()->count());
+                                          old_gc_alloc_region()->count() +
+                                          cold_old_gc_alloc_region()->count());
 
-  // If we have an old GC alloc region to release, we'll save it in
-  // _retained_old_gc_alloc_region. If we don't
-  // _retained_old_gc_alloc_region will become null. This is what we
-  // want either way so no reason to check explicitly for either
-  // condition.
   _retained_old_gc_alloc_region = old_gc_alloc_region()->release();
+
+  // Release cold-old region. Mark it as cold destination for post-fixup eviction.
+  HeapRegion* cold_old_released = cold_old_gc_alloc_region()->release();
+  if (cold_old_released != nullptr) {
+    cold_old_released->set_cold_destination();
+  }
+  _retained_cold_old_gc_alloc_region = cold_old_released;
 }
 
 void G1Allocator::abandon_gc_alloc_regions() {
@@ -161,7 +173,9 @@ void G1Allocator::abandon_gc_alloc_regions() {
     assert(survivor_gc_alloc_region(i)->get() == nullptr, "pre-condition");
   }
   assert(old_gc_alloc_region()->get() == nullptr, "pre-condition");
+  assert(cold_old_gc_alloc_region()->get() == nullptr, "pre-condition");
   _retained_old_gc_alloc_region = nullptr;
+  _retained_cold_old_gc_alloc_region = nullptr;
 }
 
 bool G1Allocator::survivor_is_full() const {
@@ -178,6 +192,14 @@ void G1Allocator::set_survivor_full() {
 
 void G1Allocator::set_old_full() {
   _old_is_full = true;
+}
+
+bool G1Allocator::cold_old_is_full() const {
+  return _cold_old_is_full;
+}
+
+void G1Allocator::set_cold_old_full() {
+  _cold_old_is_full = true;
 }
 
 size_t G1Allocator::unsafe_max_tlab_alloc() {
@@ -232,6 +254,8 @@ HeapWord* G1Allocator::par_allocate_during_gc(G1HeapRegionAttr dest,
       return survivor_attempt_allocation(node_index, min_word_size, desired_word_size, actual_word_size);
     case G1HeapRegionAttr::Old:
       return old_attempt_allocation(min_word_size, desired_word_size, actual_word_size);
+    case G1HeapRegionAttr::ColdOld:
+      return cold_old_attempt_allocation(min_word_size, desired_word_size, actual_word_size);
     default:
       ShouldNotReachHere();
       return nullptr; // Keep some compilers happy
@@ -289,6 +313,36 @@ HeapWord* G1Allocator::old_attempt_allocation(size_t min_word_size,
       if (result == nullptr) {
         set_old_full();
       }
+    }
+  }
+  return result;
+}
+
+HeapWord* G1Allocator::cold_old_attempt_allocation(size_t min_word_size,
+                                                   size_t desired_word_size,
+                                                   size_t* actual_word_size) {
+  assert(!_g1h->is_humongous(desired_word_size),
+         "we should not be seeing humongous-size allocations in this path");
+
+  HeapWord* result = cold_old_gc_alloc_region()->attempt_allocation(min_word_size,
+                                                                     desired_word_size,
+                                                                     actual_word_size);
+  if (result == nullptr && !cold_old_is_full()) {
+    MutexLocker x(FreeList_lock, Mutex::_no_safepoint_check_flag);
+    if (!cold_old_is_full()) {
+      result = cold_old_gc_alloc_region()->attempt_allocation_locked(min_word_size,
+                                                                      desired_word_size,
+                                                                      actual_word_size);
+      if (result == nullptr) {
+        set_cold_old_full();
+      }
+    }
+  }
+  // Mark the region as a cold destination when first allocated
+  if (result != nullptr) {
+    HeapRegion* hr = _g1h->heap_region_containing(result);
+    if (hr != nullptr && !hr->is_cold_destination()) {
+      hr->set_cold_destination();
     }
   }
   return result;

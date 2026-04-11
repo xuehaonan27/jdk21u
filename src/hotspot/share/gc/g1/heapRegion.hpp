@@ -583,6 +583,19 @@ public:
   bool has_classified_objects() const { return _has_classified_objects; }
   void set_has_classified_objects()   { _has_classified_objects = true; }
 
+  // Cold destination flag: set when this region is used as a cold-old
+  // allocation destination during GC. Objects in cold regions are eviction
+  // candidates after classification fixup tags their incoming refs.
+  bool _is_cold_destination;
+  bool _is_root_pinned;       // Set by root-pinning pass if region has root refs
+
+  bool is_cold_destination() const  { return _is_cold_destination; }
+  void set_cold_destination()       { _is_cold_destination = true; }
+  void clear_cold_destination()     { _is_cold_destination = false; }
+  bool is_root_pinned() const       { return _is_root_pinned; }
+  void set_root_pinned()            { _is_root_pinned = true; }
+  void clear_root_pinned()          { _is_root_pinned = false; }
+
   // Verify that the entries on the code root list for this
   // region are live and include at least one pointer into this region.
   // Returns whether there has been a failure.

@@ -45,6 +45,7 @@ private:
 
   bool _survivor_is_full;
   bool _old_is_full;
+  bool _cold_old_is_full;
 
   // The number of MutatorAllocRegions used, one per memory node.
   size_t _num_alloc_regions;
@@ -60,13 +61,19 @@ private:
   // old objects.
   OldGCAllocRegion _old_gc_alloc_region;
 
+  // Alloc region for cold old objects (eviction candidates).
+  OldGCAllocRegion _cold_old_gc_alloc_region;
+
   HeapRegion* _retained_old_gc_alloc_region;
+  HeapRegion* _retained_cold_old_gc_alloc_region;
 
   bool survivor_is_full() const;
   bool old_is_full() const;
+  bool cold_old_is_full() const;
 
   void set_survivor_full();
   void set_old_full();
+  void set_cold_old_full();
 
   void reuse_retained_old_region(G1EvacInfo* evacuation_info,
                                  OldGCAllocRegion* old,
@@ -76,6 +83,7 @@ private:
   inline MutatorAllocRegion* mutator_alloc_region(uint node_index);
   inline SurvivorGCAllocRegion* survivor_gc_alloc_region(uint node_index);
   inline OldGCAllocRegion* old_gc_alloc_region();
+  inline OldGCAllocRegion* cold_old_gc_alloc_region();
 
   // Allocation attempt during GC for a survivor object / PLAB.
   HeapWord* survivor_attempt_allocation(uint node_index,
@@ -87,6 +95,11 @@ private:
   HeapWord* old_attempt_allocation(size_t min_word_size,
                                    size_t desired_word_size,
                                    size_t* actual_word_size);
+
+  // Allocation attempt during GC for a cold-old object / PLAB.
+  HeapWord* cold_old_attempt_allocation(size_t min_word_size,
+                                        size_t desired_word_size,
+                                        size_t* actual_word_size);
 
 public:
   G1Allocator(G1CollectedHeap* heap);

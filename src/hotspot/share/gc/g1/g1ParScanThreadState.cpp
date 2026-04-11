@@ -393,6 +393,19 @@ HeapWord* G1ParScanThreadState::allocate_in_next_plab(G1HeapRegionAttr* dest,
       _old_gen_is_full = plab_refill_in_old_failed;
     }
     return obj_ptr;
+  } else if (dest->is_cold_old()) {
+    // ColdOld allocation failed — fall back to regular Old
+    bool plab_refill_in_old_failed = false;
+    HeapWord* const obj_ptr = _plab_allocator->allocate(G1HeapRegionAttr::Old,
+                                                        word_sz,
+                                                        &plab_refill_in_old_failed,
+                                                        node_index);
+    if (obj_ptr != nullptr) {
+      dest->set_old();
+    } else {
+      _old_gen_is_full = plab_refill_in_old_failed;
+    }
+    return obj_ptr;
   } else {
     _old_gen_is_full = previous_plab_refill_failed;
     assert(dest->is_old(), "Unexpected dest region attr: %s", dest->get_type_str());
@@ -402,7 +415,7 @@ HeapWord* G1ParScanThreadState::allocate_in_next_plab(G1HeapRegionAttr* dest,
 }
 
 G1HeapRegionAttr G1ParScanThreadState::next_region_attr(G1HeapRegionAttr const region_attr, markWord const m, uint& age) {
-  assert(region_attr.is_young() || region_attr.is_old(), "must be either Young or Old");
+  assert(region_attr.is_young() || region_attr.is_old(), "must be Young, Old, or ColdOld");
 
   if (region_attr.is_young()) {
     age = !m.has_displaced_mark_helper() ? m.age()
@@ -411,7 +424,20 @@ G1HeapRegionAttr G1ParScanThreadState::next_region_attr(G1HeapRegionAttr const r
       return region_attr;
     }
   }
-  // young-to-old (promotion) or old-to-old; destination is old in both cases.
+
+  // Cold object routing: if G1RemoteEvictionThreshold is active and the object
+  // has a stale hotness epoch (cold), route to ColdOld destination for eviction.
+  // Only for objects being promoted to Old (not young survivors).
+  // Skip arrays (non-barrier paths access elements directly).
+  if (G1RemoteEvictionThreshold > 0 && m.is_unlocked()) {
+    uint32_t gc_epoch = _g1h->remote_memory_manager()->gc_epoch();
+    uintptr_t distance = m.hotness_distance(gc_epoch);
+    // Cold = not accessed in 4+ GC cycles. Also skip newly promoted (distance=0).
+    if (distance >= 4) {
+      return G1HeapRegionAttr(G1HeapRegionAttr::ColdOld);
+    }
+  }
+
   return G1HeapRegionAttr::Old;
 }
 
@@ -421,11 +447,11 @@ void G1ParScanThreadState::report_promotion_event(G1HeapRegionAttr const dest_at
   PLAB* alloc_buf = _plab_allocator->alloc_buffer(dest_attr, node_index);
   if (alloc_buf->contains(obj_ptr)) {
     _g1h->gc_tracer_stw()->report_promotion_in_new_plab_event(old->klass(), word_sz * HeapWordSize, age,
-                                                              dest_attr.type() == G1HeapRegionAttr::Old,
+                                                              dest_attr.is_old(),
                                                               alloc_buf->word_sz() * HeapWordSize);
   } else {
     _g1h->gc_tracer_stw()->report_promotion_outside_plab_event(old->klass(), word_sz * HeapWordSize, age,
-                                                               dest_attr.type() == G1HeapRegionAttr::Old);
+                                                               dest_attr.is_old());
   }
 }
 

@@ -57,7 +57,8 @@ public:
   static const region_type_t NotInCSet    =  -1;    // The region is not in the collection set.
   static const region_type_t Young        =   0;    // The region is in the collection set and a young region.
   static const region_type_t Old          =   1;    // The region is in the collection set and an old region.
-  static const region_type_t Num          =   2;
+  static const region_type_t ColdOld      =   2;    // Cold old: dedicated region for cold objects, eviction candidate.
+  static const region_type_t Num          =   3;
 
   G1HeapRegionAttr(region_type_t type = NotInCSet, bool remset_is_tracked = false) :
     _remset_is_tracked(remset_is_tracked), _type(type) {
@@ -75,6 +76,7 @@ public:
       case NotInCSet: return "NotInCSet";
       case Young: return "Young";
       case Old: return "Old";
+      case ColdOld: return "ColdOld";
       default: ShouldNotReachHere(); return "";
     }
   }
@@ -83,6 +85,7 @@ public:
 
   void set_new_survivor()              { _type = NewSurvivor; }
   void set_old()                       { _type = Old; }
+  void set_cold_old()                  { _type = ColdOld; }
   void clear_humongous_candidate()               {
     assert(is_humongous_candidate() || !is_in_cset(), "must be");
     _type = NotInCSet;
@@ -95,7 +98,8 @@ public:
   bool is_humongous_candidate() const            { return type() == HumongousCandidate; }
   bool is_new_survivor() const         { return type() == NewSurvivor; }
   bool is_young() const                { return type() == Young; }
-  bool is_old() const                  { return type() == Old; }
+  bool is_old() const                  { return type() == Old || type() == ColdOld; }
+  bool is_cold_old() const             { return type() == ColdOld; }
   bool is_optional() const             { return type() == Optional; }
 
 #ifdef ASSERT
