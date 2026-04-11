@@ -38,6 +38,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
   memset(_table, 0, sizeof(_table));
   memset(_edge_tables, 0, sizeof(_edge_tables));
+  memset(_hotness_stats, 0, sizeof(_hotness_stats));
+  memset(_prev_hotness_stats, 0, sizeof(_prev_hotness_stats));
   memset(_sim_remote_slots, 0, sizeof(_sim_remote_slots));
 
   // Create remote storage backend.

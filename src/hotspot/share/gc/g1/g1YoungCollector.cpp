@@ -1007,65 +1007,77 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     }
   }
 
-  // Simulated remote memory eviction.
-  // Phase 2+: uses classification bitmap to prefer Shared objects (have Handles).
-  // Shared objects can be evicted via Handle → REMOTE transition.
-  // Unique objects are evicted by first upgrading to Shared.
+  // Simulated remote memory eviction with hotness-based candidate selection.
+  // Selects the coldest classified objects (highest epoch distance) for eviction.
+  // Uses evict_object() which builds edge tables for fetch-time field patching.
   if (G1SimulateRemoteEviction) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     RemoteHandleAllocBuffer hab;
     int evicted = 0;
+    uint32_t current_epoch = rmm->gc_epoch();
 
-    for (uint i = 0; i < _g1h->num_regions() && evicted < 3; i++) {
+    // Log previous GC's hotness stats for visibility
+    {
+      const G1RemoteMemoryManager::HotnessLevelStats* stats = rmm->prev_hotness_stats();
+      size_t total_objects = 0, total_words = 0;
+      for (int i = 0; i < G1RemoteMemoryManager::HOTNESS_LEVELS; i++) {
+        if (stats[i].object_count > 0) {
+          total_objects += stats[i].object_count;
+          total_words += stats[i].total_words;
+        }
+      }
+      if (total_objects > 0) {
+        log_info(gc)("Hotness stats (prev GC): " SIZE_FORMAT " classified objects, "
+                     SIZE_FORMAT " words total", total_objects, total_words);
+      }
+    }
+
+    // Select coldest objects: scan Old regions, pick objects with highest
+    // epoch distance (coldest). Use evict_object() for proper edge table + filler.
+    static const int MAX_EVICT = 3;
+
+    for (uint i = 0; i < _g1h->num_regions() && evicted < MAX_EVICT; i++) {
       HeapRegion* hr = _g1h->region_at(i);
       if (!hr->is_old() || hr->is_humongous()) continue;
-      if (!hr->has_classified_objects()) continue;  // No classified objects
+      if (!hr->has_classified_objects()) continue;
 
       HeapWord* p = hr->bottom();
-      while (p < hr->top() && evicted < 3) {
+      while (p < hr->top() && evicted < MAX_EVICT) {
         oop obj = cast_to_oop(p);
         size_t sz = obj->size();
         markWord mw = obj->mark();
 
-        // Check mark word classification. Skip locked/inflated objects.
         if (!mw.is_unlocked()) { p += sz; continue; }
         uintptr_t cls = mw.remote_class();
 
+        // Only evict classified objects (Unique or Shared) of reasonable size
         if ((cls == markWord::remote_class_shared || cls == markWord::remote_class_unique)
             && sz >= 2 && sz <= 128) {
-          const char* cls_name = (cls == markWord::remote_class_shared) ? "Shared" : "Unique->Shared";
-          // Ensure Handle exists (upgrade Unique→Shared if needed)
-          RemoteHandle* h = rmm->handle_for(obj);
-          if (h == nullptr) {
-            h = rmm->create_handle_for(obj, &hab);
+
+          // Hotness check: only evict cold objects (epoch distance >= 4)
+          uintptr_t distance = mw.hotness_distance(current_epoch);
+          if (distance < 4) {
+            // Object is hot (recently accessed) — skip
+            p += sz;
+            continue;
           }
-          if (cls == markWord::remote_class_unique) {
-            // Upgrade mark word: Unique → Shared (STW, plain store safe)
-            obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
-          }
-          if (h != nullptr && h->is_local()) {
-            Klass* klass = obj->klass();
-            G1RemoteBackend* be = rmm->backend();
-            size_t slot_id = be->evict(cast_from_oop<void*>(obj), sz, klass, (size_t)-1);
-            if (slot_id != (size_t)-1) {
-              h->set_remote(slot_id);
-              h->set_eviction_word_size(sz);
-              evicted++;
-              log_info(gc)("Remote evict (%s): obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT,
-                           cls_name, p2i((void*)obj), klass->external_name(), sz, slot_id);
-              // Overwrite local bytes with filler to poison stale clean oops.
-              // Any stale oop that bypassed Handle-based access will see a
-              // filler object (int[] or java.lang.Object), causing a visible
-              // crash rather than silent data corruption.
-              CollectedHeap::fill_with_object(p, sz, false /* zap */);
-            }
+
+          // Root-pinning: skip arrays (non-barrier paths access elements)
+          if (obj->klass()->is_array_klass()) { p += sz; continue; }
+
+          // Use evict_object() for proper edge table building + filler
+          if (rmm->evict_object(obj, &hab)) {
+            evicted++;
+            log_info(gc)("Hotness evict: distance=%lu obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w",
+                         (unsigned long)distance, p2i((void*)obj),
+                         obj->klass()->external_name(), sz);
           }
         }
         p += sz;
       }
     }
     if (evicted > 0) {
-      log_info(gc)("G1SimulateRemoteEviction: evicted %d classified objects (total evicted: " SIZE_FORMAT
+      log_info(gc)("G1SimulateRemoteEviction: evicted %d objects by hotness (total evicted: " SIZE_FORMAT
                    ", total fetched: " SIZE_FORMAT ")",
                    evicted, rmm->backend()->total_evicted(), rmm->backend()->total_fetched());
     }

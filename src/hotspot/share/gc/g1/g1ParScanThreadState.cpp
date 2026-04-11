@@ -769,6 +769,8 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         if (info.count == 1) {
           obj->set_mark(mw.set_remote_class(markWord::remote_class_unique));
           dest->set_has_classified_objects();
+          // Record hotness for eviction statistics
+          _g1h->remote_memory_manager()->record_hotness(mw, obj->size());
           if (safe_to_tag && !info.first_site._is_narrow) {
             oop* p = (oop*)info.first_site._ref_site;
             // Verify ref-site before writing
@@ -792,6 +794,8 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         } else {
           obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
           dest->set_has_classified_objects();
+          // Record hotness for eviction statistics
+          _g1h->remote_memory_manager()->record_hotness(mw, obj->size());
           if (safe_to_tag) {
             RemoteHandle* h = _g1h->remote_memory_manager()->create_handle_for(obj, &hab);
             if (!info.first_site._is_narrow) {

@@ -413,9 +413,48 @@ public:
   // get their epoch stamped; distance from current epoch = coldness.
   uint32_t _gc_epoch;
 
+  // Per-level hotness statistics: collected each GC, used by the NEXT GC
+  // to determine which objects are cold enough to evict.
+  static const int HOTNESS_LEVELS = 16;
+  struct HotnessLevelStats {
+    size_t object_count;
+    size_t total_words;
+  };
+  HotnessLevelStats _hotness_stats[HOTNESS_LEVELS];     // current GC's data
+  HotnessLevelStats _prev_hotness_stats[HOTNESS_LEVELS]; // previous GC's data (for eviction decisions)
+
 public:
   uint32_t gc_epoch() const { return _gc_epoch; }
-  void increment_gc_epoch() { _gc_epoch++; }
+  void increment_gc_epoch() {
+    // Rotate stats: current → previous, clear current
+    memcpy(_prev_hotness_stats, _hotness_stats, sizeof(_hotness_stats));
+    memset(_hotness_stats, 0, sizeof(_hotness_stats));
+    _gc_epoch++;
+  }
+
+  // Record an Old object's hotness during classification/evacuation.
+  void record_hotness(markWord mw, size_t word_size) {
+    if (!mw.is_unlocked()) return;
+    uintptr_t dist = mw.hotness_distance(_gc_epoch);
+    _hotness_stats[dist].object_count++;
+    _hotness_stats[dist].total_words += word_size;
+  }
+
+  // Get previous GC's stats for eviction decisions.
+  const HotnessLevelStats* prev_hotness_stats() const { return _prev_hotness_stats; }
+
+  // Determine eviction threshold: objects at or above this distance are cold.
+  // Returns the distance threshold, or HOTNESS_LEVELS if nothing to evict.
+  int eviction_threshold(size_t target_words) const {
+    // Walk from coldest (15) to hottest (0), accumulating bytes.
+    // Stop when we've accumulated enough to meet the target.
+    size_t accumulated = 0;
+    for (int level = HOTNESS_LEVELS - 1; level >= 0; level--) {
+      accumulated += _prev_hotness_stats[level].total_words;
+      if (accumulated >= target_words) return level;
+    }
+    return HOTNESS_LEVELS; // not enough cold objects
+  }
 
   // ============================================================
   // Accessors
