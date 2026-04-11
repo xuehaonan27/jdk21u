@@ -10,6 +10,7 @@
 #include "gc/g1/g1RemoteBackendRdma.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1CollectorState.hpp"
+#include "gc/g1/heapRegion.inline.hpp"
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1NUMA.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
@@ -301,6 +302,115 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
                p2i((void*)obj), klass->external_name(), word_size, slot_id, et->_entry_count);
 
   return true;
+}
+
+// ============================================================
+// Region-Granularity Eviction
+// ============================================================
+// Evicts ALL objects in a region to remote. For each object:
+//   1. Create Handle + build edge table (dormant anchors for outgoing refs)
+//   2. Backend evict (send bytes via TCP/RDMA/SIM)
+//   3. Handle → REMOTE + fill with filler
+// After all objects evicted: tag incoming refs, free the region.
+
+// Closure to tag incoming refs from other regions into the evicted region.
+// For each oop field that points into the target region, replace with
+// shared_oop(handle) so the load barrier intercepts future accesses.
+class IncomingRefTagClosure : public BasicOopIterateClosure {
+  G1RemoteMemoryManager* _rmm;
+  G1CollectedHeap*       _g1h;
+  HeapRegion*            _target_hr;
+  int                    _tagged;
+public:
+  IncomingRefTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h, HeapRegion* target)
+    : _rmm(rmm), _g1h(g1h), _target_hr(target), _tagged(0) {}
+
+  virtual void do_oop(oop* p) {
+    uintptr_t raw = *(uintptr_t*)p;
+    if (raw == 0) return;
+    // Already tagged — skip
+    if ((raw >> 63) != 0) return;
+
+    oop target = cast_to_oop(raw);
+    if (!_g1h->is_in(target)) return;
+
+    // Check if target is in the evicted region
+    HeapRegion* target_region = _g1h->heap_region_containing(target);
+    if (target_region != _target_hr) return;
+
+    // Target is in evicted region — find its Handle and tag the ref
+    RemoteHandle* h = _rmm->handle_for(target);
+    if (h != nullptr) {
+      *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+      _tagged++;
+    }
+  }
+
+  virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+
+  int tagged() const { return _tagged; }
+};
+
+void G1RemoteMemoryManager::tag_incoming_refs_to_region(HeapRegion* target_hr) {
+  IncomingRefTagClosure cl(this, _g1h, target_hr);
+
+  // Walk all non-free, non-target heap regions and scan oop fields
+  for (uint i = 0; i < _g1h->num_regions(); i++) {
+    HeapRegion* hr = _g1h->region_at(i);
+    if (hr == target_hr) continue;       // skip the evicted region itself
+    if (!hr->is_old() && !hr->is_young()) continue;  // skip free/humongous
+    if (hr->is_empty()) continue;
+
+    HeapWord* p = hr->bottom();
+    while (p < hr->top()) {
+      oop obj = cast_to_oop(p);
+      obj->oop_iterate(&cl);
+      p += obj->size();
+    }
+  }
+
+  if (cl.tagged() > 0) {
+    log_info(gc)("Tagged %d incoming refs to evicted region [" PTR_FORMAT ", " PTR_FORMAT ")",
+                 cl.tagged(), p2i(target_hr->bottom()), p2i(target_hr->top()));
+  }
+}
+
+int G1RemoteMemoryManager::evict_region(HeapRegion* hr, RemoteHandleAllocBuffer* hab) {
+  assert(hr->is_old(), "can only evict Old regions");
+  assert(!hr->is_humongous(), "cannot evict humongous regions");
+
+  int evicted = 0;
+  HeapWord* p = hr->bottom();
+
+  // Phase 1: Evict all objects in the region
+  while (p < hr->top()) {
+    oop obj = cast_to_oop(p);
+    size_t sz = obj->size();
+    markWord mw = obj->mark();
+
+    // Skip locked/inflated objects (rare in Old during STW)
+    if (!mw.is_unlocked()) { p += sz; continue; }
+
+    // Skip filler objects
+    Klass* klass = obj->klass();
+    if (klass == nullptr || obj->is_gc_marked()) { p += sz; continue; }
+
+    // Evict this object (creates Handle, builds edge table, sends to backend, fills with filler)
+    if (evict_object(obj, hab)) {
+      evicted++;
+    }
+    p += sz;
+  }
+
+  if (evicted > 0) {
+    // Phase 2: Tag incoming refs from other regions
+    tag_incoming_refs_to_region(hr);
+
+    log_info(gc)("Region eviction: region %u [" PTR_FORMAT "] — %d objects evicted",
+                 hr->hrm_index(), p2i(hr->bottom()), evicted);
+  }
+
+  return evicted;
 }
 
 Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {

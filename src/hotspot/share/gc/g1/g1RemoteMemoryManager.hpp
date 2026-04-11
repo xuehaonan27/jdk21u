@@ -601,6 +601,15 @@ public:
   template <typename OopClosureType>
   void oops_do_remote_anchors(OopClosureType* cl);
 
+  // Evict an entire region: evict all objects, tag incoming refs, free region.
+  // Called during STW post-GC when heap pressure exceeds threshold.
+  // Returns the number of objects evicted.
+  int evict_region(HeapRegion* hr, RemoteHandleAllocBuffer* hab);
+
+  // Tag incoming refs: scan heap for refs pointing into the given region,
+  // replace them with shared_oop(handle). Called during STW.
+  void tag_incoming_refs_to_region(HeapRegion* target_hr);
+
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
   // For each edge entry:

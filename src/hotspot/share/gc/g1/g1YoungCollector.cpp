@@ -1007,79 +1007,73 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     }
   }
 
-  // Simulated remote memory eviction with hotness-based candidate selection.
-  // Selects the coldest classified objects (highest epoch distance) for eviction.
-  // Uses evict_object() which builds edge tables for fetch-time field patching.
-  if (G1SimulateRemoteEviction) {
+  // ============================================================
+  // Remote Memory Eviction
+  // ============================================================
+  // Two modes:
+  //   1. G1SimulateRemoteEviction: evict 3 cold objects per GC (legacy debug)
+  //   2. G1RemoteEvictionThreshold > 0: pressure-driven region eviction
+  //      Evict entire cold Old regions until heap occupancy drops below threshold.
+  if (G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     RemoteHandleAllocBuffer hab;
-    int evicted = 0;
-    uint32_t current_epoch = rmm->gc_epoch();
+    int total_evicted = 0;
+    int regions_evicted = 0;
 
-    // Log previous GC's hotness stats for visibility
-    {
-      const G1RemoteMemoryManager::HotnessLevelStats* stats = rmm->prev_hotness_stats();
-      size_t total_objects = 0, total_words = 0;
-      for (int i = 0; i < G1RemoteMemoryManager::HOTNESS_LEVELS; i++) {
-        if (stats[i].object_count > 0) {
-          total_objects += stats[i].object_count;
-          total_words += stats[i].total_words;
+    if (G1RemoteEvictionThreshold > 0) {
+      // Pressure-driven: evict cold regions until occupancy < threshold
+      size_t heap_capacity = _g1h->max_capacity();
+      size_t heap_used = _g1h->used();
+      size_t threshold_bytes = (heap_capacity * G1RemoteEvictionThreshold) / 100;
+
+      if (heap_used > threshold_bytes) {
+        size_t to_free = heap_used - threshold_bytes;
+        log_info(gc)("Remote eviction: heap used " SIZE_FORMAT "MB / " SIZE_FORMAT "MB "
+                     "(threshold %u%% = " SIZE_FORMAT "MB), need to free " SIZE_FORMAT "MB",
+                     heap_used / M, heap_capacity / M,
+                     G1RemoteEvictionThreshold, threshold_bytes / M, to_free / M);
+
+        // Find coldest Old regions and evict them
+        // Simple strategy: iterate regions, evict non-humongous Old regions
+        // that aren't in the collection set. TODO: sort by hotness.
+        size_t freed = 0;
+        for (uint i = 0; i < _g1h->num_regions() && freed < to_free; i++) {
+          HeapRegion* hr = _g1h->region_at(i);
+          if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
+
+          size_t region_used = hr->used();
+          int evicted = rmm->evict_region(hr, &hab);
+          if (evicted > 0) {
+            total_evicted += evicted;
+            regions_evicted++;
+            freed += region_used;
+          }
         }
       }
-      if (total_objects > 0) {
-        log_info(gc)("Hotness stats (prev GC): " SIZE_FORMAT " classified objects, "
-                     SIZE_FORMAT " words total", total_objects, total_words);
-      }
-    }
+    } else {
+      // Legacy mode: evict 3 individual cold objects
+      for (uint i = 0; i < _g1h->num_regions() && total_evicted < 3; i++) {
+        HeapRegion* hr = _g1h->region_at(i);
+        if (!hr->is_old() || hr->is_humongous()) continue;
+        if (!hr->has_classified_objects()) continue;
 
-    // Select coldest objects: scan Old regions, pick objects with highest
-    // epoch distance (coldest). Use evict_object() for proper edge table + filler.
-    static const int MAX_EVICT = 3;
-
-    for (uint i = 0; i < _g1h->num_regions() && evicted < MAX_EVICT; i++) {
-      HeapRegion* hr = _g1h->region_at(i);
-      if (!hr->is_old() || hr->is_humongous()) continue;
-      if (!hr->has_classified_objects()) continue;
-
-      HeapWord* p = hr->bottom();
-      while (p < hr->top() && evicted < MAX_EVICT) {
-        oop obj = cast_to_oop(p);
-        size_t sz = obj->size();
-        markWord mw = obj->mark();
-
-        if (!mw.is_unlocked()) { p += sz; continue; }
-        uintptr_t cls = mw.remote_class();
-
-        // Only evict classified objects (Unique or Shared) of reasonable size
-        if ((cls == markWord::remote_class_shared || cls == markWord::remote_class_unique)
-            && sz >= 2 && sz <= 128) {
-
-          // Hotness check: only evict cold objects (epoch distance >= 4)
-          uintptr_t distance = mw.hotness_distance(current_epoch);
-          if (distance < 4) {
-            // Object is hot (recently accessed) — skip
-            p += sz;
-            continue;
-          }
-
-          // Root-pinning: skip arrays (non-barrier paths access elements)
-          if (obj->klass()->is_array_klass()) { p += sz; continue; }
-
-          // Use evict_object() for proper edge table building + filler
+        HeapWord* p = hr->bottom();
+        while (p < hr->top() && total_evicted < 3) {
+          oop obj = cast_to_oop(p);
+          size_t sz = obj->size();
           if (rmm->evict_object(obj, &hab)) {
-            evicted++;
-            log_info(gc)("Hotness evict: distance=%lu obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w",
-                         (unsigned long)distance, p2i((void*)obj),
-                         obj->klass()->external_name(), sz);
+            total_evicted++;
           }
+          p += sz;
         }
-        p += sz;
       }
     }
-    if (evicted > 0) {
-      log_info(gc)("G1SimulateRemoteEviction: evicted %d objects by hotness (total evicted: " SIZE_FORMAT
+
+    if (total_evicted > 0) {
+      log_info(gc)("Remote eviction: %d objects in %d regions (total evicted: " SIZE_FORMAT
                    ", total fetched: " SIZE_FORMAT ")",
-                   evicted, rmm->backend()->total_evicted(), rmm->backend()->total_fetched());
+                   total_evicted, regions_evicted,
+                   rmm->backend()->total_evicted(), rmm->backend()->total_fetched());
     }
   }
 

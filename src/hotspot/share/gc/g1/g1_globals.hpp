@@ -288,6 +288,12 @@
           "After each GC, simulate evicting a few old objects to remote "   \
           "memory. For testing disaggregated memory infrastructure.")       \
                                                                             \
+  product(uint, G1RemoteEvictionThreshold, 0, DIAGNOSTIC,                   \
+          "Heap occupancy percentage (0-100) above which cold Old regions "  \
+          "are evicted to remote memory. 0 = disabled. E.g., 75 means "    \
+          "evict when heap is >75% full. Requires UseRemoteExecutor or "   \
+          "G1SimulateRemoteEviction.")                                     \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \
