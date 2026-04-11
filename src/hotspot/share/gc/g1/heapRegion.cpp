@@ -39,6 +39,8 @@
 #include "gc/g1/heapRegionRemSet.inline.hpp"
 #include "gc/g1/heapRegionTracer.hpp"
 #include "runtime/os.hpp"
+#include "runtime/safepoint.hpp"
+#include "runtime/thread.hpp"
 #include "logging/log.hpp"
 #include "logging/logStream.hpp"
 #include "memory/iterator.inline.hpp"
@@ -186,7 +188,11 @@ void HeapRegion::set_old() {
 }
 
 void HeapRegion::set_fetch_cache() {
-  report_region_type_change(G1HeapRegionTraceType::FetchCache);
+  // Skip JFR region type tracing for FCR regions. FCR allocation happens from
+  // mutator threads via resolve_tagged_oop_slow (ThreadInVMfromJava), which
+  // may have inconsistent JFR thread-local state. The JFR EventG1HeapRegionTypeChange
+  // constructor accesses thread-local JFR data that can be null in this context.
+  // This is safe: FCR is an internal Old sub-type and the JFR trace is diagnostic only.
   _type.set_fetch_cache();
 }
 
