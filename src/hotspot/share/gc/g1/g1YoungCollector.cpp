@@ -1134,6 +1134,9 @@ void G1YoungCollector::collect() {
     // other trivial setup above).
     policy()->record_young_collection_start();
 
+    // Increment hotness epoch for recency tracking.
+    _g1h->remote_memory_manager()->increment_gc_epoch();
+
     pre_evacuate_collection_set(jtm.evacuation_info());
 
     G1ParScanThreadStateSet per_thread_states(_g1h,

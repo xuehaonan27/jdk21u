@@ -81,7 +81,26 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
     if (state == REMOTE_HANDLE_LOCAL) {
-      return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+      oopDesc* resolved = (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+
+      // Sampled hotness epoch update: stamp the object's mark word with
+      // the current GC epoch. Sample 1 in 16 resolutions (cheap hash on addr).
+      // Best-effort: skip if locked, skip on CAS failure.
+      if (((uintptr_t)resolved & 0x78) == 0) {  // ~1/16 sampling
+        markWord mw = resolved->mark_acquire();
+        if (mw.is_unlocked()) {
+          G1CollectedHeap* g1h = G1CollectedHeap::heap();
+          uint32_t epoch = g1h->remote_memory_manager()->gc_epoch() & 0xF;
+          if (mw.remote_epoch() != epoch) {
+            markWord new_mw = mw.set_remote_epoch(epoch);
+            // Best-effort CAS — skip on failure (another thread may have
+            // updated hash or lock bits concurrently).
+            resolved->cas_set_mark(new_mw, mw);
+          }
+        }
+      }
+
+      return resolved;
     }
     // REMOTE or FETCHING: return tagged oop unchanged for slow path.
     // With G1TagRefSites (no eviction), this should never happen.

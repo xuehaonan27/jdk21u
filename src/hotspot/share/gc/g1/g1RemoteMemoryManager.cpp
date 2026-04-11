@@ -33,7 +33,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _entry_chunks(nullptr), _entry_free_list(nullptr), _entry_chunk_top(ENTRY_CHUNK_CAPACITY),
     _table_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
-    _sim_remote_fetched_count(0),
+    _sim_remote_fetched_count(0), _gc_epoch(0),
     _current_fcr(nullptr), _fcr_lock(0),
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
   memset(_table, 0, sizeof(_table));

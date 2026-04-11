@@ -406,6 +406,18 @@ private:
 
 public:
   // ============================================================
+  // Hotness Tracking (P8)
+  // ============================================================
+  // GC epoch counter: incremented each GC cycle. Used for recency epoch
+  // in mark word (4-bit field, wraps at 16). Objects accessed between GCs
+  // get their epoch stamped; distance from current epoch = coldness.
+  uint32_t _gc_epoch;
+
+public:
+  uint32_t gc_epoch() const { return _gc_epoch; }
+  void increment_gc_epoch() { _gc_epoch++; }
+
+  // ============================================================
   // Accessors
   // ============================================================
 

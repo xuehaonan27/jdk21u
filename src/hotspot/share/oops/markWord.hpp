@@ -182,6 +182,26 @@ class markWord {
   static const uintptr_t remote_class_unique    = uintptr_t(1) << remote_class_shift;
   static const uintptr_t remote_class_shared    = uintptr_t(2) << remote_class_shift;
 
+  // Hotness tracking: 4-bit recency epoch in bits 41-44.
+  // Value = GC_epoch % 16 at last access. Hotness distance =
+  // (current_epoch - stored_epoch) % 16. Low distance = hot.
+  static const int       remote_epoch_shift     = 41;
+  static const uintptr_t remote_epoch_mask      = uintptr_t(0xF) << remote_epoch_shift;  // bits 41-44
+
+  uintptr_t remote_epoch() const {
+    return (value() & remote_epoch_mask) >> remote_epoch_shift;
+  }
+
+  markWord set_remote_epoch(uintptr_t epoch) const {
+    return markWord((value() & ~remote_epoch_mask) |
+                    ((epoch & 0xF) << remote_epoch_shift));
+  }
+
+  // Hotness distance: 0 = accessed this GC cycle (hottest), 15 = coldest.
+  uintptr_t hotness_distance(uintptr_t current_epoch) const {
+    return (current_epoch - remote_epoch()) & 0xF;
+  }
+
   bool has_remote_metadata() const {
     // Only valid when mark is in normal (unlocked) state.
     // In locked/monitor/marked states, the mark word holds a pointer.
@@ -206,9 +226,11 @@ class markWord {
 
   // Should this header be preserved during GC (evacuation failure)?
   bool must_be_preserved(const oopDesc* obj) const {
-    // Preserve if: locked/inflated, has hash, OR has classification bits.
+    // Preserve if: locked/inflated, has hash, OR has remote metadata bits
+    // (classification or hotness epoch).
     // Without this, init_mark() in g1EvacFailure.cpp would clear our bits.
-    return (!is_unlocked() || !has_no_hash() || (value() & remote_class_mask) != 0);
+    return (!is_unlocked() || !has_no_hash() ||
+            (value() & (remote_class_mask | remote_epoch_mask)) != 0);
   }
 
   // WARNING: The following routines are used EXCLUSIVELY by
