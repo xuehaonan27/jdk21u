@@ -1347,6 +1347,12 @@ void G1ConcurrentMark::collect_remote_root_logs() {
     log_info(gc)("Remote root collection: %d logged across tasks, %d unique handle_ids",
                  total_logged, rmm->remote_roots_count());
   }
+
+  // P13: Apply deferred remote_refcount decrements.
+  // These were buffered during concurrent marking to prevent removing dormant
+  // anchors while marking threads might still encounter refs to their targets.
+  // Now that remark is complete (STW), it's safe to apply them.
+  rmm->apply_deferred_decrements();
 }
 
 class G1ReclaimEmptyRegionsTask : public WorkerTask {

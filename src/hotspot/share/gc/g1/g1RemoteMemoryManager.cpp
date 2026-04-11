@@ -9,6 +9,7 @@
 #include "gc/g1/g1RemoteBackendTcp.hpp"
 #include "gc/g1/g1RemoteBackendRdma.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1CollectorState.hpp"
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1NUMA.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
@@ -33,7 +34,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _entry_chunks(nullptr), _entry_free_list(nullptr), _entry_chunk_top(ENTRY_CHUNK_CAPACITY),
     _table_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
-    _sim_remote_fetched_count(0), _gc_epoch(0), _remote_roots_count(0),
+    _sim_remote_fetched_count(0), _gc_epoch(0),
+    _remote_roots_count(0), _deferred_decrement_count(0),
     _current_fcr(nullptr), _fcr_lock(0),
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
   memset(_table, 0, sizeof(_table));
@@ -74,6 +76,10 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
 
   // Backend object created; connection deferred to initialize_backend()
   // (called from G1CollectedHeap::initialize() when heap info is available).
+}
+
+bool G1RemoteMemoryManager::concurrent_marking_active() const {
+  return _g1h->collector_state()->mark_or_rebuild_in_progress();
 }
 
 void G1RemoteMemoryManager::initialize_backend() {
@@ -343,6 +349,7 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
 
   uintptr_t base = (uintptr_t)dest;
   int patched = 0;
+  bool cm_active = concurrent_marking_active();
 
   for (uint32_t i = 0; i < et->_entry_count; i++) {
     EdgeEntry& edge = et->_entries[i];
@@ -368,9 +375,15 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
       patched++;
     }
 
-    // Decrement remote refcount — this object is now local, its fields
-    // no longer represent remote-stored references
-    target->decrement_remote_refcount();
+    // P13: SATB-safe refcount management.
+    // During concurrent marking, defer decrements to avoid removing dormant
+    // anchors while marking threads may still encounter refs to their targets.
+    // Deferred decrements are applied after remark (STW).
+    if (cm_active) {
+      defer_refcount_decrement(target);
+    } else {
+      target->decrement_remote_refcount();
+    }
   }
 
   log_debug(gc)("Fetch patch: handle=" PTR_FORMAT " dest=" PTR_FORMAT " patched=%d/%u fields",

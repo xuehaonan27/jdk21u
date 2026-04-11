@@ -431,6 +431,34 @@ public:
   int       _remote_roots_count;
 
 public:
+  // Deferred remote_refcount decrements (P13: SATB safety).
+  // During concurrent marking, refcount decrements are buffered here
+  // instead of applied immediately. Applied after remark (STW).
+  static const int MAX_DEFERRED_DECREMENTS = 4096;
+  RemoteHandle* _deferred_decrements[MAX_DEFERRED_DECREMENTS];
+  int           _deferred_decrement_count;
+
+public:
+  void defer_refcount_decrement(RemoteHandle* h) {
+    if (_deferred_decrement_count < MAX_DEFERRED_DECREMENTS) {
+      _deferred_decrements[_deferred_decrement_count++] = h;
+    }
+  }
+
+  // Apply all deferred decrements. Called after remark (STW).
+  void apply_deferred_decrements() {
+    for (int i = 0; i < _deferred_decrement_count; i++) {
+      _deferred_decrements[i]->decrement_remote_refcount();
+    }
+    if (_deferred_decrement_count > 0) {
+      log_info(gc)("Applied %d deferred remote_refcount decrements", _deferred_decrement_count);
+    }
+    _deferred_decrement_count = 0;
+  }
+
+  // Check if concurrent marking is in progress
+  bool concurrent_marking_active() const;
+
   void clear_remote_roots() { _remote_roots_count = 0; }
   void add_remote_root(uintptr_t handle_id) {
     if (_remote_roots_count < MAX_REMOTE_ROOTS) {
