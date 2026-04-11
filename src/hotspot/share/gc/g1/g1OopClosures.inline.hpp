@@ -28,6 +28,7 @@
 #include "gc/g1/g1OopClosures.hpp"
 
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1RemoteHandle.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1ParScanThreadState.inline.hpp"
@@ -43,6 +44,42 @@
 #include "oops/oop.inline.hpp"
 #include "runtime/prefetch.inline.hpp"
 #include "utilities/align.hpp"
+
+// ============================================================
+// De-handleification: opportunistic downgrade of tagged oops during GC
+// ============================================================
+// When GC encounters a shared_oop(handle) field whose target is LOCAL
+// and has remote_refcount == 0 (no remote object references it), rewrite
+// the field to a clean oop. This eliminates the Handle indirection overhead
+// for hot local objects that were previously referenced by remote objects.
+//
+// Ladder: shared_oop(handle) → unique_oop(addr) → clean oop(addr)
+// For prototype simplicity, go directly shared → clean when safe.
+//
+// Called during GC oop closure scanning (STW, safe to write fields).
+// Only applies to wide oop fields (UseCompressedOops=false).
+template <class T>
+inline void g1_try_dehandleify(T* p, oop resolved) {
+  // Only for wide oops
+  if (sizeof(T) != sizeof(uintptr_t)) return;
+
+  uintptr_t raw = *(uintptr_t*)p;
+  // Only process shared_oops (bit 63 + bit 62 set)
+  if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) !=
+      (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+
+  // Extract Handle
+  RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+
+  // Only de-handleify if:
+  // 1. Handle is LOCAL (target is not remote)
+  // 2. remote_refcount == 0 (no remote object's edge table references this Handle)
+  if (!h->is_local()) return;
+  if (h->remote_refcount() > 0) return;
+
+  // Safe to de-handleify: write clean oop directly
+  *(uintptr_t*)p = cast_from_oop<uintptr_t>(resolved);
+}
 
 template <class T>
 inline void G1ScanClosureBase::prefetch_and_push(T* p, const oop obj) {
@@ -89,6 +126,10 @@ inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
   if (!_g1h->is_in(obj)) {
     return;
   }
+  // De-handleification: if field is shared_oop and target is local + no remote refs,
+  // rewrite to clean oop to eliminate Handle indirection.
+  g1_try_dehandleify(p, obj);
+
   const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
   if (region_attr.is_in_cset()) {
     prefetch_and_push(p, obj);
@@ -234,6 +275,8 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
   if (!_g1h->is_in(obj)) {
     return;
   }
+  // De-handleification: opportunistic downgrade of tagged oops
+  g1_try_dehandleify(p, obj);
 
   assert(_worker_id == _par_scan_state->worker_id(), "sanity");
 
