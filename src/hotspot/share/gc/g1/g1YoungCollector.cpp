@@ -59,6 +59,7 @@
 #include "gc/shared/workerThread.hpp"
 #include "jfr/jfrEvents.hpp"
 #include "memory/resourceArea.hpp"
+#include "runtime/jniHandles.hpp"
 #include "runtime/threads.hpp"
 #include "utilities/ticks.hpp"
 
@@ -989,6 +990,43 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
   allocator()->release_gc_alloc_regions(evacuation_info);
 
+  // Step 2: Root-pinning pass for cold-destination regions.
+  // After alloc regions are released (cold_destination flag is set),
+  // scan roots to detect if any cold region has root-referenced objects.
+  // Root-pinned regions cannot be evicted (root refs bypass load barrier).
+  if (G1RemoteEvictionThreshold > 0) {
+    // Closure that checks if a root oop targets a cold-destination region
+    class ColdRegionPinClosure : public OopClosure {
+      G1CollectedHeap* _g1h;
+    public:
+      ColdRegionPinClosure(G1CollectedHeap* g1h) : _g1h(g1h) {}
+      void do_oop(oop* p) {
+        oop obj = *p;
+        if (obj == nullptr) return;
+        if (!_g1h->is_in(obj)) return;
+        HeapRegion* hr = _g1h->heap_region_containing(obj);
+        if (hr != nullptr && hr->is_cold_destination() && !hr->is_root_pinned()) {
+          hr->set_root_pinned();
+          log_debug(gc)("Root-pinned cold region %u (root at " PTR_FORMAT " → " PTR_FORMAT ")",
+                        hr->hrm_index(), p2i(p), p2i((void*)obj));
+        }
+      }
+      void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+    };
+
+    ColdRegionPinClosure pin_cl(_g1h);
+    // Scan thread stacks, JNI handles, and other strong roots
+    // This is lightweight — only root scanning, not a heap walk
+    Threads::oops_do(&pin_cl, nullptr);
+    JNIHandles::oops_do(&pin_cl);
+
+    // Also check remote anchor roots
+    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      rmm->oops_do_remote_anchors(&pin_cl);
+    }
+  }
+
   post_evacuate_cleanup_1(per_thread_states);
 
   post_evacuate_cleanup_2(per_thread_states, evacuation_info);
@@ -1008,71 +1046,62 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   }
 
   // ============================================================
-  // Remote Memory Eviction
+  // Remote Memory Eviction — evacuation-integrated
   // ============================================================
-  // Two modes:
-  //   1. G1SimulateRemoteEviction: evict 3 cold objects per GC (legacy debug)
-  //   2. G1RemoteEvictionThreshold > 0: pressure-driven region eviction
-  //      Evict entire cold Old regions until heap occupancy drops below threshold.
-  if (G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+  // Cold objects were placed in cold-destination regions during evacuation
+  // (Step 1). Classification fixup tagged their incoming refs with
+  // shared_oop(handle) (Step 3). Root-pinning (Step 2) prevented eviction
+  // of regions with root-referenced objects.
+  //
+  // Now evict all non-pinned cold-destination regions to remote.
+  // No heap walk needed — refs were tagged during fixup using ref-sites.
+  if (G1RemoteEvictionThreshold > 0 || G1SimulateRemoteEviction) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     RemoteHandleAllocBuffer hab;
     int total_evicted = 0;
     int regions_evicted = 0;
+    int regions_pinned = 0;
 
-    if (G1RemoteEvictionThreshold > 0) {
-      // Pressure-driven: evict cold regions until occupancy < threshold
-      size_t heap_capacity = _g1h->max_capacity();
-      size_t heap_used = _g1h->used();
-      size_t threshold_bytes = (heap_capacity * G1RemoteEvictionThreshold) / 100;
+    for (uint i = 0; i < _g1h->num_regions(); i++) {
+      HeapRegion* hr = _g1h->region_at(i);
+      if (!hr->is_cold_destination()) continue;
 
-      if (heap_used > threshold_bytes) {
-        size_t to_free = heap_used - threshold_bytes;
-        log_info(gc)("Remote eviction: heap used " SIZE_FORMAT "MB / " SIZE_FORMAT "MB "
-                     "(threshold %u%% = " SIZE_FORMAT "MB), need to free " SIZE_FORMAT "MB",
-                     heap_used / M, heap_capacity / M,
-                     G1RemoteEvictionThreshold, threshold_bytes / M, to_free / M);
-
-        // Find coldest Old regions and evict them
-        // Simple strategy: iterate regions, evict non-humongous Old regions
-        // that aren't in the collection set. TODO: sort by hotness.
-        size_t freed = 0;
-        for (uint i = 0; i < _g1h->num_regions() && freed < to_free; i++) {
-          HeapRegion* hr = _g1h->region_at(i);
-          if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
-
-          size_t region_used = hr->used();
-          int evicted = rmm->evict_region(hr, &hab);
-          if (evicted > 0) {
-            total_evicted += evicted;
-            regions_evicted++;
-            freed += region_used;
-          }
-        }
+      if (hr->is_root_pinned()) {
+        // Root-pinned: convert to regular old, don't evict
+        hr->clear_cold_destination();
+        hr->clear_root_pinned();
+        regions_pinned++;
+        log_debug(gc)("Cold region %u pinned by roots — kept local", hr->hrm_index());
+        continue;
       }
-    } else {
-      // Legacy mode: evict 3 individual cold objects
-      for (uint i = 0; i < _g1h->num_regions() && total_evicted < 3; i++) {
-        HeapRegion* hr = _g1h->region_at(i);
-        if (!hr->is_old() || hr->is_humongous()) continue;
-        if (!hr->has_classified_objects()) continue;
 
-        HeapWord* p = hr->bottom();
-        while (p < hr->top() && total_evicted < 3) {
-          oop obj = cast_to_oop(p);
-          size_t sz = obj->size();
-          if (rmm->evict_object(obj, &hab)) {
-            total_evicted++;
-          }
-          p += sz;
+      // Evict all objects in this cold region
+      // (they already have Handles + shared_oop tags from fixup)
+      HeapWord* p = hr->bottom();
+      int region_objects = 0;
+      while (p < hr->top()) {
+        oop obj = cast_to_oop(p);
+        size_t sz = obj->size();
+        // evict_object builds edge table, sends to backend, fills with filler
+        if (rmm->evict_object(obj, &hab)) {
+          region_objects++;
         }
+        p += sz;
+      }
+
+      if (region_objects > 0) {
+        total_evicted += region_objects;
+        regions_evicted++;
+        hr->clear_cold_destination();
+        log_info(gc)("Evicted cold region %u: %d objects to remote",
+                     hr->hrm_index(), region_objects);
       }
     }
 
-    if (total_evicted > 0) {
-      log_info(gc)("Remote eviction: %d objects in %d regions (total evicted: " SIZE_FORMAT
-                   ", total fetched: " SIZE_FORMAT ")",
-                   total_evicted, regions_evicted,
+    if (total_evicted > 0 || regions_pinned > 0) {
+      log_info(gc)("Remote eviction: %d objects in %d regions evicted, %d regions pinned "
+                   "(total evicted: " SIZE_FORMAT ", total fetched: " SIZE_FORMAT ")",
+                   total_evicted, regions_evicted, regions_pinned,
                    rmm->backend()->total_evicted(), rmm->backend()->total_fetched());
     }
   }
