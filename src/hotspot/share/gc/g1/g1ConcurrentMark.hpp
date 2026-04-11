@@ -573,6 +573,11 @@ public:
 
   void remark();
 
+  // P12: Collect remote root handle_ids logged by all CM tasks during
+  // concurrent marking. Called after remark (STW). Deduplicates and stores
+  // results on G1RemoteMemoryManager for later CMD_REPORT_REMOTE_ROOTS_V2.
+  void collect_remote_root_logs();
+
   void cleanup();
 
   // Mark in the marking bitmap. Used during evacuation failure to
@@ -738,7 +743,21 @@ private:
   bool is_below_finger(oop obj, HeapWord* global_finger) const;
 
   template<bool scan> void process_grey_task_entry(G1TaskQueueEntry task_entry);
+
+  // Remote-root logging (P12): handle_ids of REMOTE objects encountered
+  // during concurrent marking. Collected after remark for remote GC.
+  static const int REMOTE_ROOT_LOG_CAPACITY = 4096;
+  uintptr_t _remote_root_log[REMOTE_ROOT_LOG_CAPACITY];
+  int       _remote_root_log_count;
+
 public:
+  void log_remote_handle(uintptr_t handle_id) {
+    if (_remote_root_log_count < REMOTE_ROOT_LOG_CAPACITY) {
+      _remote_root_log[_remote_root_log_count++] = handle_id;
+    }
+  }
+  int remote_root_log_count() const { return _remote_root_log_count; }
+  const uintptr_t* remote_root_log() const { return _remote_root_log; }
   // Apply the closure on the given area of the objArray. Return the number of words
   // scanned.
   inline size_t scan_objArray(objArrayOop obj, MemRegion mr);

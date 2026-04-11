@@ -263,13 +263,29 @@ inline bool G1CMTask::make_reference_grey(oop obj) {
 template <class T>
 inline bool G1CMTask::deal_with_reference(T* p) {
   increment_refs_reached();
+
+  // P12: Before resolving, check if this is a REMOTE shared_oop.
+  // g1_resolved_load returns nullptr for REMOTE Handles, which would
+  // silently drop the reference. Instead, log the handle_id so the
+  // executor can trace remote-to-remote references.
+  if (sizeof(T) == sizeof(uintptr_t)) {
+    uintptr_t raw = *(uintptr_t*)p;
+    if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+        (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+      RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
+        // REMOTE or FETCHING — log for remote GC root reporting
+        log_remote_handle((uintptr_t)h);
+        return false;  // don't trace locally
+      }
+    }
+  }
+
   oop const obj = g1_resolved_load<MO_RELAXED>(p);
   if (obj == nullptr) {
     return false;
   }
-  // Remote objects: resolve_oop_raw returns nullptr for REMOTE Handles (caught
-  // above). This is_in guard is a safety net for any edge case where a resolved
-  // address falls outside the heap (e.g., FCR fallback on C heap).
   if (!_g1h->is_in(obj)) {
     return false;
   }

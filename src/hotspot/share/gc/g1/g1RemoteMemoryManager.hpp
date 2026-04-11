@@ -424,6 +424,27 @@ public:
   HotnessLevelStats _prev_hotness_stats[HOTNESS_LEVELS]; // previous GC's data (for eviction decisions)
 
 public:
+  // Remote root set: handle_ids logged during concurrent marking.
+  // Collected after remark, used for CMD_REPORT_REMOTE_ROOTS_V2.
+  static const int MAX_REMOTE_ROOTS = 8192;
+  uintptr_t _remote_roots[MAX_REMOTE_ROOTS];
+  int       _remote_roots_count;
+
+public:
+  void clear_remote_roots() { _remote_roots_count = 0; }
+  void add_remote_root(uintptr_t handle_id) {
+    if (_remote_roots_count < MAX_REMOTE_ROOTS) {
+      // Simple dedup: check last few entries (most duplicates are adjacent)
+      for (int i = (_remote_roots_count > 8 ? _remote_roots_count - 8 : 0);
+           i < _remote_roots_count; i++) {
+        if (_remote_roots[i] == handle_id) return;
+      }
+      _remote_roots[_remote_roots_count++] = handle_id;
+    }
+  }
+  int remote_roots_count() const { return _remote_roots_count; }
+  const uintptr_t* remote_roots() const { return _remote_roots; }
+
   uint32_t gc_epoch() const { return _gc_epoch; }
   void increment_gc_epoch() {
     // Rotate stats: current → previous, clear current

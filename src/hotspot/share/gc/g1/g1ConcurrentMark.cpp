@@ -38,6 +38,7 @@
 #include "gc/g1/g1OopClosures.inline.hpp"
 #include "gc/g1/g1Policy.hpp"
 #include "gc/g1/g1RegionMarkStatsCache.inline.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/g1Trace.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
@@ -1315,6 +1316,9 @@ void G1ConcurrentMark::remark() {
     reset_marking_for_restart();
   }
 
+  // P12: Collect remote root logs from all CM tasks
+  collect_remote_root_logs();
+
   // Statistics
   double now = os::elapsedTime();
   _remark_mark_times.add((mark_work_end - start) * 1000.0);
@@ -1322,6 +1326,27 @@ void G1ConcurrentMark::remark() {
   _remark_times.add((now - start) * 1000.0);
 
   policy->record_concurrent_mark_remark_end();
+}
+
+void G1ConcurrentMark::collect_remote_root_logs() {
+  G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+  if (rmm == nullptr) return;
+
+  rmm->clear_remote_roots();
+  int total_logged = 0;
+
+  for (uint i = 0; i < _max_num_tasks; i++) {
+    G1CMTask* task = _tasks[i];
+    for (int j = 0; j < task->remote_root_log_count(); j++) {
+      rmm->add_remote_root(task->remote_root_log()[j]);
+    }
+    total_logged += task->remote_root_log_count();
+  }
+
+  if (rmm->remote_roots_count() > 0) {
+    log_info(gc)("Remote root collection: %d logged across tasks, %d unique handle_ids",
+                 total_logged, rmm->remote_roots_count());
+  }
 }
 
 class G1ReclaimEmptyRegionsTask : public WorkerTask {
@@ -2132,6 +2157,9 @@ void G1CMTask::reset(G1CMBitMap* mark_bitmap) {
   _termination_start_time_ms     = 0.0;
 
   _mark_stats_cache.reset();
+
+  // Reset remote-root log for this marking cycle
+  _remote_root_log_count = 0;
 }
 
 bool G1CMTask::should_exit_termination() {
