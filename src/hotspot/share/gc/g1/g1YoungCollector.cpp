@@ -45,6 +45,7 @@
 #include "gc/g1/g1RemSet.hpp"
 #include "gc/g1/g1RootProcessor.hpp"
 #include "gc/g1/g1Trace.hpp"
+#include "gc/g1/heapRegionSet.hpp"
 #include "gc/g1/g1YoungCollector.hpp"
 #include "gc/g1/g1YoungGCPostEvacuateTasks.hpp"
 #include "gc/g1/g1YoungGCPreEvacuateTasks.hpp"
@@ -1061,6 +1062,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     int total_evicted = 0;
     int regions_evicted = 0;
     int regions_pinned = 0;
+    uint freed_regions = 0;
+    size_t total_freed_bytes = 0;
+    FreeRegionList freed_list("Evicted Cold Regions");
 
     for (uint i = 0; i < _g1h->num_regions(); i++) {
       HeapRegion* hr = _g1h->region_at(i);
@@ -1092,16 +1096,32 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       if (region_objects > 0) {
         total_evicted += region_objects;
         regions_evicted++;
-        hr->clear_cold_destination();
-        log_info(gc)("Evicted cold region %u: %d objects to remote",
+        total_freed_bytes += hr->used();
+
+        // FREE the region — return to free pool for reuse.
+        // This is the key: eviction actually reclaims local memory.
+        _g1h->free_region(hr, &freed_list);
+        freed_regions++;
+
+        log_info(gc)("Evicted cold region %u: %d objects to remote, region freed",
                      hr->hrm_index(), region_objects);
+      } else {
+        hr->clear_cold_destination();
       }
     }
 
+    // Return freed regions to the free pool
+    if (freed_regions > 0) {
+      _g1h->remove_from_old_gen_sets(freed_regions, 0);
+      _g1h->prepend_to_freelist(&freed_list);
+      _g1h->decrement_summary_bytes(total_freed_bytes);
+    }
+
     if (total_evicted > 0 || regions_pinned > 0) {
-      log_info(gc)("Remote eviction: %d objects in %d regions evicted, %d regions pinned "
-                   "(total evicted: " SIZE_FORMAT ", total fetched: " SIZE_FORMAT ")",
-                   total_evicted, regions_evicted, regions_pinned,
+      log_info(gc)("Remote eviction: %d objects in %d regions evicted (" SIZE_FORMAT "KB freed), "
+                   "%d regions pinned (total evicted: " SIZE_FORMAT ", total fetched: " SIZE_FORMAT ")",
+                   total_evicted, regions_evicted, total_freed_bytes / K,
+                   regions_pinned,
                    rmm->backend()->total_evicted(), rmm->backend()->total_fetched());
     }
   }
