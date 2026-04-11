@@ -611,7 +611,11 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
     return nullptr;
   }
 
-  HeapRegion* new_fcr = allocate_new_fcr_region();
+  HeapRegion* new_fcr = nullptr;
+  {
+    MutexLocker ml(Heap_lock);
+    new_fcr = allocate_new_fcr_region();
+  }
   if (new_fcr != nullptr) {
     _current_fcr = new_fcr;
     fcr_unlock();

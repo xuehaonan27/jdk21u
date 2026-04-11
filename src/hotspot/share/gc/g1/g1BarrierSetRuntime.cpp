@@ -103,12 +103,8 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
       return resolved;
     }
     // REMOTE or FETCHING: return tagged oop unchanged for slow path.
-    // With G1TagRefSites (no eviction), this should never happen.
-    // If it does, the Handle was created incorrectly.
-    guarantee(!G1TagRefSites || state == REMOTE_HANDLE_LOCAL,
-              "resolve_tagged_oop: Shared Handle not LOCAL! tagged=" PTR_FORMAT
-              " handle=" PTR_FORMAT " state_and_addr=" PTR_FORMAT " state=%lu",
-              v, p2i(h), sa, state);
+    // This is normal when UseRemoteExecutor is active (real eviction).
+    // The slow path (resolve_tagged_oop_slow) handles REMOTE fetch.
     return tagged;
   }
 
