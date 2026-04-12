@@ -276,8 +276,24 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
   ObjectEdgeTable* et = build_edge_table(obj, h, hab);
   store_edge_table(et);
 
-  // 3. Evict object bytes via backend (SIM/TCP/RDMA)
-  size_t slot_id = _backend->evict(cast_from_oop<void*>(obj), word_size, klass, (size_t)-1);
+  // 3. Evict object bytes via backend (V2: with edges, V1: fallback)
+  size_t slot_id;
+  if (et->_entry_count > 0) {
+    // V2: send edge table alongside object bytes
+    G1RemoteBackend::EdgeInfo* edges = nullptr;
+    if (et->_entry_count > 0) {
+      edges = (G1RemoteBackend::EdgeInfo*)os::malloc(et->_entry_count * sizeof(G1RemoteBackend::EdgeInfo), mtGC);
+      for (uint32_t i = 0; i < et->_entry_count; i++) {
+        edges[i].field_offset = et->_entries[i]._field_offset;
+        edges[i].target_handle_id = (uintptr_t)et->_entries[i]._target_handle;
+      }
+    }
+    slot_id = _backend->evict_with_edges(cast_from_oop<void*>(obj), word_size, klass,
+                                          (uintptr_t)h, edges, et->_entry_count, (size_t)-1);
+    if (edges != nullptr) os::free(edges);
+  } else {
+    slot_id = _backend->evict(cast_from_oop<void*>(obj), word_size, klass, (size_t)-1);
+  }
   if (slot_id == (size_t)-1) {
     log_warning(gc)("Remote evict failed for obj=" PTR_FORMAT, p2i((void*)obj));
     return false;
@@ -762,8 +778,14 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   table_unlock();
 
   // Step 2: Report roots to backend and request collection.
+  // V1: slot-id based roots
   _backend->report_roots(root_ids, num_roots);
   os::free(root_ids);
+
+  // V2: also report handle-id based roots from P12 concurrent marking
+  if (_remote_roots_count > 0) {
+    _backend->report_remote_roots_v2(_remote_roots, _remote_roots_count);
+  }
 
   size_t* dead_ids = nullptr;
   size_t num_dead = 0;

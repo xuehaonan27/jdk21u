@@ -26,6 +26,7 @@
 #include "gc/g1/g1BarrierSet.inline.hpp"
 #include "gc/g1/g1BarrierSetRuntime.hpp"
 #include "gc/g1/g1CollectedHeap.hpp"
+#include "gc/g1/g1RemoteBackend.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "runtime/os.hpp"
@@ -200,6 +201,10 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
 
       // Rekey handle table: old address (evicted/filler) → new FCR address
       rmm->rekey_handle_on_fetch(h, (void*)dest);
+
+      // Notify executor that this handle is now LOCAL (V2 protocol)
+      uintptr_t handle_id = (uintptr_t)h;
+      rmm->backend()->localize_batch(&handle_id, 1);
 
       h->set_local_release(dest);
       return (oopDesc*)dest;

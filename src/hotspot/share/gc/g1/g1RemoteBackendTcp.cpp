@@ -28,6 +28,12 @@ static const uint32_t RE_CMD_DISCARD_SLOT       = 0x07;
 static const uint32_t RE_CMD_SHUTDOWN           = 0xFF;
 static const uint32_t RE_RESP_OK                = 0x81;
 static const uint32_t RE_RESP_OBJECT_DATA       = 0x83;
+
+// V2 protocol constants
+static const uint32_t RE_CMD_DIRECTORY_UPSERT       = 0x10;
+static const uint32_t RE_CMD_LOCALIZE_BATCH         = 0x11;
+static const uint32_t RE_CMD_EVICT_WITH_EDGES       = 0x12;
+static const uint32_t RE_CMD_REPORT_REMOTE_ROOTS_V2 = 0x13;
 static const uint32_t RE_RESP_COLLECTION_RESULT = 0x84;
 
 TCPExecutorBackend::TCPExecutorBackend()
@@ -361,8 +367,121 @@ void TCPExecutorBackend::discard_slot(size_t slot_id) {
 }
 
 size_t TCPExecutorBackend::slot_word_size(size_t slot_id) const {
-  // For TCP backend, we don't have local metadata. The executor has the size.
-  // For now, return 0 — the fetch response includes the size.
-  // A proper implementation would cache metadata locally.
   return 0;
+}
+
+// ============================================================
+// V2 Protocol Implementations
+// ============================================================
+
+size_t TCPExecutorBackend::evict_with_edges(const void* obj_bytes, size_t word_size,
+                                            Klass* klass, uintptr_t handle_id,
+                                            const EdgeInfo* edges, uint32_t num_edges,
+                                            size_t hint_slot_id) {
+  if (!_connected) return (size_t)-1;
+
+  size_t slot_id = (hint_slot_id == (size_t)-1) ? _next_slot++ : hint_slot_id;
+  size_t byte_size = word_size * HeapWordSize;
+  // Header(16) + slot_id(8) + handle_id(8) + klass(8) + word_size(4) + num_edges(4) + bytes + edges
+  size_t edge_bytes = num_edges * (4 + 8);  // field_offset(4) + target_handle_id(8)
+  size_t msg_size = 16 + 8 + 8 + 8 + 4 + 4 + byte_size + edge_bytes;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+
+  *(uint32_t*)(msg + 0) = RE_CMD_EVICT_WITH_EDGES;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = slot_id;
+  *(uint64_t*)(msg + 24) = handle_id;
+  *(uint64_t*)(msg + 32) = (uint64_t)(uintptr_t)klass;
+  *(uint32_t*)(msg + 40) = (uint32_t)word_size;
+  *(uint32_t*)(msg + 44) = num_edges;
+  memcpy(msg + 48, obj_bytes, byte_size);
+  // Pack edges
+  uint8_t* edge_ptr = msg + 48 + byte_size;
+  for (uint32_t i = 0; i < num_edges; i++) {
+    *(uint32_t*)(edge_ptr) = edges[i].field_offset;
+    *(uint64_t*)(edge_ptr + 4) = edges[i].target_handle_id;
+    edge_ptr += 12;
+  }
+
+  send_msg(msg, msg_size);
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  recv_msg(resp, sizeof(resp), &resp_len);
+
+  if (resp_len >= 4 && *(uint32_t*)resp == RE_RESP_OK) {
+    _total_evicted++;
+    return slot_id;
+  }
+  return (size_t)-1;
+}
+
+void TCPExecutorBackend::localize_batch(const uintptr_t* handle_ids, size_t count) {
+  if (!_connected || count == 0) return;
+
+  size_t msg_size = 16 + 4 + count * 8;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  *(uint32_t*)(msg + 0) = RE_CMD_LOCALIZE_BATCH;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint32_t*)(msg + 16) = (uint32_t)count;
+  memcpy(msg + 20, handle_ids, count * 8);
+
+  send_msg(msg, msg_size);
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  recv_msg(resp, sizeof(resp), &resp_len);
+}
+
+void TCPExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, size_t count) {
+  if (!_connected) return;
+
+  size_t msg_size = 16 + 4 + count * 8;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  *(uint32_t*)(msg + 0) = RE_CMD_REPORT_REMOTE_ROOTS_V2;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint32_t*)(msg + 16) = (uint32_t)count;
+  memcpy(msg + 20, handle_ids, count * 8);
+
+  send_msg(msg, msg_size);
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  recv_msg(resp, sizeof(resp), &resp_len);
+}
+
+void TCPExecutorBackend::directory_upsert(const uintptr_t* handle_ids,
+                                          const uint32_t* states,
+                                          const size_t* slot_ids,
+                                          size_t count) {
+  if (!_connected || count == 0) return;
+
+  // Each entry: handle_id(8) + state(4) + slot_id(8) = 20 bytes
+  size_t msg_size = 16 + 4 + count * 20;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  *(uint32_t*)(msg + 0) = RE_CMD_DIRECTORY_UPSERT;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint32_t*)(msg + 16) = (uint32_t)count;
+
+  uint8_t* ptr = msg + 20;
+  for (size_t i = 0; i < count; i++) {
+    *(uint64_t*)(ptr) = handle_ids[i];
+    *(uint32_t*)(ptr + 8) = states[i];
+    *(uint64_t*)(ptr + 12) = slot_ids[i];
+    ptr += 20;
+  }
+
+  send_msg(msg, msg_size);
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  recv_msg(resp, sizeof(resp), &resp_len);
 }

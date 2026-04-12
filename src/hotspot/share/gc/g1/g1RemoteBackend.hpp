@@ -63,6 +63,39 @@ public:
 
   // Shutdown
   virtual void shutdown() = 0;
+
+  // ============================================================
+  // V2 Protocol — handle-id-based operations (optional override)
+  // ============================================================
+  // Default implementations are no-ops. TCPExecutorBackend/RDMA override
+  // to send V2 commands to the executor for edge-table tracing.
+
+  struct EdgeInfo { uint32_t field_offset; uintptr_t target_handle_id; };
+
+  // Evict with edge table: sends object bytes + sidecar edges + handle_id
+  virtual size_t evict_with_edges(const void* obj_bytes, size_t word_size,
+                                  Klass* klass, uintptr_t handle_id,
+                                  const EdgeInfo* edges, uint32_t num_edges,
+                                  size_t hint_slot_id) {
+    // Default: fall back to V1 evict (edge table stays JVM-local)
+    return evict(obj_bytes, word_size, klass, hint_slot_id);
+  }
+
+  // Notify executor that these handle_ids are now LOCAL (fetched back)
+  virtual void localize_batch(const uintptr_t* handle_ids, size_t count) {
+    // Default: no-op (SIM backend doesn't track handle state)
+  }
+
+  // Report remote roots as handle_ids (P12 concurrent marking data)
+  virtual void report_remote_roots_v2(const uintptr_t* handle_ids, size_t count) {
+    // Default: no-op
+  }
+
+  // Upsert handle directory entries on executor
+  virtual void directory_upsert(const uintptr_t* handle_ids, const uint32_t* states,
+                                const size_t* slot_ids, size_t count) {
+    // Default: no-op
+  }
 };
 
 #endif // SHARE_GC_G1_G1REMOTEBACKEND_HPP

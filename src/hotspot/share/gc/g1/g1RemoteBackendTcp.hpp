@@ -51,6 +51,16 @@ public:
   size_t total_fetched() const override { return _total_fetched; }
 
   void shutdown() override;
+
+  // V2 Protocol overrides
+  size_t evict_with_edges(const void* obj_bytes, size_t word_size,
+                          Klass* klass, uintptr_t handle_id,
+                          const EdgeInfo* edges, uint32_t num_edges,
+                          size_t hint_slot_id) override;
+  void localize_batch(const uintptr_t* handle_ids, size_t count) override;
+  void report_remote_roots_v2(const uintptr_t* handle_ids, size_t count) override;
+  void directory_upsert(const uintptr_t* handle_ids, const uint32_t* states,
+                        const size_t* slot_ids, size_t count) override;
 };
 
 #endif // SHARE_GC_G1_G1REMOTEBACKENDTCP_HPP
