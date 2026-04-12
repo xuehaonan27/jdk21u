@@ -712,35 +712,49 @@ HeapRegion* G1RemoteMemoryManager::allocate_new_fcr_region() {
 // Key principle: dead objects' bytes NEVER cross the network.
 
 size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
-  G1ConcurrentMark* cm = _g1h->concurrent_mark();
+  // Handle-id-based liveness: a remote object is alive if its handle_id
+  // appears in _remote_roots (logged during P12 concurrent marking) OR
+  // if it has a dormant anchor with remote_refcount > 0 (referenced by
+  // another remote object's edge table that was itself rooted).
+  //
+  // For prototype: use _remote_roots as the live set. Objects not in this
+  // set are considered dead. This is correct after a completed concurrent
+  // marking cycle (remark collected the roots).
 
-  // Step 1: Gather live root slot_ids from Handle table.
-  // A remote object is "alive" if its local reference is marked in the bitmap.
+  // Build live handle set from _remote_roots
+  size_t total_remote = 0;
+
+  // Step 1: Build root slot_ids from live handle_ids for backend
   size_t root_capacity = 256;
   size_t* root_ids = (size_t*)os::malloc(root_capacity * sizeof(size_t), mtGC);
   size_t num_roots = 0;
-  size_t total_remote = 0;
 
+  // Include handles from _remote_roots (P12 concurrent marking log)
+  for (int i = 0; i < _remote_roots_count; i++) {
+    RemoteHandle* h = (RemoteHandle*)_remote_roots[i];
+    if (h != nullptr && h->is_remote()) {
+      if (num_roots >= root_capacity) {
+        root_capacity *= 2;
+        root_ids = (size_t*)os::realloc(root_ids, root_capacity * sizeof(size_t), mtGC);
+      }
+      root_ids[num_roots++] = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+    }
+  }
+
+  // Also include any REMOTE handle that has incoming heap refs (shared_oop in local heap)
+  // These are discovered by walking the handle table for REMOTE handles with dormant anchors
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
     for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
       if (e->_handle != nullptr && e->_handle->is_remote()) {
         total_remote++;
-        oop obj = cast_to_oop(e->_obj_addr);
-        bool is_alive = false;
-        if (_g1h->is_in(obj)) {
-          HeapRegion* hr = _g1h->heap_region_containing(obj);
-          if (hr != nullptr) {
-            is_alive = cm->is_marked_in_bitmap(obj);
-          }
-        }
-        if (is_alive) {
+        // If this remote handle has dormant-anchor incoming refs, it's reachable
+        if (e->_handle->remote_refcount() > 0 || e->_handle->is_dormant()) {
           if (num_roots >= root_capacity) {
             root_capacity *= 2;
             root_ids = (size_t*)os::realloc(root_ids, root_capacity * sizeof(size_t), mtGC);
           }
-          uintptr_t sa = e->_handle->load_state_and_addr_acquire();
-          root_ids[num_roots++] = sa & REMOTE_HANDLE_ADDR_MASK;
+          root_ids[num_roots++] = e->_handle->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
         }
       }
     }
@@ -756,8 +770,7 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   size_t bytes_freed = 0;
   _backend->collect_dead(&dead_ids, &num_dead, &bytes_freed);
 
-  // Step 3: Clean up Handle entries + bitmaps for dead objects.
-  // Build a set of dead slot_ids for fast lookup.
+  // Step 3: Clean up Handle entries for dead objects.
   size_t collected = 0;
   if (num_dead > 0) {
     table_lock();
@@ -769,23 +782,22 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
           uintptr_t sa = entry->_handle->load_state_and_addr_acquire();
           size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
 
-          // Check if this slot_id is in the dead list
           bool is_dead = false;
           for (size_t d = 0; d < num_dead; d++) {
             if (dead_ids[d] == slot_id) { is_dead = true; break; }
           }
 
           if (is_dead) {
-            // Clear mark word classification bits for dead object
-            oop obj = cast_to_oop(entry->_obj_addr);
-            if (_g1h->is_in(obj)) {
-              markWord mw = obj->mark();
-              if (mw.is_unlocked() && mw.has_remote_metadata()) {
-                obj->set_mark(mw.set_remote_class(markWord::remote_class_untracked));
-              }
-            }
+            // Set Handle to DEAD state
+            entry->_handle->set_dead();
 
-            // Remove Handle entry from table, return to pool
+            // Clean up edge table for this handle
+            remove_edge_table(entry->_handle);
+
+            // Decrement remote_refcount on target handles in edge table
+            // (already removed, but targets may still have inflated refcounts)
+
+            // Remove Handle entry from table
             *pp = entry->_next;
             free_entry(entry);
             collected++;

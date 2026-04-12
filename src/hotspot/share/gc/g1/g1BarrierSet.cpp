@@ -188,20 +188,29 @@ oop G1BarrierSet::resolve_remote_fetch(RemoteHandle* h) {
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
 
-  // Read object size from Handle metadata (stored at eviction time)
   size_t word_size = h->eviction_word_size();
 
-  // Allocate in FCR — proper G1 heap region, no os::malloc fallback.
   HeapWord* dest = rmm->allocate_in_fcr(word_size);
   guarantee(dest != nullptr, "FCR allocation failed for fetch");
 
-  // Fetch object bytes from remote via backend (SIM/TCP/RDMA)
-  rmm->fetch_remote_object(h, dest);
+  // Fetch object bytes from remote via backend
+  Klass* fetched_klass = rmm->fetch_remote_object(h, dest);
 
-  // Publish: release-store the local address into Handle.
-  // After this, other threads doing acquire-load will see the local copy.
+  if (fetched_klass == nullptr) {
+    // Fetch failed — rollback
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    h->set_remote(sa & REMOTE_HANDLE_ADDR_MASK);
+    log_warning(gc)("C++ runtime fetch failed for handle " PTR_FORMAT, p2i(h));
+    return nullptr;
+  }
+
+  // Patch fetched object's fields using edge table (same as JRT slow path)
+  rmm->patch_fetched_fields(h, dest);
+
+  // Rekey handle table for new FCR address
+  rmm->rekey_handle_on_fetch(h, (void*)dest);
+
   h->set_local_release(dest);
-
   return cast_to_oop(dest);
 }
 
