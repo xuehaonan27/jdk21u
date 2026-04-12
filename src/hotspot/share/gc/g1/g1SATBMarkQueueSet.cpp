@@ -25,6 +25,7 @@
 #include "precompiled.hpp"
 #include "gc/g1/g1BarrierSet.inline.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1SATBMarkQueueSet.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/heapRegion.hpp"
@@ -82,8 +83,25 @@ SATBMarkQueue& G1SATBMarkQueueSet::satb_queue_for_thread(Thread* const t) const 
 
 static inline bool requires_marking(const void* entry, G1CollectedHeap* g1h) {
   // Includes rejection of null pointers.
-  assert(g1h->is_in_reserved(entry),
-         "Non-heap pointer in SATB buffer: " PTR_FORMAT, p2i(entry));
+  uintptr_t v = (uintptr_t)entry;
+
+  // Resolve tagged oops (shared_oop / unique_oop from disaggregated memory).
+  // Tagged oops have bit 63 set and their raw value is NOT a valid heap address.
+  // Resolve to the actual object address before checking heap membership.
+  if ((v >> 63) != 0) {
+    oop resolved = resolve_oop_raw(cast_to_oop(v));
+    if (resolved == nullptr) {
+      // Remote object — not locally markable
+      return false;
+    }
+    entry = (const void*)cast_from_oop<uintptr_t>(resolved);
+    v = (uintptr_t)entry;
+  }
+
+  if (!g1h->is_in_reserved(entry)) {
+    // Not in heap (could be a stale or external pointer) — discard
+    return false;
+  }
 
   HeapRegion* region = g1h->heap_region_containing(entry);
   if (entry >= region->top_at_mark_start()) {
@@ -97,6 +115,13 @@ static inline bool requires_marking(const void* entry, G1CollectedHeap* g1h) {
 }
 
 static inline bool discard_entry(const void* entry, G1CollectedHeap* g1h) {
+  // Resolve tagged oops before checking — tagged values are not valid heap oops
+  uintptr_t v = (uintptr_t)entry;
+  if ((v >> 63) != 0) {
+    oop resolved = resolve_oop_raw(cast_to_oop(v));
+    if (resolved == nullptr) return true;  // Remote — discard
+    entry = (const void*)cast_from_oop<uintptr_t>(resolved);
+  }
   return !requires_marking(entry, g1h) || g1h->is_marked(cast_to_oop(entry));
 }
 
@@ -110,6 +135,14 @@ public:
   // Return true if entry should be filtered out (removed), false if
   // it should be retained.
   bool operator()(const void* entry) const {
+    if (entry == nullptr) return true;
+    // Tagged oops (bit 63 set) from disaggregated memory — resolve first
+    uintptr_t v = (uintptr_t)entry;
+    if ((v >> 63) != 0) {
+      oop resolved = resolve_oop_raw(cast_to_oop(v));
+      if (resolved == nullptr) return true;  // Remote — discard
+      entry = (const void*)cast_from_oop<uintptr_t>(resolved);
+    }
     return discard_entry(entry, _g1h);
   }
 };
