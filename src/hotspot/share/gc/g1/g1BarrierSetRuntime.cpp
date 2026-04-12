@@ -179,18 +179,27 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
       guarantee(dest != nullptr, "FCR allocation failed for fetch");
 
       // Fetch from remote backend with safepoint awareness.
-      // ThreadBlockInVM allows the thread to participate in safepoints
-      // during blocking I/O (TCP round-trip / RDMA READ).
+      Klass* fetched_klass = nullptr;
       {
         ThreadBlockInVM tbivm(current);
-        rmm->fetch_remote_object(h, dest);
+        fetched_klass = rmm->fetch_remote_object(h, dest);
+      }
+
+      if (fetched_klass == nullptr) {
+        // Fetch failed — rollback Handle from FETCHING to REMOTE.
+        // Don't publish garbage. Other waiters will retry.
+        uintptr_t sa = h->load_state_and_addr_acquire();
+        uintptr_t remote_id = sa & REMOTE_HANDLE_ADDR_MASK;
+        h->set_remote(remote_id);
+        log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — rolled back to REMOTE", p2i(h));
+        return nullptr;  // Caller gets null, will retry or handle gracefully
       }
 
       // Patch fetched object's oop fields BEFORE publishing.
-      // The fetched bytes contain oop values from eviction time — targets
-      // may have moved since then. The sidecar edge table maps each field
-      // to the target's Handle (which tracks current address).
       rmm->patch_fetched_fields(h, dest);
+
+      // Rekey handle table: old address (evicted/filler) → new FCR address
+      rmm->rekey_handle_on_fetch(h, (void*)dest);
 
       h->set_local_release(dest);
       return (oopDesc*)dest;

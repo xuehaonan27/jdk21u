@@ -1116,12 +1116,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
     }
 
-    // Return freed regions to the free pool
-    if (freed_regions > 0) {
-      _g1h->remove_from_old_gen_sets(freed_regions, 0);
-      _g1h->prepend_to_freelist(&freed_list);
-      _g1h->decrement_summary_bytes(total_freed_bytes);
-    }
+    // (Region freeing deferred to single commit point after Path 2)
 
     // ============================================================
     // Path 2: Evict existing cold Old regions (from previous GCs)

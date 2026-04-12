@@ -240,6 +240,39 @@ public:
     // Not found — object has no Handle (OK, not all objects have Handles)
   }
 
+  // Rekey a Handle entry when an object is fetched to a new local address.
+  // The table still has the old (evicted/filler) address; update to the new FCR address.
+  void rekey_handle_on_fetch(RemoteHandle* h, void* new_addr) {
+    uintptr_t new_uaddr = (uintptr_t)new_addr;
+    table_lock();
+    // Find the entry by Handle pointer (not by address, since old address is stale)
+    for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+      HandleEntry* e = _table[idx];
+      HandleEntry** pp = &_table[idx];
+      while (e != nullptr) {
+        if (e->_handle == h) {
+          // Unlink from old bucket
+          *pp = e->_next;
+          // Rekey and insert into new bucket
+          e->_obj_addr = new_uaddr;
+          size_t new_idx = hash_obj(new_uaddr);
+          e->_next = _table[new_idx];
+          _table[new_idx] = e;
+          table_unlock();
+          return;
+        }
+        pp = &e->_next;
+        e = e->_next;
+      }
+    }
+    // Handle not found in table — it was a dormant anchor or already removed.
+    // Insert a new entry for this address.
+    HandleEntry* entry = alloc_entry();
+    entry->init(new_uaddr, h, _table[hash_obj(new_uaddr)]);
+    _table[hash_obj(new_uaddr)] = entry;
+    table_unlock();
+  }
+
   // Remove Handle mapping and return entry to free list.
   // Handle is NOT freed (chunks are pool-managed). Handle state should be set
   // to DEAD by caller before removing.
@@ -315,58 +348,51 @@ public:
     }
   };
 
-  // Edge table storage: maps evicted object Handle → edge table.
-  // Simple hash table (same pattern as _table). Low contention: only
-  // written during STW eviction, read during fetch.
-  static const size_t EDGE_TABLE_SIZE = 256;
-  ObjectEdgeTable* _edge_tables[EDGE_TABLE_SIZE];
+  // Edge table storage: chained hash table (Handle → edge table).
+  // Written during STW eviction, read during fetch.
+  static const size_t EDGE_TABLE_BUCKETS = 256;
+
+  struct EdgeTableEntry {
+    ObjectEdgeTable* _table;
+    EdgeTableEntry*  _next;
+  };
+  EdgeTableEntry* _edge_buckets[EDGE_TABLE_BUCKETS];
 
   static size_t hash_handle(RemoteHandle* h) {
-    return ((uintptr_t)h >> 4) % EDGE_TABLE_SIZE;
+    return ((uintptr_t)h >> 4) % EDGE_TABLE_BUCKETS;
   }
 
 public:
-  // Store an edge table for an evicted object.
   void store_edge_table(ObjectEdgeTable* et) {
     size_t idx = hash_handle(et->_source_handle);
-    // Simple linear chain: store as linked list would be better, but for
-    // prototype with few evictions, just use first-empty-slot probing.
-    // Actually, use the _source_handle as key with linear probing.
-    for (size_t i = 0; i < EDGE_TABLE_SIZE; i++) {
-      size_t slot = (idx + i) % EDGE_TABLE_SIZE;
-      if (_edge_tables[slot] == nullptr) {
-        _edge_tables[slot] = et;
-        return;
-      }
-    }
-    // Table full — should not happen with few evictions
-    assert(false, "edge table storage full");
+    EdgeTableEntry* entry = (EdgeTableEntry*)os::malloc(sizeof(EdgeTableEntry), mtGC);
+    entry->_table = et;
+    entry->_next = _edge_buckets[idx];
+    _edge_buckets[idx] = entry;
   }
 
-  // Look up edge table for a Handle (used at fetch time).
   ObjectEdgeTable* edge_table_for(RemoteHandle* h) const {
     size_t idx = hash_handle(h);
-    for (size_t i = 0; i < EDGE_TABLE_SIZE; i++) {
-      size_t slot = (idx + i) % EDGE_TABLE_SIZE;
-      ObjectEdgeTable* et = _edge_tables[slot];
-      if (et == nullptr) return nullptr;  // not found (empty slot = end of probe)
-      if (et->_source_handle == h) return et;
+    EdgeTableEntry* e = _edge_buckets[idx];
+    while (e != nullptr) {
+      if (e->_table->_source_handle == h) return e->_table;
+      e = e->_next;
     }
     return nullptr;
   }
 
-  // Remove edge table for a Handle (called on fetch or discard).
   void remove_edge_table(RemoteHandle* h) {
     size_t idx = hash_handle(h);
-    for (size_t i = 0; i < EDGE_TABLE_SIZE; i++) {
-      size_t slot = (idx + i) % EDGE_TABLE_SIZE;
-      ObjectEdgeTable* et = _edge_tables[slot];
-      if (et == nullptr) return;
-      if (et->_source_handle == h) {
-        ObjectEdgeTable::free(et);
-        _edge_tables[slot] = nullptr;
+    EdgeTableEntry** pp = &_edge_buckets[idx];
+    while (*pp != nullptr) {
+      if ((*pp)->_table->_source_handle == h) {
+        EdgeTableEntry* entry = *pp;
+        *pp = entry->_next;
+        ObjectEdgeTable::free(entry->_table);
+        os::free(entry);
         return;
       }
+      pp = &(*pp)->_next;
     }
   }
 
@@ -624,31 +650,54 @@ public:
 // Template implementation — must be in header for instantiation.
 template <typename OopClosureType>
 void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
-  // Walk the Handle table. For each entry whose Handle is LOCAL and has
-  // remote_refcount > 0, it's a dormant anchor that must be rooted.
-  // We call cl->do_oop on a pointer to a stack-local oop variable
-  // holding the Handle's local address. If GC moves the object, the
-  // closure updates the oop — we then update the Handle to match.
+  // Walk the Handle table. For each dormant anchor (LOCAL + remote_refcount > 0),
+  // call cl->do_oop. If GC moves the object, update Handle and rekey table entry.
+  //
+  // Collect moved entries for rehashing after the walk (can't modify hash
+  // structure during iteration).
+  static const int MAX_MOVED = 256;
+  struct MovedEntry { HandleEntry* entry; uintptr_t old_addr; };
+  MovedEntry moved[MAX_MOVED];
+  int num_moved = 0;
+
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
       RemoteHandle* h = e->_handle;
       if (h != nullptr && h->is_local() && h->remote_refcount() > 0) {
-        // This is a dormant anchor — its target must stay alive.
         oop obj = cast_to_oop(e->_obj_addr);
         cl->do_oop(&obj);
-        // If GC moved the object, the closure updated obj.
-        // We need to update the Handle and table entry to match.
         uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
         if (new_addr != e->_obj_addr) {
           h->set_local(cast_from_oop<void*>(obj));
-          // Note: table rekey happens in update_handle_for_evacuation,
-          // which is called separately from the evacuation path.
-          // Here we just update the Handle's stored address.
+          if (num_moved < MAX_MOVED) {
+            moved[num_moved++] = {e, e->_obj_addr};
+          }
           e->_obj_addr = new_addr;
         }
       }
       e = e->_next;
+    }
+  }
+
+  // Rehash moved entries: unlink from old bucket, insert into new
+  for (int i = 0; i < num_moved; i++) {
+    HandleEntry* entry = moved[i].entry;
+    size_t old_idx = hash_obj(moved[i].old_addr);
+    size_t new_idx = hash_obj(entry->_obj_addr);
+    if (old_idx != new_idx) {
+      // Unlink from old bucket
+      HandleEntry** pp = &_table[old_idx];
+      while (*pp != nullptr) {
+        if (*pp == entry) {
+          *pp = entry->_next;
+          break;
+        }
+        pp = &(*pp)->_next;
+      }
+      // Insert into new bucket
+      entry->_next = _table[new_idx];
+      _table[new_idx] = entry;
     }
   }
 }

@@ -42,7 +42,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _current_fcr(nullptr), _fcr_lock(0),
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
   memset(_table, 0, sizeof(_table));
-  memset(_edge_tables, 0, sizeof(_edge_tables));
+  memset(_edge_buckets, 0, sizeof(_edge_buckets));
   memset(_hotness_stats, 0, sizeof(_hotness_stats));
   memset(_prev_hotness_stats, 0, sizeof(_prev_hotness_stats));
   memset(_sim_remote_slots, 0, sizeof(_sim_remote_slots));
@@ -106,10 +106,16 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
   }
   memset(_table, 0, sizeof(_table));
 
-  // Free edge tables
-  for (size_t i = 0; i < EDGE_TABLE_SIZE; i++) {
-    ObjectEdgeTable::free(_edge_tables[i]);
-    _edge_tables[i] = nullptr;
+  // Free edge tables (chained hash)
+  for (size_t i = 0; i < EDGE_TABLE_BUCKETS; i++) {
+    EdgeTableEntry* e = _edge_buckets[i];
+    while (e != nullptr) {
+      EdgeTableEntry* next = e->_next;
+      ObjectEdgeTable::free(e->_table);
+      os::free(e);
+      e = next;
+    }
+    _edge_buckets[i] = nullptr;
   }
 
   // Free simulated remote slot data
@@ -450,35 +456,73 @@ int G1RemoteMemoryManager::evict_region(HeapRegion* hr, RemoteHandleAllocBuffer*
   assert(hr->is_old(), "can only evict Old regions");
   assert(!hr->is_humongous(), "cannot evict humongous regions");
 
-  int evicted = 0;
+  // All-or-nothing: validate ALL objects before evicting any.
+  // If any object is unevictable, abort the entire region.
   HeapWord* p = hr->bottom();
-
-  // Phase 1: Evict all objects in the region
+  int total_objects = 0;
   while (p < hr->top()) {
     oop obj = cast_to_oop(p);
     size_t sz = obj->size();
+    if (sz == 0) {
+      log_debug(gc)("evict_region: unparseable object at " PTR_FORMAT " in region %u — aborting",
+                     p2i(p), hr->hrm_index());
+      return 0;
+    }
     markWord mw = obj->mark();
+    // Locked/inflated objects can't be evicted (mark word holds pointer)
+    if (!mw.is_unlocked()) {
+      log_debug(gc)("evict_region: locked object at " PTR_FORMAT " in region %u — aborting",
+                     p2i(p), hr->hrm_index());
+      return 0;
+    }
+    total_objects++;
+    p += sz;
+  }
 
-    // Skip locked/inflated objects (rare in Old during STW)
-    if (!mw.is_unlocked()) { p += sz; continue; }
+  if (total_objects == 0) return 0;
 
-    // Skip filler objects
-    Klass* klass = obj->klass();
-    if (klass == nullptr || obj->is_gc_marked()) { p += sz; continue; }
+  // Phase 1: Create Handles + build edge tables for all objects
+  p = hr->bottom();
+  while (p < hr->top()) {
+    oop obj = cast_to_oop(p);
+    ensure_handle_for(obj, hab);
+    p += obj->size();
+  }
 
-    // Evict this object (creates Handle, builds edge table, sends to backend, fills with filler)
+  // Phase 2: Tag incoming refs from other regions BEFORE eviction
+  // (objects still readable, Handles created, so tag_incoming_refs can find them)
+  tag_incoming_refs_to_region(hr);
+
+  // If tagging found untaggable refs, the region was pinned — abort
+  if (hr->is_root_pinned()) {
+    log_debug(gc)("evict_region: region %u pinned by untaggable refs — aborting",
+                   hr->hrm_index());
+    return 0;
+  }
+
+  // Phase 3: Evict all objects (send to backend + fill with filler)
+  int evicted = 0;
+  p = hr->bottom();
+  while (p < hr->top()) {
+    oop obj = cast_to_oop(p);
+    size_t sz = obj->size();
     if (evict_object(obj, hab)) {
       evicted++;
+    } else {
+      // Backend failure — abort. Objects already evicted in this pass
+      // are lost (handles point to remote, local is filler). This is a
+      // hard failure; log and stop.
+      log_warning(gc)("evict_region: backend evict failed at object " PTR_FORMAT
+                      " in region %u after %d objects — partial eviction!",
+                      p2i((void*)obj), hr->hrm_index(), evicted);
+      break;
     }
     p += sz;
   }
 
   if (evicted > 0) {
-    // Phase 2: Tag incoming refs from other regions
-    tag_incoming_refs_to_region(hr);
-
-    log_info(gc)("Region eviction: region %u [" PTR_FORMAT "] — %d objects evicted",
-                 hr->hrm_index(), p2i(hr->bottom()), evicted);
+    log_info(gc)("Region eviction: region %u [" PTR_FORMAT "] — %d/%d objects evicted",
+                 hr->hrm_index(), p2i(hr->bottom()), evicted, total_objects);
   }
 
   return evicted;
