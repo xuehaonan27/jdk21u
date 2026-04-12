@@ -10,7 +10,9 @@
 #include "gc/g1/g1RemoteBackendRdma.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1CollectorState.hpp"
+#include "gc/g1/g1CardTable.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
+#include "gc/g1/heapRegionRemSet.inline.hpp"
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1NUMA.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
@@ -313,32 +315,28 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
 //   3. Handle → REMOTE + fill with filler
 // After all objects evicted: tag incoming refs, free the region.
 
-// Closure to tag incoming refs from other regions into the evicted region.
-// For each oop field that points into the target region, replace with
-// shared_oop(handle) so the load barrier intercepts future accesses.
+// Closure to tag incoming refs on a specific card range pointing into the evicted region.
 class IncomingRefTagClosure : public BasicOopIterateClosure {
   G1RemoteMemoryManager* _rmm;
   G1CollectedHeap*       _g1h;
   HeapRegion*            _target_hr;
   int                    _tagged;
+  bool                   _has_untaggable; // narrow oop or other untaggable ref found
 public:
   IncomingRefTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h, HeapRegion* target)
-    : _rmm(rmm), _g1h(g1h), _target_hr(target), _tagged(0) {}
+    : _rmm(rmm), _g1h(g1h), _target_hr(target), _tagged(0), _has_untaggable(false) {}
 
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
     if (raw == 0) return;
-    // Already tagged — skip
-    if ((raw >> 63) != 0) return;
+    if ((raw >> 63) != 0) return; // already tagged
 
     oop target = cast_to_oop(raw);
     if (!_g1h->is_in(target)) return;
 
-    // Check if target is in the evicted region
     HeapRegion* target_region = _g1h->heap_region_containing(target);
     if (target_region != _target_hr) return;
 
-    // Target is in evicted region — find its Handle and tag the ref
     RemoteHandle* h = _rmm->handle_for(target);
     if (h != nullptr) {
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
@@ -346,32 +344,125 @@ public:
     }
   }
 
-  virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
-
-  int tagged() const { return _tagged; }
-};
-
-void G1RemoteMemoryManager::tag_incoming_refs_to_region(HeapRegion* target_hr) {
-  IncomingRefTagClosure cl(this, _g1h, target_hr);
-
-  // Walk all non-free, non-target heap regions and scan oop fields
-  for (uint i = 0; i < _g1h->num_regions(); i++) {
-    HeapRegion* hr = _g1h->region_at(i);
-    if (hr == target_hr) continue;       // skip the evicted region itself
-    if (!hr->is_old() && !hr->is_young()) continue;  // skip free/humongous
-    if (hr->is_empty()) continue;
-
-    HeapWord* p = hr->bottom();
-    while (p < hr->top()) {
-      oop obj = cast_to_oop(p);
-      obj->oop_iterate(&cl);
-      p += obj->size();
+  virtual void do_oop(narrowOop* p) {
+    // Can't tag narrow oops — flag as untaggable
+    narrowOop v = *p;
+    if (!CompressedOops::is_null(v)) {
+      oop target = CompressedOops::decode(v);
+      if (_g1h->is_in(target)) {
+        HeapRegion* target_region = _g1h->heap_region_containing(target);
+        if (target_region == _target_hr) {
+          _has_untaggable = true;
+        }
+      }
     }
   }
 
-  if (cl.tagged() > 0) {
-    log_info(gc)("Tagged %d incoming refs to evicted region [" PTR_FORMAT ", " PTR_FORMAT ")",
-                 cl.tagged(), p2i(target_hr->bottom()), p2i(target_hr->top()));
+  int tagged() const { return _tagged; }
+  bool has_untaggable() const { return _has_untaggable; }
+};
+
+// Remset visitor that collects card indices for a target region.
+// Used to find which cards in source regions contain refs into the target.
+class RemsetCardCollector {
+  G1CollectedHeap* _g1h;
+  G1CardTable*     _ct;
+  HeapRegion*      _target_hr;
+  G1RemoteMemoryManager* _rmm;
+  int              _tagged;
+  bool             _has_untaggable;
+
+public:
+  RemsetCardCollector(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h, HeapRegion* target)
+    : _g1h(g1h), _ct(g1h->card_table()), _target_hr(target),
+      _rmm(rmm), _tagged(0), _has_untaggable(false) {}
+
+  bool start_iterate(uint tag, uint region_idx) {
+    // Accept all source regions
+    return true;
+  }
+
+  void do_card(uint card_idx) {
+    scan_card(card_idx, 1);
+  }
+
+  void do_card_range(uint start_card_idx, uint length) {
+    scan_card(start_card_idx, length);
+  }
+
+  int tagged() const { return _tagged; }
+  bool has_untaggable() const { return _has_untaggable; }
+
+private:
+  void scan_card(uint card_idx, uint length) {
+    // Convert card index to memory region
+    HeapWord* card_start = _ct->addr_for((G1CardTable::CardValue*)(_ct->byte_for_index(card_idx)));
+    HeapWord* card_end = card_start + length * G1CardTable::card_size_in_words();
+
+    // Find the source region
+    if (!_g1h->is_in(card_start)) return;
+    HeapRegion* source_hr = _g1h->heap_region_containing(card_start);
+    if (source_hr == nullptr || source_hr == _target_hr) return;
+
+    // Clip to region bounds
+    HeapWord* scan_start = MAX2(card_start, source_hr->bottom());
+    HeapWord* scan_end = MIN2(card_end, source_hr->top());
+    if (scan_start >= scan_end) return;
+
+    // Scan objects overlapping this card range for refs into target region
+    IncomingRefTagClosure cl(_rmm, _g1h, _target_hr);
+    MemRegion mr(scan_start, scan_end);
+    source_hr->oops_on_memregion_seq_iterate_careful<true>(mr, &cl);
+
+    _tagged += cl.tagged();
+    if (cl.has_untaggable()) _has_untaggable = true;
+  }
+};
+
+void G1RemoteMemoryManager::tag_incoming_refs_to_region(HeapRegion* target_hr) {
+  HeapRegionRemSet* rem_set = target_hr->rem_set();
+
+  if (rem_set->is_complete() && !rem_set->is_empty()) {
+    // Remset complete — use efficient remset-based scan
+    RemsetCardCollector collector(this, _g1h, target_hr);
+    rem_set->iterate_for_merge(collector);
+
+    if (collector.has_untaggable()) {
+      log_info(gc)("Region %u has untaggable incoming refs — pinning", target_hr->hrm_index());
+      target_hr->set_root_pinned();
+      return;
+    }
+
+    if (collector.tagged() > 0) {
+      log_info(gc)("Tagged %d incoming refs to region %u via remset",
+                   collector.tagged(), target_hr->hrm_index());
+    }
+  } else {
+    // Remset not complete — fall back to heap walk (O(live_heap), acceptable for prototype).
+    // Production: only evict regions with complete remsets, or force rebuild first.
+    IncomingRefTagClosure cl(this, _g1h, target_hr);
+    for (uint i = 0; i < _g1h->num_regions(); i++) {
+      HeapRegion* hr = _g1h->region_at(i);
+      if (hr == target_hr || hr->is_empty()) continue;
+      if (!hr->is_old() && !hr->is_young() && !hr->is_humongous()) continue;
+
+      HeapWord* p = hr->bottom();
+      while (p < hr->top()) {
+        oop obj = cast_to_oop(p);
+        obj->oop_iterate(&cl);
+        p += obj->size();
+      }
+    }
+
+    if (cl.has_untaggable()) {
+      target_hr->set_root_pinned();
+      return;
+    }
+
+    if (cl.tagged() > 0) {
+      log_info(gc)("Tagged %d incoming refs to region %u via heap walk (remset incomplete)",
+                   cl.tagged(), target_hr->hrm_index());
+    }
   }
 }
 

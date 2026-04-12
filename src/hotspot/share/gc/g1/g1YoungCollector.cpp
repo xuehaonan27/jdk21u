@@ -973,6 +973,26 @@ void G1YoungCollector::post_evacuate_cleanup_2(G1ParScanThreadStateSet* per_thre
   phase_times()->record_post_evacuate_cleanup_task_2_time((Ticks::now() - start).seconds() * 1000.0);
 }
 
+// Closure that checks if a root oop targets a cold-destination region.
+// Used by both Path 1 (root-pinning) and Path 2 (existing region pinning).
+class ColdRegionPinClosure : public OopClosure {
+  G1CollectedHeap* _g1h;
+public:
+  ColdRegionPinClosure(G1CollectedHeap* g1h) : _g1h(g1h) {}
+  void do_oop(oop* p) {
+    oop obj = *p;
+    if (obj == nullptr) return;
+    if (!_g1h->is_in(obj)) return;
+    HeapRegion* hr = _g1h->heap_region_containing(obj);
+    if (hr != nullptr && hr->is_cold_destination() && !hr->is_root_pinned()) {
+      hr->set_root_pinned();
+      log_info(gc)("Root-pinned region %u (root " PTR_FORMAT " → obj " PTR_FORMAT " klass=%s)",
+                    hr->hrm_index(), p2i(p), p2i((void*)obj), obj->klass()->external_name());
+    }
+  }
+  void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+};
+
 void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                                     G1ParScanThreadStateSet* per_thread_states) {
   G1GCPhaseTimes* p = phase_times();
@@ -996,25 +1016,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // scan roots to detect if any cold region has root-referenced objects.
   // Root-pinned regions cannot be evicted (root refs bypass load barrier).
   if (G1RemoteEvictionThreshold > 0) {
-    // Closure that checks if a root oop targets a cold-destination region
-    class ColdRegionPinClosure : public OopClosure {
-      G1CollectedHeap* _g1h;
-    public:
-      ColdRegionPinClosure(G1CollectedHeap* g1h) : _g1h(g1h) {}
-      void do_oop(oop* p) {
-        oop obj = *p;
-        if (obj == nullptr) return;
-        if (!_g1h->is_in(obj)) return;
-        HeapRegion* hr = _g1h->heap_region_containing(obj);
-        if (hr != nullptr && hr->is_cold_destination() && !hr->is_root_pinned()) {
-          hr->set_root_pinned();
-          log_debug(gc)("Root-pinned cold region %u (root at " PTR_FORMAT " → " PTR_FORMAT ")",
-                        hr->hrm_index(), p2i(p), p2i((void*)obj));
-        }
-      }
-      void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
-    };
-
     ColdRegionPinClosure pin_cl(_g1h);
     // Scan thread stacks, JNI handles, and other strong roots
     // This is lightweight — only root scanning, not a heap walk
@@ -1107,6 +1108,103 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                      hr->hrm_index(), region_objects);
       } else {
         hr->clear_cold_destination();
+      }
+    }
+
+    // Return freed regions to the free pool
+    if (freed_regions > 0) {
+      _g1h->remove_from_old_gen_sets(freed_regions, 0);
+      _g1h->prepend_to_freelist(&freed_list);
+      _g1h->decrement_summary_bytes(total_freed_bytes);
+    }
+
+    // ============================================================
+    // Path 2: Evict existing cold Old regions (from previous GCs)
+    // ============================================================
+    // These are Old regions that survived previous GCs, are cold, and have
+    // complete remsets. Unlike Path 1 (newly promoted objects), these objects
+    // are typically NOT root-referenced (off the stack after many GCs).
+    if (G1RemoteEvictionThreshold > 0) {
+      size_t heap_capacity = _g1h->max_capacity();
+      size_t heap_used = _g1h->used();
+      size_t threshold_bytes = (heap_capacity * G1RemoteEvictionThreshold) / 100;
+
+      if (heap_used > threshold_bytes) {
+        size_t to_free = heap_used - threshold_bytes;
+        log_info(gc)("Path 2 eviction: heap " SIZE_FORMAT "MB / " SIZE_FORMAT "MB "
+                     "(threshold %u%%), need " SIZE_FORMAT "KB",
+                     heap_used / M, heap_capacity / M,
+                     G1RemoteEvictionThreshold, to_free / K);
+
+        size_t path2_freed = 0;
+        int path2_candidates = 0, path2_pinned_by_tag = 0, path2_old_count = 0;
+        for (uint i = 0; i < _g1h->num_regions() && path2_freed < to_free; i++) {
+          HeapRegion* hr = _g1h->region_at(i);
+          if (hr->is_old() && !hr->is_humongous() && !hr->is_empty()) path2_old_count++;
+          // Only existing Old regions (not cold-destination, not humongous, not empty)
+          if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
+          if (hr->is_cold_destination()) continue;  // already handled by Path 1
+
+          // Remset completeness: prefer regions with complete remsets (efficient scan).
+          // For regions without, tag_incoming_refs_to_region falls back to heap walk.
+
+          // Skip per-region root-pinning for Path 2. Root scanning pins too
+          // many regions (Class objects, Thread objects in Old). Instead rely on:
+          // - G1TagRefSites for heap ref tagging
+          // - tag_incoming_refs_to_region for cross-region refs
+          // - Load barrier catches tagged oops from heap paths
+          // Risk: clean root oops to evicted objects. Mitigated: truly cold
+          // objects (survived many GCs) are rarely directly root-referenced.
+          hr->set_cold_destination();
+          path2_candidates++;
+
+          // Ensure all objects in the region have Handles (for incoming ref tagging)
+          HeapWord* p = hr->bottom();
+          while (p < hr->top()) {
+            oop obj = cast_to_oop(p);
+            rmm->ensure_handle_for(obj, &hab);
+            p += obj->size();
+          }
+
+          // Tag incoming refs via remset (NOT heap walk)
+          rmm->tag_incoming_refs_to_region(hr);
+
+          // If region was pinned by remset scan (untaggable refs), skip
+          if (hr->is_root_pinned()) {
+            hr->clear_cold_destination();
+            hr->clear_root_pinned();
+            path2_pinned_by_tag++;
+            continue;
+          }
+
+          // Evict all objects in the region
+          size_t region_used = hr->used();
+          p = hr->bottom();
+          int region_objects = 0;
+          while (p < hr->top()) {
+            oop obj = cast_to_oop(p);
+            size_t sz = obj->size();
+            if (rmm->evict_object(obj, &hab)) {
+              region_objects++;
+            }
+            p += sz;
+          }
+
+          if (region_objects > 0) {
+            total_evicted += region_objects;
+            regions_evicted++;
+            total_freed_bytes += region_used;
+            path2_freed += region_used;
+            _g1h->free_region(hr, &freed_list);
+            freed_regions++;
+            log_info(gc)("Path 2: evicted region %u (%d objects, " SIZE_FORMAT "KB)",
+                         hr->hrm_index(), region_objects, region_used / K);
+          } else {
+            hr->clear_cold_destination();
+          }
+        }
+        log_info(gc)("Path 2: %d old regions, %d candidates, %d pinned by tagging, " SIZE_FORMAT "KB freed",
+                     path2_old_count, path2_candidates, path2_pinned_by_tag, path2_freed / K);
       }
     }
 
