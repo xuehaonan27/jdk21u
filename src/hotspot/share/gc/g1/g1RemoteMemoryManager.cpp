@@ -438,31 +438,11 @@ void G1RemoteMemoryManager::tag_incoming_refs_to_region(HeapRegion* target_hr) {
                    collector.tagged(), target_hr->hrm_index());
     }
   } else {
-    // Remset not complete — fall back to heap walk (O(live_heap), acceptable for prototype).
-    // Production: only evict regions with complete remsets, or force rebuild first.
-    IncomingRefTagClosure cl(this, _g1h, target_hr);
-    for (uint i = 0; i < _g1h->num_regions(); i++) {
-      HeapRegion* hr = _g1h->region_at(i);
-      if (hr == target_hr || hr->is_empty()) continue;
-      if (!hr->is_old() && !hr->is_young() && !hr->is_humongous()) continue;
-
-      HeapWord* p = hr->bottom();
-      while (p < hr->top()) {
-        oop obj = cast_to_oop(p);
-        obj->oop_iterate(&cl);
-        p += obj->size();
-      }
-    }
-
-    if (cl.has_untaggable()) {
-      target_hr->set_root_pinned();
-      return;
-    }
-
-    if (cl.tagged() > 0) {
-      log_info(gc)("Tagged %d incoming refs to region %u via heap walk (remset incomplete)",
-                   cl.tagged(), target_hr->hrm_index());
-    }
+    // Remset not complete — cannot safely find all incoming refs.
+    // Skip this region for eviction.
+    log_debug(gc)("Remset incomplete for region %u — skipping eviction",
+                  target_hr->hrm_index());
+    target_hr->set_root_pinned();  // prevent eviction
   }
 }
 

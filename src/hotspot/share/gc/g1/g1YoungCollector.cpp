@@ -997,6 +997,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                                     G1ParScanThreadStateSet* per_thread_states) {
   G1GCPhaseTimes* p = phase_times();
 
+  // Capture heap usage before cleanup for eviction threshold check.
+  // After cleanup, used() drops (young regions reclaimed) and may fall
+  // below threshold even when Old gen pressure warrants eviction.
+  const size_t pre_cleanup_heap_used = _g1h->used();
+
   // Process any discovered reference objects - we have
   // to do this _before_ we retire the GC alloc regions
   // as we may have to copy some 'reachable' referent
@@ -1126,15 +1131,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // are typically NOT root-referenced (off the stack after many GCs).
     if (G1RemoteEvictionThreshold > 0) {
       size_t heap_capacity = _g1h->max_capacity();
-      size_t heap_used = _g1h->used();
+      // Use pre-cleanup heap usage (captured before young regions reclaimed)
       size_t threshold_bytes = (heap_capacity * G1RemoteEvictionThreshold) / 100;
 
-      if (heap_used > threshold_bytes) {
-        size_t to_free = heap_used - threshold_bytes;
-        log_info(gc)("Path 2 eviction: heap " SIZE_FORMAT "MB / " SIZE_FORMAT "MB "
-                     "(threshold %u%%), need " SIZE_FORMAT "KB",
-                     heap_used / M, heap_capacity / M,
-                     G1RemoteEvictionThreshold, to_free / K);
+      if (pre_cleanup_heap_used > threshold_bytes) {
+        size_t to_free = pre_cleanup_heap_used - threshold_bytes;
+        log_info(gc)("Path 2 eviction: pre-cleanup heap " SIZE_FORMAT "MB / " SIZE_FORMAT "MB "
+                     "(threshold %u%% = " SIZE_FORMAT "MB), need " SIZE_FORMAT "KB",
+                     pre_cleanup_heap_used / M, heap_capacity / M,
+                     G1RemoteEvictionThreshold, threshold_bytes / M, to_free / K);
 
         size_t path2_freed = 0;
         int path2_candidates = 0, path2_pinned_by_tag = 0, path2_old_count = 0;
