@@ -240,11 +240,9 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   RawAccess<IS_NOT_NULL>::oop_store(p, obj);
 
   // Phase 2: Record reference site for RC counting if target was promoted to Old.
-  // CRITICAL: only record ref-sites that are WITHIN the Java heap.
-  // During root scanning, p can be a stack slot, JNI handle, CLD oop, etc.
-  // Writing tagged oops into non-heap slots crashes because aload, JNI access,
-  // and CLD access paths do NOT go through the G1 load barrier.
-  {
+  // Only record when eviction is possible (G1TagRefSites or G1SimulateRemoteEviction
+  // or G1RemoteEvictionThreshold > 0). Otherwise, skip to avoid post-evacuate overhead.
+  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     HeapRegion* dest = _g1h->heap_region_containing(obj);
     if (dest != nullptr && dest->is_old() && _g1h->is_in((void*)p)) {
       record_rc_ref_site(obj, (void*)p, sizeof(T) == sizeof(narrowOop));
@@ -894,9 +892,12 @@ void G1ParScanThreadStateSet::flush_stats() {
   assert(!_flushed, "thread local state from the per thread states should be flushed once");
 
   // Phase 2: OOP Classification Fixup — classifies promoted Old objects.
-  // Sets mark word bits 39-40 (safe during STW, no concurrent mutator CAS)
-  // and tags ref-site heap slots as Unique/Shared OOPs.
-  process_oop_classification_fixup();
+  // Classification fixup: only run when eviction is possible.
+  // When disabled, skip to avoid post-evacuate overhead (can be 2+ seconds
+  // for large heaps due to RC hash map construction + mark word updates).
+  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    process_oop_classification_fixup();
+  }
 
   for (uint worker_id = 0; worker_id < _num_workers; ++worker_id) {
     G1ParScanThreadState* pss = _states[worker_id];
