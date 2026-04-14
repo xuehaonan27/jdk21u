@@ -126,10 +126,6 @@ inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
   if (!_g1h->is_in(obj)) {
     return;
   }
-  // De-handleification: if field is shared_oop and target is local + no remote refs,
-  // rewrite to clean oop to eliminate Handle indirection.
-  g1_try_dehandleify(p, obj);
-
   const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
   if (region_attr.is_in_cset()) {
     prefetch_and_push(p, obj);
@@ -275,9 +271,6 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
   if (!_g1h->is_in(obj)) {
     return;
   }
-  // De-handleification: opportunistic downgrade of tagged oops
-  g1_try_dehandleify(p, obj);
-
   assert(_worker_id == _par_scan_state->worker_id(), "sanity");
 
   const G1HeapRegionAttr state = _g1h->region_attr(obj);
