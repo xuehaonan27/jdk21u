@@ -24,7 +24,11 @@ AC_DEFUN_ONCE([LIB_SETUP_LIBAPTH],
     fi
 
     LIBAPTH_CFLAGS="-I${LIBAPTH_ABS_SRC} -DUSE_LIBAPTH -DUSE_LIBRARY_BASED_TLS_ONLY"
-    LIBAPTH_LIBS="-L${LIBAPTH_ABS_LIB} -lapth -Wl,-rpath,${LIBAPTH_ABS_LIB} -lpthread -ldl"
+    # Link against libapth_core.a (hook-free, static). No LD_PRELOAD needed.
+    # The core library provides: apth_create, apth_init_library, apth_yield,
+    # sync primitives, safepoint APIs — everything the JVM needs without
+    # intercepting libc I/O functions.
+    LIBAPTH_LIBS="${LIBAPTH_ABS_LIB}/libapth_core.a -lpthread -ldl"
 
     # Remote memory backend selection.
     # --with-remote=SIM   → default, in-process simulated remote (no network)
