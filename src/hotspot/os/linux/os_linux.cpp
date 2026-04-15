@@ -931,11 +931,14 @@ static void init_adjust_stacksize_for_guard_pages() {
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
   switch (thr_type) {
-  // ALL JVM threads run as DEDICATED (1:1 pthread) by default.
-  // This avoids LIBAPTH hook overhead for compute-bound threads.
-  // When RDMA fetch is needed, the fetch path uses ThreadBlockInVM
-  // which is compatible with dedicated pthreads.
-  case os::java_thread:     return APTH_CLASS_DEDICATED;
+  // Mutator threads: M:N (IO_BOUND) for RDMA latency hiding.
+  // When a mutator fetches a remote object via RDMA, it yields to the
+  // scheduler via apth_rdma_wait, and another mutator runs on the same
+  // core. With libapth_core.a (no hooks), regular I/O (Spark networking)
+  // goes directly to libc with zero overhead — only RDMA operations
+  // trigger the M:N cooperative yield.
+  case os::java_thread:     return APTH_CLASS_IO_BOUND;
+  // GC/compiler/service threads: DEDICATED (1:1 pthread, no scheduling overhead)
   case os::gc_thread:       return APTH_CLASS_DEDICATED;
   case os::compiler_thread: return APTH_CLASS_DEDICATED;
   default:                  return APTH_CLASS_DEDICATED;
