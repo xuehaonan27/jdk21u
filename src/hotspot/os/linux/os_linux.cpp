@@ -931,13 +931,11 @@ static void init_adjust_stacksize_for_guard_pages() {
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
   switch (thr_type) {
-  // Mutator threads: M:N (IO_BOUND) for RDMA latency hiding.
-  // When a mutator fetches a remote object via RDMA, it yields to the
-  // scheduler via apth_rdma_wait, and another mutator runs on the same
-  // core. With libapth_core.a (no hooks), regular I/O (Spark networking)
-  // goes directly to libc with zero overhead — only RDMA operations
-  // trigger the M:N cooperative yield.
-  case os::java_thread:     return APTH_CLASS_IO_BOUND;
+  // ALL threads DEDICATED for now. M:N (IO_BOUND) requires I/O hooks
+  // to handle blocking I/O cooperatively. With libapth_core.a (no hooks),
+  // M:N threads block the worker pthread on regular I/O, causing hangs.
+  // TODO: enable M:N only when LD_PRELOAD hooks are active.
+  case os::java_thread:     return APTH_CLASS_DEDICATED;
   // GC/compiler/service threads: DEDICATED (1:1 pthread, no scheduling overhead)
   case os::gc_thread:       return APTH_CLASS_DEDICATED;
   case os::compiler_thread: return APTH_CLASS_DEDICATED;
