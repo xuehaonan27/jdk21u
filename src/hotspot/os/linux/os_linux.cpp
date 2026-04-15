@@ -931,9 +931,13 @@ static void init_adjust_stacksize_for_guard_pages() {
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
   switch (thr_type) {
-  case os::java_thread:     return APTH_CLASS_IO_BOUND;
-  case os::gc_thread:       return APTH_CLASS_DEDICATED;    // GC workers as 1:1 pthreads (bypass hooks)
-  case os::compiler_thread: return APTH_CLASS_DEDICATED;    // JIT compilers as 1:1 pthreads
+  // ALL JVM threads run as DEDICATED (1:1 pthread) by default.
+  // This avoids LIBAPTH hook overhead for compute-bound threads.
+  // When RDMA fetch is needed, the fetch path uses ThreadBlockInVM
+  // which is compatible with dedicated pthreads.
+  case os::java_thread:     return APTH_CLASS_DEDICATED;
+  case os::gc_thread:       return APTH_CLASS_DEDICATED;
+  case os::compiler_thread: return APTH_CLASS_DEDICATED;
   default:                  return APTH_CLASS_DEDICATED;
   }
 }
