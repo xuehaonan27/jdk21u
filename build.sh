@@ -71,7 +71,7 @@ if [[ "$ACTION" == "build" || "$ACTION" == "buildtest" ]]; then
     # Build LIBAPTH
     if [[ "$USE_LIBAPTH" == "1" ]]; then
         echo "=== Building LIBAPTH ==="
-        cd "$LIBAPTH_DIR" && make clean && make all || exit 1
+        cd "$LIBAPTH_DIR" && make clean && make all && make core || exit 1
     fi
 
     # Configure JDK
