@@ -963,8 +963,8 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
   thread->set_osthread(osthread);
 
 #ifdef USE_LIBAPTH
-  {
-    // Calculate stack size if it's not specified by caller.
+  // LIBAPTH init disabled for perf testing — fall through to pthread path
+  if (false) {
     size_t stack_size = os::Posix::get_initial_stack_size(thr_type, req_stack_size);
 
     apth_t tid;
