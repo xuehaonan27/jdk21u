@@ -931,11 +931,11 @@ static void init_adjust_stacksize_for_guard_pages() {
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
   switch (thr_type) {
-  // ALL threads DEDICATED for now. M:N (IO_BOUND) requires I/O hooks
-  // to handle blocking I/O cooperatively. With libapth_core.a (no hooks),
-  // M:N threads block the worker pthread on regular I/O, causing hangs.
-  // TODO: enable M:N only when LD_PRELOAD hooks are active.
-  case os::java_thread:     return APTH_CLASS_DEDICATED;
+  // Mutators: M:N (IO_BOUND) for RDMA latency hiding at localrate<100.
+  // With LD_PRELOAD of libapth.so, blocking I/O is cooperative (hooks
+  // set FDs non-blocking + yield on EAGAIN). RDMA fetch yields via
+  // apth_rdma_wait. At localrate=100, use USE_LIBAPTH=0 for zero overhead.
+  case os::java_thread:     return APTH_CLASS_IO_BOUND;
   // GC/compiler/service threads: DEDICATED (1:1 pthread, no scheduling overhead)
   case os::gc_thread:       return APTH_CLASS_DEDICATED;
   case os::compiler_thread: return APTH_CLASS_DEDICATED;
