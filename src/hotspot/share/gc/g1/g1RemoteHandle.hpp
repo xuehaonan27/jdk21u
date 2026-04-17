@@ -97,9 +97,12 @@ struct RemoteHandle {
     Atomic::release_store(&_state_and_addr, val);
   }
 
-  // Set to remote (used during eviction)
+  // Set to remote (used during eviction).
+  // Release store: ensures prior writes (e.g. set_eviction_word_size)
+  // are visible to readers who see REMOTE via load_state_and_addr_acquire.
   void set_remote(uintptr_t remote_id) {
-    _state_and_addr = REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK);
+    Atomic::release_store(&_state_and_addr,
+      (uintptr_t)(REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK)));
   }
 
   // Set to local (used during Handle creation and GC evacuation)

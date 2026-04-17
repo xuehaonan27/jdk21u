@@ -299,9 +299,11 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
     return false;
   }
 
-  // 4. Set Handle to REMOTE with slot_id + store word_size for fetch-time allocation
-  h->set_remote(slot_id);
+  // 4. Store word_size FIRST, then publish REMOTE state (release store).
+  //    Readers (resolve_tagged_oop_slow) see REMOTE via acquire load, then
+  //    read eviction_word_size(). Size must be visible before REMOTE.
   h->set_eviction_word_size(word_size);
+  h->set_remote(slot_id);
 
   // 5. Set classification in mark word + per-region bitmap.
   //    Mark word: fast per-object check for mutators (same cache line as header)
