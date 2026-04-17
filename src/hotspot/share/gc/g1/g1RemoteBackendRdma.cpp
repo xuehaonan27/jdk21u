@@ -83,10 +83,32 @@ static bool tcp_recv_exact(int fd, void* buf, size_t len) {
 }
 
 // ================================================================
-// CQ polling helper
+// CQ completion wait — uses LIBAPTH's apth_rdma_wait for cooperative yield
 // ================================================================
+// Instead of busy-spinning (burning 100% CPU), yield to LIBAPTH scheduler.
+// Fast path: single poll (~10ns). If not ready: register with RDMA poller,
+// yield (~20ns context switch), another thread runs. Poller detects completion
+// (~50ns) and wakes us. Total: ~90ns vs ~5μs kernel context switch.
 
-static bool poll_cq_wait(struct ibv_cq* cq, struct ibv_wc* wc) {
+#ifdef USE_LIBAPTH
+#include "apth.h"
+#endif
+
+static bool poll_cq_wait(struct ibv_cq* cq, uint64_t wr_id, struct ibv_wc* wc) {
+#ifdef USE_LIBAPTH
+  // LIBAPTH cooperative wait: fast poll → yield → wake on completion
+  int ret = apth_rdma_wait(cq, wr_id, wc);
+  if (ret != 0) {
+    log_warning(gc)("RDMA: apth_rdma_wait failed: errno=%d", errno);
+    return false;
+  }
+  if (wc->status != IBV_WC_SUCCESS) {
+    log_warning(gc)("RDMA: completion error: status=%d", wc->status);
+    return false;
+  }
+  return true;
+#else
+  // Fallback: busy-poll (no LIBAPTH)
   int ne;
   do { ne = ibv_poll_cq(cq, 1, wc); } while (ne == 0);
   if (ne < 0 || wc->status != IBV_WC_SUCCESS) {
@@ -94,6 +116,7 @@ static bool poll_cq_wait(struct ibv_cq* cq, struct ibv_wc* wc) {
     return false;
   }
   return true;
+#endif
 }
 
 // ================================================================
@@ -133,6 +156,18 @@ bool RDMAExecutorBackend::setup_rdma_resources() {
   _send_cq = ibv_create_cq(_ctx, RDMACQDepth, NULL, NULL, 0);
   _recv_cq = ibv_create_cq(_ctx, RDMACQDepth, NULL, NULL, 0);
   if (!_send_cq || !_recv_cq) { log_warning(gc)("RDMA: ibv_create_cq failed"); return false; }
+
+#ifdef USE_LIBAPTH
+  // Register CQs with LIBAPTH's RDMA poller for cooperative completion waiting.
+  // apth_rdma_wait() needs the poller to monitor these CQs for completions.
+  if (apth_rdma_register_cq(_send_cq) != 0) {
+    log_warning(gc)("RDMA: failed to register send_cq with LIBAPTH poller");
+  }
+  if (apth_rdma_register_cq(_recv_cq) != 0) {
+    log_warning(gc)("RDMA: failed to register recv_cq with LIBAPTH poller");
+  }
+  log_info(gc)("RDMA: CQs registered with LIBAPTH poller for cooperative wait");
+#endif
 
   struct ibv_qp_init_attr qp_init;
   memset(&qp_init, 0, sizeof(qp_init));
@@ -296,7 +331,7 @@ bool RDMAExecutorBackend::rdma_send_msg(const void* data, size_t len) {
   if (ibv_post_send(_qp, &wr, &bad_wr)) return false;
 
   struct ibv_wc wc;
-  return poll_cq_wait(_send_cq, &wc);
+  return poll_cq_wait(_send_cq, wr.wr_id, &wc);
 }
 
 bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actual_len) {
@@ -318,7 +353,7 @@ bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actua
 
   // Wait for completion
   struct ibv_wc wc;
-  if (!poll_cq_wait(_recv_cq, &wc)) return false;
+  if (!poll_cq_wait(_recv_cq, wr.wr_id, &wc)) return false;
 
   size_t len = wc.byte_len;
   if (len > max_len) len = max_len;
@@ -354,7 +389,7 @@ bool RDMAExecutorBackend::rdma_write(uint64_t remote_offset, const void* local_b
   if (ibv_post_send(_qp, &wr, &bad_wr)) return false;
 
   struct ibv_wc wc;
-  return poll_cq_wait(_send_cq, &wc);
+  return poll_cq_wait(_send_cq, wr.wr_id, &wc);
 }
 
 bool RDMAExecutorBackend::rdma_read(uint64_t remote_offset, void* local_buf, size_t len) {
@@ -379,7 +414,7 @@ bool RDMAExecutorBackend::rdma_read(uint64_t remote_offset, void* local_buf, siz
   if (ibv_post_send(_qp, &wr, &bad_wr)) return false;
 
   struct ibv_wc wc;
-  if (!poll_cq_wait(_send_cq, &wc)) return false;
+  if (!poll_cq_wait(_send_cq, wr.wr_id, &wc)) return false;
 
   memcpy(local_buf, data_buf, len);
   return true;
