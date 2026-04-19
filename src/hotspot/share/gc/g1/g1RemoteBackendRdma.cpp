@@ -452,6 +452,19 @@ bool RDMAExecutorBackend::initialize() {
   log_info(gc)("RDMA: trying to exchange QP info");
   if (!exchange_qp_info()) return false;
 
+#ifdef USE_LIBAPTH
+  // Register CQs with LIBAPTH's RDMA poller AFTER QP is RTS but BEFORE any
+  // RDMA operations. The poller must monitor CQs for apth_rdma_wait to work.
+  // Safe to start poller here: CQs are valid and QP is connected.
+  if (apth_rdma_register_cq(_send_cq) != 0) {
+    log_warning(gc)("RDMA: failed to register send_cq with LIBAPTH poller");
+  }
+  if (apth_rdma_register_cq(_recv_cq) != 0) {
+    log_warning(gc)("RDMA: failed to register recv_cq with LIBAPTH poller");
+  }
+  log_info(gc)("RDMA: CQs registered with LIBAPTH poller for cooperative wait");
+#endif
+
   // Pre-post recv buffers
   for (int i = 0; i < 4; i++) {
     void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
@@ -484,20 +497,6 @@ bool RDMAExecutorBackend::initialize() {
   if (*(uint32_t*)resp != RE_RESP_OK) { log_warning(gc)("RDMA: hello rejected"); return false; }
 
   _connected = true;
-
-#ifdef USE_LIBAPTH
-  // Register CQs with LIBAPTH's RDMA poller AFTER successful connection.
-  // This starts the poller thread. Must not be done earlier — if init fails
-  // the poller would crash polling destroyed CQs.
-  if (apth_rdma_register_cq(_send_cq) != 0) {
-    log_warning(gc)("RDMA: failed to register send_cq with LIBAPTH poller");
-  }
-  if (apth_rdma_register_cq(_recv_cq) != 0) {
-    log_warning(gc)("RDMA: failed to register recv_cq with LIBAPTH poller");
-  }
-  log_info(gc)("RDMA: CQs registered with LIBAPTH poller for cooperative wait");
-#endif
-
   log_info(gc)("Remote backend: rdma-executor connected to %s:%d via RDMA", host, port);
   return true;
 }
