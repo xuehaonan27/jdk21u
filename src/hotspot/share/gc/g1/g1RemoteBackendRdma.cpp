@@ -91,8 +91,14 @@ static bool tcp_recv_exact(int fd, void* buf, size_t len) {
 // (~50ns) and wakes us. Total: ~90ns vs ~5μs kernel context switch.
 
 #ifdef USE_LIBAPTH
-#define APTH_USE_RDMA 1  // Enable RDMA API declarations in apth.h
 #include "apth.h"
+// RDMA API from LIBAPTH — declared here because apth.h guards them behind
+// APTH_USE_RDMA which isn't set in the JDK build (and precompiled headers
+// would ignore a source-level #define anyway).
+extern "C" {
+  int apth_rdma_register_cq(struct ibv_cq *cq);
+  int apth_rdma_wait(struct ibv_cq *cq, uint64_t wr_id, struct ibv_wc *wc);
+}
 #endif
 
 static bool poll_cq_wait(struct ibv_cq* cq, uint64_t wr_id, struct ibv_wc* wc) {
