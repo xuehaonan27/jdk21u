@@ -91,6 +91,7 @@ static bool tcp_recv_exact(int fd, void* buf, size_t len) {
 // (~50ns) and wakes us. Total: ~90ns vs ~5μs kernel context switch.
 
 #ifdef USE_LIBAPTH
+#define APTH_USE_RDMA 1  // Enable RDMA API declarations in apth.h
 #include "apth.h"
 #endif
 
