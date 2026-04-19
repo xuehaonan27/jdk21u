@@ -164,17 +164,9 @@ bool RDMAExecutorBackend::setup_rdma_resources() {
   _recv_cq = ibv_create_cq(_ctx, RDMACQDepth, NULL, NULL, 0);
   if (!_send_cq || !_recv_cq) { log_warning(gc)("RDMA: ibv_create_cq failed"); return false; }
 
-#ifdef USE_LIBAPTH
-  // Register CQs with LIBAPTH's RDMA poller for cooperative completion waiting.
-  // apth_rdma_wait() needs the poller to monitor these CQs for completions.
-  if (apth_rdma_register_cq(_send_cq) != 0) {
-    log_warning(gc)("RDMA: failed to register send_cq with LIBAPTH poller");
-  }
-  if (apth_rdma_register_cq(_recv_cq) != 0) {
-    log_warning(gc)("RDMA: failed to register recv_cq with LIBAPTH poller");
-  }
-  log_info(gc)("RDMA: CQs registered with LIBAPTH poller for cooperative wait");
-#endif
+  // NOTE: CQ registration with LIBAPTH poller is deferred to after successful
+  // TCP bootstrap (in initialize()). Registering here would start the poller
+  // thread, and if init fails the poller crashes on destroyed CQs.
 
   struct ibv_qp_init_attr qp_init;
   memset(&qp_init, 0, sizeof(qp_init));
@@ -492,6 +484,20 @@ bool RDMAExecutorBackend::initialize() {
   if (*(uint32_t*)resp != RE_RESP_OK) { log_warning(gc)("RDMA: hello rejected"); return false; }
 
   _connected = true;
+
+#ifdef USE_LIBAPTH
+  // Register CQs with LIBAPTH's RDMA poller AFTER successful connection.
+  // This starts the poller thread. Must not be done earlier — if init fails
+  // the poller would crash polling destroyed CQs.
+  if (apth_rdma_register_cq(_send_cq) != 0) {
+    log_warning(gc)("RDMA: failed to register send_cq with LIBAPTH poller");
+  }
+  if (apth_rdma_register_cq(_recv_cq) != 0) {
+    log_warning(gc)("RDMA: failed to register recv_cq with LIBAPTH poller");
+  }
+  log_info(gc)("RDMA: CQs registered with LIBAPTH poller for cooperative wait");
+#endif
+
   log_info(gc)("Remote backend: rdma-executor connected to %s:%d via RDMA", host, port);
   return true;
 }
