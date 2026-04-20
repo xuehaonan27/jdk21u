@@ -26,6 +26,10 @@
 #include "nio.h"
 #include "nio_util.h"
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 #include "sun_nio_ch_UnixDispatcher.h"
 
 static int preCloseFD = -1;     /* File descriptor to which we dup other fd's
@@ -33,7 +37,11 @@ static int preCloseFD = -1;     /* File descriptor to which we dup other fd's
 
 static void closeFileDescriptor(JNIEnv *env, int fd) {
     if (fd != -1) {
+#ifdef USE_LIBAPTH
+        int result = apth_io_close(fd);
+#else
         int result = close(fd);
+#endif
         if (result < 0)
             JNU_ThrowIOExceptionWithLastError(env, "Close failed");
     }
@@ -43,12 +51,20 @@ JNIEXPORT void JNICALL
 Java_sun_nio_ch_UnixDispatcher_init(JNIEnv *env, jclass clazz)
 {
     int sp[2];
+#ifdef USE_LIBAPTH
+    if (apth_io_socketpair(PF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+#else
     if (socketpair(PF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+#endif
         JNU_ThrowIOExceptionWithLastError(env, "socketpair failed");
         return;
     }
     preCloseFD = sp[0];
+#ifdef USE_LIBAPTH
+    apth_io_close(sp[1]);
+#else
     close(sp[1]);
+#endif
 }
 
 JNIEXPORT void JNICALL
@@ -63,7 +79,11 @@ Java_sun_nio_ch_UnixDispatcher_preClose0(JNIEnv *env, jclass clazz, jobject fdo)
 {
     jint fd = fdval(env, fdo);
     if (preCloseFD >= 0) {
+#ifdef USE_LIBAPTH
+        if (apth_io_dup2(preCloseFD, fd) < 0)
+#else
         if (dup2(preCloseFD, fd) < 0)
+#endif
             JNU_ThrowIOExceptionWithLastError(env, "dup2 failed");
     }
 }

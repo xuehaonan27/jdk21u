@@ -57,6 +57,10 @@
 #include "java_lang_Long.h"
 #include <assert.h>
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 JNIEXPORT jint JNICALL
 Java_sun_nio_ch_UnixFileDispatcherImpl_read0(JNIEnv *env, jclass clazz,
                              jobject fdo, jlong address, jint len)
@@ -64,7 +68,11 @@ Java_sun_nio_ch_UnixFileDispatcherImpl_read0(JNIEnv *env, jclass clazz,
     jint fd = fdval(env, fdo);
     void *buf = (void *)jlong_to_ptr(address);
 
+#ifdef USE_LIBAPTH
+    return convertReturnVal(env, apth_io_read(fd, buf, len), JNI_TRUE);
+#else
     return convertReturnVal(env, read(fd, buf, len), JNI_TRUE);
+#endif
 }
 
 JNIEXPORT jint JNICALL
@@ -74,7 +82,11 @@ Java_sun_nio_ch_UnixFileDispatcherImpl_pread0(JNIEnv *env, jclass clazz, jobject
     jint fd = fdval(env, fdo);
     void *buf = (void *)jlong_to_ptr(address);
 
+#ifdef USE_LIBAPTH
+    return convertReturnVal(env, apth_io_pread(fd, buf, len, offset), JNI_TRUE);
+#else
     return convertReturnVal(env, pread64(fd, buf, len, offset), JNI_TRUE);
+#endif
 }
 
 JNIEXPORT jlong JNICALL
@@ -83,7 +95,11 @@ Java_sun_nio_ch_UnixFileDispatcherImpl_readv0(JNIEnv *env, jclass clazz,
 {
     jint fd = fdval(env, fdo);
     struct iovec *iov = (struct iovec *)jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+    return convertLongReturnVal(env, apth_io_readv(fd, iov, len), JNI_TRUE);
+#else
     return convertLongReturnVal(env, readv(fd, iov, len), JNI_TRUE);
+#endif
 }
 
 JNIEXPORT jint JNICALL
@@ -93,7 +109,11 @@ Java_sun_nio_ch_UnixFileDispatcherImpl_write0(JNIEnv *env, jclass clazz,
     jint fd = fdval(env, fdo);
     void *buf = (void *)jlong_to_ptr(address);
 
+#ifdef USE_LIBAPTH
+    return convertReturnVal(env, apth_io_write(fd, buf, len), JNI_FALSE);
+#else
     return convertReturnVal(env, write(fd, buf, len), JNI_FALSE);
+#endif
 }
 
 JNIEXPORT jint JNICALL
@@ -103,7 +123,11 @@ Java_sun_nio_ch_UnixFileDispatcherImpl_pwrite0(JNIEnv *env, jclass clazz, jobjec
     jint fd = fdval(env, fdo);
     void *buf = (void *)jlong_to_ptr(address);
 
+#ifdef USE_LIBAPTH
+    return convertReturnVal(env, apth_io_pwrite(fd, buf, len, offset), JNI_FALSE);
+#else
     return convertReturnVal(env, pwrite64(fd, buf, len, offset), JNI_FALSE);
+#endif
 }
 
 JNIEXPORT jlong JNICALL
@@ -112,7 +136,11 @@ Java_sun_nio_ch_UnixFileDispatcherImpl_writev0(JNIEnv *env, jclass clazz,
 {
     jint fd = fdval(env, fdo);
     struct iovec *iov = (struct iovec *)jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+    return convertLongReturnVal(env, apth_io_writev(fd, iov, len), JNI_FALSE);
+#else
     return convertLongReturnVal(env, writev(fd, iov, len), JNI_FALSE);
+#endif
 }
 
 static jlong
@@ -249,7 +277,11 @@ Java_sun_nio_ch_UnixFileDispatcherImpl_release0(JNIEnv *env, jobject this,
 
 static void closeFileDescriptor(JNIEnv *env, int fd) {
     if (fd != -1) {
+#ifdef USE_LIBAPTH
+        int result = apth_io_close(fd);
+#else
         int result = close(fd);
+#endif
         if (result < 0)
             JNU_ThrowIOExceptionWithLastError(env, "Close failed");
     }

@@ -83,6 +83,7 @@
 
 #ifdef USE_LIBAPTH
 #include <apth.h>
+#include <apth_io.h>
 #endif
 
 #define ROOT_UID 0
@@ -784,13 +785,21 @@ FILE* os::fdopen(int fd, const char* mode) {
 }
 
 ssize_t os::pd_write(int fd, const void *buf, size_t nBytes) {
+#ifdef USE_LIBAPTH
+  return apth_io_write(fd, buf, nBytes);
+#else
   ssize_t res;
   RESTARTABLE(::write(fd, buf, nBytes), res);
   return res;
+#endif
 }
 
 ssize_t os::read_at(int fd, void *buf, unsigned int nBytes, jlong offset) {
+#ifdef USE_LIBAPTH
+  return apth_io_pread(fd, buf, nBytes, offset);
+#else
   return ::pread(fd, buf, nBytes, offset);
+#endif
 }
 
 void os::flockfile(FILE* fp) {
@@ -817,15 +826,27 @@ int os::closedir(DIR *dirp) {
 }
 
 int os::socket_close(int fd) {
+#ifdef USE_LIBAPTH
+  return apth_io_close(fd);
+#else
   return ::close(fd);
+#endif
 }
 
 int os::recv(int fd, char* buf, size_t nBytes, uint flags) {
+#ifdef USE_LIBAPTH
+  return (int)apth_io_recv(fd, buf, nBytes, flags);
+#else
   RESTARTABLE_RETURN_INT(::recv(fd, buf, nBytes, flags));
+#endif
 }
 
 int os::send(int fd, char* buf, size_t nBytes, uint flags) {
+#ifdef USE_LIBAPTH
+  return (int)apth_io_send(fd, buf, nBytes, flags);
+#else
   RESTARTABLE_RETURN_INT(::send(fd, buf, nBytes, flags));
+#endif
 }
 
 int os::raw_send(int fd, char* buf, size_t nBytes, uint flags) {
@@ -833,7 +854,11 @@ int os::raw_send(int fd, char* buf, size_t nBytes, uint flags) {
 }
 
 int os::connect(int fd, struct sockaddr* him, socklen_t len) {
+#ifdef USE_LIBAPTH
+  return apth_io_connect(fd, him, len);
+#else
   RESTARTABLE_RETURN_INT(::connect(fd, him, len));
+#endif
 }
 
 void os::exit(int num) {

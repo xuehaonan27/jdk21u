@@ -31,6 +31,10 @@
 #include <netinet/tcp.h>
 #include <limits.h>
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 #include "jni.h"
 #include "jni_util.h"
 #include "jvm.h"
@@ -256,7 +260,11 @@ Java_sun_nio_ch_Net_socket0(JNIEnv *env, jclass cl, jboolean preferIPv6,
     int type = (stream ? SOCK_STREAM : SOCK_DGRAM);
     int domain = (ipv6_available() && preferIPv6) ? AF_INET6 : AF_INET;
 
+#ifdef USE_LIBAPTH
+    fd = apth_io_socket(domain, type, 0);
+#else
     fd = socket(domain, type, 0);
+#endif
     if (fd < 0) {
         return handleSocketError(env, errno);
     }
@@ -271,7 +279,11 @@ Java_sun_nio_ch_Net_socket0(JNIEnv *env, jclass cl, jboolean preferIPv6,
             JNU_ThrowByNameWithLastError(env,
                                          JNU_JAVANETPKG "SocketException",
                                          "Unable to set IPV6_V6ONLY");
+#ifdef USE_LIBAPTH
+            apth_io_close(fd);
+#else
             close(fd);
+#endif
             return -1;
         }
     }
@@ -283,7 +295,11 @@ Java_sun_nio_ch_Net_socket0(JNIEnv *env, jclass cl, jboolean preferIPv6,
             JNU_ThrowByNameWithLastError(env,
                                          JNU_JAVANETPKG "SocketException",
                                          "Unable to set SO_REUSEADDR");
+#ifdef USE_LIBAPTH
+            apth_io_close(fd);
+#else
             close(fd);
+#endif
             return -1;
         }
     }
@@ -297,7 +313,11 @@ Java_sun_nio_ch_Net_socket0(JNIEnv *env, jclass cl, jboolean preferIPv6,
             JNU_ThrowByNameWithLastError(env,
                                          JNU_JAVANETPKG "SocketException",
                                          "Unable to set IP_MULTICAST_ALL");
+#ifdef USE_LIBAPTH
+            apth_io_close(fd);
+#else
             close(fd);
+#endif
             return -1;
         }
     }
@@ -310,7 +330,11 @@ Java_sun_nio_ch_Net_socket0(JNIEnv *env, jclass cl, jboolean preferIPv6,
             JNU_ThrowByNameWithLastError(env,
                                          JNU_JAVANETPKG "SocketException",
                                          "Unable to set IPV6_MULTICAST_HOPS");
+#ifdef USE_LIBAPTH
+            apth_io_close(fd);
+#else
             close(fd);
+#endif
             return -1;
         }
     }
@@ -358,7 +382,11 @@ Java_sun_nio_ch_Net_bind0(JNIEnv *env, jclass clazz, jobject fdo, jboolean prefe
 JNIEXPORT void JNICALL
 Java_sun_nio_ch_Net_listen(JNIEnv *env, jclass cl, jobject fdo, jint backlog)
 {
+#ifdef USE_LIBAPTH
+    if (apth_io_listen(fdval(env, fdo), backlog) < 0)
+#else
     if (listen(fdval(env, fdo), backlog) < 0)
+#endif
         handleSocketError(env, errno);
 }
 
@@ -374,7 +402,11 @@ Java_sun_nio_ch_Net_connect0(JNIEnv *env, jclass clazz, jboolean preferIPv6,
         return IOS_THROWN;
     }
 
+#ifdef USE_LIBAPTH
+    rv = apth_io_connect(fdval(env, fdo), &sa.sa, sa_len);
+#else
     rv = connect(fdval(env, fdo), &sa.sa, sa_len);
+#endif
     if (rv != 0) {
         if (errno == EINPROGRESS) {
             return IOS_UNAVAILABLE;
@@ -400,7 +432,11 @@ Java_sun_nio_ch_Net_accept(JNIEnv *env, jclass clazz, jobject fdo, jobject newfd
 
     /* accept connection but ignore ECONNABORTED */
     for (;;) {
+#ifdef USE_LIBAPTH
+        newfd = apth_io_accept(fd, &sa.sa, &sa_len);
+#else
         newfd = accept(fd, &sa.sa, &sa_len);
+#endif
         if (newfd >= 0) {
             break;
         }
@@ -873,7 +909,11 @@ Java_sun_nio_ch_Net_poll(JNIEnv* env, jclass this, jobject fdo, jint events, jlo
     } else if (timeout > INT_MAX) {
         timeout = INT_MAX;
     }
+#ifdef USE_LIBAPTH
+    rv = apth_io_poll(&pfd, 1, (int)timeout);
+#else
     rv = poll(&pfd, 1, (int)timeout);
+#endif
 
     if (rv >= 0) {
         return pfd.revents;
@@ -902,7 +942,11 @@ Java_sun_nio_ch_Net_pollConnect(JNIEnv *env, jobject this, jobject fdo, jlong ti
         timeout = INT_MAX;
     }
 
+#ifdef USE_LIBAPTH
+    result = apth_io_poll(&poller, 1, (int)timeout);
+#else
     result = poll(&poller, 1, (int)timeout);
+#endif
 
     if (result > 0) {
         int error = 0;
@@ -968,7 +1012,11 @@ Java_sun_nio_ch_Net_pollconnValue(JNIEnv *env, jclass this)
 JNIEXPORT jint JNICALL
 Java_sun_nio_ch_Net_sendOOB(JNIEnv* env, jclass this, jobject fdo, jbyte b)
 {
+#ifdef USE_LIBAPTH
+    int n = apth_io_send(fdval(env, fdo), (const void*)&b, 1, MSG_OOB);
+#else
     int n = send(fdval(env, fdo), (const void*)&b, 1, MSG_OOB);
+#endif
     return convertReturnVal(env, n, JNI_FALSE);
 }
 

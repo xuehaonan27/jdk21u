@@ -27,6 +27,10 @@
 #include <string.h>
 #include <sys/resource.h>
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 #include "jni.h"
 #include "jni_util.h"
 #include "jvm.h"
@@ -89,7 +93,11 @@ Java_sun_nio_ch_IOUtil_makePipe(JNIEnv *env, jobject this, jboolean blocking)
 {
     int fd[2];
 
+#ifdef USE_LIBAPTH
+    if (apth_io_pipe(fd) < 0) {
+#else
     if (pipe(fd) < 0) {
+#endif
         JNU_ThrowIOExceptionWithLastError(env, "Pipe failed");
         return 0;
     }
@@ -97,8 +105,13 @@ Java_sun_nio_ch_IOUtil_makePipe(JNIEnv *env, jobject this, jboolean blocking)
         if ((configureBlocking(fd[0], JNI_FALSE) < 0)
             || (configureBlocking(fd[1], JNI_FALSE) < 0)) {
             JNU_ThrowIOExceptionWithLastError(env, "Configure blocking failed");
+#ifdef USE_LIBAPTH
+            apth_io_close(fd[0]);
+            apth_io_close(fd[1]);
+#else
             close(fd[0]);
             close(fd[1]);
+#endif
             return 0;
         }
     }
@@ -109,7 +122,11 @@ JNIEXPORT jint JNICALL
 Java_sun_nio_ch_IOUtil_write1(JNIEnv *env, jclass cl, jint fd, jbyte b)
 {
     char c = (char)b;
+#ifdef USE_LIBAPTH
+    return convertReturnVal(env, apth_io_write(fd, &c, 1), JNI_FALSE);
+#else
     return convertReturnVal(env, write(fd, &c, 1), JNI_FALSE);
+#endif
 }
 
 JNIEXPORT jboolean JNICALL

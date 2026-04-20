@@ -27,6 +27,10 @@
  #include <sys/uio.h>
  #include <unistd.h>
 
+ #ifdef USE_LIBAPTH
+ #include <apth_io.h>
+ #endif
+
  #include "jni.h"
  #include "jni_util.h"
  #include "jlong.h"
@@ -40,7 +44,11 @@
  {
      jint fd = fdval(env, fdo);
      void *buf = (void *)jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+     jint n = apth_io_read(fd, buf, len);
+#else
      jint n = read(fd, buf, len);
+#endif
      if ((n == -1) && (errno == ECONNRESET || errno == EPIPE)) {
          JNU_ThrowByName(env, "sun/net/ConnectionResetException", "Connection reset");
          return IOS_THROWN;
@@ -55,7 +63,11 @@
  {
      jint fd = fdval(env, fdo);
      struct iovec *iov = (struct iovec *)jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+     jlong n = apth_io_readv(fd, iov, len);
+#else
      jlong n = readv(fd, iov, len);
+#endif
      if ((n == -1) && (errno == ECONNRESET || errno == EPIPE)) {
          JNU_ThrowByName(env, "sun/net/ConnectionResetException", "Connection reset");
          return IOS_THROWN;
@@ -71,7 +83,11 @@ Java_sun_nio_ch_SocketDispatcher_write0(JNIEnv *env, jclass clazz,
     jint fd = fdval(env, fdo);
     void *buf = (void *)jlong_to_ptr(address);
 
+#ifdef USE_LIBAPTH
+    return convertReturnVal(env, apth_io_write(fd, buf, len), JNI_FALSE);
+#else
     return convertReturnVal(env, write(fd, buf, len), JNI_FALSE);
+#endif
 }
 
 JNIEXPORT jlong JNICALL
@@ -80,5 +96,9 @@ Java_sun_nio_ch_SocketDispatcher_writev0(JNIEnv *env, jclass clazz,
 {
     jint fd = fdval(env, fdo);
     struct iovec *iov = (struct iovec *)jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+    return convertLongReturnVal(env, apth_io_writev(fd, iov, len), JNI_FALSE);
+#else
     return convertLongReturnVal(env, writev(fd, iov, len), JNI_FALSE);
+#endif
 }

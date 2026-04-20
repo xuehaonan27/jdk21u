@@ -29,6 +29,10 @@
 #include <string.h>
 #include <limits.h>
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 #include "jni.h"
 #include "jni_util.h"
 #include "jvm.h"
@@ -43,7 +47,11 @@ Java_sun_nio_ch_DatagramDispatcher_read0(JNIEnv *env, jclass clazz,
 {
     jint fd = fdval(env, fdo);
     void *buf = (void *)jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+    int result = apth_io_recv(fd, buf, len, 0);
+#else
     int result = recv(fd, buf, len, 0);
+#endif
     if (result < 0 && errno == ECONNREFUSED) {
         JNU_ThrowByName(env, JNU_JAVANETPKG "PortUnreachableException", 0);
         return IOS_THROWN;
@@ -69,7 +77,11 @@ Java_sun_nio_ch_DatagramDispatcher_readv0(JNIEnv *env, jclass clazz,
     m.msg_iov = iov;
     m.msg_iovlen = len;
 
+#ifdef USE_LIBAPTH
+    result = apth_io_recvmsg(fd, &m, 0);
+#else
     result = recvmsg(fd, &m, 0);
+#endif
     if (result < 0 && errno == ECONNREFUSED) {
         JNU_ThrowByName(env, JNU_JAVANETPKG "PortUnreachableException", 0);
         return IOS_THROWN;
@@ -83,7 +95,11 @@ Java_sun_nio_ch_DatagramDispatcher_write0(JNIEnv *env, jclass clazz,
 {
     jint fd = fdval(env, fdo);
     void *buf = (void *)jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+    int result = apth_io_send(fd, buf, len, 0);
+#else
     int result = send(fd, buf, len, 0);
+#endif
     if (result < 0 && errno == ECONNREFUSED) {
         JNU_ThrowByName(env, JNU_JAVANETPKG "PortUnreachableException", 0);
         return IOS_THROWN;
@@ -108,7 +124,11 @@ Java_sun_nio_ch_DatagramDispatcher_writev0(JNIEnv *env, jclass clazz,
     m.msg_iov = iov;
     m.msg_iovlen = len;
 
+#ifdef USE_LIBAPTH
+    result = apth_io_sendmsg(fd, &m, 0);
+#else
     result = sendmsg(fd, &m, 0);
+#endif
     if (result < 0 && errno == ECONNREFUSED) {
         JNU_ThrowByName(env, JNU_JAVANETPKG "PortUnreachableException", 0);
         return IOS_THROWN;
@@ -120,7 +140,11 @@ JNIEXPORT void JNICALL
 Java_sun_nio_ch_DatagramDispatcher_dup0(JNIEnv* env, jclass clazz,
     jobject fdo1, jobject fdo2)
 {
+#ifdef USE_LIBAPTH
+    if (apth_io_dup2(fdval(env, fdo1), fdval(env, fdo2)) < 0) {
+#else
     if (dup2(fdval(env, fdo1), fdval(env, fdo2)) < 0) {
+#endif
         JNU_ThrowIOExceptionWithLastError(env, "dup2 failed");
     }
 }

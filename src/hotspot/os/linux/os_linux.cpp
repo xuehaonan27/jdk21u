@@ -124,6 +124,38 @@
 
 #ifdef USE_LIBAPTH
 #include <apth.h>
+#include <apth_io.h>
+
+// Key for storing the saved JavaThreadState in apth-specific TLS when an
+// M:N thread yields.  Created in os::init(), used by yield hooks below.
+static apth_key_t apth_jvm_state_key;
+
+// Pre-yield hook: called by the LIBAPTH scheduler AFTER a thread yields
+// (ctx_switch returns) but BEFORE SET_CUR_APTH(NULL).
+// Saves the current JavaThreadState and transitions to _thread_blocked
+// so the safepoint mechanism considers this thread safe.
+extern "C" void apth_pre_yield_hook_fn(apth_t th, void *arg) {
+  (void)th;
+  JavaThread *jt = (JavaThread *)arg;
+  JavaThreadState saved = jt->thread_state();
+  apth_setspecific(apth_jvm_state_key, (void *)(intptr_t)saved);
+  // Transition to _thread_blocked — safepoint_safe_with() at safepoint.cpp
+  // considers _thread_blocked unconditionally safe.
+  jt->set_thread_state(_thread_blocked);
+  OrderAccess::fence();
+}
+
+// Post-resume hook: called by the LIBAPTH scheduler AFTER SET_CUR_APTH(th)
+// but BEFORE the thread resumes execution via ctx_switch.
+// Restores the saved JavaThreadState.  The thread will process any pending
+// safepoint requests when it naturally hits a transition/poll point.
+extern "C" void apth_post_resume_hook_fn(apth_t th, void *arg) {
+  (void)th;
+  JavaThread *jt = (JavaThread *)arg;
+  JavaThreadState saved = (JavaThreadState)(intptr_t)apth_getspecific(apth_jvm_state_key);
+  OrderAccess::fence();
+  jt->set_thread_state(saved);
+}
 #endif
 
 #ifndef _GNU_SOURCE
@@ -808,12 +840,35 @@ static void *thread_native_entry(Thread *thread) {
   assert(osthread->pthread_id() != 0, "pthread_id was not set as expected");
 #endif
 
+#ifdef USE_LIBAPTH
+  // Register yield hooks for M:N JavaThreads so the LIBAPTH scheduler
+  // transitions the thread to _thread_blocked before parking it, making
+  // it invisible to the HotSpot safepoint mechanism.
+  apth_t my_apth = osthread->apth_id();
+  if (thread->is_Java_thread() &&
+      os::Linux::apth_class_for((os::ThreadType)osthread->thread_type()) != APTH_CLASS_DEDICATED) {
+    apth_set_yield_hooks(my_apth,
+                         apth_pre_yield_hook_fn,
+                         apth_post_resume_hook_fn,
+                         (void *)thread);
+    log_info(os, thread)("Registered M:N yield hooks for JavaThread " PTR_FORMAT, p2i(thread));
+  }
+#endif
+
   if (DelayThreadStartALot) {
     os::naked_short_sleep(100);
   }
 
   // call one more level start routine
   thread->call_run();
+
+#ifdef USE_LIBAPTH
+  // Clear yield hooks before the thread exits — the JavaThread* passed as
+  // yield_hook_arg may be freed after call_run() returns.
+  if (my_apth != nullptr) {
+    apth_set_yield_hooks(my_apth, nullptr, nullptr, nullptr);
+  }
+#endif
 
   // Note: at this point the thread object may already have deleted itself.
   // Prevent dereferencing it from here on out.
@@ -931,15 +986,11 @@ static void init_adjust_stacksize_for_guard_pages() {
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
   switch (thr_type) {
-  // ALL threads DEDICATED with LD_PRELOAD: hooks still intercept I/O for
-  // non-blocking behavior, but threads are 1:1 pthreads (no M:N scheduling).
-  // M:N (IO_BOUND) mutators hang during JVM startup — needs deeper
-  // investigation of LIBAPTH scheduler + HotSpot safepoint interaction.
-  // TODO: fix M:N + safepoint interaction for RDMA latency hiding.
-  case os::java_thread:     return APTH_CLASS_DEDICATED;
-  // GC/compiler/service threads: DEDICATED (1:1 pthread, no scheduling overhead)
-  case os::gc_thread:       return APTH_CLASS_DEDICATED;
+  case os::java_thread:     return APTH_CLASS_IO_BOUND;
+  case os::gc_thread:       return APTH_CLASS_DISTRIBUTED;
   case os::compiler_thread: return APTH_CLASS_DEDICATED;
+  case os::vm_thread:       return APTH_CLASS_DEDICATED;
+  case os::watcher_thread:  return APTH_CLASS_DEDICATED;
   default:                  return APTH_CLASS_DEDICATED;
   }
 }
@@ -4653,6 +4704,15 @@ void os::init(void) {
   FLAG_SET_DEFAULT(UseMadvPopulateWrite, (::madvise(0, 0, MADV_POPULATE_WRITE) == 0));
 
   os::Posix::init();
+
+#ifdef USE_LIBAPTH
+  // Create the apth-specific key used by yield hooks to save/restore
+  // the JavaThreadState across M:N cooperative yields.
+  int key_ret = apth_key_create(&apth_jvm_state_key, nullptr);
+  if (key_ret != 0) {
+    fatal("os_linux.cpp: os::init: apth_key_create failed (%s)", os::strerror(key_ret));
+  }
+#endif
 }
 
 // To install functions for atexit system call

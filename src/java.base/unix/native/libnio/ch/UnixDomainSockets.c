@@ -41,6 +41,10 @@
 #include "nio_util.h"
 #include "nio.h"
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 /* Subtle platform differences in how unnamed sockets (empty path)
  * are returned from getsockname()
  */
@@ -103,7 +107,11 @@ Java_sun_nio_ch_UnixDomainSockets_init(JNIEnv *env, jclass cl)
 JNIEXPORT jint JNICALL
 Java_sun_nio_ch_UnixDomainSockets_socket0(JNIEnv *env, jclass cl)
 {
+#ifdef USE_LIBAPTH
+    int fd = apth_io_socket(PF_UNIX, SOCK_STREAM, 0);
+#else
     int fd = socket(PF_UNIX, SOCK_STREAM, 0);
+#endif
     if (fd < 0) {
         return handleSocketError(env, errno);
     }
@@ -137,7 +145,11 @@ Java_sun_nio_ch_UnixDomainSockets_connect0(JNIEnv *env, jclass clazz, jobject fd
         return IOS_THROWN;
     }
 
+#ifdef USE_LIBAPTH
+    rv = apth_io_connect(fdval(env, fdo), (struct sockaddr *)&sa, sa_len);
+#else
     rv = connect(fdval(env, fdo), (struct sockaddr *)&sa, sa_len);
+#endif
     if (rv != 0) {
         if (errno == EINPROGRESS) {
             return IOS_UNAVAILABLE;
@@ -159,7 +171,11 @@ Java_sun_nio_ch_UnixDomainSockets_accept0(JNIEnv *env, jclass clazz, jobject fdo
     socklen_t sa_len = sizeof(struct sockaddr_un);
     jbyteArray address;
 
+#ifdef USE_LIBAPTH
+    newfd = apth_io_accept(fd, (struct sockaddr *)&sa, &sa_len);
+#else
     newfd = accept(fd, (struct sockaddr *)&sa, &sa_len);
+#endif
     if (newfd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return IOS_UNAVAILABLE;

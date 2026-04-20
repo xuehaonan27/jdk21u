@@ -41,6 +41,10 @@
 #include "nio.h"
 #include "nio_util.h"
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 #include "sun_nio_ch_DatagramChannelImpl.h"
 
 JNIEXPORT void JNICALL
@@ -63,7 +67,11 @@ Java_sun_nio_ch_DatagramChannelImpl_disconnect0(JNIEnv *env, jclass clazz,
     #endif
     socklen_t len = isIPv6 ? sizeof(struct sockaddr_in6) :
                              sizeof(struct sockaddr_in);
+#ifdef USE_LIBAPTH
+    rv = apth_io_connect(fd, &sa.sa, len);
+#else
     rv = connect(fd, &sa.sa, len);
+#endif
 #endif
 
 #if defined(_ALLBSD_SOURCE) && !defined(__APPLE__)
@@ -106,7 +114,11 @@ Java_sun_nio_ch_DatagramChannelImpl_receive0(JNIEnv *env, jclass clazz,
 
     do {
         retry = JNI_FALSE;
+#ifdef USE_LIBAPTH
+        n = apth_io_recvfrom(fd, buf, len, 0, (struct sockaddr *)sa, &sa_len);
+#else
         n = recvfrom(fd, buf, len, 0, (struct sockaddr *)sa, &sa_len);
+#endif
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return IOS_UNAVAILABLE;
@@ -145,7 +157,11 @@ Java_sun_nio_ch_DatagramChannelImpl_send0(JNIEnv *env, jclass clazz,
         len = MAX_PACKET_LEN;
     }
 
+#ifdef USE_LIBAPTH
+    n = apth_io_sendto(fd, buf, len, 0, (struct sockaddr *)sa, sa_len);
+#else
     n = sendto(fd, buf, len, 0, (struct sockaddr *)sa, sa_len);
+#endif
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return IOS_UNAVAILABLE;

@@ -25,6 +25,10 @@
 
 #include <poll.h>
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 #include "jni.h"
 #include "jni_util.h"
 #include "jvm.h"
@@ -41,7 +45,11 @@ Java_sun_nio_ch_PollSelectorImpl_poll(JNIEnv *env, jclass clazz,
     int res;
 
     a = (struct pollfd *) jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+    res = apth_io_poll(a, numfds, timeout);
+#else
     res = poll(a, numfds, timeout);
+#endif
     if (res < 0) {
         if (errno == EINTR) {
             return IOS_INTERRUPTED;
