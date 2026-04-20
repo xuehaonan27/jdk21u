@@ -1642,14 +1642,19 @@ void PosixSignals::hotspot_sigmask(Thread* thread) {
   }
 
 #ifdef USE_LIBAPTH
-  // LIBAPTH owns SIGPROF for preemption timers. DEDICATED threads must
-  // keep SIGPROF blocked. hotspot_sigmask may have unblocked it above
-  // via unblocked_signals(). Re-block it here.
+  // LIBAPTH owns SIGPROF for preemption timers on M:N workers.
+  // DEDICATED threads must keep SIGPROF blocked (they bypass the scheduler).
+  // M:N threads must NOT block SIGPROF — it's their preemption signal.
   {
-    sigset_t sigprof_set;
-    sigemptyset(&sigprof_set);
-    sigaddset(&sigprof_set, SIGPROF);
-    apth_sigmask(SIG_BLOCK, &sigprof_set, nullptr);
+    OSThread* ost = thread->osthread();
+    bool is_dedicated = (ost == nullptr) ||
+        (os::Linux::apth_class_for((os::ThreadType)ost->thread_type()) == APTH_CLASS_DEDICATED);
+    if (is_dedicated) {
+      sigset_t sigprof_set;
+      sigemptyset(&sigprof_set);
+      sigaddset(&sigprof_set, SIGPROF);
+      apth_sigmask(SIG_BLOCK, &sigprof_set, nullptr);
+    }
   }
 #endif
 }

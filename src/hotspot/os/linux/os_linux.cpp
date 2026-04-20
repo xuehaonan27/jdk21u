@@ -138,9 +138,8 @@ extern "C" void apth_pre_yield_hook_fn(apth_t th, void *arg) {
   (void)th;
   JavaThread *jt = (JavaThread *)arg;
   JavaThreadState saved = jt->thread_state();
+  fprintf(stderr, "[APTH-HOOK] pre_yield: jt=%p state=%d -> _thread_blocked\n", (void*)jt, (int)saved);
   apth_setspecific(apth_jvm_state_key, (void *)(intptr_t)saved);
-  // Transition to _thread_blocked — safepoint_safe_with() at safepoint.cpp
-  // considers _thread_blocked unconditionally safe.
   jt->set_thread_state(_thread_blocked);
   OrderAccess::fence();
 }
@@ -152,7 +151,13 @@ extern "C" void apth_pre_yield_hook_fn(apth_t th, void *arg) {
 extern "C" void apth_post_resume_hook_fn(apth_t th, void *arg) {
   (void)th;
   JavaThread *jt = (JavaThread *)arg;
-  JavaThreadState saved = (JavaThreadState)(intptr_t)apth_getspecific(apth_jvm_state_key);
+  void *raw = apth_getspecific(apth_jvm_state_key);
+  if (raw == nullptr) {
+    fprintf(stderr, "[APTH-HOOK] post_resume: jt=%p SKIP (no saved state)\n", (void*)jt);
+    return;
+  }
+  JavaThreadState saved = (JavaThreadState)(intptr_t)raw;
+  fprintf(stderr, "[APTH-HOOK] post_resume: jt=%p state=%d\n", (void*)jt, (int)saved);
   OrderAccess::fence();
   jt->set_thread_state(saved);
 }
@@ -768,8 +773,16 @@ bool os::Linux::manually_expand_stack(JavaThread * t, address addr) {
 
 // Thread start routine for all newly created threads
 static void *thread_native_entry(Thread *thread) {
+#ifdef USE_LIBAPTH
+  fprintf(stderr, "[APTH-ENTRY] thread=%p apth=%p is_java=%d\n",
+          (void*)thread, (void*)apth_self(), thread->is_Java_thread());
+#endif
 
   thread->record_stack_base_and_size();
+#ifdef USE_LIBAPTH
+  fprintf(stderr, "[APTH-ENTRY] thread=%p stack_base=%p stack_size=%zu\n",
+          (void*)thread, (void*)thread->stack_base(), thread->stack_size());
+#endif
 
 #ifndef __GLIBC__
   // Try to randomize the cache line index of hot stack frames.
@@ -788,6 +801,10 @@ static void *thread_native_entry(Thread *thread) {
 #endif
 
   thread->initialize_thread_current();
+#ifdef USE_LIBAPTH
+  fprintf(stderr, "[APTH-ENTRY] thread=%p initialize_thread_current done, Thread::current=%p\n",
+          (void*)thread, (void*)Thread::current_or_null());
+#endif
 
   OSThread* osthread = thread->osthread();
   Monitor* sync = osthread->startThread_lock();
@@ -799,6 +816,8 @@ static void *thread_native_entry(Thread *thread) {
   // For DEDICATED threads, this is the real backing pthread.
   // For M:N threads, this is the worker pthread (shared, used for logging only).
   osthread->set_pthread_id(apth_func_raw(pthread_self)());
+  fprintf(stderr, "[APTH-ENTRY] thread=%p tid=%d about to enter handshake\n",
+          (void*)thread, (int)os::current_thread_id());
 #endif
 
   if (UseNUMA) {
@@ -845,13 +864,16 @@ static void *thread_native_entry(Thread *thread) {
   // transitions the thread to _thread_blocked before parking it, making
   // it invisible to the HotSpot safepoint mechanism.
   apth_t my_apth = osthread->apth_id();
-  if (thread->is_Java_thread() &&
-      os::Linux::apth_class_for((os::ThreadType)osthread->thread_type()) != APTH_CLASS_DEDICATED) {
+  int thr_class = os::Linux::apth_class_for((os::ThreadType)osthread->thread_type());
+  fprintf(stderr, "[APTH-ENTRY] thread=%p apth=%p thr_type=%d class=%d is_java=%d handshake done\n",
+          (void*)thread, (void*)my_apth, osthread->thread_type(), thr_class,
+          thread->is_Java_thread());
+  if (thread->is_Java_thread() && thr_class != APTH_CLASS_DEDICATED) {
     apth_set_yield_hooks(my_apth,
                          apth_pre_yield_hook_fn,
                          apth_post_resume_hook_fn,
                          (void *)thread);
-    log_info(os, thread)("Registered M:N yield hooks for JavaThread " PTR_FORMAT, p2i(thread));
+    fprintf(stderr, "[APTH-ENTRY] thread=%p hooks registered\n", (void*)thread);
   }
 #endif
 
@@ -1018,6 +1040,9 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
   {
     // Calculate stack size if it's not specified by caller.
     size_t stack_size = os::Posix::get_initial_stack_size(thr_type, req_stack_size);
+    int apth_cls = os::Linux::apth_class_for(thr_type);
+    fprintf(stderr, "[APTH-CREATE] thread=%p thr_type=%d apth_class=%d stack=%zu\n",
+            (void*)thread, (int)thr_type, apth_cls, stack_size);
 
     apth_t tid;
     apth_attr_t apth_attr;
