@@ -23,6 +23,9 @@
  */
 
 #include "precompiled.hpp"
+#ifdef USE_LIBAPTH
+#include <apth.h>
+#endif
 #include "classfile/classLoaderDataGraph.hpp"
 #include "classfile/stringTable.hpp"
 #include "classfile/symbolTable.hpp"
@@ -387,6 +390,14 @@ void SafepointSynchronize::begin() {
   EventSafepointStateSynchronization sync_event;
   int initial_running = 0;
 
+#ifdef USE_LIBAPTH
+  // Pause M:N mutator dispatch before arming safepoint polls.
+  // Yielded mutators stay parked in their scheduler's ready queue.
+  // Prefer GC threads (DISTRIBUTED) during STW for maximum throughput.
+  apth_pause_class(APTH_CLASS_IO_BOUND);
+  apth_set_preferred_class(APTH_CLASS_DISTRIBUTED);
+#endif
+
   // Arms the safepoint, _current_jni_active_count and _waiting_to_block must be set before.
   arm_safepoint();
 
@@ -506,6 +517,13 @@ void SafepointSynchronize::end() {
   assert(Thread::current()->is_VM_thread(), "Only VM thread can execute a safepoint");
 
   disarm_safepoint();
+
+#ifdef USE_LIBAPTH
+  // Resume M:N mutator dispatch after safepoint is fully disarmed.
+  // Clear GC-thread preference — return to normal FIFO dispatch.
+  apth_set_preferred_class(-1);
+  apth_resume_class(APTH_CLASS_IO_BOUND);
+#endif
 
   Universe::heap()->safepoint_synchronize_end();
 
