@@ -391,10 +391,9 @@ void SafepointSynchronize::begin() {
   int initial_running = 0;
 
 #ifdef USE_LIBAPTH
-  // Pause M:N mutator dispatch before arming safepoint polls.
-  // Yielded mutators stay parked in their scheduler's ready queue.
   // Prefer GC threads (DISTRIBUTED) during STW for maximum throughput.
-  apth_pause_class(APTH_CLASS_IO_BOUND);
+  // NOTE: we do NOT call apth_pause_class() — pausing dispatch prevents M:N
+  // threads from reaching block() where they yield cooperatively.
   apth_set_preferred_class(APTH_CLASS_DISTRIBUTED);
 #endif
 
@@ -497,6 +496,14 @@ void SafepointSynchronize::disarm_safepoint() {
       assert(!cur_state->is_running(), "Thread not suspended at safepoint");
       cur_state->restart(); // TSS _running
       assert(cur_state->is_running(), "safepoint state has not been reset");
+
+#ifdef USE_LIBAPTH
+      // Allow M:N threads to be re-dispatched now that polls are disarmed.
+      apth_t aid = current->osthread()->apth_id();
+      if (!apth_is_dedicated(aid)) {
+        apth_allow_dispatch(aid);
+      }
+#endif
     }
   } // ~JavaThreadIteratorWithHandle
 
@@ -519,10 +526,7 @@ void SafepointSynchronize::end() {
   disarm_safepoint();
 
 #ifdef USE_LIBAPTH
-  // Resume M:N mutator dispatch after safepoint is fully disarmed.
-  // Clear GC-thread preference — return to normal FIFO dispatch.
   apth_set_preferred_class(-1);
-  apth_resume_class(APTH_CLASS_IO_BOUND);
 #endif
 
   Universe::heap()->safepoint_synchronize_end();
@@ -766,6 +770,30 @@ void SafepointSynchronize::block(JavaThread *thread) {
   OrderAccess::storestore();
   // Load in wait barrier should not float up
   thread->set_thread_state_fence(_thread_blocked);
+
+#ifdef USE_LIBAPTH
+  {
+    apth_t aid = thread->osthread()->apth_id();
+    if (!apth_is_dedicated(aid)) {
+      // M:N thread: yield to scheduler instead of blocking the worker pthread.
+      // State is _thread_blocked — synchronize_threads() counts us as safe.
+      // dispatch_prevented keeps us out of dispatch until disarm_safepoint()
+      // clears it, preventing recursive block() via post_resume_hook.
+      apth_prevent_dispatch(aid);
+      apth_yield();
+      // Resumed here after disarm_safepoint() cleared dispatch_prevented.
+
+      OrderAccess::loadstore();
+      thread->set_thread_state(state);
+      thread->safepoint_state()->reset_safepoint_id();
+      OrderAccess::fence();
+
+      guarantee(thread->safepoint_state()->get_safepoint_id() == InactiveSafepointCounter,
+                "The safepoint id should be set only in block path");
+      return;
+    }
+  }
+#endif
 
   _wait_barrier->wait(static_cast<int>(safepoint_id));
   assert(_state != _synchronized, "Can't be");
