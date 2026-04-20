@@ -59,7 +59,6 @@ class os::Linux {
   static pthread_t _main_thread;
 #ifdef USE_LIBAPTH
   static apth_t _main_apth;
-  static int apth_class_for(os::ThreadType thr_type);
 #endif
 
   static julong available_memory();
@@ -106,6 +105,9 @@ class os::Linux {
   static void print_uptime_info(outputStream* st);
 
  public:
+#ifdef USE_LIBAPTH
+  static int apth_class_for(os::ThreadType thr_type);
+#endif
   struct CPUPerfTicks {
     uint64_t used;
     uint64_t usedKernel;
