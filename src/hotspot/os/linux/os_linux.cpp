@@ -56,6 +56,7 @@
 #include "runtime/osInfo.hpp"
 #include "runtime/osThread.hpp"
 #include "runtime/perfMemory.hpp"
+#include "runtime/safepointMechanism.hpp"
 #include "runtime/sharedRuntime.hpp"
 #include "runtime/statSampler.hpp"
 #include "runtime/stubRoutines.hpp"
@@ -155,6 +156,17 @@ extern "C" void apth_post_resume_hook_fn(apth_t th, void *arg) {
   JavaThreadState saved = (JavaThreadState)(intptr_t)raw;
   OrderAccess::fence();
   jt->set_thread_state(saved);
+}
+
+// Yield-resume callback: called on the THREAD's own stack immediately after
+// ctx_switch returns (thread resumed).  Checks for pending safepoint requests
+// so that M:N threads respond to safepoints promptly after being rescheduled.
+extern "C" void apth_yield_resume_callback_fn(apth_t th, void *arg) {
+  (void)th;
+  JavaThread *jt = (JavaThread *)arg;
+  if (SafepointMechanism::should_process(jt)) {
+    SafepointMechanism::process_if_requested(jt);
+  }
 }
 #endif
 
@@ -851,6 +863,9 @@ static void *thread_native_entry(Thread *thread) {
                          apth_pre_yield_hook_fn,
                          apth_post_resume_hook_fn,
                          (void *)thread);
+    apth_set_yield_resume_callback(my_apth,
+                                   apth_yield_resume_callback_fn,
+                                   (void *)thread);
     log_info(os, thread)("Registered M:N yield hooks for JavaThread " PTR_FORMAT, p2i(thread));
   }
 #endif
@@ -867,6 +882,7 @@ static void *thread_native_entry(Thread *thread) {
   // yield_hook_arg may be freed after call_run() returns.
   if (my_apth != nullptr) {
     apth_set_yield_hooks(my_apth, nullptr, nullptr, nullptr);
+    apth_set_yield_resume_callback(my_apth, nullptr, nullptr);
   }
 #endif
 
