@@ -71,7 +71,11 @@ if [[ "$ACTION" == "build" || "$ACTION" == "buildtest" ]]; then
     # Build LIBAPTH
     if [[ "$USE_LIBAPTH" == "1" ]]; then
         echo "=== Building LIBAPTH ==="
-        cd "$LIBAPTH_DIR" && make clean && make all && make core || exit 1
+        LIBAPTH_EXTRA=""
+        if [[ "$REMOTE_BACKEND" == "RDMA" ]]; then
+            LIBAPTH_EXTRA="-DAPTH_USE_RDMA"
+        fi
+        cd "$LIBAPTH_DIR" && make clean && EXTRA_CFLAGS="$LIBAPTH_EXTRA" make all && EXTRA_CFLAGS="$LIBAPTH_EXTRA" make core || exit 1
     fi
 
     # Configure JDK
