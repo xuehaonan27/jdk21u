@@ -165,7 +165,7 @@ extern "C" void apth_yield_resume_callback_fn(apth_t th, void *arg) {
   (void)th;
   JavaThread *jt = (JavaThread *)arg;
   if (SafepointMechanism::should_process(jt)) {
-    SafepointMechanism::process_if_requested(jt);
+    SafepointMechanism::process_if_requested(jt, true, true);
   }
 }
 #endif
