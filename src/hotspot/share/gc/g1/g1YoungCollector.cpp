@@ -1122,9 +1122,33 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     }
 
     int total_candidates = path1_candidates + path2_candidates;
+
+    // ---- Phase D (early): Root-pin check BEFORE expensive heap scan ----
+    // At lr=25 the full heap scan triggers massive kernel paging (20-80s).
+    // Most candidates end up root-pinned. Check first, skip scan if all pinned.
+    if (total_candidates > 0 && path2_candidates > 0) {
+      ColdRegionPinClosure pin_cl(_g1h);
+      Threads::oops_do(&pin_cl, nullptr);
+      JNIHandles::oops_do(&pin_cl);
+      OopStorageSet::strong_oops_do(&pin_cl);
+      rmm->oops_do_remote_anchors(&pin_cl);
+
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        HeapRegion* hr = _g1h->region_at(i);
+        if (hr->is_root_pinned()) {
+          hr->clear_cold_destination();
+          hr->clear_root_pinned();
+          eviction_candidates[i] = false;
+          regions_pinned++;
+          total_candidates--;
+        }
+      }
+    }
+
     if (total_candidates > 0) {
-      log_info(gc)("Eviction candidates: %d path1 + %d path2 = %d regions",
-                   path1_candidates, path2_candidates, total_candidates);
+      log_info(gc)("Eviction candidates: %d path1 + %d path2 = %d surviving (%d pinned early)",
+                   path1_candidates, path2_candidates, total_candidates, regions_pinned);
 
       // ---- Phase B: Ensure handles for all objects in candidate regions ----
       for (uint i = 0; i < num_regions; i++) {
@@ -1139,34 +1163,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
 
       // ---- Phase C: Full heap scan — tag ALL refs to candidates ----
-      // Walks every non-candidate region and tags oop fields pointing
-      // to candidate regions with shared_oop(handle). This replaces the
-      // per-region remset-only scan which missed unrefined dirty cards.
       rmm->tag_all_heap_refs_to_eviction_set(eviction_candidates, num_regions);
-
-      // ---- Phase D: Root-pin candidates with root refs ----
-      // Re-scan roots for Path 2 candidates (Path 1 was pinned at Step 2).
-      if (path2_candidates > 0) {
-        ColdRegionPinClosure pin_cl(_g1h);
-        Threads::oops_do(&pin_cl, nullptr);
-        JNIHandles::oops_do(&pin_cl);
-        OopStorageSet::strong_oops_do(&pin_cl);
-        rmm->oops_do_remote_anchors(&pin_cl);
-      }
 
       // ---- Phase E: Evict non-pinned candidates ----
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at(i);
-
-        if (hr->is_root_pinned()) {
-          hr->clear_cold_destination();
-          hr->clear_root_pinned();
-          eviction_candidates[i] = false;
-          regions_pinned++;
-          log_debug(gc)("Region %u pinned by roots — kept local", hr->hrm_index());
-          continue;
-        }
 
         size_t region_used = hr->used();
         HeapWord* p = hr->bottom();
