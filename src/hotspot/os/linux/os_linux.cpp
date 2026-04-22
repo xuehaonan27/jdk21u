@@ -164,12 +164,15 @@ extern "C" void apth_post_resume_hook_fn(apth_t th, void *arg) {
 extern "C" void apth_yield_resume_callback_fn(apth_t th, void *arg) {
   (void)th;
   JavaThread *jt = (JavaThread *)arg;
-  if (SafepointMechanism::should_process(jt)) {
-    JavaThreadState saved = jt->thread_state();
+  // Only process safepoints when the thread was in _thread_in_Java.
+  // If it was in _thread_in_vm (e.g. inside SafepointSynchronize::block()),
+  // re-entering process_if_requested causes a dispatch-yield livelock.
+  if (jt->thread_state() == _thread_in_Java &&
+      SafepointMechanism::should_process(jt)) {
     jt->set_thread_state(_thread_in_vm);
     OrderAccess::fence();
     SafepointMechanism::process_if_requested(jt, true, true);
-    jt->set_thread_state(saved);
+    jt->set_thread_state(_thread_in_Java);
     OrderAccess::fence();
   }
 }
