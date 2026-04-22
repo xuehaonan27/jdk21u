@@ -1010,8 +1010,8 @@ static void init_adjust_stacksize_for_guard_pages() {
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
   switch (thr_type) {
-  case os::java_thread:     return APTH_CLASS_IO_BOUND;
-  case os::gc_thread:       return APTH_CLASS_DISTRIBUTED;
+  case os::java_thread:     return APTH_CLASS_DEDICATED;
+  case os::gc_thread:       return APTH_CLASS_DEDICATED;
   case os::compiler_thread: return APTH_CLASS_DEDICATED;
   case os::vm_thread:       return APTH_CLASS_DEDICATED;
   case os::watcher_thread:  return APTH_CLASS_DEDICATED;
