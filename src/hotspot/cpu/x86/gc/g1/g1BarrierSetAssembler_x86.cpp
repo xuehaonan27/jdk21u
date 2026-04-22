@@ -252,8 +252,12 @@ void G1BarrierSetAssembler::copy_load_at(MacroAssembler* masm, DecoratorSet deco
     __ movptr(rbx, rax);   // rbx = still-tagged (callee-saved)
     __ pop_call_clobbered_registers(false);
     __ set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
+    // After pop, only push(rbx) remains (8 bytes). Pad RSP so the call
+    // enters the callee with RSP = 8 mod 16 per x86-64 ABI.
+    __ subptr(rsp, wordSize);
     __ movptr(c_rarg0, rbx);           // tagged oop (single arg)
     __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
+    __ addptr(rsp, wordSize);
     __ reset_last_Java_frame(r15_thread, false);
     __ movptr(dst, rax);
     __ pop(rbx);
