@@ -636,6 +636,12 @@ public:
   // replace them with shared_oop(handle). Called during STW.
   void tag_incoming_refs_to_region(HeapRegion* target_hr);
 
+  // Full heap scan: tag ALL heap refs pointing to any region in the
+  // eviction set. eviction_set[i]==true means region i is a candidate.
+  // More expensive than remset-based scan but catches dirty cards not
+  // yet refined and other remset gaps. Returns total refs tagged.
+  int tag_all_heap_refs_to_eviction_set(const bool* eviction_set, uint num_regions);
+
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
   // For each edge entry:

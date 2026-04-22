@@ -470,6 +470,72 @@ void G1RemoteMemoryManager::tag_incoming_refs_to_region(HeapRegion* target_hr) {
   }
 }
 
+// Full heap scan: tag ALL heap refs pointing to any eviction candidate.
+// Walks every non-candidate, non-empty region and checks each oop field.
+// O(live_heap) but runs during STW and catches refs that remset misses
+// (dirty cards not yet refined, post-evacuation card dirtying, etc.).
+int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
+    const bool* eviction_set, uint num_regions) {
+
+  class EvictionSetTagClosure : public BasicOopIterateClosure {
+    G1RemoteMemoryManager* _rmm;
+    G1CollectedHeap*       _g1h;
+    const bool*            _eviction_set;
+    uint                   _num_regions;
+    int                    _tagged;
+  public:
+    EvictionSetTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
+                          const bool* eset, uint nregions)
+      : _rmm(rmm), _g1h(g1h), _eviction_set(eset),
+        _num_regions(nregions), _tagged(0) {}
+
+    virtual void do_oop(oop* p) {
+      uintptr_t raw = *(uintptr_t*)p;
+      if (raw == 0) return;
+      if ((raw >> 63) != 0) return; // already tagged
+
+      oop target = cast_to_oop(raw);
+      if (!_g1h->is_in(target)) return;
+
+      HeapRegion* target_hr = _g1h->heap_region_containing(target);
+      uint idx = target_hr->hrm_index();
+      if (idx >= _num_regions || !_eviction_set[idx]) return;
+
+      RemoteHandle* h = _rmm->handle_for(target);
+      if (h != nullptr) {
+        *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+        _tagged++;
+      }
+    }
+
+    virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+
+    int tagged() const { return _tagged; }
+  };
+
+  EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
+
+  for (uint i = 0; i < _g1h->num_regions(); i++) {
+    if (i < num_regions && eviction_set[i]) continue; // skip eviction candidates
+    HeapRegion* hr = _g1h->region_at(i);
+    if (hr->is_empty() || hr->is_free()) continue;
+
+    HeapWord* p = hr->bottom();
+    while (p < hr->top()) {
+      oop obj = cast_to_oop(p);
+      size_t sz = obj->size();
+      if (sz == 0) break; // unparseable
+      obj->oop_iterate(&cl);
+      p += sz;
+    }
+  }
+
+  if (cl.tagged() > 0) {
+    log_info(gc)("Full heap scan: tagged %d refs to eviction candidates", cl.tagged());
+  }
+  return cl.tagged();
+}
+
 int G1RemoteMemoryManager::evict_region(HeapRegion* hr, RemoteHandleAllocBuffer* hab) {
   assert(hr->is_old(), "can only evict Old regions");
   assert(!hr->is_humongous(), "cannot evict humongous regions");
