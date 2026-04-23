@@ -204,28 +204,16 @@ oop_load_in_heap_at(oop base, ptrdiff_t offset) {
   return value;
 }
 
-// Override arraycopy: resolve tagged oops in source elements before raw copy.
-// Without this, System.arraycopy / Arrays.copyOfRange propagates tagged oop
-// bytes via Raw::oop_arraycopy, bypassing ALL load barriers.
+// Arraycopy: let tagged oops propagate from source to destination.
+// The load barrier resolves them when the destination elements are read.
+// Previous code used resolve_oop_raw here, which returned nullptr for
+// REMOTE handles — destroying valid references during copy.
 template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline bool G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_arraycopy_in_heap(arrayOop src_obj, size_t src_offset_in_bytes, T* src_raw,
                       arrayOop dst_obj, size_t dst_offset_in_bytes, T* dst_raw,
                       size_t length) {
-  if (!UseCompressedOops && sizeof(T) == sizeof(oop)) {
-    // Resolve any tagged oops in the source array before copying.
-    // Only needed for wide oops (UseCompressedOops=false).
-    oop* src = (oop*)arrayOopDesc::obj_offset_to_raw(src_obj, src_offset_in_bytes, (oop*)src_raw);
-    for (size_t i = 0; i < length; i++) {
-      uintptr_t v = cast_from_oop<uintptr_t>(src[i]);
-      if ((v & G1_OOP_TAG_MASK) != 0) {
-        // Tagged oop — resolve in place before the bulk copy.
-        src[i] = resolve_oop_raw(src[i]);
-      }
-    }
-  }
-  // Delegate to parent which does the actual copy + write barriers.
   return ModRef::oop_arraycopy_in_heap(src_obj, src_offset_in_bytes, src_raw,
                                        dst_obj, dst_offset_in_bytes, dst_raw,
                                        length);

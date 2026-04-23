@@ -74,10 +74,11 @@ G1BarrierSet::write_ref_array_pre_work(T* dst, size_t count) {
     T heap_oop = RawAccess<>::oop_load(elem_ptr);
     if (!CompressedOops::is_null(heap_oop)) {
       // Resolve tag bits before SATB enqueue (array pre-barrier path).
-      // SATB queue asserts valid heap pointers (g1SATBMarkQueueSet.cpp:83).
-      // Use raw cast to avoid debug oop constructor assert for tagged oops.
+      // resolve_oop_raw returns nullptr for REMOTE handles — skip those.
       oop resolved = resolve_oop_raw(cast_to_oop((uintptr_t)(oopDesc*)heap_oop));
-      queue_set.enqueue_known_active(queue, resolved);
+      if (resolved != nullptr) {
+        queue_set.enqueue_known_active(queue, resolved);
+      }
     }
   }
 }
