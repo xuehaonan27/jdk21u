@@ -1178,6 +1178,20 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       // ---- Phase C: Full heap scan — tag ALL refs to candidates ----
       rmm->tag_all_heap_refs_to_eviction_set(eviction_candidates, num_regions);
 
+      // ---- Phase C.5: Verify no untagged refs remain ----
+      int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates, num_regions);
+      if (missed > 0) {
+        log_warning(gc)("Eviction ABORTED: %d untagged refs found after tagging", missed);
+        for (uint i = 0; i < num_regions; i++) {
+          if (eviction_candidates[i]) {
+            HeapRegion* hr = _g1h->region_at(i);
+            hr->clear_cold_destination();
+            eviction_candidates[i] = false;
+          }
+        }
+        total_candidates = 0;
+      }
+
       // ---- Phase E: Evict non-pinned candidates ----
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;

@@ -22,6 +22,9 @@
 #include "runtime/os.hpp"
 #include "runtime/safepoint.hpp"
 #include "runtime/mutexLocker.hpp"
+#include "runtime/jniHandles.hpp"
+#include "runtime/threads.hpp"
+#include "gc/shared/oopStorageSet.inline.hpp"
 #include "utilities/copy.hpp"
 
 // TCP client for remote executor communication
@@ -483,11 +486,12 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     const bool*            _eviction_set;
     uint                   _num_regions;
     int                    _tagged;
+    int                    _no_handle;
   public:
     EvictionSetTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
                           const bool* eset, uint nregions)
       : _rmm(rmm), _g1h(g1h), _eviction_set(eset),
-        _num_regions(nregions), _tagged(0) {}
+        _num_regions(nregions), _tagged(0), _no_handle(0) {}
 
     virtual void do_oop(oop* p) {
       uintptr_t raw = *(uintptr_t*)p;
@@ -505,12 +509,20 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
       if (h != nullptr) {
         *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
         _tagged++;
+      } else {
+        _no_handle++;
+        if (_no_handle <= 10) {
+          log_warning(gc)("Tagging: no handle for target " PTR_FORMAT " in candidate region %u "
+                          "(field at " PTR_FORMAT ")",
+                          p2i((void*)target), idx, p2i(p));
+        }
       }
     }
 
     virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
 
     int tagged() const { return _tagged; }
+    int no_handle() const { return _no_handle; }
   };
 
   EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
@@ -519,9 +531,6 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     if (i < num_regions && eviction_set[i]) continue; // skip eviction candidates
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
-    // NOTE: Do NOT skip _current_fcr. Fetched objects in the FCR may reference
-    // eviction candidates. The klass_or_null()+size guards below safely handle
-    // any partially-initialized object at the tail (STW: no concurrent fetches).
 
     HeapWord* p = hr->bottom();
     HeapWord* region_end = hr->end();
@@ -537,10 +546,97 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     }
   }
 
-  if (cl.tagged() > 0) {
-    log_info(gc)("Full heap scan: tagged %d refs to eviction candidates", cl.tagged());
+  if (cl.tagged() > 0 || cl.no_handle() > 0) {
+    log_info(gc)("Full heap scan: tagged %d refs, %d refs had no handle",
+                 cl.tagged(), cl.no_handle());
   }
   return cl.tagged();
+}
+
+int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
+    const bool* eviction_set, uint num_regions) {
+
+  class VerifyTagClosure : public BasicOopIterateClosure {
+    G1CollectedHeap*       _g1h;
+    const bool*            _eviction_set;
+    uint                   _num_regions;
+    int                    _missed;
+    oop                    _cur_obj;
+  public:
+    VerifyTagClosure(G1CollectedHeap* g1h, const bool* eset, uint nregions)
+      : _g1h(g1h), _eviction_set(eset), _num_regions(nregions),
+        _missed(0), _cur_obj(nullptr) {}
+
+    void set_cur_obj(oop obj) { _cur_obj = obj; }
+
+    virtual void do_oop(oop* p) {
+      uintptr_t raw = *(uintptr_t*)p;
+      if (raw == 0) return;
+      if ((raw >> 63) != 0) return; // tagged — OK
+
+      oop target = cast_to_oop(raw);
+      if (!_g1h->is_in(target)) return;
+
+      HeapRegion* target_hr = _g1h->heap_region_containing(target);
+      uint idx = target_hr->hrm_index();
+      if (idx >= _num_regions || !_eviction_set[idx]) return;
+
+      _missed++;
+      if (_missed <= 20) {
+        HeapRegion* src_hr = (_cur_obj != nullptr && _g1h->is_in(_cur_obj))
+          ? _g1h->heap_region_containing(_cur_obj) : nullptr;
+        log_warning(gc)("VERIFY: untagged ref field=" PTR_FORMAT " -> target=" PTR_FORMAT
+                        " in candidate region %u, src_obj=" PTR_FORMAT " klass=%s src_region=%u",
+                        p2i(p), p2i((void*)target), idx,
+                        p2i((void*)_cur_obj),
+                        (_cur_obj != nullptr ? _cur_obj->klass()->external_name() : "root"),
+                        (src_hr != nullptr ? src_hr->hrm_index() : 9999));
+      }
+    }
+
+    virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+
+    int missed() const { return _missed; }
+  };
+
+  VerifyTagClosure cl(_g1h, eviction_set, num_regions);
+
+  // 1. Verify heap: same walk as tagging scan
+  for (uint i = 0; i < _g1h->num_regions(); i++) {
+    if (i < num_regions && eviction_set[i]) continue;
+    HeapRegion* hr = _g1h->region_at(i);
+    if (hr->is_empty() || hr->is_free()) continue;
+
+    HeapWord* p = hr->bottom();
+    HeapWord* region_end = hr->end();
+    while (p < hr->top()) {
+      if (p < hr->bottom() || p >= region_end) break;
+      oop obj = cast_to_oop(p);
+      Klass* k = obj->klass_or_null();
+      if (k == nullptr) break;
+      size_t sz = obj->size();
+      if (sz == 0 || sz > (size_t)(region_end - p)) break;
+      cl.set_cur_obj(obj);
+      obj->oop_iterate(&cl);
+      p += sz;
+    }
+  }
+
+  // 2. Verify roots: check thread stacks, JNI, OopStorages
+  cl.set_cur_obj(nullptr);
+  Threads::oops_do(&cl, nullptr);
+  JNIHandles::oops_do(&cl);
+  OopStorageSet::strong_oops_do(&cl);
+  for (auto id : EnumRange<OopStorageSet::WeakId>()) {
+    OopStorageSet::storage(id)->oops_do(&cl);
+  }
+  oops_do_remote_anchors(&cl);
+
+  if (cl.missed() > 0) {
+    log_warning(gc)("VERIFY: %d untagged refs to eviction candidates AFTER tagging!",
+                    cl.missed());
+  }
+  return cl.missed();
 }
 
 int G1RemoteMemoryManager::evict_region(HeapRegion* hr, RemoteHandleAllocBuffer* hab) {
