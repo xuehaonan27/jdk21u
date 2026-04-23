@@ -528,7 +528,6 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
   EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
 
   for (uint i = 0; i < _g1h->num_regions(); i++) {
-    if (i < num_regions && eviction_set[i]) continue; // skip eviction candidates
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
 
@@ -601,9 +600,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
   VerifyTagClosure cl(_g1h, eviction_set, num_regions);
 
-  // 1. Verify heap: same walk as tagging scan
+  // 1. Verify heap: same walk as tagging scan (including candidate regions)
   for (uint i = 0; i < _g1h->num_regions(); i++) {
-    if (i < num_regions && eviction_set[i]) continue;
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
 
