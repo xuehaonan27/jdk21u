@@ -133,17 +133,19 @@ public:
     size_t idx = hash_obj(addr);
 
     table_lock();
-    // Check for existing entry (dedup)
+    // Check for existing entry (dedup).
+    // Skip stale entries: after eviction frees a region, addresses get reused.
+    // A REMOTE/DEAD handle at this address belongs to a previously evicted object.
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr) {
+      if (e->_obj_addr == addr && e->_handle->is_local()) {
         RemoteHandle* existing = e->_handle;
         table_unlock();
         return existing;
       }
       e = e->_next;
     }
-    // Not found — create new Handle and entry
+    // Not found (or only stale entries) — create new Handle and entry
     RemoteHandle* h = _handle_allocator.allocate_handle(hab);
     h->initialize(cast_from_oop<void*>(obj));
 
@@ -163,9 +165,8 @@ public:
     table_lock();
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr) {
+      if (e->_obj_addr == addr && e->_handle->is_local()) {
         RemoteHandle* existing = e->_handle;
-        // Existing handle might not be dormant yet; mark it
         existing->set_dormant();
         table_unlock();
         return existing;
@@ -196,7 +197,7 @@ public:
 
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr) return e->_handle;
+      if (e->_obj_addr == addr && e->_handle->is_local()) return e->_handle;
       e = e->_next;
     }
     return nullptr;
@@ -220,12 +221,16 @@ public:
     while (*pp != nullptr) {
       if ((*pp)->_obj_addr == old_addr) {
         HandleEntry* entry = *pp;
+        // Only rekey LOCAL handles. REMOTE/DEAD entries are stale —
+        // the address was reused after the original object's region was freed.
+        if (!entry->_handle->is_local()) {
+          pp = &((*pp)->_next);
+          continue;
+        }
         *pp = entry->_next;  // unlink from old bucket
 
-        // Update Handle to point to new object address
         entry->_handle->set_local(cast_from_oop<void*>(new_obj));
 
-        // Re-insert in new bucket
         entry->_obj_addr = new_addr;
         size_t new_idx = hash_obj(new_addr);
         entry->_next = _table[new_idx];
@@ -237,7 +242,6 @@ public:
       pp = &((*pp)->_next);
     }
     table_unlock();
-    // Not found — object has no Handle (OK, not all objects have Handles)
   }
 
   // Rekey a Handle entry when an object is fetched to a new local address.
