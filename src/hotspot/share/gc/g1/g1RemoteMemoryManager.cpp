@@ -519,7 +519,9 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     if (i < num_regions && eviction_set[i]) continue; // skip eviction candidates
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
-    if (hr == _current_fcr) continue; // FCR may have partially-initialized fetched objects
+    // NOTE: Do NOT skip _current_fcr. Fetched objects in the FCR may reference
+    // eviction candidates. The klass_or_null()+size guards below safely handle
+    // any partially-initialized object at the tail (STW: no concurrent fetches).
 
     HeapWord* p = hr->bottom();
     HeapWord* region_end = hr->end();
