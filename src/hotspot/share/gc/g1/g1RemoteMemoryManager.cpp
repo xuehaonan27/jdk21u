@@ -770,6 +770,8 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
 
   for (uint32_t i = 0; i < et->_entry_count; i++) {
     EdgeEntry& edge = et->_entries[i];
+    guarantee(edge._field_offset >= 16,
+              "Edge table offset %u would corrupt object header", edge._field_offset);
     uintptr_t* field_addr = (uintptr_t*)(base + edge._field_offset);
     RemoteHandle* target = edge._target_handle;
 
