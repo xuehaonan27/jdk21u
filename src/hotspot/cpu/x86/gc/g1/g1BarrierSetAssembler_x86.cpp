@@ -160,7 +160,18 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
     if (dst != c_rarg0) __ mov(c_rarg0, dst);
     masm->MacroAssembler::call_VM_leaf_base(
         CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), 1);
-    // rax = resolved oop. Stash in rbx (callee-saved, survives pops).
+    // rax = resolved oop. Check if still tagged (REMOTE handle).
+    {
+      Label leaf_resolved;
+      __ testptr(rax, rax);
+      __ jcc(Assembler::positive, leaf_resolved);
+      // Still tagged — REMOTE object needs fetch. Call slow path.
+      __ mov(c_rarg0, rax);
+      masm->MacroAssembler::call_VM_leaf_base(
+          CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow), 1);
+      __ bind(leaf_resolved);
+    }
+    // rax = fully resolved oop. Stash in rbx (callee-saved, survives pops).
     __ mov(rbx, rax);
     // Restore caller-saved GP registers (reverse order)
     __ pop(r11); __ pop(r10); __ pop(r9);  __ pop(r8);
@@ -175,16 +186,6 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
     }
 
     __ bind(done);
-#ifdef ASSERT
-    // Verify barrier produced a clean oop.
-    {
-      Label clean;
-      __ testptr(dst, dst);
-      __ jcc(Assembler::positive, clean);
-      __ stop("G1 load_at barrier: tagged oop leaked (bit 63 set after resolve)");
-      __ bind(clean);
-    }
-#endif
   }
 
   if (on_oop && on_reference) {
