@@ -87,6 +87,10 @@ class G1BarrierSet: public CardTableBarrierSet {
   static oop resolve_remote_fetch(RemoteHandle* h);
   static oop wait_for_fetch(RemoteHandle* h);
 
+  // Full tagged oop resolution for VM context (JNI handles, runtime calls).
+  // Handles LOCAL, REMOTE (fetch), FETCHING (wait), and Unique (strip tags).
+  static oop resolve_tagged_oop_in_vm(oop tagged);
+
   // DEPRECATED: resolve_managed_store was the write barrier that re-encoded
   // clean oops as shared_oop(handle) on every store. Removed in the
   // invisible-handle design — handleification is now eviction-time only.

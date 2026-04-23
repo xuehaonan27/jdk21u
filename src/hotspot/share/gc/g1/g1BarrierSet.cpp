@@ -233,6 +233,41 @@ oop G1BarrierSet::wait_for_fetch(RemoteHandle* h) {
 }
 
 // ============================================================
+// Full tagged oop resolution for VM context (JNI, runtime).
+// ============================================================
+// Same logic as oop_load_in_heap but callable from any VM context.
+// Does NOT do thread state transitions — caller must be in VM.
+oop G1BarrierSet::resolve_tagged_oop_in_vm(oop tagged) {
+  uintptr_t v = cast_from_oop<uintptr_t>(tagged);
+  if ((v & G1_OOP_TAG_MASK) == 0) return tagged;
+
+  if (v & G1_OOP_INDIRECT_BIT) {
+    RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    if (state == REMOTE_HANDLE_LOCAL) {
+      return cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+    } else if (state == REMOTE_HANDLE_REMOTE) {
+      if (h->cas_remote_to_fetching()) {
+        return resolve_remote_fetch(h);
+      } else {
+        return wait_for_fetch(h);
+      }
+    } else {
+      return wait_for_fetch(h);
+    }
+  }
+
+  // Unique/Direct: strip tags
+  return cast_to_oop(v & G1_OOP_ADDR_MASK);
+}
+
+// Free function wrapper declared in g1RemoteOop.hpp
+oop resolve_oop_full(oop tagged) {
+  return G1BarrierSet::resolve_tagged_oop_in_vm(tagged);
+}
+
+// ============================================================
 // Write Barrier: Managed Object Classification Check (Phase 2b)
 // ============================================================
 // Called from oop_store_in_heap when new_value is non-null.

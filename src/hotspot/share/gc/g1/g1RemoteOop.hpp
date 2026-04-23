@@ -143,6 +143,11 @@ inline oop resolve_oop_raw(oop tagged) {
 }
 
 
+// Full resolution for non-GC contexts (JNI handles, runtime calls).
+// Handles LOCAL, REMOTE (triggers fetch), FETCHING (waits).
+// Defined in g1BarrierSet.cpp. NOT suitable during STW.
+oop resolve_oop_full(oop tagged);
+
 // ============================================================
 // g1_resolved_load: centralized GC-side oop load + resolution
 // ============================================================

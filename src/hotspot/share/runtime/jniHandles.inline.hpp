@@ -93,7 +93,7 @@ inline oop JNIHandles::resolve(jobject handle) {
   oop result = nullptr;
   if (handle != nullptr) {
     result = resolve_impl<DECORATORS_NONE, false /* external_guard */>(handle);
-    result = resolve_oop_raw(result);
+    result = resolve_oop_full(result);
   }
   return result;
 }
@@ -102,7 +102,7 @@ inline oop JNIHandles::resolve_no_keepalive(jobject handle) {
   oop result = nullptr;
   if (handle != nullptr) {
     result = resolve_impl<AS_NO_KEEPALIVE, false /* external_guard */>(handle);
-    result = resolve_oop_raw(result);
+    result = resolve_oop_full(result);
   }
   return result;
 }
@@ -117,7 +117,7 @@ inline oop JNIHandles::resolve_non_null(jobject handle) {
   assert(handle != nullptr, "JNI handle should not be null");
   oop result = resolve_impl<DECORATORS_NONE, false /* external_guard */>(handle);
   assert(result != nullptr, "null read from jni handle");
-  result = resolve_oop_raw(result);
+  result = resolve_oop_full(result);
   return result;
 }
 

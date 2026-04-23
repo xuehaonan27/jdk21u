@@ -133,7 +133,7 @@ oop JNIHandles::resolve_external_guard(jobject handle) {
   oop result = nullptr;
   if (handle != nullptr) {
     result = resolve_impl<DECORATORS_NONE, true /* external_guard */>(handle);
-    result = resolve_oop_raw(result);
+    result = resolve_oop_full(result);
   }
   return result;
 }
