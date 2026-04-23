@@ -1024,11 +1024,16 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // Root-pinned regions cannot be evicted (root refs bypass load barrier).
   if (G1RemoteEvictionThreshold > 0) {
     ColdRegionPinClosure pin_cl(_g1h);
-    // Scan ALL strong root sources (not just threads+JNI).
+    // Scan ALL root sources (not just threads+JNI).
     // Missing any root type leaves clean oops to filler → crash.
     Threads::oops_do(&pin_cl, nullptr);
     JNIHandles::oops_do(&pin_cl);
     OopStorageSet::strong_oops_do(&pin_cl);
+    // Weak OopStorages: StringTable, ResolvedMethodTable, etc.
+    // These hold direct oops (not tagged) that bypass the load barrier.
+    for (auto id : EnumRange<OopStorageSet::WeakId>()) {
+      OopStorageSet::storage(id)->oops_do(&pin_cl);
+    }
 
     // Also check remote anchor roots
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
@@ -1131,6 +1136,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       Threads::oops_do(&pin_cl, nullptr);
       JNIHandles::oops_do(&pin_cl);
       OopStorageSet::strong_oops_do(&pin_cl);
+      for (auto id : EnumRange<OopStorageSet::WeakId>()) {
+        OopStorageSet::storage(id)->oops_do(&pin_cl);
+      }
       rmm->oops_do_remote_anchors(&pin_cl);
 
       for (uint i = 0; i < num_regions; i++) {
