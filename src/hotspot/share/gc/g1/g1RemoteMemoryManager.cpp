@@ -833,21 +833,20 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
     }
   }
 
-  // Also include any REMOTE handle that has incoming heap refs (shared_oop in local heap)
-  // These are discovered by walking the handle table for REMOTE handles with dormant anchors
+  // Report ALL remote handles as roots. Without a completed concurrent
+  // marking cycle, _remote_roots is empty/stale and we cannot determine
+  // which handles are truly dead. Reporting all as alive is conservative
+  // but correct — the executor will only free objects not in the root set.
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
     for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
       if (e->_handle != nullptr && e->_handle->is_remote()) {
         total_remote++;
-        // If this remote handle has dormant-anchor incoming refs, it's reachable
-        if (e->_handle->remote_refcount() > 0 || e->_handle->is_dormant()) {
-          if (num_roots >= root_capacity) {
-            root_capacity *= 2;
-            root_ids = (size_t*)os::realloc(root_ids, root_capacity * sizeof(size_t), mtGC);
-          }
-          root_ids[num_roots++] = e->_handle->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+        if (num_roots >= root_capacity) {
+          root_capacity *= 2;
+          root_ids = (size_t*)os::realloc(root_ids, root_capacity * sizeof(size_t), mtGC);
         }
+        root_ids[num_roots++] = e->_handle->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
       }
     }
   }
