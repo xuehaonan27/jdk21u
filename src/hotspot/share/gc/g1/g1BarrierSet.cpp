@@ -215,8 +215,6 @@ oop G1BarrierSet::resolve_remote_fetch(RemoteHandle* h) {
 }
 
 oop G1BarrierSet::wait_for_fetch(RemoteHandle* h) {
-  // Spin-yield until the Handle transitions to LOCAL.
-  // Phase 1: simple spin. Phase 5: apth_yield for M:N scheduling.
   int spins = 0;
   while (true) {
     uintptr_t sa = h->load_state_and_addr_acquire();
@@ -224,7 +222,9 @@ oop G1BarrierSet::wait_for_fetch(RemoteHandle* h) {
     if (state == REMOTE_HANDLE_LOCAL) {
       return cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
     }
-    // Yield CPU briefly
+    if (state == REMOTE_HANDLE_DEAD || state == REMOTE_HANDLE_REMOTE) {
+      return nullptr;
+    }
     if (++spins > 1000) {
       os::naked_yield();
       spins = 0;
@@ -247,6 +247,8 @@ oop G1BarrierSet::resolve_tagged_oop_in_vm(oop tagged) {
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
     if (state == REMOTE_HANDLE_LOCAL) {
       return cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+    } else if (state == REMOTE_HANDLE_DEAD) {
+      return nullptr;
     } else if (state == REMOTE_HANDLE_REMOTE) {
       if (h->cas_remote_to_fetching()) {
         return resolve_remote_fetch(h);

@@ -138,28 +138,23 @@ oop_load_in_heap(T* addr) {
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
 
       if (state == REMOTE_HANDLE_LOCAL) {
-        // Fast path: Handle is LOCAL
         value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+      } else if (state == REMOTE_HANDLE_DEAD) {
+        value = nullptr;
       } else if (state == REMOTE_HANDLE_REMOTE) {
-        // Slow path: object is remote — trigger fetch
-        // CAS REMOTE -> FETCHING (we win the fetch race)
         if (h->cas_remote_to_fetching()) {
           value = G1BarrierSet::resolve_remote_fetch(h);
         } else {
-          // Someone else is fetching — spin until LOCAL
           value = G1BarrierSet::wait_for_fetch(h);
         }
       } else {
-        // FETCHING state — someone else is fetching, wait
         value = G1BarrierSet::wait_for_fetch(h);
       }
     } else {
-      // Unique/Direct OOP: just strip tags
       value = cast_to_oop(v & G1_OOP_ADDR_MASK);
     }
   }
 
-  // Post-resolution guarantee: result must be clean (no tag bits).
   guarantee(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
             "oop_load_in_heap: barrier returned tagged value " PTR_FORMAT " from addr " PTR_FORMAT,
             cast_from_oop<uintptr_t>(value), p2i(addr));
@@ -187,6 +182,8 @@ oop_load_in_heap_at(oop base, ptrdiff_t offset) {
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
       if (state == REMOTE_HANDLE_LOCAL) {
         value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+      } else if (state == REMOTE_HANDLE_DEAD) {
+        value = nullptr;
       } else if (state == REMOTE_HANDLE_REMOTE) {
         if (h->cas_remote_to_fetching()) {
           value = G1BarrierSet::resolve_remote_fetch(h);

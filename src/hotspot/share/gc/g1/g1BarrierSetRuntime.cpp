@@ -137,101 +137,93 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   // Fast path: clean oop / null — no thread transition needed.
   if ((v >> 63) == 0) return tagged;
 
-  // Leaf resolve: handles LOCAL Handles + Unique OOPs without ThreadInVMfromJava.
-  // This is the common case (99.99%) — no safepoint, no blocking.
-  if (!(v & G1_OOP_INDIRECT_BIT)) {
-    // Unique/Direct: strip tags
-    return (oopDesc*)(v & G1_OOP_ADDR_MASK);
-  }
-  // Shared: follow Handle
-  RemoteHandle* h_fast = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
-  uintptr_t sa_fast = h_fast->load_state_and_addr_acquire();
-  if ((sa_fast & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL) {
-    return (oopDesc*)(sa_fast & REMOTE_HANDLE_ADDR_MASK);
-  }
-
-  // Slow path: REMOTE/FETCHING — requires ThreadInVMfromJava for blocking I/O.
-  // This path is rare (only for actually-evicted objects).
-  JavaThread* current = JavaThread::current();
-  ThreadInVMfromJava tiv(current);
-  v = (uintptr_t)tagged; // re-read (stable since tagged value doesn't change)
-  // Re-check after transition (Handle may have been resolved by another thread)
+  // Unique/Direct: strip tags (no thread transition needed).
   if (!(v & G1_OOP_INDIRECT_BIT)) {
     return (oopDesc*)(v & G1_OOP_ADDR_MASK);
   }
 
+  // Shared: follow Handle — fast check before thread transition.
   RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-
   if (state == REMOTE_HANDLE_LOCAL) {
     return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
   }
+  if (state == REMOTE_HANDLE_DEAD) {
+    return nullptr;
+  }
 
-  if (state == REMOTE_HANDLE_REMOTE) {
-    if (h->cas_remote_to_fetching()) {
-      G1CollectedHeap* g1h = G1CollectedHeap::heap();
-      G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-      size_t word_size = h->eviction_word_size();
+  // Slow path: REMOTE/FETCHING — requires ThreadInVMfromJava for blocking I/O.
+  JavaThread* current = JavaThread::current();
+  ThreadInVMfromJava tiv(current);
 
-      // Allocate in FCR — JRT_ENTRY context can acquire Heap_lock.
-      // No os::malloc fallback: all fetched objects go into proper G1 regions.
-      HeapWord* dest = rmm->allocate_in_fcr(word_size);
-      guarantee(dest != nullptr, "FCR allocation failed for fetch");
-
-      // Fetch from remote backend with safepoint awareness.
-      Klass* fetched_klass = nullptr;
-      {
-        ThreadBlockInVM tbivm(current);
-        fetched_klass = rmm->fetch_remote_object(h, dest);
-      }
-
-      if (fetched_klass == nullptr) {
-        // Fetch failed — rollback Handle from FETCHING to REMOTE.
-        // Don't publish garbage. Other waiters will retry.
-        uintptr_t sa = h->load_state_and_addr_acquire();
-        uintptr_t remote_id = sa & REMOTE_HANDLE_ADDR_MASK;
-        h->set_remote(remote_id);
-        log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — rolled back to REMOTE", p2i(h));
-        return nullptr;  // Caller gets null, will retry or handle gracefully
-      }
-
-      // Patch fetched object's oop fields BEFORE publishing.
-      rmm->patch_fetched_fields(h, dest);
-
-      // Rekey handle table: old address (evicted/filler) → new FCR address
-      rmm->rekey_handle_on_fetch(h, (void*)dest);
-
-      // Notify executor that this handle is now LOCAL (V2 protocol)
-      uintptr_t handle_id = (uintptr_t)h;
-      rmm->backend()->localize_batch(&handle_id, 1);
-
-      h->set_local_release(dest);
-      return (oopDesc*)dest;
-    }
+  // State machine loop: handles all transitions including re-eviction
+  // during safepoints and handle death from remote GC.
+  while (true) {
     sa = h->load_state_and_addr_acquire();
     state = sa & REMOTE_HANDLE_STATE_MASK;
-  }
 
-  // After CAS race or direct entry: handle any state.
-  if (state == REMOTE_HANDLE_LOCAL) {
-    return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-  }
-
-  if (state == REMOTE_HANDLE_FETCHING) {
-    // Wait with safepoint awareness
-    ThreadBlockInVM tbivm(current);
-    while (true) {
-      sa = h->load_state_and_addr_acquire();
-      state = sa & REMOTE_HANDLE_STATE_MASK;
-      if (state == REMOTE_HANDLE_LOCAL) break;
-      os::naked_yield();
+    if (state == REMOTE_HANDLE_LOCAL) {
+      return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
     }
-    return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-  }
 
-  ShouldNotReachHere();
-  return nullptr;
+    if (state == REMOTE_HANDLE_DEAD) {
+      return nullptr;
+    }
+
+    if (state == REMOTE_HANDLE_REMOTE) {
+      if (h->cas_remote_to_fetching()) {
+        G1CollectedHeap* g1h = G1CollectedHeap::heap();
+        G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+        size_t word_size = h->eviction_word_size();
+
+        HeapWord* dest = rmm->allocate_in_fcr(word_size);
+        guarantee(dest != nullptr, "FCR allocation failed for fetch");
+
+        Klass* fetched_klass = nullptr;
+        {
+          ThreadBlockInVM tbivm(current);
+          fetched_klass = rmm->fetch_remote_object(h, dest);
+        }
+
+        if (fetched_klass == nullptr) {
+          uintptr_t sa2 = h->load_state_and_addr_acquire();
+          uintptr_t remote_id = sa2 & REMOTE_HANDLE_ADDR_MASK;
+          h->set_remote(remote_id);
+          log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — rolled back to REMOTE", p2i(h));
+          return nullptr;
+        }
+
+        rmm->patch_fetched_fields(h, dest);
+        rmm->rekey_handle_on_fetch(h, (void*)dest);
+
+        uintptr_t handle_id = (uintptr_t)h;
+        rmm->backend()->localize_batch(&handle_id, 1);
+
+        h->set_local_release(dest);
+        return (oopDesc*)dest;
+      }
+      // CAS failed — another thread is fetching. Re-read and retry.
+      continue;
+    }
+
+    if (state == REMOTE_HANDLE_FETCHING) {
+      ThreadBlockInVM tbivm(current);
+      while (true) {
+        sa = h->load_state_and_addr_acquire();
+        state = sa & REMOTE_HANDLE_STATE_MASK;
+        if (state != REMOTE_HANDLE_FETCHING) break;
+        os::naked_yield();
+      }
+      // State changed — might be LOCAL, REMOTE (re-evicted), or DEAD.
+      continue;
+    }
+
+    // Unknown state — log and retry.
+    log_warning(gc)("resolve_tagged_oop_slow: unexpected state 0x%lx for handle " PTR_FORMAT,
+                    (unsigned long)state, p2i(h));
+    os::naked_yield();
+  }
 }
 
 // JRT_ENTRY wrapper for interpreter call_VM (proper oop map + frame anchor).
