@@ -522,12 +522,14 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     if (hr == _current_fcr) continue; // FCR may have partially-initialized fetched objects
 
     HeapWord* p = hr->bottom();
+    HeapWord* region_end = hr->end();
     while (p < hr->top()) {
+      if (p < hr->bottom() || p >= region_end) break;
       oop obj = cast_to_oop(p);
       Klass* k = obj->klass_or_null();
       if (k == nullptr) break;
       size_t sz = obj->size();
-      if (sz == 0) break;
+      if (sz == 0 || sz > (size_t)(region_end - p)) break;
       obj->oop_iterate(&cl);
       p += sz;
     }
@@ -546,8 +548,10 @@ int G1RemoteMemoryManager::evict_region(HeapRegion* hr, RemoteHandleAllocBuffer*
   // All-or-nothing: validate ALL objects before evicting any.
   // If any object is unevictable, abort the entire region.
   HeapWord* p = hr->bottom();
+  HeapWord* region_end = hr->end();
   int total_objects = 0;
   while (p < hr->top()) {
+    if (p < hr->bottom() || p >= region_end) return 0;
     oop obj = cast_to_oop(p);
     if (obj->klass_or_null() == nullptr) {
       log_debug(gc)("evict_region: null klass at " PTR_FORMAT " in region %u — aborting",

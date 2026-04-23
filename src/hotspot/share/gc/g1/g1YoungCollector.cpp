@@ -1163,11 +1163,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at(i);
         HeapWord* p = hr->bottom();
+        HeapWord* region_end = hr->end();
         while (p < hr->top()) {
+          if (p < hr->bottom() || p >= region_end) break;
           oop obj = cast_to_oop(p);
           if (obj->klass_or_null() == nullptr) break;
+          size_t sz = obj->size();
+          if (sz == 0 || sz > (size_t)(region_end - p)) break;
           rmm->ensure_handle_for(obj, &hab);
-          p += obj->size();
+          p += sz;
         }
       }
 
