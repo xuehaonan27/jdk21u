@@ -205,14 +205,14 @@ oop G1BarrierSet::resolve_remote_fetch(RemoteHandle* h) {
     return nullptr;
   }
 
+  // The raw bytes from remote may have stale header data (eviction-time mark
+  // word, classification bits, etc.). Overwrite both the mark word and the
+  // klass pointer with known-good values before the object becomes visible.
+  cast_to_oop(dest)->set_mark(markWord::prototype());
+  cast_to_oop(dest)->set_klass(fetched_klass);
+
   // Patch fetched object's fields using edge table (same as JRT slow path)
   rmm->patch_fetched_fields(h, dest);
-
-  // Reset mark word to a clean, unlocked prototype with the fetched klass.
-  // The raw bytes from remote contain the eviction-time mark word, which may
-  // have stale classification bits or hash values. A fresh mark word avoids
-  // confusing locking/hashing code that inspects mark word bits.
-  cast_to_oop(dest)->set_mark(markWord::prototype());
 
   // Rekey handle table for new FCR address
   rmm->rekey_handle_on_fetch(h, (void*)dest);

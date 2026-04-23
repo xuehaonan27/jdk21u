@@ -232,6 +232,7 @@ public:
   }
 
   int count() const { return _count; }
+  bool overflowed() const { return _count >= MAX_EDGES; }
   const G1RemoteMemoryManager::EdgeEntry* edges() const { return _edges; }
 };
 
@@ -240,6 +241,12 @@ G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
                                         RemoteHandleAllocBuffer* hab) {
   EdgeTableBuildClosure cl(this, _g1h, hab, obj);
   obj->oop_iterate(&cl);
+
+  if (cl.overflowed()) {
+    log_warning(gc)("Edge table overflow: obj=" PTR_FORMAT " klass=%s has >256 oop fields — "
+                    "unpatched fields will retain eviction-time values!",
+                    p2i((void*)obj), obj->klass()->external_name());
+  }
 
   // Allocate and populate the edge table
   ObjectEdgeTable* et = ObjectEdgeTable::allocate(cl.count());
