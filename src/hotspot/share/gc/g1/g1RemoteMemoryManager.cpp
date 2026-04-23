@@ -519,12 +519,15 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     if (i < num_regions && eviction_set[i]) continue; // skip eviction candidates
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
+    if (hr == _current_fcr) continue; // FCR may have partially-initialized fetched objects
 
     HeapWord* p = hr->bottom();
     while (p < hr->top()) {
       oop obj = cast_to_oop(p);
+      Klass* k = obj->klass_or_null();
+      if (k == nullptr) break;
       size_t sz = obj->size();
-      if (sz == 0) break; // unparseable
+      if (sz == 0) break;
       obj->oop_iterate(&cl);
       p += sz;
     }
@@ -546,6 +549,11 @@ int G1RemoteMemoryManager::evict_region(HeapRegion* hr, RemoteHandleAllocBuffer*
   int total_objects = 0;
   while (p < hr->top()) {
     oop obj = cast_to_oop(p);
+    if (obj->klass_or_null() == nullptr) {
+      log_debug(gc)("evict_region: null klass at " PTR_FORMAT " in region %u — aborting",
+                     p2i(p), hr->hrm_index());
+      return 0;
+    }
     size_t sz = obj->size();
     if (sz == 0) {
       log_debug(gc)("evict_region: unparseable object at " PTR_FORMAT " in region %u — aborting",

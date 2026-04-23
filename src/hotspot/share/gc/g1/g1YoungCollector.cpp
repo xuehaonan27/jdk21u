@@ -1165,6 +1165,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         HeapWord* p = hr->bottom();
         while (p < hr->top()) {
           oop obj = cast_to_oop(p);
+          if (obj->klass_or_null() == nullptr) break;
           rmm->ensure_handle_for(obj, &hab);
           p += obj->size();
         }
