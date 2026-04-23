@@ -132,23 +132,34 @@ oop_load_in_heap(T* addr) {
   uintptr_t v = cast_from_oop<uintptr_t>(value);
   if ((v & G1_OOP_TAG_MASK) != 0) {
     if (v & G1_OOP_INDIRECT_BIT) {
-      // Shared OOP: follow Handle
       RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
-      uintptr_t sa = h->load_state_and_addr_acquire();
-      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-
-      if (state == REMOTE_HANDLE_LOCAL) {
-        value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
-      } else if (state == REMOTE_HANDLE_DEAD) {
-        value = nullptr;
-      } else if (state == REMOTE_HANDLE_REMOTE) {
-        if (h->cas_remote_to_fetching()) {
-          value = G1BarrierSet::resolve_remote_fetch(h);
+      int fetch_attempts = 0;
+      while (true) {
+        uintptr_t sa = h->load_state_and_addr_acquire();
+        uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+        if (state == REMOTE_HANDLE_LOCAL) {
+          value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+          break;
+        } else if (state == REMOTE_HANDLE_DEAD) {
+          value = nullptr;
+          break;
+        } else if (state == REMOTE_HANDLE_REMOTE) {
+          if (h->cas_remote_to_fetching()) {
+            value = G1BarrierSet::resolve_remote_fetch(h);
+            if (value != nullptr) break;
+            fetch_attempts++;
+            if (fetch_attempts >= 3) { h->set_dead(); value = nullptr; break; }
+            continue;
+          } else {
+            value = G1BarrierSet::wait_for_fetch(h);
+            if (value != nullptr) break;
+            continue;
+          }
         } else {
           value = G1BarrierSet::wait_for_fetch(h);
+          if (value != nullptr) break;
+          continue;
         }
-      } else {
-        value = G1BarrierSet::wait_for_fetch(h);
       }
     } else {
       value = cast_to_oop(v & G1_OOP_ADDR_MASK);
@@ -178,20 +189,33 @@ oop_load_in_heap_at(oop base, ptrdiff_t offset) {
   if ((v & G1_OOP_TAG_MASK) != 0) {
     if (v & G1_OOP_INDIRECT_BIT) {
       RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
-      uintptr_t sa = h->load_state_and_addr_acquire();
-      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-      if (state == REMOTE_HANDLE_LOCAL) {
-        value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
-      } else if (state == REMOTE_HANDLE_DEAD) {
-        value = nullptr;
-      } else if (state == REMOTE_HANDLE_REMOTE) {
-        if (h->cas_remote_to_fetching()) {
-          value = G1BarrierSet::resolve_remote_fetch(h);
+      int fetch_attempts = 0;
+      while (true) {
+        uintptr_t sa = h->load_state_and_addr_acquire();
+        uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+        if (state == REMOTE_HANDLE_LOCAL) {
+          value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+          break;
+        } else if (state == REMOTE_HANDLE_DEAD) {
+          value = nullptr;
+          break;
+        } else if (state == REMOTE_HANDLE_REMOTE) {
+          if (h->cas_remote_to_fetching()) {
+            value = G1BarrierSet::resolve_remote_fetch(h);
+            if (value != nullptr) break;
+            fetch_attempts++;
+            if (fetch_attempts >= 3) { h->set_dead(); value = nullptr; break; }
+            continue;
+          } else {
+            value = G1BarrierSet::wait_for_fetch(h);
+            if (value != nullptr) break;
+            continue;
+          }
         } else {
           value = G1BarrierSet::wait_for_fetch(h);
+          if (value != nullptr) break;
+          continue;
         }
-      } else {
-        value = G1BarrierSet::wait_for_fetch(h);
       }
     } else {
       value = cast_to_oop(v & G1_OOP_ADDR_MASK);

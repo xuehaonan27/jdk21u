@@ -244,20 +244,31 @@ oop G1BarrierSet::resolve_tagged_oop_in_vm(oop tagged) {
 
   if (v & G1_OOP_INDIRECT_BIT) {
     RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
-    uintptr_t sa = h->load_state_and_addr_acquire();
-    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-    if (state == REMOTE_HANDLE_LOCAL) {
-      return cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
-    } else if (state == REMOTE_HANDLE_DEAD) {
-      return nullptr;
-    } else if (state == REMOTE_HANDLE_REMOTE) {
-      if (h->cas_remote_to_fetching()) {
-        return resolve_remote_fetch(h);
+    int fetch_attempts = 0;
+    while (true) {
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) {
+        return cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+      } else if (state == REMOTE_HANDLE_DEAD) {
+        return nullptr;
+      } else if (state == REMOTE_HANDLE_REMOTE) {
+        if (h->cas_remote_to_fetching()) {
+          oop result = resolve_remote_fetch(h);
+          if (result != nullptr) return result;
+          fetch_attempts++;
+          if (fetch_attempts >= 3) { h->set_dead(); return nullptr; }
+          continue;
+        } else {
+          oop result = wait_for_fetch(h);
+          if (result != nullptr) return result;
+          continue;
+        }
       } else {
-        return wait_for_fetch(h);
+        oop result = wait_for_fetch(h);
+        if (result != nullptr) return result;
+        continue;
       }
-    } else {
-      return wait_for_fetch(h);
     }
   }
 

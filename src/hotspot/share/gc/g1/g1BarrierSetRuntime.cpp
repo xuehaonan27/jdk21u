@@ -157,6 +157,7 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   JavaThread* current = JavaThread::current();
   ThreadInVMfromJava tiv(current);
 
+  int fetch_attempts = 0;
   // State machine loop: handles all transitions including re-eviction
   // during safepoints and handle death from remote GC.
   while (true) {
@@ -187,11 +188,17 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
         }
 
         if (fetched_klass == nullptr) {
+          fetch_attempts++;
+          if (fetch_attempts >= 3) {
+            h->set_dead();
+            log_warning(gc)("Fetch failed %d times for handle " PTR_FORMAT " — marking DEAD", fetch_attempts, p2i(h));
+            return nullptr;
+          }
           uintptr_t sa2 = h->load_state_and_addr_acquire();
           uintptr_t remote_id = sa2 & REMOTE_HANDLE_ADDR_MASK;
           h->set_remote(remote_id);
-          log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — rolled back to REMOTE", p2i(h));
-          return nullptr;
+          log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — retry %d/3", p2i(h), fetch_attempts);
+          continue;
         }
 
         rmm->patch_fetched_fields(h, dest);
