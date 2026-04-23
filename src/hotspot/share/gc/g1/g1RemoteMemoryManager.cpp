@@ -42,6 +42,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
     _remote_roots_count(0), _deferred_decrement_count(0),
+    _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
     _current_fcr(nullptr), _fcr_lock(0),
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
   memset(_table, 0, sizeof(_table));
@@ -515,6 +516,7 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
       RemoteHandle* h = _rmm->handle_for(target);
       if (h != nullptr) {
         *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+        _rmm->add_tagged_field(p, h);
         _tagged++;
       } else {
         _no_handle++;
@@ -1027,10 +1029,61 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   return collected;
 }
 
+int G1RemoteMemoryManager::fixup_tagged_field_handles() {
+  int updated = 0;
+  int removed = 0;
+  int write_idx = 0;
+
+  for (int i = 0; i < _tagged_field_count; i++) {
+    oop* field_addr = _tagged_fields[i]._field_addr;
+    RemoteHandle* h = _tagged_fields[i]._handle;
+
+    uintptr_t raw = *(uintptr_t*)field_addr;
+
+    // Stale entry: field no longer tagged or points to a different Handle
+    if ((raw & G1_OOP_INDIRECT_BIT) == 0 ||
+        (RemoteHandle*)(raw & G1_OOP_ADDR_MASK) != h) {
+      removed++;
+      continue;
+    }
+
+    // Handle must be LOCAL for fixup (REMOTE/DEAD handles don't need it)
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    if (state != REMOTE_HANDLE_LOCAL) {
+      _tagged_fields[write_idx++] = _tagged_fields[i];
+      continue;
+    }
+
+    HeapWord* target = (HeapWord*)(sa & REMOTE_HANDLE_ADDR_MASK);
+    oop target_oop = cast_to_oop(target);
+
+    // Check if target has been forwarded (mark word contains forwarding ptr)
+    if (_g1h->is_in(target_oop)) {
+      markWord m = target_oop->mark();
+      if (m.is_marked()) {
+        oop forwardee = cast_to_oop(m.decode_pointer());
+        h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
+        updated++;
+      }
+    }
+
+    _tagged_fields[write_idx++] = _tagged_fields[i];
+  }
+
+  _tagged_field_count = write_idx;
+
+  if (updated > 0 || removed > 0) {
+    log_info(gc)("Tagged field fixup: %d handles updated, %d stale entries removed, %d entries remaining",
+                 updated, removed, _tagged_field_count);
+  }
+  return updated;
+}
+
 HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
   // Fast path: try CAS bump pointer on existing FCR region (lock-free).
   HeapRegion* fcr = _current_fcr;
-  if (fcr != nullptr) {
+  if (fcr != nullptr && !fcr->is_free()) {
     size_t actual = 0;
     HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
     if (result != nullptr) {

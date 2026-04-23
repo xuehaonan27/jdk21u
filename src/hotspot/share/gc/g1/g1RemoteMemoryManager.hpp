@@ -486,6 +486,50 @@ public:
     _deferred_decrement_count = 0;
   }
 
+  // ============================================================
+  // Tagged Field List (Bug 2 fix: side list for GC root scanning)
+  // ============================================================
+  // Records heap fields that were rewritten to shared_oop(Handle) during
+  // Phase C eviction tagging. Processed as roots during GC to ensure
+  // Handle targets in the collection set are evacuated and Handles updated.
+  //
+  // This avoids polluting G1's card/remset system with tagged oops, which
+  // break refinement (Handle can transition REMOTE→LOCAL without any heap
+  // field write, so cards can't track the indirection).
+  struct TaggedFieldEntry {
+    oop*          _field_addr;
+    RemoteHandle* _handle;
+  };
+private:
+  TaggedFieldEntry* _tagged_fields;
+  int _tagged_field_count;
+  int _tagged_field_capacity;
+
+public:
+  void add_tagged_field(oop* field_addr, RemoteHandle* h) {
+    if (_tagged_field_count >= _tagged_field_capacity) {
+      int new_cap = (_tagged_field_capacity == 0) ? 4096 : _tagged_field_capacity * 2;
+      TaggedFieldEntry* new_buf = NEW_C_HEAP_ARRAY(TaggedFieldEntry, new_cap, mtGC);
+      if (_tagged_fields != nullptr) {
+        memcpy(new_buf, _tagged_fields, _tagged_field_count * sizeof(TaggedFieldEntry));
+        FREE_C_HEAP_ARRAY(TaggedFieldEntry, _tagged_fields);
+      }
+      _tagged_fields = new_buf;
+      _tagged_field_capacity = new_cap;
+    }
+    _tagged_fields[_tagged_field_count]._field_addr = field_addr;
+    _tagged_fields[_tagged_field_count]._handle = h;
+    _tagged_field_count++;
+  }
+
+  int tagged_field_count() const { return _tagged_field_count; }
+  const TaggedFieldEntry* tagged_fields() const { return _tagged_fields; }
+
+  // Post-evacuation fixup: iterate tagged fields, update Handles whose
+  // targets have been forwarded during evacuation. Lazily removes stale
+  // entries (fields no longer tagged). Returns number of handles updated.
+  int fixup_tagged_field_handles();
+
   // Check if concurrent marking is in progress
   bool concurrent_marking_active() const;
 
@@ -564,6 +608,15 @@ public:
   // Thread-safe (CAS-based bump pointer). Returns nullptr if FCR is full
   // and we can't allocate a new one (e.g., in JRT_LEAF context).
   HeapWord* allocate_in_fcr(size_t word_size);
+
+  // Called during eviction Phase E when a region is freed.
+  // If the freed region is the current FCR, clear the pointer to prevent
+  // post-GC fetches from allocating into a freed/reused region.
+  void invalidate_fcr_if_freed(HeapRegion* freed_hr) {
+    if (_current_fcr == freed_hr) {
+      _current_fcr = nullptr;
+    }
+  }
 
   // ============================================================
   // Remote Collection — "Garbage Never Crosses the Network"

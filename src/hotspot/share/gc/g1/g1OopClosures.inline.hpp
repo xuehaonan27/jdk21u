@@ -283,7 +283,21 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
       forwardee = _par_scan_state->copy_to_survivor_space(state, obj, m);
     }
     assert(forwardee != nullptr, "forwardee should not be null");
-    RawAccess<IS_NOT_NULL>::oop_store(p, forwardee);
+
+    // Tag-aware write-back: if the field contains a shared_oop(Handle),
+    // update the Handle's address instead of overwriting the tagged field.
+    // The field (in the copied object) retains the tagged encoding.
+    if (sizeof(T) == sizeof(uintptr_t)) {
+      uintptr_t raw = *(uintptr_t*)p;
+      if (raw & G1_OOP_INDIRECT_BIT) {
+        RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+        h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
+      } else {
+        RawAccess<IS_NOT_NULL>::oop_store(p, forwardee);
+      }
+    } else {
+      RawAccess<IS_NOT_NULL>::oop_store(p, forwardee);
+    }
 
     if (barrier == G1BarrierCLD) {
       do_cld_barrier(forwardee);

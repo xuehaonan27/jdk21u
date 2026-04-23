@@ -658,6 +658,45 @@ class G1EvacuateRegionsTask : public G1EvacuateRegionsBaseTask {
     _root_processor->evacuate_roots(pss, worker_id);
     _g1h->rem_set()->scan_heap_roots(pss, worker_id, G1GCPhaseTimes::ScanHR, G1GCPhaseTimes::ObjCopy, _has_optional_evacuation_work);
     _g1h->rem_set()->scan_collection_set_code_roots(pss, worker_id, G1GCPhaseTimes::CodeRoots, G1GCPhaseTimes::ObjCopy);
+
+    // Worker 0 scans tagged field roots: ensures Handle targets in the
+    // cset are evacuated even if no card/remset entry points to them.
+    if (worker_id == 0) {
+      G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+      if (rmm != nullptr && rmm->tagged_field_count() > 0) {
+        int count = rmm->tagged_field_count();
+        const G1RemoteMemoryManager::TaggedFieldEntry* entries = rmm->tagged_fields();
+        int evacuated = 0;
+        for (int i = 0; i < count; i++) {
+          RemoteHandle* h = entries[i]._handle;
+          uintptr_t sa = h->load_state_and_addr_acquire();
+          uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+          if (state != REMOTE_HANDLE_LOCAL) continue;
+
+          oop target = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+          if (target == nullptr || !_g1h->is_in(target)) continue;
+
+          const G1HeapRegionAttr region_attr = _g1h->region_attr(target);
+          if (!region_attr.is_in_cset()) continue;
+
+          markWord m = target->mark();
+          oop forwardee;
+          if (m.is_marked()) {
+            forwardee = cast_to_oop(m.decode_pointer());
+          } else {
+            forwardee = pss->copy_to_survivor_space(region_attr, target, m);
+          }
+          if (forwardee != nullptr) {
+            h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
+            evacuated++;
+          }
+        }
+        if (evacuated > 0) {
+          log_info(gc)("Tagged field root scan: evacuated %d Handle targets from cset", evacuated);
+        }
+      }
+    }
+
     // There are no optional roots to scan right now.
 #ifdef ASSERT
     class VerifyOptionalCollectionSetRootsEmptyClosure : public HeapRegionClosure {
@@ -1011,6 +1050,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // not copied during the pause.
   process_discovered_references(per_thread_states);
 
+  // Fixup tagged field Handles: update any LOCAL Handle whose target was
+  // forwarded during evacuation. The root scan in G1EvacuateRegionsTask
+  // evacuates Handle targets in the cset; this pass catches any that were
+  // forwarded by other closures (e.g., through remset scanning).
+  {
+    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+    if (rmm != nullptr && rmm->tagged_field_count() > 0) {
+      rmm->fixup_tagged_field_handles();
+    }
+  }
+
   G1STWIsAliveClosure is_alive(_g1h);
   G1KeepAliveClosure keep_alive(_g1h);
 
@@ -1213,6 +1263,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           total_evicted += region_objects;
           regions_evicted++;
           total_freed_bytes += region_used;
+          rmm->invalidate_fcr_if_freed(hr);
           _g1h->free_region(hr, &freed_list);
           freed_regions++;
           log_info(gc)("Evicted region %u (%d objects, " SIZE_FORMAT "KB)",
