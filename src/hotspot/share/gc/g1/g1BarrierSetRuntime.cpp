@@ -213,6 +213,11 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
     state = sa & REMOTE_HANDLE_STATE_MASK;
   }
 
+  // After CAS race or direct entry: handle any state.
+  if (state == REMOTE_HANDLE_LOCAL) {
+    return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+  }
+
   if (state == REMOTE_HANDLE_FETCHING) {
     // Wait with safepoint awareness
     ThreadBlockInVM tbivm(current);
