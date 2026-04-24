@@ -58,6 +58,7 @@
 #include "gc/shared/referenceProcessor.hpp"
 #include "gc/shared/weakProcessor.inline.hpp"
 #include "gc/shared/workerPolicy.hpp"
+#include "code/codeCache.hpp"
 #include "gc/shared/workerThread.hpp"
 #include "jfr/jfrEvents.hpp"
 #include "memory/resourceArea.hpp"
@@ -1085,6 +1086,18 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     for (auto id : EnumRange<OopStorageSet::WeakId>()) {
       OopStorageSet::storage(id)->oops_do(&pin_cl);
     }
+    // ClassLoaderDataGraph — java.lang.Class mirrors and CLD oops
+    {
+      CLDToOopClosure cld_cl(&pin_cl, ClassLoaderData::_claim_none);
+      ClassLoaderDataGraph::cld_do(&cld_cl);
+    }
+    // CodeCache — embedded oop constants in compiled methods
+    {
+      CodeBlobToOopClosure code_cl(&pin_cl, false);
+      CodeCache::blobs_do(&code_cl);
+    }
+    // Concurrent mark ref processor — discovered references
+    _g1h->ref_processor_cm()->weak_oops_do(&pin_cl);
 
     // Also check remote anchor roots
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
@@ -1192,6 +1205,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       for (auto id : EnumRange<OopStorageSet::WeakId>()) {
         OopStorageSet::storage(id)->oops_do(&pin_cl);
       }
+      {
+        CLDToOopClosure cld_cl(&pin_cl, ClassLoaderData::_claim_none);
+        ClassLoaderDataGraph::cld_do(&cld_cl);
+      }
+      {
+        CodeBlobToOopClosure code_cl(&pin_cl, false);
+        CodeCache::blobs_do(&code_cl);
+      }
+      _g1h->ref_processor_cm()->weak_oops_do(&pin_cl);
       rmm->oops_do_remote_anchors(&pin_cl);
 
       for (uint i = 0; i < num_regions; i++) {
@@ -1318,6 +1340,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       for (auto id : EnumRange<OopStorageSet::WeakId>()) {
         OopStorageSet::storage(id)->oops_do(&vr);
       }
+      {
+        CLDToOopClosure cld_cl(&vr, ClassLoaderData::_claim_none);
+        ClassLoaderDataGraph::cld_do(&cld_cl);
+      }
+      {
+        CodeBlobToOopClosure code_cl(&vr, false);
+        CodeCache::blobs_do(&code_cl);
+      }
+      _g1h->ref_processor_cm()->weak_oops_do(&vr);
       // Skip oops_do_remote_anchors: handles for objects in eviction candidates
       // naturally point into those regions (that's the eviction infrastructure).
       if (vr.bad() > 0) {
