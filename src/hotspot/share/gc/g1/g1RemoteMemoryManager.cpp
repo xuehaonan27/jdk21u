@@ -527,9 +527,17 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     virtual void do_oop(oop* p) {
       uintptr_t raw = *(uintptr_t*)p;
       if (raw == 0) return;
-      if ((raw >> 63) != 0) return; // already tagged
+      // Shared oops (bits 63+62) already have Handle indirection — skip.
+      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
 
-      oop target = cast_to_oop(raw);
+      // Resolve: strip Unique tag bits if present.
+      oop target;
+      if ((raw >> 63) != 0) {
+        target = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+      } else {
+        target = cast_to_oop(raw);
+      }
       if (!_g1h->is_in(target)) return;
 
       HeapRegion* target_hr = _g1h->heap_region_containing(target);
@@ -603,9 +611,16 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     virtual void do_oop(oop* p) {
       uintptr_t raw = *(uintptr_t*)p;
       if (raw == 0) return;
-      if ((raw >> 63) != 0) return; // tagged — OK
+      // Shared oops (bits 63+62) already go through a Handle — OK.
+      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
 
-      oop target = cast_to_oop(raw);
+      oop target;
+      if ((raw >> 63) != 0) {
+        target = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+      } else {
+        target = cast_to_oop(raw);
+      }
       if (!_g1h->is_in(target)) return;
 
       HeapRegion* target_hr = _g1h->heap_region_containing(target);
@@ -617,11 +632,13 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         HeapRegion* src_hr = (_cur_obj != nullptr && _g1h->is_in(_cur_obj))
           ? _g1h->heap_region_containing(_cur_obj) : nullptr;
         log_warning(gc)("VERIFY: untagged ref field=" PTR_FORMAT " -> target=" PTR_FORMAT
-                        " in candidate region %u, src_obj=" PTR_FORMAT " klass=%s src_region=%u",
+                        " in candidate region %u, src_obj=" PTR_FORMAT " klass=%s src_region=%u"
+                        " raw=0x%lx",
                         p2i(p), p2i((void*)target), idx,
                         p2i((void*)_cur_obj),
                         (_cur_obj != nullptr ? _cur_obj->klass()->external_name() : "root"),
-                        (src_hr != nullptr ? src_hr->hrm_index() : 9999));
+                        (src_hr != nullptr ? src_hr->hrm_index() : 9999),
+                        (unsigned long)raw);
       }
     }
 
