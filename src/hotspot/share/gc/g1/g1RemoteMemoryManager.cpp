@@ -29,6 +29,9 @@
 #include "runtime/threads.hpp"
 #include "gc/shared/oopStorageSet.inline.hpp"
 #include "utilities/copy.hpp"
+#include "classfile/classLoaderDataGraph.hpp"
+#include "code/codeCache.hpp"
+#include "gc/shared/referenceProcessor.hpp"
 
 // TCP client for remote executor communication
 #include <sys/socket.h>
@@ -678,6 +681,15 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     OopStorageSet::storage(id)->oops_do(&cl);
   }
   oops_do_remote_anchors(&cl);
+  {
+    CLDToOopClosure cld_cl(&cl, ClassLoaderData::_claim_none);
+    ClassLoaderDataGraph::cld_do(&cld_cl);
+  }
+  {
+    CodeBlobToOopClosure code_cl(&cl, false);
+    CodeCache::blobs_do(&code_cl);
+  }
+  _g1h->ref_processor_cm()->weak_oops_do(&cl);
 
   if (cl.missed() > 0) {
     log_warning(gc)("VERIFY: %d untagged refs to eviction candidates AFTER tagging!",

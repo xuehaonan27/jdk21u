@@ -1288,6 +1288,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           total_evicted += region_objects;
           regions_evicted++;
           total_freed_bytes += region_used;
+          // Poison freed region: 0x5A → words become 0x5A5A5A5A5A5A5A5A
+          // (bit 63 clear = clean oop, unmapped addr → immediate SIGSEGV)
+          memset((void*)hr->bottom(), 0x5A, (size_t)((char*)hr->top() - (char*)hr->bottom()));
           rmm->invalidate_fcr_if_freed(hr);
           _g1h->free_region(hr, &freed_list);
           freed_regions++;
