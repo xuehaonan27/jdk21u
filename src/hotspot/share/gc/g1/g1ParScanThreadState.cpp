@@ -237,7 +237,19 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   } else {
     obj = do_copy_to_survivor_space(region_attr, obj, m);
   }
-  RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+  // Tag-aware write-back: if the field contains a shared_oop(Handle),
+  // update the Handle's address instead of overwriting the tagged field.
+  if (sizeof(T) == sizeof(uintptr_t)) {
+    uintptr_t raw = *(uintptr_t*)p;
+    if (raw & G1_OOP_INDIRECT_BIT) {
+      RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+      h->set_local_release((void*)cast_from_oop<uintptr_t>(obj));
+    } else {
+      RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+    }
+  } else {
+    RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+  }
 
   // Phase 2: Record reference site for RC counting if target was promoted to Old.
   // Only record when eviction is possible (G1TagRefSites or G1SimulateRemoteEviction
