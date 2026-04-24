@@ -908,7 +908,9 @@ void G1ParScanThreadStateSet::flush_stats() {
   // When disabled, skip to avoid post-evacuate overhead (can be 2+ seconds
   // for large heaps due to RC hash map construction + mark word updates).
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
-    process_oop_classification_fixup();
+    // BISECT: skip classification+tagging to test if it's the crash cause.
+    // Cold routing + ref-site recording still active.
+    // process_oop_classification_fixup();
   }
 
   for (uint worker_id = 0; worker_id < _num_workers; ++worker_id) {
