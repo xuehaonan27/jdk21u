@@ -41,6 +41,7 @@
 #include "gc/g1/g1Policy.hpp"
 #include "gc/g1/g1RemoteBackend.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1RedirtyCardsQueue.hpp"
 #include "gc/g1/g1RemSet.hpp"
 #include "gc/g1/g1RootProcessor.hpp"
@@ -1180,9 +1181,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     int total_candidates = path1_candidates + path2_candidates;
 
     // ---- Phase D (early): Root-pin check BEFORE expensive heap scan ----
-    // At lr=25 the full heap scan triggers massive kernel paging (20-80s).
-    // Most candidates end up root-pinned. Check first, skip scan if all pinned.
-    if (total_candidates > 0 && path2_candidates > 0) {
+    // Must run for ALL candidates (path1 AND path2). Path1 was root-checked
+    // in Step 2, but Step 2 runs before post_evacuate_cleanup; re-check here
+    // to catch any roots that moved during cleanup.
+    if (total_candidates > 0) {
       ColdRegionPinClosure pin_cl(_g1h);
       Threads::oops_do(&pin_cl, nullptr);
       JNIHandles::oops_do(&pin_cl);
@@ -1272,6 +1274,54 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         } else {
           hr->clear_cold_destination();
         }
+      }
+    }
+
+    // Post-eviction diagnostic: verify no root oops point into freed regions.
+    // Run BEFORE freeing so region metadata is still valid.
+    if (regions_evicted > 0) {
+      class VerifyNoRootToFreedClosure : public OopClosure {
+        G1CollectedHeap* _g1h;
+        bool* _freed_set;
+        uint _num_regions;
+        int _bad;
+      public:
+        VerifyNoRootToFreedClosure(G1CollectedHeap* g1h, bool* fset, uint n)
+          : _g1h(g1h), _freed_set(fset), _num_regions(n), _bad(0) {}
+        void do_oop(oop* p) {
+          uintptr_t raw = *(uintptr_t*)p;
+          if (raw == 0) return;
+          oop obj;
+          if ((raw >> 63) != 0) {
+            if (raw & G1_OOP_INDIRECT_BIT) return; // Shared → Handle
+            obj = (oop)(raw & G1_OOP_ADDR_MASK); // Unique → strip
+          } else {
+            obj = (oop)raw;
+          }
+          if (!_g1h->is_in(obj)) return;
+          HeapRegion* hr = _g1h->heap_region_containing(obj);
+          uint idx = hr->hrm_index();
+          if (idx < _num_regions && _freed_set[idx]) {
+            _bad++;
+            log_warning(gc)("POST-EVICTION ROOT DANGLE: root_slot=" PTR_FORMAT
+                            " -> obj=" PTR_FORMAT " in freed region %u raw=0x%lx",
+                            p2i(p), p2i((void*)obj), idx, (unsigned long)raw);
+          }
+        }
+        void do_oop(narrowOop* p) {}
+        int bad() const { return _bad; }
+      };
+      VerifyNoRootToFreedClosure vr(_g1h, eviction_candidates, num_regions);
+      Threads::oops_do(&vr, nullptr);
+      JNIHandles::oops_do(&vr);
+      OopStorageSet::strong_oops_do(&vr);
+      for (auto id : EnumRange<OopStorageSet::WeakId>()) {
+        OopStorageSet::storage(id)->oops_do(&vr);
+      }
+      rmm->oops_do_remote_anchors(&vr);
+      if (vr.bad() > 0) {
+        log_warning(gc)("POST-EVICTION: %d root oops point into %d freed regions!",
+                        vr.bad(), regions_evicted);
       }
     }
 
