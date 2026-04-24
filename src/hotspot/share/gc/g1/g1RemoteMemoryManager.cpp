@@ -1154,6 +1154,7 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
     size_t actual = 0;
     HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
     if (result != nullptr) {
+      fcr->update_bot_for_obj(result, word_size);
       return result;
     }
   }
@@ -1169,7 +1170,10 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
     if (fcr != nullptr) {
       size_t actual = 0;
       HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
-      if (result != nullptr) return result;
+      if (result != nullptr) {
+        fcr->update_bot_for_obj(result, word_size);
+        return result;
+      }
     }
     return nullptr;
   }
@@ -1183,7 +1187,11 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
     _current_fcr = new_fcr;
     fcr_unlock();
     size_t actual = 0;
-    return new_fcr->par_allocate(word_size, word_size, &actual);
+    HeapWord* result = new_fcr->par_allocate(word_size, word_size, &actual);
+    if (result != nullptr) {
+      new_fcr->update_bot_for_obj(result, word_size);
+    }
+    return result;
   }
 
   fcr_unlock();
