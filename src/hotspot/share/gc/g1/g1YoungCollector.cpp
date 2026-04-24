@@ -1318,7 +1318,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       for (auto id : EnumRange<OopStorageSet::WeakId>()) {
         OopStorageSet::storage(id)->oops_do(&vr);
       }
-      rmm->oops_do_remote_anchors(&vr);
+      // Skip oops_do_remote_anchors: handles for objects in eviction candidates
+      // naturally point into those regions (that's the eviction infrastructure).
       if (vr.bad() > 0) {
         log_warning(gc)("POST-EVICTION: %d root oops point into %d freed regions!",
                         vr.bad(), regions_evicted);
