@@ -201,7 +201,62 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
           continue;
         }
 
+        // Overwrite stale eviction-time header with known-good values.
+        // The raw bytes from remote contain the mark word and klass from
+        // eviction time — stale classification bits, hash, etc.
+        cast_to_oop(dest)->set_mark(markWord::prototype());
+        cast_to_oop(dest)->set_klass(fetched_klass);
+
         rmm->patch_fetched_fields(h, dest);
+
+        // Post-fetch validation: scan all oop fields of the fetched object
+        // and verify each is null, a valid heap oop, or a valid tagged oop.
+        {
+          oop fetched = cast_to_oop(dest);
+          Klass* fk = fetched->klass();
+          class ValidateOopClosure : public BasicOopIterateClosure {
+            G1CollectedHeap* _g1h;
+            oop _obj;
+            int _bad;
+          public:
+            ValidateOopClosure(G1CollectedHeap* g1h, oop obj) : _g1h(g1h), _obj(obj), _bad(0) {}
+            virtual void do_oop(oop* p) {
+              uintptr_t raw = *(uintptr_t*)p;
+              if (raw == 0) return;
+              if ((raw >> 63) != 0) return; // tagged — OK
+              if (!_g1h->is_in((void*)raw)) {
+                uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
+                log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
+                                "field_val=" PTR_FORMAT " not in heap",
+                                p2i((void*)_obj), _obj->klass()->external_name(),
+                                off, raw);
+                *(uintptr_t*)p = 0;
+                _bad++;
+                return;
+              }
+              oop target = cast_to_oop(raw);
+              Klass* tk = target->klass_or_null();
+              if (tk == nullptr) {
+                uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
+                log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
+                                "target=" PTR_FORMAT " has null klass",
+                                p2i((void*)_obj), _obj->klass()->external_name(),
+                                off, raw);
+                *(uintptr_t*)p = 0;
+                _bad++;
+              }
+            }
+            virtual void do_oop(narrowOop* p) {}
+            int bad() const { return _bad; }
+          };
+          ValidateOopClosure vcl(g1h, fetched);
+          fetched->oop_iterate(&vcl);
+          if (vcl.bad() > 0) {
+            log_warning(gc)("POST-FETCH: %d corrupt fields nulled in obj=" PTR_FORMAT
+                            " klass=%s", vcl.bad(), p2i(dest), fk->external_name());
+          }
+        }
+
         rmm->rekey_handle_on_fetch(h, (void*)dest);
 
         uintptr_t handle_id = (uintptr_t)h;

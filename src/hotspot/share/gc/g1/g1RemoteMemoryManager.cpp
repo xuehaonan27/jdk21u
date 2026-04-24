@@ -803,7 +803,29 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
 
     if (target_state == REMOTE_HANDLE_LOCAL) {
       // Target is local — patch to clean oop (current address)
-      *field_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      uintptr_t target_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      if (target_addr != 0 && _g1h->is_in((void*)target_addr)) {
+        oop target_oop = cast_to_oop(target_addr);
+        Klass* target_klass = target_oop->klass_or_null();
+        if (target_klass == nullptr) {
+          log_warning(gc)("Fetch patch CORRUPT: edge %u offset=%u handle=" PTR_FORMAT
+                          " target=" PTR_FORMAT " has null klass — nulling field",
+                          i, edge._field_offset, p2i(target), p2i((void*)target_addr));
+          *field_addr = 0;
+          patched++;
+          if (cm_active) { defer_refcount_decrement(target); } else { target->decrement_remote_refcount(); }
+          continue;
+        }
+      } else if (target_addr != 0) {
+        log_warning(gc)("Fetch patch CORRUPT: edge %u offset=%u handle=" PTR_FORMAT
+                        " target=" PTR_FORMAT " not in heap — nulling field",
+                        i, edge._field_offset, p2i(target), p2i((void*)target_addr));
+        *field_addr = 0;
+        patched++;
+        if (cm_active) { defer_refcount_decrement(target); } else { target->decrement_remote_refcount(); }
+        continue;
+      }
+      *field_addr = target_addr;
       patched++;
     } else if (target_state == REMOTE_HANDLE_REMOTE ||
                target_state == REMOTE_HANDLE_FETCHING) {
