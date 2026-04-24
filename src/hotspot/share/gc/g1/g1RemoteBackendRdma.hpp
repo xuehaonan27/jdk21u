@@ -20,6 +20,7 @@
 #define SHARE_GC_G1_G1REMOTEBACKENDRDMA_HPP
 
 #include "gc/g1/g1RemoteBackend.hpp"
+#include "runtime/atomic.hpp"
 
 #ifdef REMOTE_EXECUTOR_USE_RDMA
 
@@ -48,6 +49,10 @@ class RDMAExecutorBackend : public G1RemoteBackend {
   size_t   _next_slot;
   size_t   _total_evicted;
   size_t   _total_fetched;
+  volatile int _io_lock;
+
+  void io_lock()   { while (Atomic::cmpxchg(&_io_lock, 0, 1) != 0) { /* spin */ } }
+  void io_unlock() { Atomic::release_store(&_io_lock, 0); }
 
   // RDMA helpers
   bool setup_rdma_resources();

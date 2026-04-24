@@ -11,6 +11,7 @@
 #define SHARE_GC_G1_G1REMOTEBACKENDTCP_HPP
 
 #include "gc/g1/g1RemoteBackend.hpp"
+#include "runtime/atomic.hpp"
 
 class TCPExecutorBackend : public G1RemoteBackend {
   int      _fd;              // TCP socket
@@ -19,6 +20,10 @@ class TCPExecutorBackend : public G1RemoteBackend {
   size_t   _next_slot;
   size_t   _total_evicted;
   size_t   _total_fetched;
+  volatile int _io_lock;
+
+  void io_lock()   { while (Atomic::cmpxchg(&_io_lock, 0, 1) != 0) { /* spin */ } }
+  void io_unlock() { Atomic::release_store(&_io_lock, 0); }
 
   bool send_all(const void* data, size_t len);
   bool recv_all(void* buf, size_t len);

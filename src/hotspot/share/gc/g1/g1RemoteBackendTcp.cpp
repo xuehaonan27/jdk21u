@@ -38,7 +38,7 @@ static const uint32_t RE_RESP_COLLECTION_RESULT = 0x84;
 
 TCPExecutorBackend::TCPExecutorBackend()
   : _fd(-1), _connected(false), _seq_id(0),
-    _next_slot(0), _total_evicted(0), _total_fetched(0) {}
+    _next_slot(0), _total_evicted(0), _total_fetched(0), _io_lock(0) {}
 
 TCPExecutorBackend::~TCPExecutorBackend() {
   shutdown();
@@ -184,28 +184,13 @@ size_t TCPExecutorBackend::evict(const void* obj_bytes, size_t word_size,
                                  Klass* klass, size_t hint_slot_id) {
   if (!_connected) return (size_t)-1;
 
+  io_lock();
+
   size_t slot_id = (hint_slot_id != (size_t)-1) ? hint_slot_id : _next_slot++;
   size_t byte_size = word_size * HeapWordSize;
 
-  // CMD_EVICT_OBJECT: header(12) + slot_id(8) + klass(8) + word_size(4) + bytes
-  size_t msg_size = 32 + byte_size;
+  size_t msg_size = 36 + byte_size;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
-  *(uint32_t*)(msg + 0) = RE_CMD_EVICT_OBJECT;
-  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
-  *(uint64_t*)(msg + 8) = _seq_id++;
-  *(uint64_t*)(msg + 16) = slot_id;        // after header: offset 12..19 in protocol, but we use simplified layout
-  *(uint64_t*)(msg + 24) = (uint64_t)klass;
-  // We need to fit word_size in there too. Protocol says offset 28 is word_size(4).
-  // But we started payload at offset 16. Let me pack tightly:
-  // [0:4] type [4:8] length [8:16] seq_id [16:24] slot_id [24:32] klass_addr
-  // We're at 32 bytes for header+fields. word_size needs to go at 32.
-  // But msg_size = 32 + byte_size and we copy bytes at offset 32.
-  // Fix: extend header to include word_size.
-  os::free(msg);
-
-  // Corrected layout: 36 byte header + bytes
-  msg_size = 36 + byte_size;
-  msg = (uint8_t*)os::malloc(msg_size, mtGC);
   *(uint32_t*)(msg + 0)  = RE_CMD_EVICT_OBJECT;
   *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
   *(uint64_t*)(msg + 8)  = _seq_id++;
@@ -216,11 +201,13 @@ size_t TCPExecutorBackend::evict(const void* obj_bytes, size_t word_size,
 
   bool ok = send_msg(msg, msg_size);
   os::free(msg);
-  if (!ok) return (size_t)-1;
+  if (!ok) { io_unlock(); return (size_t)-1; }
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  if (!recv_msg(resp, sizeof(resp), &resp_len)) return (size_t)-1;
+  if (!recv_msg(resp, sizeof(resp), &resp_len)) { io_unlock(); return (size_t)-1; }
+
+  io_unlock();
 
   _total_evicted++;
   return slot_id;
@@ -229,44 +216,31 @@ size_t TCPExecutorBackend::evict(const void* obj_bytes, size_t word_size,
 Klass* TCPExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_size) {
   if (!_connected) return nullptr;
 
-  // CMD_FETCH_OBJECT: header(12) + slot_id(8) = 20
-  uint8_t msg[20];
-  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_OBJECT;
-  *(uint32_t*)(msg + 4) = 20;
-  *(uint64_t*)(msg + 8) = _seq_id++;
-  *(uint64_t*)(msg + 12) = slot_id;
+  io_lock();
 
-  // Hmm, the header is 12 bytes (type+length+seq_id), so slot_id starts at 12.
-  // But we wrote seq_id at offset 8 (8 bytes), which overlaps with length field.
-  // Let me use the proper protocol layout:
-  // [0:4]=type [4:8]=length [8:16]=seq_id → that's 16 bytes for header
-  // No, protocol says header is 12: type(4)+length(4)+seq_id(8) → but 4+4+8=16.
-  // Actually remote_protocol.h says: uint32_t type, uint32_t length, uint64_t seq_id = 16 bytes.
-  // So header is 16 bytes, not 12. Let me fix.
-
-  // Corrected: header is 16 bytes
   uint8_t fetch_msg[24];  // header(16) + slot_id(8)
   *(uint32_t*)(fetch_msg + 0) = RE_CMD_FETCH_OBJECT;
   *(uint32_t*)(fetch_msg + 4) = 24;
   *(uint64_t*)(fetch_msg + 8) = _seq_id++;
   *(uint64_t*)(fetch_msg + 16) = slot_id;
 
-  if (!send_msg(fetch_msg, 24)) return nullptr;
+  if (!send_msg(fetch_msg, 24)) { io_unlock(); return nullptr; }
 
-  // RESP_OBJECT_DATA: header(16) + slot_id(8) + klass(8) + word_size(4) + bytes
   uint8_t* resp = (uint8_t*)os::malloc(128 * 1024, mtGC);
   size_t resp_len = 0;
   if (!recv_msg(resp, 128 * 1024, &resp_len)) {
     os::free(resp);
+    io_unlock();
     return nullptr;
   }
+
+  io_unlock();
 
   if (*(uint32_t*)resp != RE_RESP_OBJECT_DATA) {
     os::free(resp);
     return nullptr;
   }
 
-  // Parse response: header(16) + slot_id(8) + klass(8) + word_size(4) + bytes
   uint64_t resp_klass_val = *(uint64_t*)(resp + 24);
   uint32_t resp_ws = *(uint32_t*)(resp + 32);
   size_t byte_size = resp_ws * HeapWordSize;
@@ -281,14 +255,14 @@ Klass* TCPExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_si
 void TCPExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_roots) {
   if (!_connected) return;
 
-  // CMD_REPORT_ROOTS: header(16) + num_roots(4) + slot_ids[num_roots * 8]
+  io_lock();
+
   size_t msg_size = 20 + num_roots * 8;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
   *(uint32_t*)(msg + 0) = RE_CMD_REPORT_ROOTS;
   *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
   *(uint64_t*)(msg + 8) = _seq_id++;
   *(uint32_t*)(msg + 16) = (uint32_t)num_roots;
-  // Copy slot_ids (converting size_t to uint64_t)
   uint64_t* dst_ids = (uint64_t*)(msg + 20);
   for (size_t i = 0; i < num_roots; i++) {
     dst_ids[i] = (uint64_t)root_slot_ids[i];
@@ -297,10 +271,11 @@ void TCPExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_ro
   send_msg(msg, msg_size);
   os::free(msg);
 
-  // Wait for OK
   uint8_t resp[64];
   size_t resp_len = 0;
   recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 void TCPExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_dead,
@@ -310,21 +285,24 @@ void TCPExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_dea
     return;
   }
 
-  // CMD_REQUEST_COLLECTION: header only (16 bytes)
+  io_lock();
+
   uint8_t msg[16];
   *(uint32_t*)(msg + 0) = RE_CMD_REQUEST_COLLECTION;
   *(uint32_t*)(msg + 4) = 16;
   *(uint64_t*)(msg + 8) = _seq_id++;
   send_msg(msg, 16);
 
-  // RESP_COLLECTION_RESULT: header(16) + num_dead(4) + num_live(4) + bytes_freed(8) + dead_ids[]
   uint8_t* resp = (uint8_t*)os::malloc(1024 * 1024, mtGC);
   size_t resp_len = 0;
   if (!recv_msg(resp, 1024 * 1024, &resp_len)) {
     os::free(resp);
+    io_unlock();
     *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
     return;
   }
+
+  io_unlock();
 
   if (*(uint32_t*)resp != RE_RESP_COLLECTION_RESULT) {
     os::free(resp);
@@ -332,13 +310,10 @@ void TCPExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_dea
     return;
   }
 
-  // Parse: header(16) + num_dead(4) + num_live(4) + bytes_freed(8) + dead_ids[]
   uint32_t num_dead = *(uint32_t*)(resp + 16);
-  // uint32_t num_live = *(uint32_t*)(resp + 20);
   uint64_t bytes_freed = *(uint64_t*)(resp + 24);
   uint64_t* dead_ids_raw = (uint64_t*)(resp + 32);
 
-  // Convert to size_t array
   size_t* dead_ids = (size_t*)os::malloc(num_dead * sizeof(size_t), mtGC);
   for (uint32_t i = 0; i < num_dead; i++) {
     dead_ids[i] = (size_t)dead_ids_raw[i];
@@ -354,6 +329,8 @@ void TCPExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_dea
 void TCPExecutorBackend::discard_slot(size_t slot_id) {
   if (!_connected) return;
 
+  io_lock();
+
   uint8_t msg[24];
   *(uint32_t*)(msg + 0) = RE_CMD_DISCARD_SLOT;
   *(uint32_t*)(msg + 4) = 24;
@@ -364,6 +341,8 @@ void TCPExecutorBackend::discard_slot(size_t slot_id) {
   uint8_t resp[64];
   size_t resp_len = 0;
   recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 size_t TCPExecutorBackend::slot_word_size(size_t slot_id) const {
@@ -379,6 +358,8 @@ size_t TCPExecutorBackend::evict_with_edges(const void* obj_bytes, size_t word_s
                                             const EdgeInfo* edges, uint32_t num_edges,
                                             size_t hint_slot_id) {
   if (!_connected) return (size_t)-1;
+
+  io_lock();
 
   size_t slot_id = (hint_slot_id == (size_t)-1) ? _next_slot++ : hint_slot_id;
   size_t byte_size = word_size * HeapWordSize;
@@ -411,6 +392,8 @@ size_t TCPExecutorBackend::evict_with_edges(const void* obj_bytes, size_t word_s
   size_t resp_len = 0;
   recv_msg(resp, sizeof(resp), &resp_len);
 
+  io_unlock();
+
   if (resp_len >= 4 && *(uint32_t*)resp == RE_RESP_OK) {
     _total_evicted++;
     return slot_id;
@@ -420,6 +403,8 @@ size_t TCPExecutorBackend::evict_with_edges(const void* obj_bytes, size_t word_s
 
 void TCPExecutorBackend::localize_batch(const uintptr_t* handle_ids, size_t count) {
   if (!_connected || count == 0) return;
+
+  io_lock();
 
   size_t msg_size = 16 + 4 + count * 8;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
@@ -435,10 +420,14 @@ void TCPExecutorBackend::localize_batch(const uintptr_t* handle_ids, size_t coun
   uint8_t resp[64];
   size_t resp_len = 0;
   recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 void TCPExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, size_t count) {
   if (!_connected) return;
+
+  io_lock();
 
   size_t msg_size = 16 + 4 + count * 8;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
@@ -454,6 +443,8 @@ void TCPExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, siz
   uint8_t resp[64];
   size_t resp_len = 0;
   recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 void TCPExecutorBackend::directory_upsert(const uintptr_t* handle_ids,
@@ -462,7 +453,8 @@ void TCPExecutorBackend::directory_upsert(const uintptr_t* handle_ids,
                                           size_t count) {
   if (!_connected || count == 0) return;
 
-  // Each entry: handle_id(8) + state(4) + slot_id(8) = 20 bytes
+  io_lock();
+
   size_t msg_size = 16 + 4 + count * 20;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
   *(uint32_t*)(msg + 0) = RE_CMD_DIRECTORY_UPSERT;
@@ -484,4 +476,6 @@ void TCPExecutorBackend::directory_upsert(const uintptr_t* handle_ids,
   uint8_t resp[64];
   size_t resp_len = 0;
   recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }

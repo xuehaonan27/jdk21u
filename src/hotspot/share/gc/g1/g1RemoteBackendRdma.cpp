@@ -135,7 +135,7 @@ RDMAExecutorBackend::RDMAExecutorBackend()
     _qp(nullptr), _local_mr(nullptr),
     _remote_base_addr(0), _remote_rkey(0), _remote_arena_size(0),
     _tcp_fd(-1), _connected(false), _seq_id(0),
-    _next_slot(0), _total_evicted(0), _total_fetched(0) {
+    _next_slot(0), _total_evicted(0), _total_fetched(0), _io_lock(0) {
 }
 
 RDMAExecutorBackend::~RDMAExecutorBackend() {
@@ -533,10 +533,11 @@ size_t RDMAExecutorBackend::evict(const void* obj_bytes, size_t word_size,
                                   Klass* klass, size_t hint_slot_id) {
   if (!_connected) return (size_t)-1;
 
+  io_lock();
+
   size_t slot_id = (hint_slot_id != (size_t)-1) ? hint_slot_id : _next_slot++;
   size_t byte_size = word_size * HeapWordSize;
 
-  // CMD_EVICT_OBJECT: header(16) + slot_id(8) + klass(8) + word_size(4) + bytes
   size_t msg_size = 36 + byte_size;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
   *(uint32_t*)(msg + 0)  = RE_CMD_EVICT_OBJECT;
@@ -549,11 +550,13 @@ size_t RDMAExecutorBackend::evict(const void* obj_bytes, size_t word_size,
 
   bool ok = rdma_send_msg(msg, msg_size);
   os::free(msg);
-  if (!ok) return (size_t)-1;
+  if (!ok) { io_unlock(); return (size_t)-1; }
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) return (size_t)-1;
+  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) { io_unlock(); return (size_t)-1; }
+
+  io_unlock();
 
   _total_evicted++;
   return slot_id;
@@ -562,16 +565,21 @@ size_t RDMAExecutorBackend::evict(const void* obj_bytes, size_t word_size,
 Klass* RDMAExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_size) {
   if (!_connected) return nullptr;
 
+  io_lock();
+
   uint8_t msg[24];
   *(uint32_t*)(msg + 0) = RE_CMD_FETCH_OBJECT;
   *(uint32_t*)(msg + 4) = 24;
   *(uint64_t*)(msg + 8) = _seq_id++;
   *(uint64_t*)(msg + 16) = slot_id;
-  if (!rdma_send_msg(msg, 24)) return nullptr;
+  if (!rdma_send_msg(msg, 24)) { io_unlock(); return nullptr; }
 
   uint8_t* resp = (uint8_t*)os::malloc(128 * 1024, mtGC);
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, 128 * 1024, &resp_len)) { os::free(resp); return nullptr; }
+  if (!rdma_recv_msg(resp, 128 * 1024, &resp_len)) { os::free(resp); io_unlock(); return nullptr; }
+
+  io_unlock();
+
   if (*(uint32_t*)resp != RE_RESP_OBJECT_DATA) { os::free(resp); return nullptr; }
 
   uint64_t resp_klass = *(uint64_t*)(resp + 24);
@@ -586,6 +594,8 @@ Klass* RDMAExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_s
 
 void RDMAExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_roots) {
   if (!_connected) return;
+
+  io_lock();
 
   size_t msg_size = 20 + num_roots * 8;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
@@ -602,6 +612,8 @@ void RDMAExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_r
   uint8_t resp[64];
   size_t resp_len = 0;
   rdma_recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_dead,
@@ -610,6 +622,8 @@ void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_de
     *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
     return;
   }
+
+  io_lock();
 
   uint8_t msg[16];
   *(uint32_t*)(msg + 0) = RE_CMD_REQUEST_COLLECTION;
@@ -621,9 +635,12 @@ void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_de
   size_t resp_len = 0;
   if (!rdma_recv_msg(resp, 1024 * 1024, &resp_len)) {
     os::free(resp);
+    io_unlock();
     *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
     return;
   }
+
+  io_unlock();
 
   if (*(uint32_t*)resp != RE_RESP_COLLECTION_RESULT) {
     os::free(resp);
@@ -646,6 +663,9 @@ void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_de
 
 void RDMAExecutorBackend::discard_slot(size_t slot_id) {
   if (!_connected) return;
+
+  io_lock();
+
   uint8_t msg[24];
   *(uint32_t*)(msg + 0) = RE_CMD_DISCARD_SLOT;
   *(uint32_t*)(msg + 4) = 24;
@@ -655,6 +675,8 @@ void RDMAExecutorBackend::discard_slot(size_t slot_id) {
   uint8_t resp[64];
   size_t resp_len = 0;
   rdma_recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 size_t RDMAExecutorBackend::slot_word_size(size_t /*slot_id*/) const {

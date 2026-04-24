@@ -749,8 +749,9 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
   if (klass != nullptr) {
     size_t expected_ws = h->eviction_word_size();
     if (word_size != expected_ws) {
-      log_warning(gc)("Remote fetch size MISMATCH: slot=" SIZE_FORMAT " expected=" SIZE_FORMAT "w got=" SIZE_FORMAT "w — possible FCR corruption",
+      log_warning(gc)("Remote fetch size MISMATCH: slot=" SIZE_FORMAT " expected=" SIZE_FORMAT "w got=" SIZE_FORMAT "w — aborting fetch to prevent type confusion",
                        slot_id, expected_ws, word_size);
+      return nullptr;
     }
     log_info(gc)("Remote fetch: slot=" SIZE_FORMAT " -> dest=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w",
                  slot_id, p2i(dest), klass->external_name(), word_size);
