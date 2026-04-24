@@ -93,13 +93,21 @@ bool G1RemoteMemoryManager::concurrent_marking_active() const {
 }
 
 void G1RemoteMemoryManager::initialize_backend() {
-  if (!_backend->initialize()) {
-    log_warning(gc)("Remote backend (%s) initialization failed, falling back to sim-local",
-                    _backend->name());
-    delete _backend;
-    _backend = new SimLocalBackend();
-    _backend->initialize();
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    if (_backend->initialize()) {
+      log_info(gc)("Remote memory backend: %s", _backend->name());
+      return;
+    }
+    log_warning(gc)("Remote backend (%s) initialization attempt %d/5 failed, retrying in 2s...",
+                    _backend->name(), attempt);
+    _backend->shutdown();
+    os::naked_sleep(2000);
   }
+  log_warning(gc)("Remote backend (%s) initialization failed after 5 attempts, falling back to sim-local",
+                  _backend->name());
+  delete _backend;
+  _backend = new SimLocalBackend();
+  _backend->initialize();
   log_info(gc)("Remote memory backend: %s", _backend->name());
 }
 
