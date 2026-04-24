@@ -11,6 +11,9 @@
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1CollectorState.hpp"
 #include "gc/g1/g1CardTable.hpp"
+#include "gc/g1/g1BarrierSet.hpp"
+#include "gc/g1/g1DirtyCardQueue.hpp"
+#include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
 #include "gc/g1/heapRegionRemSet.inline.hpp"
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
@@ -850,14 +853,24 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
     }
   }
 
-  // Dirty card table entries covering the fetched object so G1's remembered
-  // sets track cross-region references from this FCR object.  Without this,
-  // young GC won't find FCR→young references and won't update them after
-  // evacuation, leaving stale pointers.
+  // Enqueue dirty cards covering the fetched object into the G1 dirty card
+  // queue. dirty_MemRegion alone only sets card bytes — G1 concurrent
+  // refinement and STW merging only process cards from the dirty card queue.
+  // Without enqueuing, cross-region refs from this FCR object are never
+  // added to remembered sets, so GC won't find or update them.
   if (patched > 0) {
     G1CardTable* ct = _g1h->card_table();
-    MemRegion mr(dest, et->_eviction_word_size);
-    ct->dirty_MemRegion(mr);
+    G1DirtyCardQueueSet& qset = G1BarrierSet::dirty_card_queue_set();
+    Thread* thr = Thread::current();
+    G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(thr);
+    CardTable::CardValue* first = ct->byte_for(dest);
+    CardTable::CardValue* last = ct->byte_for(dest + et->_eviction_word_size - 1);
+    for (CardTable::CardValue* card = first; card <= last; card++) {
+      if (*card != G1CardTable::g1_young_card_val()) {
+        *card = G1CardTable::dirty_card_val();
+        qset.enqueue(queue, card);
+      }
+    }
   }
 
   log_debug(gc)("Fetch patch: handle=" PTR_FORMAT " dest=" PTR_FORMAT " patched=%d/%u fields",
