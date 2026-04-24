@@ -1287,15 +1287,18 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (region_objects > 0) {
           total_evicted += region_objects;
           regions_evicted++;
-          total_freed_bytes += region_used;
-          // Poison freed region: 0x5A → words become 0x5A5A5A5A5A5A5A5A
-          // (bit 63 clear = clean oop, unmapped addr → immediate SIGSEGV)
-          memset((void*)hr->bottom(), 0x5A, (size_t)((char*)hr->top() - (char*)hr->bottom()));
+          // Poison evicted region: 0x5A → 0x5A5A5A5A5A5A5A5A
+          // QUARANTINE: don't free, don't return to free list.
+          // Set top=bottom so G1 walkers skip the poisoned data.
+          // Stale oop access from Java code still hits the poison.
+          size_t poison_bytes = (size_t)((char*)hr->top() - (char*)hr->bottom());
+          memset((void*)hr->bottom(), 0x5A, poison_bytes);
+          hr->set_top(hr->bottom());
           rmm->invalidate_fcr_if_freed(hr);
-          _g1h->free_region(hr, &freed_list);
-          freed_regions++;
-          log_info(gc)("Evicted region %u (%d objects, " SIZE_FORMAT "KB)",
-                       hr->hrm_index(), region_objects, region_used / K);
+          log_info(gc)("Evicted+QUARANTINED region %u (%d objects, " SIZE_FORMAT "KB) "
+                       "[" PTR_FORMAT ", " PTR_FORMAT ")",
+                       hr->hrm_index(), region_objects, region_used / K,
+                       p2i(hr->bottom()), p2i((char*)hr->bottom() + poison_bytes));
         } else {
           hr->clear_cold_destination();
         }
