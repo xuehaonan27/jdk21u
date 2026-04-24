@@ -228,19 +228,56 @@ oop_load_in_heap_at(oop base, ptrdiff_t offset) {
   return value;
 }
 
-// Arraycopy: let tagged oops propagate from source to destination.
-// The load barrier resolves them when the destination elements are read.
-// Previous code used resolve_oop_raw here, which returned nullptr for
-// REMOTE handles — destroying valid references during copy.
+// Arraycopy: for non-checkcast copies, let tagged oops propagate as-is
+// (load barrier resolves on read). For checkcast copies, resolve tagged
+// oops BEFORE the type check — is_instanceof dereferences the oop to
+// read klass, which crashes on a tagged pointer (bit 63 set).
 template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline bool G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_arraycopy_in_heap(arrayOop src_obj, size_t src_offset_in_bytes, T* src_raw,
                       arrayOop dst_obj, size_t dst_offset_in_bytes, T* dst_raw,
                       size_t length) {
-  return ModRef::oop_arraycopy_in_heap(src_obj, src_offset_in_bytes, src_raw,
-                                       dst_obj, dst_offset_in_bytes, dst_raw,
-                                       length);
+  if (!HasDecorator<decorators, ARRAYCOPY_CHECKCAST>::value) {
+    return ModRef::oop_arraycopy_in_heap(src_obj, src_offset_in_bytes, src_raw,
+                                         dst_obj, dst_offset_in_bytes, dst_raw,
+                                         length);
+  }
+
+  BarrierSetT *bs = barrier_set_cast<BarrierSetT>(BarrierSet::barrier_set());
+  src_raw = arrayOopDesc::obj_offset_to_raw(src_obj, src_offset_in_bytes, src_raw);
+  dst_raw = arrayOopDesc::obj_offset_to_raw(dst_obj, dst_offset_in_bytes, dst_raw);
+
+  assert(dst_obj != nullptr, "better have an actual oop");
+  Klass* bound = objArrayOop(dst_obj)->element_klass();
+  T* from = const_cast<T*>(src_raw);
+  T* end  = from + length;
+  for (T* p = dst_raw; from < end; from++, p++) {
+    T element = *from;
+    oop decoded = CompressedOops::decode(element);
+    bool resolved_tag = false;
+    // Tagged oops (bit 63) only exist with uncompressed oops (sizeof(T)==8).
+    if (sizeof(T) == sizeof(oop) && decoded != nullptr &&
+        (cast_from_oop<uintptr_t>(decoded) & G1_OOP_TAG_MASK) != 0) {
+      decoded = resolve_oop_full(decoded);
+      resolved_tag = true;
+    }
+    if (oopDesc::is_instanceof_or_null(decoded, bound)) {
+      bs->template write_ref_field_pre<decorators>(p);
+      if (resolved_tag) {
+        *(oop*)p = decoded;
+      } else {
+        *p = element;
+      }
+    } else {
+      const size_t pd = pointer_delta(p, dst_raw, (size_t)heapOopSize);
+      assert(pd == (size_t)(int)pd, "length field overflow");
+      bs->write_ref_array((HeapWord*)dst_raw, pd);
+      return false;
+    }
+  }
+  bs->write_ref_array((HeapWord*)dst_raw, length);
+  return true;
 }
 
 template <DecoratorSet decorators, typename BarrierSetT>
