@@ -438,13 +438,16 @@ G1HeapRegionAttr G1ParScanThreadState::next_region_attr(G1HeapRegionAttr const r
   // Cold object routing: if G1RemoteEvictionThreshold is active and the object
   // has a stale hotness epoch (cold), route to ColdOld destination for eviction.
   // Only for objects being promoted to Old (not young survivors).
-  // Skip arrays (non-barrier paths access elements directly).
+  // Objects with epoch=0 have never been stamped by the load barrier —
+  // they're freshly promoted with unknown hotness, not cold.
   if (G1RemoteEvictionThreshold > 0 && m.is_unlocked()) {
-    uint32_t gc_epoch = _g1h->remote_memory_manager()->gc_epoch();
-    uintptr_t distance = m.hotness_distance(gc_epoch);
-    // Cold = not accessed in 4+ GC cycles. Also skip newly promoted (distance=0).
-    if (distance >= 4) {
-      return G1HeapRegionAttr(G1HeapRegionAttr::ColdOld);
+    uint32_t obj_epoch = m.remote_epoch();
+    if (obj_epoch != 0) {
+      uint32_t gc_epoch = _g1h->remote_memory_manager()->gc_epoch();
+      uintptr_t distance = m.hotness_distance(gc_epoch);
+      if (distance >= 4) {
+        return G1HeapRegionAttr(G1HeapRegionAttr::ColdOld);
+      }
     }
   }
 
@@ -797,8 +800,7 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         // Determine if tagging is safe: skip arrays and JVM-internal types
         // that are accessed by non-barrier paths (arraycopy, MH dispatch).
         bool in_cold_region = dest->is_cold_destination() && !dest->is_root_pinned();
-        // BISECT-2: disable tagged oop writes, keep mark word classification.
-        bool safe_to_tag = false; // was: G1TagRefSites || in_cold_region;
+        bool safe_to_tag = G1TagRefSites || in_cold_region;
         if (safe_to_tag) {
           Klass* k = obj->klass();
           if (k->is_array_klass()) {
@@ -820,10 +822,12 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         }
 
         if (info.count == 1) {
-          obj->set_mark(mw.set_remote_class(markWord::remote_class_unique));
+          uint32_t cur_epoch = _g1h->remote_memory_manager()->gc_epoch() & 0xF;
+          markWord new_mw = mw.set_remote_class(markWord::remote_class_unique)
+                               .set_remote_epoch(cur_epoch);
+          obj->set_mark(new_mw);
           dest->set_has_classified_objects();
-          // Record hotness for eviction statistics
-          _g1h->remote_memory_manager()->record_hotness(mw, obj->size());
+          _g1h->remote_memory_manager()->record_hotness(new_mw, obj->size());
           if (safe_to_tag && !info.first_site._is_narrow) {
             oop* p = (oop*)info.first_site._ref_site;
             // Verify ref-site before writing
@@ -845,10 +849,12 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
           }
           unique_count++;
         } else {
-          obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
+          uint32_t cur_epoch = _g1h->remote_memory_manager()->gc_epoch() & 0xF;
+          markWord new_mw = mw.set_remote_class(markWord::remote_class_shared)
+                               .set_remote_epoch(cur_epoch);
+          obj->set_mark(new_mw);
           dest->set_has_classified_objects();
-          // Record hotness for eviction statistics
-          _g1h->remote_memory_manager()->record_hotness(mw, obj->size());
+          _g1h->remote_memory_manager()->record_hotness(new_mw, obj->size());
           if (safe_to_tag) {
             RemoteHandle* h = _g1h->remote_memory_manager()->create_handle_for(obj, &hab);
             if (!info.first_site._is_narrow) {
