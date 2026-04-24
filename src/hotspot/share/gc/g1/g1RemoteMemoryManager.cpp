@@ -744,6 +744,11 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
   Klass* klass = _backend->fetch(slot_id, dest, &word_size);
 
   if (klass != nullptr) {
+    size_t expected_ws = h->eviction_word_size();
+    if (word_size != expected_ws) {
+      log_warning(gc)("Remote fetch size MISMATCH: slot=" SIZE_FORMAT " expected=" SIZE_FORMAT "w got=" SIZE_FORMAT "w — possible FCR corruption",
+                       slot_id, expected_ws, word_size);
+    }
     log_info(gc)("Remote fetch: slot=" SIZE_FORMAT " -> dest=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w",
                  slot_id, p2i(dest), klass->external_name(), word_size);
   } else {
@@ -777,10 +782,15 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
   int patched = 0;
   bool cm_active = concurrent_marking_active();
 
+  size_t obj_byte_size = et->_eviction_word_size * HeapWordSize;
+
   for (uint32_t i = 0; i < et->_entry_count; i++) {
     EdgeEntry& edge = et->_entries[i];
     guarantee(edge._field_offset >= 16,
               "Edge table offset %u would corrupt object header", edge._field_offset);
+    guarantee(edge._field_offset + sizeof(uintptr_t) <= obj_byte_size,
+              "Edge table offset %u + %zu overflows object of %zu bytes",
+              edge._field_offset, sizeof(uintptr_t), obj_byte_size);
     uintptr_t* field_addr = (uintptr_t*)(base + edge._field_offset);
     RemoteHandle* target = edge._target_handle;
 

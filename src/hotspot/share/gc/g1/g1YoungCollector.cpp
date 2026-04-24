@@ -1138,6 +1138,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     for (uint i = 0; i < num_regions; i++) {
       HeapRegion* hr = _g1h->region_at(i);
       if (!hr->is_cold_destination()) continue;
+      if (hr->is_fetch_cache()) continue;
       if (hr->is_root_pinned()) {
         hr->clear_cold_destination();
         hr->clear_root_pinned();
@@ -1165,7 +1166,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         for (uint i = 0; i < num_regions && path2_bytes < to_free; i++) {
           HeapRegion* hr = _g1h->region_at(i);
           if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
-          if (hr->is_cold_destination()) continue;
+          if (hr->is_cold_destination() || hr->is_fetch_cache()) continue;
           if (eviction_candidates[i]) continue;
 
           hr->set_cold_destination();
