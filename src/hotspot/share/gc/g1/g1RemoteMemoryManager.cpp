@@ -244,9 +244,9 @@ G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
   obj->oop_iterate(&cl);
 
   if (cl.overflowed()) {
-    log_warning(gc)("Edge table overflow: obj=" PTR_FORMAT " klass=%s has >256 oop fields — "
-                    "unpatched fields will retain eviction-time values!",
-                    p2i((void*)obj), obj->klass()->external_name());
+    log_info(gc)("Edge table overflow: obj=" PTR_FORMAT " klass=%s has >256 oop fields — skipping eviction",
+                 p2i((void*)obj), obj->klass()->external_name());
+    return nullptr;
   }
 
   // Allocate and populate the edge table
@@ -285,6 +285,9 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
   // 2. Build sidecar edge table BEFORE eviction (object bytes still readable).
   //    Scans oop fields, creates dormant anchors for targets, records edges.
   ObjectEdgeTable* et = build_edge_table(obj, h, hab);
+  if (et == nullptr) {
+    return false;  // too many oop fields — cannot safely evict
+  }
   store_edge_table(et);
 
   // 3. Evict object bytes via backend (V2: with edges, V1: fallback)
