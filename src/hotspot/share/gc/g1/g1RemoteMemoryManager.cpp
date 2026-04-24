@@ -827,6 +827,16 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
     }
   }
 
+  // Dirty card table entries covering the fetched object so G1's remembered
+  // sets track cross-region references from this FCR object.  Without this,
+  // young GC won't find FCR→young references and won't update them after
+  // evacuation, leaving stale pointers.
+  if (patched > 0) {
+    G1CardTable* ct = _g1h->card_table();
+    MemRegion mr(dest, et->_eviction_word_size);
+    ct->dirty_MemRegion(mr);
+  }
+
   log_debug(gc)("Fetch patch: handle=" PTR_FORMAT " dest=" PTR_FORMAT " patched=%d/%u fields",
                 p2i(source_handle), p2i(dest), patched, et->_entry_count);
 
