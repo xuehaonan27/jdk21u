@@ -797,7 +797,8 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         // Determine if tagging is safe: skip arrays and JVM-internal types
         // that are accessed by non-barrier paths (arraycopy, MH dispatch).
         bool in_cold_region = dest->is_cold_destination() && !dest->is_root_pinned();
-        bool safe_to_tag = G1TagRefSites || in_cold_region;
+        // BISECT-2: disable tagged oop writes, keep mark word classification.
+        bool safe_to_tag = false; // was: G1TagRefSites || in_cold_region;
         if (safe_to_tag) {
           Klass* k = obj->klass();
           if (k->is_array_klass()) {
@@ -908,9 +909,7 @@ void G1ParScanThreadStateSet::flush_stats() {
   // When disabled, skip to avoid post-evacuate overhead (can be 2+ seconds
   // for large heaps due to RC hash map construction + mark word updates).
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
-    // BISECT: skip classification+tagging to test if it's the crash cause.
-    // Cold routing + ref-site recording still active.
-    // process_oop_classification_fixup();
+    process_oop_classification_fixup();
   }
 
   for (uint worker_id = 0; worker_id < _num_workers; ++worker_id) {
