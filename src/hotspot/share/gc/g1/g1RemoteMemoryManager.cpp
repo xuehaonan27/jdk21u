@@ -378,9 +378,18 @@ public:
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
     if (raw == 0) return;
-    if ((raw >> 63) != 0) return; // already tagged
 
-    oop target = cast_to_oop(raw);
+    // Shared oops (bits 63+62) already go through a Handle — skip.
+    if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+        (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+
+    // Resolve: strip Unique tag bits if present to get raw address.
+    oop target;
+    if ((raw >> 63) != 0) {
+      target = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+    } else {
+      target = cast_to_oop(raw);
+    }
     if (!_g1h->is_in(target)) return;
 
     HeapRegion* target_region = _g1h->heap_region_containing(target);
