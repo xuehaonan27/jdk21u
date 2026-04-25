@@ -1350,47 +1350,150 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
-      // ---- Phase E: Evict non-pinned candidates ----
+      // ---- Phase E: Evict non-pinned candidates (batched) ----
+      {
       Ticks phase_e_start = Ticks::now();
+
+      // E1: Prepare all evictions (build edge tables, assign slot_ids).
+      typedef G1RemoteMemoryManager::PreparedEviction PreparedEviction;
+      int max_entries = 0;
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at(i);
+        max_entries += (int)((hr->top() - hr->bottom()) / MinObjAlignmentInBytes) + 1;
+      }
+      if (max_entries > 2 * 1024 * 1024) max_entries = 2 * 1024 * 1024;
+      PreparedEviction* entries = NEW_C_HEAP_ARRAY(PreparedEviction, max_entries, mtGC);
+      int* region_start = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
+      int* region_count_arr = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
+      memset(region_start, 0, num_regions * sizeof(int));
+      memset(region_count_arr, 0, num_regions * sizeof(int));
+      int num_entries = 0;
 
-        size_t region_used = hr->used();
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        HeapRegion* hr = _g1h->region_at(i);
+        region_start[i] = num_entries;
+        int rcount = 0;
         HeapWord* p = hr->bottom();
-        int region_objects = 0;
-        while (p < hr->top()) {
+        while (p < hr->top() && num_entries < max_entries) {
           oop obj = cast_to_oop(p);
           size_t sz = obj->size();
-          if (rmm->evict_object(obj, &hab)) {
-            region_objects++;
+          if (rmm->prepare_eviction(obj, &hab, &entries[num_entries])) {
+            num_entries++;
+            rcount++;
           }
           p += sz;
         }
+        region_count_arr[i] = rcount;
+      }
+      double e1_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
 
-        if (region_objects > 0) {
-          total_evicted += region_objects;
+      // E2: Batch-send to remote backend.
+      Ticks e2_start = Ticks::now();
+      G1RemoteBackend* backend = rmm->backend();
+      int batches_sent = 0;
+
+      if (num_entries > 0) {
+        // CMD_BATCH_EVICT message format (matches remote_cmd_batch_evict_t):
+        // header(24) + N × [slot_id(8) + klass(8) + word_size(4) + obj_bytes(ws*8)]
+        static const size_t BATCH_HDR_SIZE = 24;
+        static const size_t BATCH_BUF_SIZE = 4 * 1024 * 1024;
+        uint8_t* batch_buf = (uint8_t*)os::malloc(BATCH_BUF_SIZE, mtGC);
+        size_t batch_offset = BATCH_HDR_SIZE;
+        int batch_count = 0;
+
+        for (int e = 0; e < num_entries; e++) {
+          PreparedEviction* pe = &entries[e];
+          size_t byte_size = pe->word_size * HeapWordSize;
+          size_t entry_size = 8 + 8 + 4 + byte_size;
+
+          if (batch_offset + entry_size > BATCH_BUF_SIZE && batch_count > 0) {
+            *(uint32_t*)(batch_buf + 0) = 0x15; // CMD_BATCH_EVICT
+            *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
+            *(uint64_t*)(batch_buf + 8) = 0;
+            *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
+            int rc = backend->batch_evict(batch_buf, batch_offset);
+            if (rc < 0) {
+              // Fallback: serial per-object eviction
+              for (int f = e - batch_count; f < e; f++) {
+                backend->evict(cast_from_oop<void*>(entries[f].obj), entries[f].word_size,
+                               entries[f].klass, entries[f].slot_id);
+              }
+            }
+            batches_sent++;
+            batch_offset = BATCH_HDR_SIZE;
+            batch_count = 0;
+          }
+
+          *(uint64_t*)(batch_buf + batch_offset) = (uint64_t)pe->slot_id;
+          *(uint64_t*)(batch_buf + batch_offset + 8) = (uint64_t)(uintptr_t)pe->klass;
+          *(uint32_t*)(batch_buf + batch_offset + 16) = (uint32_t)pe->word_size;
+          memcpy(batch_buf + batch_offset + 20, cast_from_oop<void*>(pe->obj), byte_size);
+          batch_offset += entry_size;
+          batch_count++;
+        }
+
+        if (batch_count > 0) {
+          *(uint32_t*)(batch_buf + 0) = 0x15;
+          *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
+          *(uint64_t*)(batch_buf + 8) = 0;
+          *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
+          int rc = backend->batch_evict(batch_buf, batch_offset);
+          if (rc < 0) {
+            int start = num_entries - batch_count;
+            for (int f = start; f < num_entries; f++) {
+              backend->evict(cast_from_oop<void*>(entries[f].obj), entries[f].word_size,
+                             entries[f].klass, entries[f].slot_id);
+            }
+          }
+          batches_sent++;
+        }
+
+        os::free(batch_buf);
+      }
+      double e2_ms = (Ticks::now() - e2_start).seconds() * 1000.0;
+
+      // E3: Finalize all evictions + quarantine regions.
+      Ticks e3_start = Ticks::now();
+      for (int e = 0; e < num_entries; e++) {
+        rmm->finalize_eviction(&entries[e]);
+      }
+
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        HeapRegion* hr = _g1h->region_at(i);
+        int rcount = region_count_arr[i];
+
+        if (rcount > 0) {
+          total_evicted += rcount;
           regions_evicted++;
-          // Poison evicted region: 0x5A → 0x5A5A5A5A5A5A5A5A
-          // QUARANTINE: don't free, don't return to free list.
-          // Set top=bottom so G1 walkers skip the poisoned data.
-          // Stale oop access from Java code still hits the poison.
+          size_t region_used = hr->used();
           size_t poison_bytes = (size_t)((char*)hr->top() - (char*)hr->bottom());
           memset((void*)hr->bottom(), 0x5A, poison_bytes);
           hr->set_top(hr->bottom());
           rmm->invalidate_fcr_if_freed(hr);
           log_info(gc)("Evicted+QUARANTINED region %u (%d objects, " SIZE_FORMAT "KB) "
                        "[" PTR_FORMAT ", " PTR_FORMAT ")",
-                       hr->hrm_index(), region_objects, region_used / K,
+                       hr->hrm_index(), rcount, region_used / K,
                        p2i(hr->bottom()), p2i((char*)hr->bottom() + poison_bytes));
         } else {
           hr->clear_cold_destination();
         }
       }
+      double e3_ms = (Ticks::now() - e3_start).seconds() * 1000.0;
+
+      FREE_C_HEAP_ARRAY(PreparedEviction, entries);
+      FREE_C_HEAP_ARRAY(int, region_start);
+      FREE_C_HEAP_ARRAY(int, region_count_arr);
 
       if (total_candidates > 0) {
         double phase_e_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
-        log_info(gc)("Phase E eviction: %.1fms (%d objects, %d regions)", phase_e_ms, total_evicted, regions_evicted);
+        log_info(gc)("Phase E eviction: %.1fms (E1=%.1fms E2=%.1fms/%d batches E3=%.1fms) "
+                     "(%d objects, %d regions)",
+                     phase_e_ms, e1_ms, e2_ms, batches_sent, e3_ms,
+                     total_evicted, regions_evicted);
+      }
       }
     }
 

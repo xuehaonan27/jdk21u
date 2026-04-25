@@ -361,6 +361,51 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
   return true;
 }
 
+bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* hab,
+                                              PreparedEviction* out) {
+  if (obj == nullptr) return false;
+
+  markWord mw = obj->mark();
+  if (!mw.is_unlocked()) return false;
+
+  Klass* klass = obj->klass();
+  size_t word_size = obj->size_given_klass(klass);
+
+  RemoteHandle* h = handle_for(obj);
+  if (h == nullptr) h = create_handle_for(obj, hab);
+
+  ObjectEdgeTable* et = build_edge_table(obj, h, hab);
+  if (et == nullptr) return false;
+  store_edge_table(et);
+
+  size_t slot_id = _backend->allocate_slot_id();
+  if (slot_id == (size_t)-1) return false;
+
+  out->obj = obj;
+  out->handle = h;
+  out->klass = klass;
+  out->word_size = word_size;
+  out->slot_id = slot_id;
+  out->edge_table = et;
+  return true;
+}
+
+void G1RemoteMemoryManager::finalize_eviction(PreparedEviction* entry) {
+  entry->handle->set_eviction_word_size(entry->word_size);
+  entry->handle->set_remote(entry->slot_id);
+
+  markWord mw = entry->obj->mark();
+  if (mw.is_unlocked()) {
+    entry->obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
+  }
+  HeapRegion* hr = _g1h->heap_region_containing(entry->obj);
+  if (hr != nullptr) {
+    hr->set_has_classified_objects();
+  }
+
+  CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(entry->obj), entry->word_size, false);
+}
+
 // ============================================================
 // Region-Granularity Eviction
 // ============================================================

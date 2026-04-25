@@ -83,9 +83,12 @@ public:
   void discard_slot(size_t slot_id) override;
   size_t slot_word_size(size_t slot_id) const override;
 
+  size_t allocate_slot_id() override { return _next_slot++; }
   size_t total_evicted() const override { return _total_evicted; }
   size_t total_fetched() const override { return _total_fetched; }
   void shutdown() override;
+
+  int batch_evict(const void* msg_buf, size_t msg_len) override;
 };
 
 #else // !REMOTE_EXECUTOR_USE_RDMA

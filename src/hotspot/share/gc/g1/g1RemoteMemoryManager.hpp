@@ -748,6 +748,28 @@ public:
   // Returns true on success.
   bool evict_object(oop obj, RemoteHandleAllocBuffer* hab);
 
+  // ============================================================
+  // Batch Eviction API
+  // ============================================================
+  // Split eviction into prepare → batch_send → finalize for batching.
+
+  struct PreparedEviction {
+    oop           obj;
+    RemoteHandle* handle;
+    Klass*        klass;
+    size_t        word_size;
+    size_t        slot_id;
+    ObjectEdgeTable* edge_table;
+  };
+
+  // Prepare: safety checks, handle lookup, edge table build.
+  // Does NOT send to backend. Returns false if object is unevictable.
+  bool prepare_eviction(oop obj, RemoteHandleAllocBuffer* hab, PreparedEviction* out);
+
+  // Finalize: set handle remote, mark word, fill with filler.
+  // Called after backend confirms batch eviction.
+  void finalize_eviction(PreparedEviction* entry);
+
   // Fetch a remote object back to a local destination address.
   // Called from the load barrier when a REMOTE Handle is encountered.
   // 1. Looks up slot from Handle's remote_id

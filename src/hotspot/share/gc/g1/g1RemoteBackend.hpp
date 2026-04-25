@@ -57,6 +57,9 @@ public:
   // Query slot metadata (word size) without fetching.
   virtual size_t slot_word_size(size_t slot_id) const = 0;
 
+  // Allocate a slot_id for pre-assigned batch eviction.
+  virtual size_t allocate_slot_id() { return (size_t)-1; }
+
   // Statistics
   virtual size_t total_evicted() const = 0;
   virtual size_t total_fetched() const = 0;
@@ -79,6 +82,13 @@ public:
                                   size_t hint_slot_id) {
     // Default: fall back to V1 evict (edge table stays JVM-local)
     return evict(obj_bytes, word_size, klass, hint_slot_id);
+  }
+
+  // Batch evict: send multiple objects in a single message.
+  // msg_buf is a pre-built CMD_BATCH_EVICT message (header + packed entries).
+  // Returns number of objects successfully stored, or -1 on failure.
+  virtual int batch_evict(const void* msg_buf, size_t msg_len) {
+    return -1; // Not supported by default
   }
 
   // Notify executor that these handle_ids are now LOCAL (fetched back)

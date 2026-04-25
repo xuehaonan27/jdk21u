@@ -679,6 +679,21 @@ void RDMAExecutorBackend::discard_slot(size_t slot_id) {
   io_unlock();
 }
 
+int RDMAExecutorBackend::batch_evict(const void* msg_buf, size_t msg_len) {
+  if (!_connected) return -1;
+
+  io_lock();
+  bool ok = rdma_send_msg(msg_buf, msg_len);
+  if (!ok) { io_unlock(); return -1; }
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) { io_unlock(); return -1; }
+
+  io_unlock();
+  return (*(uint32_t*)resp == RE_RESP_OK) ? 0 : -1;
+}
+
 size_t RDMAExecutorBackend::slot_word_size(size_t /*slot_id*/) const {
   return 0;  // Remote metadata — fetch response includes size
 }
