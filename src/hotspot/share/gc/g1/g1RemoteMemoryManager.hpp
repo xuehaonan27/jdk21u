@@ -126,6 +126,36 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
     return e;
   }
 
+  // Allocate a new entry chunk and link into global chain (under alloc_lock).
+  // Called once per 256 entries — low contention.
+  HandleEntryChunk* alloc_new_entry_chunk() {
+    while (Atomic::cmpxchg(&_alloc_lock, 0, 1) != 0) { /* spin */ }
+    HandleEntryChunk* chunk = new HandleEntryChunk();
+    chunk->_next = _entry_chunks;
+    _entry_chunks = chunk;
+    Atomic::release_store(&_alloc_lock, 0);
+    return chunk;
+  }
+
+public:
+  // Per-worker entry allocation buffer — bump-pointer within a chunk.
+  // One lock acquisition per 256 entries instead of per entry.
+  struct HandleEntryAllocBuffer {
+    HandleEntry* _top;
+    HandleEntry* _end;
+    HandleEntryAllocBuffer() : _top(nullptr), _end(nullptr) {}
+    HandleEntry* allocate() {
+      if (_top < _end) return _top++;
+      return nullptr;
+    }
+    void set_chunk(HandleEntryChunk* chunk) {
+      _top = &chunk->_entries[0];
+      _end = &chunk->_entries[ENTRY_CHUNK_CAPACITY];
+    }
+  };
+
+private:
+
   static size_t hash_obj(uintptr_t addr) {
     return (addr >> 3) % TABLE_SIZE;  // Objects are 8-byte aligned
   }
@@ -182,7 +212,10 @@ public:
   // Thread-safe variant for parallel Phase B: uses per-bucket stripe locks
   // instead of the global table_lock. Multiple workers can create handles
   // concurrently for objects that hash to different stripes.
-  RemoteHandle* ensure_handle_for_parallel(oop obj, RemoteHandleAllocBuffer* hab) {
+  // Each worker supplies its own HandleEntryAllocBuffer (EAB) for lock-free
+  // entry allocation (one alloc_lock acquisition per 256 entries).
+  RemoteHandle* ensure_handle_for_parallel(oop obj, RemoteHandleAllocBuffer* hab,
+                                           HandleEntryAllocBuffer* eab) {
     uintptr_t addr = cast_from_oop<uintptr_t>(obj);
     size_t idx = hash_obj(addr);
 
@@ -196,7 +229,12 @@ public:
       }
       e = e->_next;
     }
-    HandleEntry* entry = alloc_entry_locked();
+    HandleEntry* entry = eab->allocate();
+    if (entry == nullptr) {
+      HandleEntryChunk* chunk = alloc_new_entry_chunk();
+      eab->set_chunk(chunk);
+      entry = eab->allocate();
+    }
     RemoteHandle* h = _handle_allocator.allocate_handle(hab);
     h->initialize(cast_from_oop<void*>(obj));
     entry->init(addr, h, _table[idx]);
