@@ -37,6 +37,7 @@
 #include "runtime/atomic.hpp"
 #include "runtime/mutexLocker.hpp"
 #include "runtime/orderAccess.hpp"
+#include "runtime/os.hpp"
 #include "utilities/bitMap.inline.hpp"
 
 class MasterFreeRegionListChecker : public HeapRegionSetChecker {
@@ -108,6 +109,11 @@ HeapRegion* HeapRegionManager::allocate_free_region(HeapRegionType type, uint re
   if (hr != nullptr) {
     assert(hr->next() == nullptr, "Single region should not have next");
     assert(is_available(hr->hrm_index()), "Must be committed");
+
+    if (hr->is_evict_guarded()) {
+      os::unguard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+      hr->clear_evict_guarded();
+    }
 
     if (numa->is_enabled() && hr->node_index() < numa->num_active_nodes()) {
       numa->update_statistics(G1NUMAStats::NewRegionAlloc, requested_node_index, hr->node_index());

@@ -30,6 +30,7 @@
 #include "gc/g1/g1CommittedRegionMap.inline.hpp"
 #include "gc/g1/heapRegion.hpp"
 #include "gc/g1/heapRegionSet.inline.hpp"
+#include "runtime/os.hpp"
 
 inline bool HeapRegionManager::is_available(uint region) const {
   return _committed_map.active(region);
@@ -80,6 +81,13 @@ inline void HeapRegionManager::insert_into_free_list(HeapRegion* hr) {
 inline HeapRegion* HeapRegionManager::allocate_free_regions_starting_at(uint first, uint num_regions) {
   HeapRegion* start = at(first);
   _free_list.remove_starting_at(start, num_regions);
+  for (uint i = first; i < first + num_regions; i++) {
+    HeapRegion* hr = at(i);
+    if (hr->is_evict_guarded()) {
+      os::unguard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+      hr->clear_evict_guarded();
+    }
+  }
   return start;
 }
 
