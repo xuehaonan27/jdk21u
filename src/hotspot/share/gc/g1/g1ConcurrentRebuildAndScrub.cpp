@@ -284,6 +284,12 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
         return true;
       }
 
+      // Skip quarantined regions: eviction sets top=bottom and poisons data.
+      // The rebuild snapshot (top_at_rebuild_start) may predate quarantine.
+      if (hr->is_empty() || hr->is_free()) {
+        return false;
+      }
+
       HeapWord* const pb = hr->parsable_bottom_acquire();
 
       if (!should_rebuild_or_scrub(hr)) {

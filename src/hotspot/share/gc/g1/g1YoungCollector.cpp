@@ -1025,12 +1025,18 @@ public:
   void do_oop(oop* p) {
     oop obj = *p;
     if (obj == nullptr) return;
+    uintptr_t raw = cast_from_oop<uintptr_t>(obj);
+    if ((raw & G1_OOP_TAG_MASK) != 0) {
+      obj = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+    }
     if (!_g1h->is_in(obj)) return;
     HeapRegion* hr = _g1h->heap_region_containing(obj);
     if (hr != nullptr && hr->is_cold_destination() && !hr->is_root_pinned()) {
       hr->set_root_pinned();
-      log_info(gc)("Root-pinned region %u (root " PTR_FORMAT " → obj " PTR_FORMAT " klass=%s)",
-                    hr->hrm_index(), p2i(p), p2i((void*)obj), obj->klass()->external_name());
+      Klass* k = obj->klass_or_null();
+      log_info(gc)("Root-pinned region %u (root " PTR_FORMAT " -> obj " PTR_FORMAT " klass=%s)",
+                    hr->hrm_index(), p2i(p), p2i((void*)obj),
+                    (k != nullptr ? k->external_name() : "<null klass>"));
     }
   }
   void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
@@ -1132,6 +1138,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // remset-only tagging misses (dirty cards not refined, post-evacuation
   // card dirtying, cross-region refs from non-collected regions).
   if (G1RemoteEvictionThreshold > 0 || G1SimulateRemoteEviction) {
+    // Skip eviction during concurrent start (initial mark) GC.
+    // Old/survivor alloc regions retired during concurrent start are registered
+    // as concurrent mark root regions. Quarantining them causes SIGSEGV when
+    // the concurrent mark thread later scans the poisoned root region data.
+    if (collector_state()->in_concurrent_start_gc()) {
+      log_info(gc)("Skipping eviction during concurrent start GC (root region conflict)");
+    } else {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     RemoteHandleAllocBuffer hab;
     int total_evicted = 0;
@@ -1379,6 +1392,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                    regions_pinned,
                    rmm->backend()->total_evicted(), rmm->backend()->total_fetched());
     }
+    } // end else (not concurrent start)
   }
 
   _g1h->rebuild_free_region_list();

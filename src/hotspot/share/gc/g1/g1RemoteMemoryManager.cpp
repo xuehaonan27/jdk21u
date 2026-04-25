@@ -582,7 +582,13 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
       Klass* k = obj->klass_or_null();
       if (k == nullptr) break;
       size_t sz = obj->size();
-      if (sz == 0 || sz > (size_t)(region_end - p)) break;
+      if (sz == 0) break;
+      if (sz > (size_t)(region_end - p)) {
+        // Humongous object spanning multiple regions — still must iterate
+        // its oop fields, since they may reference eviction candidates.
+        obj->oop_iterate(&cl);
+        break;
+      }
       obj->oop_iterate(&cl);
       p += sz;
     }
@@ -665,8 +671,12 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       Klass* k = obj->klass_or_null();
       if (k == nullptr) break;
       size_t sz = obj->size();
-      if (sz == 0 || sz > (size_t)(region_end - p)) break;
+      if (sz == 0) break;
       cl.set_cur_obj(obj);
+      if (sz > (size_t)(region_end - p)) {
+        obj->oop_iterate(&cl);
+        break;
+      }
       obj->oop_iterate(&cl);
       p += sz;
     }

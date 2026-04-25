@@ -730,7 +730,12 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
     while (e != nullptr) {
       RemoteHandle* h = e->_handle;
       if (h != nullptr && h->is_local() && h->remote_refcount() > 0) {
-        oop obj = cast_to_oop(e->_obj_addr);
+        // Use Handle's live LOCAL target, not potentially stale table key.
+        oop obj = cast_to_oop(h->local_addr());
+        if (obj == nullptr || obj->klass_or_null() == nullptr) {
+          e = e->_next;
+          continue;
+        }
         cl->do_oop(&obj);
         uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
         if (new_addr != e->_obj_addr) {
