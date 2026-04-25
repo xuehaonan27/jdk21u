@@ -589,6 +589,7 @@ public:
   // candidates after classification fixup tags their incoming refs.
   bool _is_cold_destination;
   bool _is_root_pinned;       // Set by root-pinning pass if region has root refs
+  bool _evict_guarded;        // Set after eviction: pages released + mprotect(PROT_NONE)
 
   bool is_cold_destination() const  { return _is_cold_destination; }
   void set_cold_destination()       { _is_cold_destination = true; }
@@ -596,6 +597,9 @@ public:
   bool is_root_pinned() const       { return _is_root_pinned; }
   void set_root_pinned()            { _is_root_pinned = true; }
   void clear_root_pinned()          { _is_root_pinned = false; }
+  bool is_evict_guarded() const     { return _evict_guarded; }
+  void set_evict_guarded()          { _evict_guarded = true; }
+  void clear_evict_guarded()        { _evict_guarded = false; }
 
   // Verify that the entries on the code root list for this
   // region are live and include at least one pointer into this region.

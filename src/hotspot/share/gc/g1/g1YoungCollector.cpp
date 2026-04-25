@@ -65,8 +65,11 @@
 #include "gc/shared/oopStorage.inline.hpp"
 #include "gc/shared/oopStorageSet.inline.hpp"
 #include "runtime/jniHandles.hpp"
+#include "runtime/os.hpp"
 #include "runtime/threads.hpp"
 #include "utilities/ticks.hpp"
+
+#include <sys/mman.h>
 
 // GCTraceTime wrapper that constructs the message according to GC pause type and
 // GC cause.
@@ -1484,14 +1487,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           regions_evicted++;
           size_t region_used = hr->used();
           total_freed_bytes += region_used;
-          size_t poison_bytes = (size_t)((char*)hr->top() - (char*)hr->bottom());
-          memset((void*)hr->bottom(), 0x5A, poison_bytes);
           rmm->invalidate_fcr_if_freed(hr);
           log_info(gc)("Evicted region %u (%d objects, " SIZE_FORMAT "KB) "
                        "[" PTR_FORMAT ", " PTR_FORMAT ")",
                        hr->hrm_index(), rcount, region_used / K,
-                       p2i(hr->bottom()), p2i((char*)hr->bottom() + poison_bytes));
+                       p2i(hr->bottom()), p2i(hr->top()));
           _g1h->free_region(hr, &freed_list);
+          ::madvise((char*)hr->bottom(), HeapRegion::GrainBytes, MADV_DONTNEED);
+          os::guard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+          hr->set_evict_guarded();
           freed_regions++;
         } else if (rcount > 0 && !region_complete[i]) {
           log_info(gc)("Region %u kept alive: %d objects prepared but some failed "

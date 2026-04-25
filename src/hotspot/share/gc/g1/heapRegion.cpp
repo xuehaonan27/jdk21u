@@ -125,6 +125,11 @@ void HeapRegion::unlink_from_list() {
 }
 
 void HeapRegion::hr_clear(bool clear_space) {
+  if (_evict_guarded) {
+    os::unguard_memory((char*)bottom(), HeapRegion::GrainBytes);
+    _evict_guarded = false;
+  }
+
   set_top(bottom());
   clear_young_index_in_cset();
   clear_index_in_opt_cset();
@@ -257,7 +262,8 @@ HeapRegion::HeapRegion(uint hrm_index,
   _node_index(G1NUMA::UnknownNodeIndex),
   _has_classified_objects(false),
   _is_cold_destination(false),
-  _is_root_pinned(false)
+  _is_root_pinned(false),
+  _evict_guarded(false)
 {
   assert(Universe::on_page_boundary(mr.start()) && Universe::on_page_boundary(mr.end()),
          "invalid space boundaries");

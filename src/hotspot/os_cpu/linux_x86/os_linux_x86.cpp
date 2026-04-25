@@ -53,6 +53,8 @@
 #include "utilities/debug.hpp"
 #include "utilities/events.hpp"
 #include "utilities/vmError.hpp"
+#include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/heapRegion.hpp"
 
 // put OS-includes here
 # include <sys/types.h>
@@ -240,6 +242,20 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
         // stack overflow
         if (os::Posix::handle_stack_overflow(thread, addr, pc, uc, &stub)) {
           return true; // continue
+        }
+      }
+    }
+
+    if (sig == SIGSEGV && UseG1GC) {
+      address fault_addr = (address) info->si_addr;
+      G1CollectedHeap* g1h = G1CollectedHeap::heap();
+      if (g1h != nullptr && g1h->is_in(fault_addr)) {
+        HeapRegion* hr = g1h->heap_region_containing_or_null(fault_addr);
+        if (hr != nullptr && hr->is_evict_guarded()) {
+          tty->print_cr("FATAL: SIGSEGV on evict-guarded region %u at " PTR_FORMAT
+                        " (pc=" PTR_FORMAT ")", hr->hrm_index(),
+                        p2i(fault_addr), p2i(pc));
+          return false;
         }
       }
     }
