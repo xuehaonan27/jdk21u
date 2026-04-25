@@ -1494,7 +1494,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        p2i(hr->bottom()), p2i(hr->top()));
           hr->clear_cardtable();
           _g1h->free_region(hr, &freed_list);
-          ::madvise((char*)hr->bottom(), HeapRegion::GrainBytes, MADV_DONTNEED);
           freed_regions++;
         } else if (rcount > 0 && !region_complete[i]) {
           log_info(gc)("Region %u kept alive: %d objects prepared but some failed "
