@@ -792,6 +792,232 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
   return total_tagged;
 }
 
+// Scan a sub-range [start, end) of a region with EvictionSetTagClosure.
+// All objects in [start, end) must be parsable (no bitmap needed).
+static void scan_range_for_eviction_tags(HeapRegion* hr, HeapWord* start,
+                                         HeapWord* end,
+                                         EvictionSetTagClosure* cl) {
+  HeapWord* const region_end = hr->end();
+  HeapWord* p = start;
+  while (p < end) {
+    if (p >= region_end) break;
+    oop obj = cast_to_oop(p);
+    Klass* k = obj->klass_or_null();
+    if (k == nullptr) break;
+    size_t sz = obj->size();
+    if (sz == 0) break;
+    if (sz > (size_t)(region_end - p)) {
+      obj->oop_iterate(cl);
+      break;
+    }
+    obj->oop_iterate(cl);
+    p += sz;
+  }
+}
+
+// RSet visitor: for each card in a candidate's RSet, scan with
+// EvictionSetTagClosure to tag refs pointing to ANY candidate.
+class EvictionSetRsetScanner {
+  G1CollectedHeap*       _g1h;
+  G1CardTable*           _ct;
+  EvictionSetTagClosure* _cl;
+  const bool*            _eviction_set;
+  uint                   _num_regions;
+
+public:
+  EvictionSetRsetScanner(G1CollectedHeap* g1h, EvictionSetTagClosure* cl,
+                         const bool* eviction_set, uint num_regions)
+    : _g1h(g1h), _ct(g1h->card_table()), _cl(cl),
+      _eviction_set(eviction_set), _num_regions(num_regions) {}
+
+  bool start_iterate(uint tag, uint region_idx) { return true; }
+  void do_card(uint card_idx) { scan_card(card_idx, 1); }
+  void do_card_range(uint start_card_idx, uint length) { scan_card(start_card_idx, length); }
+
+private:
+  void scan_card(uint card_idx, uint length) {
+    HeapWord* card_start = _ct->addr_for(_ct->byte_for_index(card_idx));
+    HeapWord* card_end = card_start + length * CardTable::card_size_in_words();
+    if (!_g1h->is_in(card_start)) return;
+    HeapRegion* source_hr = _g1h->heap_region_containing(card_start);
+    if (source_hr == nullptr || source_hr->is_empty() || source_hr->is_free()) return;
+    uint src_idx = source_hr->hrm_index();
+    // Skip regions already scanned directly (candidates + young/survivors)
+    if (src_idx < _num_regions && _eviction_set[src_idx]) return;
+    if (source_hr->is_young()) return;
+
+    HeapWord* scan_start = MAX2(card_start, source_hr->bottom());
+    HeapWord* scan_end = MIN2(card_end, source_hr->top());
+    if (scan_start >= scan_end) return;
+
+    MemRegion mr(scan_start, scan_end);
+    source_hr->oops_on_memregion_seq_iterate_careful<true>(mr, _cl);
+  }
+};
+
+class TagFastRefsTask : public WorkerTask {
+  G1RemoteMemoryManager* _rmm;
+  G1CollectedHeap*       _g1h;
+  const bool*            _eviction_set;
+  uint                   _num_regions;
+  HeapWord* const*       _pre_evac_tops;
+  const G1CMBitMap*      _bitmap;
+  HeapRegionClaimer      _claimer;
+  volatile int           _total_tagged;
+  volatile int           _total_no_handle;
+  volatile int           _regions_scanned;
+
+  typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
+  TaggedFieldEntry** _worker_bufs;
+  int*               _worker_counts;
+  uint               _num_workers;
+
+public:
+  TagFastRefsTask(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
+                  const bool* eset, uint nregions, HeapWord* const* pre_evac_tops,
+                  uint num_workers, const G1CMBitMap* bitmap)
+    : WorkerTask("Tag eviction refs (fast)"),
+      _rmm(rmm), _g1h(g1h), _eviction_set(eset), _num_regions(nregions),
+      _pre_evac_tops(pre_evac_tops), _bitmap(bitmap),
+      _claimer(num_workers), _total_tagged(0), _total_no_handle(0),
+      _regions_scanned(0), _num_workers(num_workers) {
+    _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
+    _worker_counts = NEW_C_HEAP_ARRAY(int, num_workers, mtGC);
+    memset(_worker_bufs, 0, num_workers * sizeof(TaggedFieldEntry*));
+    memset(_worker_counts, 0, num_workers * sizeof(int));
+  }
+
+  ~TagFastRefsTask() {
+    for (uint i = 0; i < _num_workers; i++) {
+      if (_worker_bufs[i] != nullptr) {
+        FREE_C_HEAP_ARRAY(TaggedFieldEntry, _worker_bufs[i]);
+      }
+    }
+    FREE_C_HEAP_ARRAY(TaggedFieldEntry*, _worker_bufs);
+    FREE_C_HEAP_ARRAY(int, _worker_counts);
+  }
+
+  void work(uint worker_id) {
+    EvictionSetTagClosure cl(_rmm, _g1h, _eviction_set, _num_regions);
+    EvictionSetRsetScanner rset_scanner(_g1h, &cl, _eviction_set, _num_regions);
+    int scanned = 0;
+
+    for (uint i = _claimer.offset_for_worker(worker_id); i < _num_regions; i++) {
+      if (!_claimer.claim_region(i)) continue;
+      HeapRegion* hr = _g1h->region_at(i);
+
+      if (_eviction_set[i]) {
+        scan_region_for_eviction_tags(hr, &cl, _bitmap);
+        HeapRegionRemSet* rem_set = hr->rem_set();
+        if (rem_set->is_complete() && !rem_set->is_empty()) {
+          rem_set->iterate_for_merge(rset_scanner);
+        }
+        scanned++;
+        continue;
+      }
+
+      if (hr->is_young()) {
+        scan_region_for_eviction_tags(hr, &cl, _bitmap);
+        scanned++;
+        continue;
+      }
+
+      if (hr->is_old() && !hr->is_empty() && !hr->is_continues_humongous() &&
+          hr->top() > _pre_evac_tops[i]) {
+        scan_range_for_eviction_tags(hr, _pre_evac_tops[i], hr->top(), &cl);
+        scanned++;
+        continue;
+      }
+    }
+
+    Atomic::add(&_total_tagged, cl.tagged());
+    Atomic::add(&_total_no_handle, cl.no_handle());
+    Atomic::add(&_regions_scanned, scanned);
+    _worker_bufs[worker_id] = cl.release_local_buf();
+    _worker_counts[worker_id] = cl.local_count();
+  }
+
+  void flush_to_rmm() {
+    for (uint i = 0; i < _num_workers; i++) {
+      for (int j = 0; j < _worker_counts[i]; j++) {
+        _rmm->add_tagged_field(_worker_bufs[i][j]._field_addr,
+                               _worker_bufs[i][j]._handle);
+      }
+    }
+  }
+
+  int total_tagged() const { return _total_tagged; }
+  int total_no_handle() const { return _total_no_handle; }
+  int regions_scanned() const { return _regions_scanned; }
+};
+
+int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
+    const bool* eviction_set, uint num_regions,
+    HeapWord* const* pre_evac_tops,
+    WorkerThreads* workers, uint num_workers) {
+
+  const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
+  int total_tagged, total_no_handle;
+
+  if (workers != nullptr && num_workers > 1) {
+    TagFastRefsTask task(this, _g1h, eviction_set, num_regions,
+                         pre_evac_tops, num_workers, bitmap);
+    workers->run_task(&task, num_workers);
+    task.flush_to_rmm();
+    total_tagged = task.total_tagged();
+    total_no_handle = task.total_no_handle();
+
+    if (total_tagged > 0 || total_no_handle > 0) {
+      log_info(gc)("Fast Phase C (%u workers, %d regions scanned): tagged %d refs, %d no handle",
+                   num_workers, task.regions_scanned(), total_tagged, total_no_handle);
+    }
+  } else {
+    EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
+    EvictionSetRsetScanner rset_scanner(_g1h, &cl, eviction_set, num_regions);
+    int scanned = 0;
+
+    for (uint i = 0; i < num_regions; i++) {
+      HeapRegion* hr = _g1h->region_at(i);
+
+      if (eviction_set[i]) {
+        scan_region_for_eviction_tags(hr, &cl, bitmap);
+        HeapRegionRemSet* rem_set = hr->rem_set();
+        if (rem_set->is_complete() && !rem_set->is_empty()) {
+          rem_set->iterate_for_merge(rset_scanner);
+        }
+        scanned++;
+        continue;
+      }
+
+      if (hr->is_young()) {
+        scan_region_for_eviction_tags(hr, &cl, bitmap);
+        scanned++;
+        continue;
+      }
+
+      if (hr->is_old() && !hr->is_empty() && !hr->is_continues_humongous() &&
+          pre_evac_tops != nullptr && hr->top() > pre_evac_tops[i]) {
+        scan_range_for_eviction_tags(hr, pre_evac_tops[i], hr->top(), &cl);
+        scanned++;
+        continue;
+      }
+    }
+
+    for (int j = 0; j < cl.local_count(); j++) {
+      add_tagged_field(cl.local_buf()[j]._field_addr, cl.local_buf()[j]._handle);
+    }
+    total_tagged = cl.tagged();
+    total_no_handle = cl.no_handle();
+
+    if (total_tagged > 0 || total_no_handle > 0) {
+      log_info(gc)("Fast Phase C (1 worker, %d regions scanned): tagged %d refs, %d no handle",
+                   scanned, total_tagged, total_no_handle);
+    }
+  }
+
+  return total_tagged;
+}
+
 int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     const bool* eviction_set, uint num_regions) {
 

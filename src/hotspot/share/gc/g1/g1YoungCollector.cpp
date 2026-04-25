@@ -1325,14 +1325,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
-      // ---- Phase C: Full heap scan — tag ALL refs to candidates ----
+      // ---- Phase C: Fast targeted scan — RSet + young + candidate + destination ----
       {
         Ticks phase_c_start = Ticks::now();
         uint nworkers = _g1h->workers()->active_workers();
-        rmm->tag_all_heap_refs_to_eviction_set(eviction_candidates, num_regions,
-                                                _g1h->workers(), nworkers);
+        rmm->tag_refs_to_eviction_set_fast(eviction_candidates, num_regions,
+                                           _pre_evac_tops,
+                                           _g1h->workers(), nworkers);
         double phase_c_ms = (Ticks::now() - phase_c_start).seconds() * 1000.0;
-        log_info(gc)("Phase C heap scan: %.1fms (%u workers)", phase_c_ms, nworkers);
+        log_info(gc)("Phase C fast scan: %.1fms (%u workers)", phase_c_ms, nworkers);
       }
 
       // ---- Phase C.5: Verify no untagged refs remain (diagnostic only) ----
@@ -1615,7 +1616,8 @@ G1YoungCollector::G1YoungCollector(GCCause::Cause gc_cause) :
   _g1h(G1CollectedHeap::heap()),
   _gc_cause(gc_cause),
   _concurrent_operation_is_full_mark(false),
-  _evac_failure_regions()
+  _evac_failure_regions(),
+  _pre_evac_tops(nullptr)
 {
 }
 
@@ -1662,6 +1664,14 @@ void G1YoungCollector::collect() {
 
     pre_evacuate_collection_set(jtm.evacuation_info());
 
+    // Save region tops before evacuation for fast Phase C destination scan.
+    uint num_regions = _g1h->num_regions();
+    _pre_evac_tops = NEW_C_HEAP_ARRAY(HeapWord*, num_regions, mtGC);
+    for (uint i = 0; i < num_regions; i++) {
+      HeapRegion* hr = _g1h->region_at(i);
+      _pre_evac_tops[i] = hr->top();
+    }
+
     G1ParScanThreadStateSet per_thread_states(_g1h,
                                               workers()->active_workers(),
                                               collection_set(),
@@ -1675,6 +1685,8 @@ void G1YoungCollector::collect() {
       evacuate_optional_collection_set(&per_thread_states);
     }
     post_evacuate_collection_set(jtm.evacuation_info(), &per_thread_states);
+    FREE_C_HEAP_ARRAY(HeapWord*, _pre_evac_tops);
+    _pre_evac_tops = nullptr;
 
     // Refine the type of a concurrent mark operation now that we did the
     // evacuation, eventually aborting it.

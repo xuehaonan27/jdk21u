@@ -87,6 +87,11 @@ class G1YoungCollector {
   // Evacuation failure tracking.
   G1EvacFailureRegions _evac_failure_regions;
 
+  // Pre-evacuation region tops for fast Phase C eviction scan.
+  // Saved before evacuation so post-evac destination regions can be identified
+  // by comparing top() > _pre_evac_tops[i].
+  HeapWord** _pre_evac_tops;
+
   // Runs the given WorkerTask with the current active workers,
   // returning the total time taken.
   Tickspan run_task_timed(WorkerTask* task);

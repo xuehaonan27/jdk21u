@@ -813,6 +813,14 @@ public:
   int tag_all_heap_refs_to_eviction_set(const bool* eviction_set, uint num_regions,
                                         WorkerThreads* workers = nullptr, uint num_workers = 0);
 
+  // Fast Phase C: scan only RSet entries + young/candidate/destination regions.
+  // O(rset + young + candidates + destinations) instead of O(entire_heap).
+  // pre_evac_tops[i] is region i's top() before evacuation — old regions where
+  // top() > pre_evac_tops[i] received promoted objects and need scanning.
+  int tag_refs_to_eviction_set_fast(const bool* eviction_set, uint num_regions,
+                                    HeapWord* const* pre_evac_tops,
+                                    WorkerThreads* workers = nullptr, uint num_workers = 0);
+
   int verify_no_untagged_refs_to_eviction_set(const bool* eviction_set, uint num_regions);
 
   void add_tagged_field_locked(oop* field_addr, RemoteHandle* h) {
