@@ -67,6 +67,10 @@ public:
   void report_remote_roots_v2(const uintptr_t* handle_ids, size_t count) override;
   void directory_upsert(const uintptr_t* handle_ids, const uint32_t* states,
                         const size_t* slot_ids, size_t count) override;
+  void trace_and_report(uintptr_t** out_dead_ids, size_t* out_num_dead,
+                        size_t* out_bytes_freed,
+                        uintptr_t** out_cross_src, uintptr_t** out_cross_tgt,
+                        size_t* out_num_cross) override;
 };
 
 #endif // SHARE_GC_G1_G1REMOTEBACKENDTCP_HPP

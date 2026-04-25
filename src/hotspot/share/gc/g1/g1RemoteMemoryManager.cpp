@@ -49,7 +49,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _table_lock(0), _alloc_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
-    _remote_roots_count(0), _deferred_decrement_count(0),
+    _remote_roots_count(0), _cross_roots_count(0), _deferred_decrement_count(0),
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
     _current_fcr(nullptr), _fcr_lock(0),
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
@@ -1505,10 +1505,38 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
     _backend->report_remote_roots_v2(_remote_roots, _remote_roots_count);
   }
 
-  size_t* dead_ids = nullptr;
+  // Step 2b: trace_and_report — get dead handles + cross-boundary edges
+  uintptr_t* dead_ids = nullptr;
   size_t num_dead = 0;
   size_t bytes_freed = 0;
-  _backend->collect_dead(&dead_ids, &num_dead, &bytes_freed);
+  uintptr_t* cross_src = nullptr;
+  uintptr_t* cross_tgt = nullptr;
+  size_t num_cross = 0;
+
+  _backend->trace_and_report(&dead_ids, &num_dead, &bytes_freed,
+                             &cross_src, &cross_tgt, &num_cross);
+
+  // Step 2c: Populate cross-boundary roots.
+  // Cross-edges: live REMOTE handle → LOCAL handle.
+  // The LOCAL targets must be rooted during GC to prevent collection.
+  _cross_roots_count = 0;
+  if (num_cross > 0) {
+    table_lock();
+    for (size_t i = 0; i < num_cross && _cross_roots_count < MAX_CROSS_ROOTS; i++) {
+      uintptr_t local_handle_id = cross_tgt[i];
+      // Find the RemoteHandle by handle_id (address of Handle)
+      RemoteHandle* h = (RemoteHandle*)local_handle_id;
+      if (h != nullptr && h->is_local()) {
+        _cross_roots[_cross_roots_count++] = h;
+      }
+    }
+    table_unlock();
+    log_info(gc)("Cross-boundary roots: %d LOCAL handles kept alive by live REMOTE objects",
+                 _cross_roots_count);
+  }
+
+  if (cross_src) os::free(cross_src);
+  if (cross_tgt) os::free(cross_tgt);
 
   // Step 3: Clean up Handle entries for dead objects.
   size_t collected = 0;
@@ -1519,25 +1547,20 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
       while (*pp != nullptr) {
         HandleEntry* entry = *pp;
         if (entry->_handle != nullptr && entry->_handle->is_remote()) {
+          uintptr_t handle_addr = (uintptr_t)entry->_handle;
           uintptr_t sa = entry->_handle->load_state_and_addr_acquire();
           size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
 
           bool is_dead = false;
           for (size_t d = 0; d < num_dead; d++) {
-            if (dead_ids[d] == slot_id) { is_dead = true; break; }
+            if (dead_ids[d] == handle_addr || dead_ids[d] == (uintptr_t)slot_id) {
+              is_dead = true; break;
+            }
           }
 
           if (is_dead) {
-            // Set Handle to DEAD state
             entry->_handle->set_dead();
-
-            // Clean up edge table for this handle
             remove_edge_table(entry->_handle);
-
-            // Decrement remote_refcount on target handles in edge table
-            // (already removed, but targets may still have inflated refcounts)
-
-            // Remove Handle entry from table
             *pp = entry->_next;
             free_entry(entry);
             collected++;
@@ -1555,8 +1578,8 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   size_t retained = total_remote - collected;
   if (collected > 0 || retained > 0) {
     log_info(gc)("Remote collection: " SIZE_FORMAT " dead objects freed (" SIZE_FORMAT " bytes reclaimed remotely), "
-                 SIZE_FORMAT " live objects retained",
-                 collected, bytes_freed, retained);
+                 SIZE_FORMAT " live objects retained, %d cross-boundary roots",
+                 collected, bytes_freed, retained, _cross_roots_count);
   }
   return collected;
 }

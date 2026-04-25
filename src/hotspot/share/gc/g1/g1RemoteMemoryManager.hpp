@@ -551,6 +551,12 @@ public:
   uintptr_t _remote_roots[MAX_REMOTE_ROOTS];
   int       _remote_roots_count;
 
+  // Cross-boundary roots: LOCAL handles referenced by live REMOTE objects.
+  // Populated by trace_and_report(), consumed as GC roots during Phase D.
+  static const int MAX_CROSS_ROOTS = 4096;
+  RemoteHandle* _cross_roots[MAX_CROSS_ROOTS];
+  int           _cross_roots_count;
+
 public:
   // Deferred remote_refcount decrements (P13: SATB safety).
   // During concurrent marking, refcount decrements are buffered here
@@ -797,6 +803,12 @@ public:
   template <typename OopClosureType>
   void oops_do_remote_anchors(OopClosureType* cl);
 
+  // Iterate cross-boundary roots: LOCAL handles that are kept alive by
+  // live REMOTE objects. Populated by collect_dead_remote_objects() via
+  // trace_and_report(). Complementary to oops_do_remote_anchors().
+  template <typename OopClosureType>
+  void oops_do_remote_cross_roots(OopClosureType* cl);
+
   // Evict an entire region: evict all objects, tag incoming refs, free region.
   // Called during STW post-GC when heap pressure exceeds threshold.
   // Returns the number of objects evicted.
@@ -894,6 +906,53 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
         pp = &(*pp)->_next;
       }
       // Insert into new bucket
+      entry->_next = _table[new_idx];
+      _table[new_idx] = entry;
+    }
+  }
+}
+
+template <typename OopClosureType>
+void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
+  static const int MAX_MOVED = 256;
+  struct MovedEntry { HandleEntry* entry; uintptr_t old_addr; };
+  MovedEntry moved[MAX_MOVED];
+  int num_moved = 0;
+
+  for (int i = 0; i < _cross_roots_count; i++) {
+    RemoteHandle* h = _cross_roots[i];
+    if (h == nullptr || !h->is_local()) continue;
+    uintptr_t old_addr = (uintptr_t)h->local_addr();
+    oop obj = cast_to_oop(h->local_addr());
+    if (obj == nullptr || obj->klass_or_null() == nullptr) continue;
+    cl->do_oop(&obj);
+    uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
+    if (new_addr != old_addr) {
+      h->set_local(cast_from_oop<void*>(obj));
+      // Find table entry by old address for rehashing
+      size_t idx = hash_obj(old_addr);
+      for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+        if (e->_handle == h) {
+          if (num_moved < MAX_MOVED) {
+            moved[num_moved++] = {e, old_addr};
+            e->_obj_addr = new_addr;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  for (int i = 0; i < num_moved; i++) {
+    HandleEntry* entry = moved[i].entry;
+    size_t old_idx = hash_obj(moved[i].old_addr);
+    size_t new_idx = hash_obj(entry->_obj_addr);
+    if (old_idx != new_idx) {
+      HandleEntry** pp = &_table[old_idx];
+      while (*pp != nullptr) {
+        if (*pp == entry) { *pp = entry->_next; break; }
+        pp = &(*pp)->_next;
+      }
       entry->_next = _table[new_idx];
       _table[new_idx] = entry;
     }

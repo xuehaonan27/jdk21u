@@ -106,6 +106,23 @@ public:
                                 const size_t* slot_ids, size_t count) {
     // Default: no-op
   }
+
+  // Trace remote object graph and report dead handles + cross-boundary edges.
+  // Cross-edges: live REMOTE objects referencing LOCAL handles.
+  // out_cross_src[i]/out_cross_tgt[i]: remote/local handle_id pairs.
+  // Caller frees all output arrays.
+  virtual void trace_and_report(uintptr_t** out_dead_ids, size_t* out_num_dead,
+                                size_t* out_bytes_freed,
+                                uintptr_t** out_cross_src, uintptr_t** out_cross_tgt,
+                                size_t* out_num_cross) {
+    // Default: no cross-edges, delegate to V1 collect_dead
+    *out_cross_src = nullptr;
+    *out_cross_tgt = nullptr;
+    *out_num_cross = 0;
+    size_t* dead_slot_ids = nullptr;
+    collect_dead(&dead_slot_ids, out_num_dead, out_bytes_freed);
+    *out_dead_ids = (uintptr_t*)dead_slot_ids;
+  }
 };
 
 #endif // SHARE_GC_G1_G1REMOTEBACKEND_HPP

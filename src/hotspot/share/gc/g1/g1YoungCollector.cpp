@@ -1105,10 +1105,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // Concurrent mark ref processor — discovered references
     _g1h->ref_processor_cm()->weak_oops_do(&pin_cl);
 
-    // Also check remote anchor roots
+    // Also check remote anchor roots + cross-boundary roots
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
       rmm->oops_do_remote_anchors(&pin_cl);
+      rmm->oops_do_remote_cross_roots(&pin_cl);
     }
   }
 
@@ -1232,6 +1233,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
       _g1h->ref_processor_cm()->weak_oops_do(&pin_cl);
       rmm->oops_do_remote_anchors(&pin_cl);
+      rmm->oops_do_remote_cross_roots(&pin_cl);
 
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
