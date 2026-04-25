@@ -1138,6 +1138,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // remset-only tagging misses (dirty cards not refined, post-evacuation
   // card dirtying, cross-region refs from non-collected regions).
   if (G1RemoteEvictionThreshold > 0 || G1SimulateRemoteEviction) {
+    guarantee(!UseCompressedOops,
+              "Remote eviction requires -XX:-UseCompressedOops "
+              "(tagged oops need 64-bit pointers)");
     // Skip eviction during concurrent start (initial mark) GC.
     // Old/survivor alloc regions retired during concurrent start are registered
     // as concurrent mark root regions. Quarantining them causes SIGSEGV when
