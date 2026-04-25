@@ -1153,6 +1153,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     int total_evicted = 0;
     int regions_evicted = 0;
     int regions_pinned = 0;
+    int regions_kept_alive = 0;
     uint freed_regions = 0;
     size_t total_freed_bytes = 0;
     FreeRegionList freed_list("Evicted Cold Regions");
@@ -1366,8 +1367,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       PreparedEviction* entries = NEW_C_HEAP_ARRAY(PreparedEviction, max_entries, mtGC);
       int* region_start = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
       int* region_count_arr = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
+      bool* region_complete = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
       memset(region_start, 0, num_regions * sizeof(int));
       memset(region_count_arr, 0, num_regions * sizeof(int));
+      memset(region_complete, 0, num_regions * sizeof(bool));
       int num_entries = 0;
 
       for (uint i = 0; i < num_regions; i++) {
@@ -1375,6 +1378,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         HeapRegion* hr = _g1h->region_at(i);
         region_start[i] = num_entries;
         int rcount = 0;
+        bool all_prepared = true;
         HeapWord* p = hr->bottom();
         while (p < hr->top() && num_entries < max_entries) {
           oop obj = cast_to_oop(p);
@@ -1382,10 +1386,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           if (rmm->prepare_eviction(obj, &hab, &entries[num_entries])) {
             num_entries++;
             rcount++;
+          } else {
+            all_prepared = false;
           }
           p += sz;
         }
+        if (p < hr->top()) all_prepared = false;
         region_count_arr[i] = rcount;
+        region_complete[i] = all_prepared;
       }
       double e1_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
 
@@ -1454,18 +1462,21 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
       double e2_ms = (Ticks::now() - e2_start).seconds() * 1000.0;
 
-      // E3: Finalize all evictions + quarantine regions.
+      // E3: Finalize complete regions' evictions + free them.
+      // Incomplete regions (where prepare_eviction failed for some objects)
+      // must NOT be freed — their LOCAL handles still point into the region.
       Ticks e3_start = Ticks::now();
-      for (int e = 0; e < num_entries; e++) {
-        rmm->finalize_eviction(&entries[e]);
-      }
 
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at(i);
         int rcount = region_count_arr[i];
 
-        if (rcount > 0) {
+        if (rcount > 0 && region_complete[i]) {
+          int start = region_start[i];
+          for (int e = start; e < start + rcount; e++) {
+            rmm->finalize_eviction(&entries[e]);
+          }
           total_evicted += rcount;
           regions_evicted++;
           size_t region_used = hr->used();
@@ -1477,11 +1488,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        "[" PTR_FORMAT ", " PTR_FORMAT ")",
                        hr->hrm_index(), rcount, region_used / K,
                        p2i(hr->bottom()), p2i((char*)hr->bottom() + poison_bytes));
-          // Properly free: clear RSet, card table, set type → Free, add to free list.
-          // Fixes GC(N+1) hang: stale RSet/card entries in quarantined regions
-          // caused subsequent GC to scan poisoned memory.
           _g1h->free_region(hr, &freed_list);
           freed_regions++;
+        } else if (rcount > 0 && !region_complete[i]) {
+          log_info(gc)("Region %u kept alive: %d objects prepared but some failed "
+                       "prepare_eviction — handles stay LOCAL",
+                       hr->hrm_index(), rcount);
+          regions_kept_alive++;
+          hr->clear_cold_destination();
         } else {
           hr->clear_cold_destination();
         }
@@ -1491,6 +1505,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       FREE_C_HEAP_ARRAY(PreparedEviction, entries);
       FREE_C_HEAP_ARRAY(int, region_start);
       FREE_C_HEAP_ARRAY(int, region_count_arr);
+      FREE_C_HEAP_ARRAY(bool, region_complete);
 
       if (total_candidates > 0) {
         double phase_e_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
