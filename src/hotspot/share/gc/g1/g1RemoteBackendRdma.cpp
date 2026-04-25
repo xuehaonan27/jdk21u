@@ -38,6 +38,8 @@ static const uint32_t RE_CMD_SHUTDOWN           = 0xFF;
 static const uint32_t RE_RESP_OK                = 0x81;
 static const uint32_t RE_RESP_OBJECT_DATA       = 0x83;
 static const uint32_t RE_RESP_COLLECTION_RESULT = 0x84;
+static const uint32_t RE_CMD_TRACE_AND_REPORT   = 0x17;
+static const uint32_t RE_RESP_TRACE_RESULT       = 0x86;
 
 // RDMA parameters are set via JVM flags (g1_globals.hpp):
 //   -XX:RDMAMsgBufSize=65536    (SEND/RECV buffer, default 64K)
@@ -658,6 +660,70 @@ void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_de
   *out_dead_ids = dead;
   *out_num_dead = num_dead;
   *out_bytes_freed = bytes_freed;
+  os::free(resp);
+}
+
+void RDMAExecutorBackend::trace_and_report(uintptr_t** out_dead_ids, size_t* out_num_dead,
+                                           size_t* out_bytes_freed,
+                                           uintptr_t** out_cross_src, uintptr_t** out_cross_tgt,
+                                           size_t* out_num_cross) {
+  *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
+  *out_cross_src = nullptr; *out_cross_tgt = nullptr; *out_num_cross = 0;
+  if (!_connected) return;
+
+  io_lock();
+
+  uint8_t msg[16];
+  *(uint32_t*)(msg + 0) = RE_CMD_TRACE_AND_REPORT;
+  *(uint32_t*)(msg + 4) = 16;
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  if (!rdma_send_msg(msg, 16)) { io_unlock(); return; }
+
+  uint8_t* resp = (uint8_t*)os::malloc(4 * 1024 * 1024, mtGC);
+  size_t resp_len = 0;
+  if (!rdma_recv_msg(resp, 4 * 1024 * 1024, &resp_len)) {
+    os::free(resp);
+    io_unlock();
+    return;
+  }
+
+  io_unlock();
+
+  if (resp_len < 4 || *(uint32_t*)resp != RE_RESP_TRACE_RESULT) {
+    os::free(resp);
+    return;
+  }
+
+  uint32_t num_dead    = *(uint32_t*)(resp + 16);
+  uint32_t num_live    = *(uint32_t*)(resp + 20);
+  uint64_t bytes_freed = *(uint64_t*)(resp + 24);
+  uint32_t num_cross   = *(uint32_t*)(resp + 32);
+
+  *out_num_dead = num_dead;
+  *out_bytes_freed = bytes_freed;
+  *out_num_cross = num_cross;
+
+  uint64_t* dead_raw = (uint64_t*)(resp + 40);
+  if (num_dead > 0) {
+    uintptr_t* dead = (uintptr_t*)os::malloc(num_dead * sizeof(uintptr_t), mtGC);
+    for (uint32_t i = 0; i < num_dead; i++) dead[i] = (uintptr_t)dead_raw[i];
+    *out_dead_ids = dead;
+  }
+
+  if (num_cross > 0) {
+    uint8_t* cross_raw = resp + 40 + num_dead * 8;
+    uintptr_t* cross_src = (uintptr_t*)os::malloc(num_cross * sizeof(uintptr_t), mtGC);
+    uintptr_t* cross_tgt = (uintptr_t*)os::malloc(num_cross * sizeof(uintptr_t), mtGC);
+    for (uint32_t i = 0; i < num_cross; i++) {
+      cross_src[i] = (uintptr_t)*(uint64_t*)(cross_raw + i * 16);
+      cross_tgt[i] = (uintptr_t)*(uint64_t*)(cross_raw + i * 16 + 8);
+    }
+    *out_cross_src = cross_src;
+    *out_cross_tgt = cross_tgt;
+  }
+
+  log_info(gc)("trace_and_report: %u dead, %u live, " UINT64_FORMAT " bytes freed, %u cross-edges",
+               num_dead, num_live, bytes_freed, num_cross);
   os::free(resp);
 }
 
