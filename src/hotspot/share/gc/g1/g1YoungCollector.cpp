@@ -1225,11 +1225,43 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     int total_candidates = path1_candidates + path2_candidates;
 
     // ---- Phase D (early): Root-pin check BEFORE expensive heap scan ----
-    // Must run for ALL candidates (path1 AND path2). Path1 was root-checked
-    // in Step 2, but Step 2 runs before post_evacuate_cleanup; re-check here
-    // to catch any roots that moved during cleanup.
+    // Pin ALL candidates (path1 AND path2) that have root references.
+    // Root oops (thread stacks, JNI handles, etc.) bypass the load barrier,
+    // so evicting a region with root refs causes SIGSEGV on mprotect-guarded pages.
     if (total_candidates > 0) {
-      ColdRegionPinClosure pin_cl(_g1h);
+      class EvictionCandidatePinClosure : public OopClosure {
+        G1CollectedHeap* _g1h;
+        bool*            _eviction_candidates;
+        uint             _num_regions;
+        int              _pinned;
+      public:
+        EvictionCandidatePinClosure(G1CollectedHeap* g1h, bool* candidates, uint num_regions)
+          : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions), _pinned(0) {}
+        int pinned() const { return _pinned; }
+        void do_oop(oop* p) {
+          oop obj = *p;
+          if (obj == nullptr) return;
+          uintptr_t raw = cast_from_oop<uintptr_t>(obj);
+          if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+              (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+          if ((raw & G1_OOP_TAG_MASK) != 0) {
+            obj = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+          }
+          if (!_g1h->is_in(obj)) return;
+          HeapRegion* hr = _g1h->heap_region_containing(obj);
+          if (hr == nullptr) return;
+          uint idx = hr->hrm_index();
+          if (idx < _num_regions && _eviction_candidates[idx]) {
+            _eviction_candidates[idx] = false;
+            _pinned++;
+            log_info(gc)("Root-pinned eviction candidate region %u (root " PTR_FORMAT " -> obj " PTR_FORMAT ")",
+                         idx, p2i(p), p2i((void*)obj));
+          }
+        }
+        void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+      };
+
+      EvictionCandidatePinClosure pin_cl(_g1h, eviction_candidates, num_regions);
       Threads::oops_do(&pin_cl, nullptr);
       JNIHandles::oops_do(&pin_cl);
       OopStorageSet::strong_oops_do(&pin_cl);
@@ -1248,17 +1280,16 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       rmm->oops_do_remote_anchors(&pin_cl);
       rmm->oops_do_remote_cross_roots(&pin_cl);
 
+      // Clean up cold_destination/root_pinned flags from earlier scan
       for (uint i = 0; i < num_regions; i++) {
-        if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at(i);
         if (hr->is_root_pinned()) {
           hr->clear_cold_destination();
           hr->clear_root_pinned();
-          eviction_candidates[i] = false;
-          regions_pinned++;
-          total_candidates--;
         }
       }
+      regions_pinned += pin_cl.pinned();
+      total_candidates -= pin_cl.pinned();
     }
 
     if (total_candidates > 0) {
