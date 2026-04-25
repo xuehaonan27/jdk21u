@@ -25,6 +25,7 @@
 
 class G1CollectedHeap;
 class HeapRegion;
+class WorkerThreads;
 
 // ============================================================
 // G1RemoteMemoryManager
@@ -697,9 +698,16 @@ public:
   // eviction set. eviction_set[i]==true means region i is a candidate.
   // More expensive than remset-based scan but catches dirty cards not
   // yet refined and other remset gaps. Returns total refs tagged.
-  int tag_all_heap_refs_to_eviction_set(const bool* eviction_set, uint num_regions);
+  int tag_all_heap_refs_to_eviction_set(const bool* eviction_set, uint num_regions,
+                                        WorkerThreads* workers = nullptr, uint num_workers = 0);
 
   int verify_no_untagged_refs_to_eviction_set(const bool* eviction_set, uint num_regions);
+
+  void add_tagged_field_locked(oop* field_addr, RemoteHandle* h) {
+    table_lock();
+    add_tagged_field(field_addr, h);
+    table_unlock();
+  }
 
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().

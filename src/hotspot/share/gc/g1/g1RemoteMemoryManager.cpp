@@ -30,6 +30,8 @@
 #include "gc/shared/oopStorageSet.inline.hpp"
 #include "utilities/copy.hpp"
 #include "classfile/classLoaderDataGraph.hpp"
+#include "gc/shared/workerThread.hpp"
+#include "gc/g1/heapRegionManager.inline.hpp"
 #include "code/codeCache.hpp"
 #include "gc/shared/referenceProcessor.hpp"
 
@@ -352,8 +354,8 @@ bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) 
   //    a filler object, causing a visible crash instead of silent corruption.
   CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(obj), word_size, false);
 
-  log_info(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT " edges=%u (filled)",
-               p2i((void*)obj), klass->external_name(), word_size, slot_id, et->_entry_count);
+  log_trace(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT " edges=%u (filled)",
+                p2i((void*)obj), klass->external_name(), word_size, slot_id, et->_entry_count);
 
   return true;
 }
@@ -509,96 +511,144 @@ void G1RemoteMemoryManager::tag_incoming_refs_to_region(HeapRegion* target_hr) {
 
 // Full heap scan: tag ALL heap refs pointing to any eviction candidate.
 // Walks every non-candidate, non-empty region and checks each oop field.
-// O(live_heap) but runs during STW and catches refs that remset misses
-// (dirty cards not yet refined, post-evacuation card dirtying, etc.).
-int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
-    const bool* eviction_set, uint num_regions) {
+// O(live_heap) but parallelized across GC workers. Catches refs that remset
+// misses (dirty cards not yet refined, post-evacuation card dirtying, etc.).
 
-  class EvictionSetTagClosure : public BasicOopIterateClosure {
-    G1RemoteMemoryManager* _rmm;
-    G1CollectedHeap*       _g1h;
-    const bool*            _eviction_set;
-    uint                   _num_regions;
-    int                    _tagged;
-    int                    _no_handle;
-  public:
-    EvictionSetTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
-                          const bool* eset, uint nregions)
-      : _rmm(rmm), _g1h(g1h), _eviction_set(eset),
-        _num_regions(nregions), _tagged(0), _no_handle(0) {}
+class EvictionSetTagClosure : public BasicOopIterateClosure {
+  G1RemoteMemoryManager* _rmm;
+  G1CollectedHeap*       _g1h;
+  const bool*            _eviction_set;
+  uint                   _num_regions;
+  int                    _tagged;
+  int                    _no_handle;
+  bool                   _use_locked;
+public:
+  EvictionSetTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
+                        const bool* eset, uint nregions, bool use_locked = false)
+    : _rmm(rmm), _g1h(g1h), _eviction_set(eset),
+      _num_regions(nregions), _tagged(0), _no_handle(0), _use_locked(use_locked) {}
 
-    virtual void do_oop(oop* p) {
-      uintptr_t raw = *(uintptr_t*)p;
-      if (raw == 0) return;
-      // Shared oops (bits 63+62) already have Handle indirection — skip.
-      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
-          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+  virtual void do_oop(oop* p) {
+    uintptr_t raw = *(uintptr_t*)p;
+    if (raw == 0) return;
+    if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+        (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
 
-      // Resolve: strip Unique tag bits if present.
-      oop target;
-      if ((raw >> 63) != 0) {
-        target = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+    oop target;
+    if ((raw >> 63) != 0) {
+      target = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+    } else {
+      target = cast_to_oop(raw);
+    }
+    if (!_g1h->is_in(target)) return;
+
+    HeapRegion* target_hr = _g1h->heap_region_containing(target);
+    uint idx = target_hr->hrm_index();
+    if (idx >= _num_regions || !_eviction_set[idx]) return;
+
+    RemoteHandle* h = _rmm->handle_for(target);
+    if (h != nullptr) {
+      *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+      if (_use_locked) {
+        _rmm->add_tagged_field_locked(p, h);
       } else {
-        target = cast_to_oop(raw);
-      }
-      if (!_g1h->is_in(target)) return;
-
-      HeapRegion* target_hr = _g1h->heap_region_containing(target);
-      uint idx = target_hr->hrm_index();
-      if (idx >= _num_regions || !_eviction_set[idx]) return;
-
-      RemoteHandle* h = _rmm->handle_for(target);
-      if (h != nullptr) {
-        *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
         _rmm->add_tagged_field(p, h);
-        _tagged++;
-      } else {
-        _no_handle++;
-        if (_no_handle <= 10) {
-          log_warning(gc)("Tagging: no handle for target " PTR_FORMAT " in candidate region %u "
-                          "(field at " PTR_FORMAT ")",
-                          p2i((void*)target), idx, p2i(p));
-        }
       }
-    }
-
-    virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
-
-    int tagged() const { return _tagged; }
-    int no_handle() const { return _no_handle; }
-  };
-
-  EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
-
-  for (uint i = 0; i < _g1h->num_regions(); i++) {
-    HeapRegion* hr = _g1h->region_at(i);
-    if (hr->is_empty() || hr->is_free()) continue;
-
-    HeapWord* p = hr->bottom();
-    HeapWord* region_end = hr->end();
-    while (p < hr->top()) {
-      if (p < hr->bottom() || p >= region_end) break;
-      oop obj = cast_to_oop(p);
-      Klass* k = obj->klass_or_null();
-      if (k == nullptr) break;
-      size_t sz = obj->size();
-      if (sz == 0) break;
-      if (sz > (size_t)(region_end - p)) {
-        // Humongous object spanning multiple regions — still must iterate
-        // its oop fields, since they may reference eviction candidates.
-        obj->oop_iterate(&cl);
-        break;
+      _tagged++;
+    } else {
+      _no_handle++;
+      if (_no_handle <= 10) {
+        log_warning(gc)("Tagging: no handle for target " PTR_FORMAT " in candidate region %u "
+                        "(field at " PTR_FORMAT ")",
+                        p2i((void*)target), idx, p2i(p));
       }
-      obj->oop_iterate(&cl);
-      p += sz;
     }
   }
 
-  if (cl.tagged() > 0 || cl.no_handle() > 0) {
-    log_info(gc)("Full heap scan: tagged %d refs, %d refs had no handle",
-                 cl.tagged(), cl.no_handle());
+  virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+
+  int tagged() const { return _tagged; }
+  int no_handle() const { return _no_handle; }
+};
+
+static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure* cl) {
+  HeapWord* p = hr->bottom();
+  HeapWord* region_end = hr->end();
+  while (p < hr->top()) {
+    if (p < hr->bottom() || p >= region_end) break;
+    oop obj = cast_to_oop(p);
+    Klass* k = obj->klass_or_null();
+    if (k == nullptr) break;
+    size_t sz = obj->size();
+    if (sz == 0) break;
+    if (sz > (size_t)(region_end - p)) {
+      obj->oop_iterate(cl);
+      break;
+    }
+    obj->oop_iterate(cl);
+    p += sz;
   }
-  return cl.tagged();
+}
+
+class TagAllHeapRefsTask : public WorkerTask {
+  G1RemoteMemoryManager* _rmm;
+  G1CollectedHeap*       _g1h;
+  const bool*            _eviction_set;
+  uint                   _num_regions;
+  HeapRegionClaimer      _claimer;
+  volatile int           _total_tagged;
+  volatile int           _total_no_handle;
+
+public:
+  TagAllHeapRefsTask(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
+                     const bool* eset, uint nregions, uint num_workers)
+    : WorkerTask("Tag eviction refs"),
+      _rmm(rmm), _g1h(g1h), _eviction_set(eset), _num_regions(nregions),
+      _claimer(num_workers), _total_tagged(0), _total_no_handle(0) {}
+
+  void work(uint worker_id) {
+    EvictionSetTagClosure cl(_rmm, _g1h, _eviction_set, _num_regions, true);
+    for (uint i = _claimer.offset_for_worker(worker_id); i < _g1h->num_regions(); i++) {
+      if (!_claimer.claim_region(i)) continue;
+      HeapRegion* hr = _g1h->region_at(i);
+      if (hr->is_empty() || hr->is_free()) continue;
+      scan_region_for_eviction_tags(hr, &cl);
+    }
+    Atomic::add(&_total_tagged, cl.tagged());
+    Atomic::add(&_total_no_handle, cl.no_handle());
+  }
+
+  int total_tagged() const { return _total_tagged; }
+  int total_no_handle() const { return _total_no_handle; }
+};
+
+int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
+    const bool* eviction_set, uint num_regions,
+    WorkerThreads* workers, uint num_workers) {
+
+  int total_tagged, total_no_handle;
+
+  if (workers != nullptr && num_workers > 1) {
+    TagAllHeapRefsTask task(this, _g1h, eviction_set, num_regions, num_workers);
+    workers->run_task(&task, num_workers);
+    total_tagged = task.total_tagged();
+    total_no_handle = task.total_no_handle();
+  } else {
+    EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions, false);
+    for (uint i = 0; i < _g1h->num_regions(); i++) {
+      HeapRegion* hr = _g1h->region_at(i);
+      if (hr->is_empty() || hr->is_free()) continue;
+      scan_region_for_eviction_tags(hr, &cl);
+    }
+    total_tagged = cl.tagged();
+    total_no_handle = cl.no_handle();
+  }
+
+  if (total_tagged > 0 || total_no_handle > 0) {
+    log_info(gc)("Full heap scan (%u workers): tagged %d refs, %d refs had no handle",
+                 (workers != nullptr ? num_workers : 1), total_tagged, total_no_handle);
+  }
+  return total_tagged;
 }
 
 int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(

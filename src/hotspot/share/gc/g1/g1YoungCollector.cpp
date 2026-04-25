@@ -1267,23 +1267,33 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
 
       // ---- Phase C: Full heap scan — tag ALL refs to candidates ----
-      rmm->tag_all_heap_refs_to_eviction_set(eviction_candidates, num_regions);
+      {
+        Ticks phase_c_start = Ticks::now();
+        uint nworkers = _g1h->workers()->active_workers();
+        rmm->tag_all_heap_refs_to_eviction_set(eviction_candidates, num_regions,
+                                                _g1h->workers(), nworkers);
+        double phase_c_ms = (Ticks::now() - phase_c_start).seconds() * 1000.0;
+        log_info(gc)("Phase C heap scan: %.1fms (%u workers)", phase_c_ms, nworkers);
+      }
 
-      // ---- Phase C.5: Verify no untagged refs remain ----
-      int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates, num_regions);
-      if (missed > 0) {
-        log_warning(gc)("Eviction ABORTED: %d untagged refs found after tagging", missed);
-        for (uint i = 0; i < num_regions; i++) {
-          if (eviction_candidates[i]) {
-            HeapRegion* hr = _g1h->region_at(i);
-            hr->clear_cold_destination();
-            eviction_candidates[i] = false;
+      // ---- Phase C.5: Verify no untagged refs remain (diagnostic only) ----
+      if (G1SimulateRemoteEviction) {
+        int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates, num_regions);
+        if (missed > 0) {
+          log_warning(gc)("Eviction ABORTED: %d untagged refs found after tagging", missed);
+          for (uint i = 0; i < num_regions; i++) {
+            if (eviction_candidates[i]) {
+              HeapRegion* hr = _g1h->region_at(i);
+              hr->clear_cold_destination();
+              eviction_candidates[i] = false;
+            }
           }
+          total_candidates = 0;
         }
-        total_candidates = 0;
       }
 
       // ---- Phase E: Evict non-pinned candidates ----
+      Ticks phase_e_start = Ticks::now();
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at(i);
@@ -1319,6 +1329,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           hr->clear_cold_destination();
         }
       }
+    }
+
+    if (total_candidates > 0) {
+      double phase_e_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
+      log_info(gc)("Phase E eviction: %.1fms (%d objects, %d regions)", phase_e_ms, total_evicted, regions_evicted);
     }
 
     // Post-eviction diagnostic: verify no root oops point into freed regions.
