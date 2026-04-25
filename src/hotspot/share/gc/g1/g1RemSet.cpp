@@ -696,6 +696,7 @@ public:
   }
 
   bool do_heap_region(HeapRegion* r) {
+    if (r->is_evict_guarded()) return false;
     assert(!r->in_collection_set() && r->is_old_or_humongous(),
            "Should only be called on old gen non-collection set regions but region %u is not.",
            r->hrm_index());
