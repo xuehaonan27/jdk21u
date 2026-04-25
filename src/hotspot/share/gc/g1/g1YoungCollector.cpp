@@ -1329,11 +1329,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           hr->clear_cold_destination();
         }
       }
-    }
 
-    if (total_candidates > 0) {
-      double phase_e_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
-      log_info(gc)("Phase E eviction: %.1fms (%d objects, %d regions)", phase_e_ms, total_evicted, regions_evicted);
+      if (total_candidates > 0) {
+        double phase_e_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
+        log_info(gc)("Phase E eviction: %.1fms (%d objects, %d regions)", phase_e_ms, total_evicted, regions_evicted);
+      }
     }
 
     // Post-eviction diagnostic: verify no root oops point into freed regions.
