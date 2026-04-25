@@ -1250,19 +1250,76 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                    path1_candidates, path2_candidates, total_candidates, regions_pinned);
 
       // ---- Phase B: Ensure handles for all objects in candidate regions ----
-      for (uint i = 0; i < num_regions; i++) {
-        if (!eviction_candidates[i]) continue;
-        HeapRegion* hr = _g1h->region_at(i);
-        HeapWord* p = hr->bottom();
-        HeapWord* region_end = hr->end();
-        while (p < hr->top()) {
-          if (p < hr->bottom() || p >= region_end) break;
-          oop obj = cast_to_oop(p);
-          if (obj->klass_or_null() == nullptr) break;
-          size_t sz = obj->size();
-          if (sz == 0 || sz > (size_t)(region_end - p)) break;
-          rmm->ensure_handle_for(obj, &hab);
-          p += sz;
+      {
+        Ticks phase_b_start = Ticks::now();
+        uint nworkers = _g1h->workers()->active_workers();
+
+        class EnsureHandlesTask : public WorkerTask {
+          G1RemoteMemoryManager* _rmm;
+          G1CollectedHeap*       _g1h;
+          const bool*            _eviction_candidates;
+          uint                   _num_regions;
+          HeapRegionClaimer      _claimer;
+          volatile int           _total_handles;
+        public:
+          EnsureHandlesTask(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
+                            const bool* candidates, uint num_regions, uint num_workers)
+            : WorkerTask("G1 Ensure Handles"),
+              _rmm(rmm), _g1h(g1h),
+              _eviction_candidates(candidates), _num_regions(num_regions),
+              _claimer(num_workers), _total_handles(0) {}
+
+          void work(uint worker_id) {
+            RemoteHandleAllocBuffer hab;
+            int count = 0;
+            for (uint i = _claimer.offset_for_worker(worker_id); i < _num_regions; i++) {
+              if (!_eviction_candidates[i]) continue;
+              if (!_claimer.claim_region(i)) continue;
+              HeapRegion* hr = _g1h->region_at(i);
+              HeapWord* p = hr->bottom();
+              HeapWord* region_end = hr->end();
+              while (p < hr->top()) {
+                if (p < hr->bottom() || p >= region_end) break;
+                oop obj = cast_to_oop(p);
+                if (obj->klass_or_null() == nullptr) break;
+                size_t sz = obj->size();
+                if (sz == 0 || sz > (size_t)(region_end - p)) break;
+                _rmm->ensure_handle_for_parallel(obj, &hab);
+                count++;
+                p += sz;
+              }
+            }
+            Atomic::add(&_total_handles, count);
+          }
+          int total_handles() const { return _total_handles; }
+        };
+
+        if (nworkers > 1) {
+          EnsureHandlesTask task(rmm, _g1h, eviction_candidates, num_regions, nworkers);
+          _g1h->workers()->run_task(&task, nworkers);
+          double phase_b_ms = (Ticks::now() - phase_b_start).seconds() * 1000.0;
+          log_info(gc)("Phase B ensure handles: %.1fms (%d handles, %u workers)",
+                       phase_b_ms, task.total_handles(), nworkers);
+        } else {
+          int count = 0;
+          for (uint i = 0; i < num_regions; i++) {
+            if (!eviction_candidates[i]) continue;
+            HeapRegion* hr = _g1h->region_at(i);
+            HeapWord* p = hr->bottom();
+            HeapWord* region_end = hr->end();
+            while (p < hr->top()) {
+              if (p < hr->bottom() || p >= region_end) break;
+              oop obj = cast_to_oop(p);
+              if (obj->klass_or_null() == nullptr) break;
+              size_t sz = obj->size();
+              if (sz == 0 || sz > (size_t)(region_end - p)) break;
+              rmm->ensure_handle_for(obj, &hab);
+              count++;
+              p += sz;
+            }
+          }
+          double phase_b_ms = (Ticks::now() - phase_b_start).seconds() * 1000.0;
+          log_info(gc)("Phase B ensure handles: %.1fms (%d handles, 1 worker)", phase_b_ms, count);
         }
       }
 

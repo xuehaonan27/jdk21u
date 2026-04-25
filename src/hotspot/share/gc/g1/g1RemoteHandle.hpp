@@ -216,7 +216,7 @@ class RemoteHandleAllocator : public CHeapObj<mtGC> {
   RemoteHandleChunk* _free_chunks;   // Free chunk list (for reuse)
   RemoteHandleChunk* _all_chunks;    // All allocated chunks (for cleanup)
   size_t _total_chunks;
-  size_t _total_handles_allocated;
+  volatile size_t _total_handles_allocated;
 
   // Simple lock for chunk allocation (low contention: one CAS per 256 handles)
   volatile int _lock;
@@ -266,7 +266,7 @@ public:
       h = hab->allocate();
       assert(h != nullptr, "fresh chunk should have space");
     }
-    _total_handles_allocated++;
+    Atomic::add(&_total_handles_allocated, (size_t)1);
     return h;
   }
 

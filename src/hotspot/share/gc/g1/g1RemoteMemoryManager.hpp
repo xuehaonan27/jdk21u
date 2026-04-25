@@ -104,6 +104,28 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   void table_lock()   { while (Atomic::cmpxchg(&_table_lock, 0, 1) != 0) { /* spin */ } }
   void table_unlock() { Atomic::release_store(&_table_lock, 0); }
 
+  // Stripe locks for parallel ensure_handle_for (Phase B).
+  // 128 stripes over 1024 buckets = 8 buckets per stripe.
+  static const int TABLE_STRIPES = 128;
+  volatile int _stripe_locks[TABLE_STRIPES];
+  volatile int _alloc_lock;
+
+  void stripe_lock(size_t bucket_idx) {
+    int stripe = (int)(bucket_idx % TABLE_STRIPES);
+    while (Atomic::cmpxchg(&_stripe_locks[stripe], 0, 1) != 0) { /* spin */ }
+  }
+  void stripe_unlock(size_t bucket_idx) {
+    int stripe = (int)(bucket_idx % TABLE_STRIPES);
+    Atomic::release_store(&_stripe_locks[stripe], 0);
+  }
+
+  HandleEntry* alloc_entry_locked() {
+    while (Atomic::cmpxchg(&_alloc_lock, 0, 1) != 0) { /* spin */ }
+    HandleEntry* e = alloc_entry();
+    Atomic::release_store(&_alloc_lock, 0);
+    return e;
+  }
+
   static size_t hash_obj(uintptr_t addr) {
     return (addr >> 3) % TABLE_SIZE;  // Objects are 8-byte aligned
   }
@@ -154,6 +176,32 @@ public:
     entry->init(addr, h, _table[idx]);
     _table[idx] = entry;
     table_unlock();
+    return h;
+  }
+
+  // Thread-safe variant for parallel Phase B: uses per-bucket stripe locks
+  // instead of the global table_lock. Multiple workers can create handles
+  // concurrently for objects that hash to different stripes.
+  RemoteHandle* ensure_handle_for_parallel(oop obj, RemoteHandleAllocBuffer* hab) {
+    uintptr_t addr = cast_from_oop<uintptr_t>(obj);
+    size_t idx = hash_obj(addr);
+
+    stripe_lock(idx);
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      if (e->_obj_addr == addr && e->_handle->is_local()) {
+        RemoteHandle* existing = e->_handle;
+        stripe_unlock(idx);
+        return existing;
+      }
+      e = e->_next;
+    }
+    HandleEntry* entry = alloc_entry_locked();
+    RemoteHandle* h = _handle_allocator.allocate_handle(hab);
+    h->initialize(cast_from_oop<void*>(obj));
+    entry->init(addr, h, _table[idx]);
+    _table[idx] = entry;
+    stripe_unlock(idx);
     return h;
   }
 
