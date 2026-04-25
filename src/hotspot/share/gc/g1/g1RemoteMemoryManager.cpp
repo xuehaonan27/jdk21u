@@ -53,7 +53,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
     _current_fcr(nullptr), _fcr_lock(0),
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
-  memset(_table, 0, sizeof(_table));
+  _table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
+  memset(_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
   memset((void*)_stripe_locks, 0, sizeof(_stripe_locks));
   memset(_edge_buckets, 0, sizeof(_edge_buckets));
   memset(_hotness_stats, 0, sizeof(_hotness_stats));
@@ -125,7 +126,8 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     delete ec;
     ec = next;
   }
-  memset(_table, 0, sizeof(_table));
+  FREE_C_HEAP_ARRAY(HandleEntry*, _table);
+  _table = nullptr;
 
   // Free edge tables (chained hash)
   for (size_t i = 0; i < EDGE_TABLE_BUCKETS; i++) {

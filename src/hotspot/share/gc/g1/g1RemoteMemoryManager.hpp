@@ -96,17 +96,17 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
     _entry_free_list = e;
   }
 
-  // Hash table for secondary index
-  static const size_t TABLE_SIZE = 1024;
-  HandleEntry* _table[TABLE_SIZE];
+  // Hash table for secondary index.
+  // 1M buckets: with ~800K handles, avg chain length < 1.
+  static const size_t TABLE_SIZE = (1 << 20);
+  HandleEntry** _table;
   volatile int _table_lock;
 
   void table_lock()   { while (Atomic::cmpxchg(&_table_lock, 0, 1) != 0) { /* spin */ } }
   void table_unlock() { Atomic::release_store(&_table_lock, 0); }
 
   // Stripe locks for parallel ensure_handle_for (Phase B).
-  // 128 stripes over 1024 buckets = 8 buckets per stripe.
-  static const int TABLE_STRIPES = 128;
+  static const int TABLE_STRIPES = 4096;
   volatile int _stripe_locks[TABLE_STRIPES];
   volatile int _alloc_lock;
 
@@ -157,7 +157,11 @@ public:
 private:
 
   static size_t hash_obj(uintptr_t addr) {
-    return (addr >> 3) % TABLE_SIZE;  // Objects are 8-byte aligned
+    size_t h = addr >> 3;
+    h ^= (h >> 17);
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= (h >> 31);
+    return h & (TABLE_SIZE - 1);
   }
 
 public:
