@@ -521,12 +521,44 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
   uint                   _num_regions;
   int                    _tagged;
   int                    _no_handle;
-  bool                   _use_locked;
+
+  typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
+  TaggedFieldEntry* _local_buf;
+  int               _local_count;
+  int               _local_capacity;
+
+  void local_buf_add(oop* field_addr, RemoteHandle* h) {
+    if (_local_count >= _local_capacity) {
+      int new_cap = (_local_capacity == 0) ? 4096 : _local_capacity * 2;
+      TaggedFieldEntry* nb = NEW_C_HEAP_ARRAY(TaggedFieldEntry, new_cap, mtGC);
+      if (_local_buf != nullptr) {
+        memcpy(nb, _local_buf, _local_count * sizeof(TaggedFieldEntry));
+        FREE_C_HEAP_ARRAY(TaggedFieldEntry, _local_buf);
+      }
+      _local_buf = nb;
+      _local_capacity = new_cap;
+    }
+    _local_buf[_local_count]._field_addr = field_addr;
+    _local_buf[_local_count]._handle = h;
+    _local_count++;
+  }
+
 public:
   EvictionSetTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
-                        const bool* eset, uint nregions, bool use_locked = false)
+                        const bool* eset, uint nregions)
     : _rmm(rmm), _g1h(g1h), _eviction_set(eset),
-      _num_regions(nregions), _tagged(0), _no_handle(0), _use_locked(use_locked) {}
+      _num_regions(nregions), _tagged(0), _no_handle(0),
+      _local_buf(nullptr), _local_count(0), _local_capacity(0) {}
+
+  ~EvictionSetTagClosure() {
+    // Don't free _local_buf here — caller takes ownership via release_local_buf()
+  }
+
+  TaggedFieldEntry* release_local_buf() {
+    TaggedFieldEntry* buf = _local_buf;
+    _local_buf = nullptr;
+    return buf;
+  }
 
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
@@ -549,11 +581,7 @@ public:
     RemoteHandle* h = _rmm->handle_for(target);
     if (h != nullptr) {
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
-      if (_use_locked) {
-        _rmm->add_tagged_field_locked(p, h);
-      } else {
-        _rmm->add_tagged_field(p, h);
-      }
+      local_buf_add(p, h);
       _tagged++;
     } else {
       _no_handle++;
@@ -569,6 +597,8 @@ public:
 
   int tagged() const { return _tagged; }
   int no_handle() const { return _no_handle; }
+  const TaggedFieldEntry* local_buf() const { return _local_buf; }
+  int local_count() const { return _local_count; }
 };
 
 static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure* cl) {
@@ -599,15 +629,36 @@ class TagAllHeapRefsTask : public WorkerTask {
   volatile int           _total_tagged;
   volatile int           _total_no_handle;
 
+  typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
+  TaggedFieldEntry** _worker_bufs;
+  int*               _worker_counts;
+  uint               _num_workers;
+
 public:
   TagAllHeapRefsTask(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
                      const bool* eset, uint nregions, uint num_workers)
     : WorkerTask("Tag eviction refs"),
       _rmm(rmm), _g1h(g1h), _eviction_set(eset), _num_regions(nregions),
-      _claimer(num_workers), _total_tagged(0), _total_no_handle(0) {}
+      _claimer(num_workers), _total_tagged(0), _total_no_handle(0),
+      _num_workers(num_workers) {
+    _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
+    _worker_counts = NEW_C_HEAP_ARRAY(int, num_workers, mtGC);
+    memset(_worker_bufs, 0, num_workers * sizeof(TaggedFieldEntry*));
+    memset(_worker_counts, 0, num_workers * sizeof(int));
+  }
+
+  ~TagAllHeapRefsTask() {
+    for (uint i = 0; i < _num_workers; i++) {
+      if (_worker_bufs[i] != nullptr) {
+        FREE_C_HEAP_ARRAY(TaggedFieldEntry, _worker_bufs[i]);
+      }
+    }
+    FREE_C_HEAP_ARRAY(TaggedFieldEntry*, _worker_bufs);
+    FREE_C_HEAP_ARRAY(int, _worker_counts);
+  }
 
   void work(uint worker_id) {
-    EvictionSetTagClosure cl(_rmm, _g1h, _eviction_set, _num_regions, true);
+    EvictionSetTagClosure cl(_rmm, _g1h, _eviction_set, _num_regions);
     for (uint i = _claimer.offset_for_worker(worker_id); i < _g1h->num_regions(); i++) {
       if (!_claimer.claim_region(i)) continue;
       HeapRegion* hr = _g1h->region_at(i);
@@ -616,6 +667,17 @@ public:
     }
     Atomic::add(&_total_tagged, cl.tagged());
     Atomic::add(&_total_no_handle, cl.no_handle());
+    _worker_bufs[worker_id] = cl.release_local_buf();
+    _worker_counts[worker_id] = cl.local_count();
+  }
+
+  void flush_to_rmm() {
+    for (uint i = 0; i < _num_workers; i++) {
+      for (int j = 0; j < _worker_counts[i]; j++) {
+        _rmm->add_tagged_field(_worker_bufs[i][j]._field_addr,
+                               _worker_bufs[i][j]._handle);
+      }
+    }
   }
 
   int total_tagged() const { return _total_tagged; }
@@ -631,14 +693,18 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
   if (workers != nullptr && num_workers > 1) {
     TagAllHeapRefsTask task(this, _g1h, eviction_set, num_regions, num_workers);
     workers->run_task(&task, num_workers);
+    task.flush_to_rmm();
     total_tagged = task.total_tagged();
     total_no_handle = task.total_no_handle();
   } else {
-    EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions, false);
+    EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
     for (uint i = 0; i < _g1h->num_regions(); i++) {
       HeapRegion* hr = _g1h->region_at(i);
       if (hr->is_empty() || hr->is_free()) continue;
       scan_region_for_eviction_tags(hr, &cl);
+    }
+    for (int j = 0; j < cl.local_count(); j++) {
+      add_tagged_field(cl.local_buf()[j]._field_addr, cl.local_buf()[j]._handle);
     }
     total_tagged = cl.tagged();
     total_no_handle = cl.no_handle();
