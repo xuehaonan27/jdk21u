@@ -649,11 +649,31 @@ public:
   int local_count() const { return _local_count; }
 };
 
-static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure* cl) {
+static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure* cl,
+                                          const G1CMBitMap* bitmap) {
+  HeapWord* const pb = hr->parsable_bottom_acquire();
+  HeapWord* const region_top = hr->top();
+  HeapWord* const region_end = hr->end();
+
+  // Below parsable_bottom: dead objects may have dangling klasses (class unloaded,
+  // concurrent rebuild hasn't filled them yet). Use the mark bitmap to find live
+  // objects, skipping dead ones — same approach as G1ConcurrentRebuildAndScrub.
   HeapWord* p = hr->bottom();
-  HeapWord* region_end = hr->end();
-  while (p < hr->top()) {
-    if (p < hr->bottom() || p >= region_end) break;
+  while (p < pb && p < region_top) {
+    if (bitmap->is_marked(p)) {
+      oop obj = cast_to_oop(p);
+      size_t sz = obj->size();
+      obj->oop_iterate(cl);
+      p += sz;
+    } else {
+      p = bitmap->get_next_marked_addr(p, pb);
+    }
+  }
+
+  // Above parsable_bottom: all objects are live, sequential scan is safe.
+  if (p < pb) p = pb;
+  while (p < region_top) {
+    if (p >= region_end) break;
     oop obj = cast_to_oop(p);
     Klass* k = obj->klass_or_null();
     if (k == nullptr) break;
@@ -673,6 +693,7 @@ class TagAllHeapRefsTask : public WorkerTask {
   G1CollectedHeap*       _g1h;
   const bool*            _eviction_set;
   uint                   _num_regions;
+  const G1CMBitMap*      _bitmap;
   HeapRegionClaimer      _claimer;
   volatile int           _total_tagged;
   volatile int           _total_no_handle;
@@ -684,9 +705,11 @@ class TagAllHeapRefsTask : public WorkerTask {
 
 public:
   TagAllHeapRefsTask(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
-                     const bool* eset, uint nregions, uint num_workers)
+                     const bool* eset, uint nregions, uint num_workers,
+                     const G1CMBitMap* bitmap)
     : WorkerTask("Tag eviction refs"),
       _rmm(rmm), _g1h(g1h), _eviction_set(eset), _num_regions(nregions),
+      _bitmap(bitmap),
       _claimer(num_workers), _total_tagged(0), _total_no_handle(0),
       _num_workers(num_workers) {
     _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
@@ -712,7 +735,7 @@ public:
       HeapRegion* hr = _g1h->region_at(i);
       if (hr->is_empty() || hr->is_free()) continue;
       if (hr->is_continues_humongous()) continue;
-      scan_region_for_eviction_tags(hr, &cl);
+      scan_region_for_eviction_tags(hr, &cl, _bitmap);
     }
     Atomic::add(&_total_tagged, cl.tagged());
     Atomic::add(&_total_no_handle, cl.no_handle());
@@ -739,8 +762,10 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
 
   int total_tagged, total_no_handle;
 
+  const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
+
   if (workers != nullptr && num_workers > 1) {
-    TagAllHeapRefsTask task(this, _g1h, eviction_set, num_regions, num_workers);
+    TagAllHeapRefsTask task(this, _g1h, eviction_set, num_regions, num_workers, bitmap);
     workers->run_task(&task, num_workers);
     task.flush_to_rmm();
     total_tagged = task.total_tagged();
@@ -751,7 +776,7 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
       HeapRegion* hr = _g1h->region_at(i);
       if (hr->is_empty() || hr->is_free()) continue;
       if (hr->is_continues_humongous()) continue;
-      scan_region_for_eviction_tags(hr, &cl);
+      scan_region_for_eviction_tags(hr, &cl, bitmap);
     }
     for (int j = 0; j < cl.local_count(); j++) {
       add_tagged_field(cl.local_buf()[j]._field_addr, cl.local_buf()[j]._handle);
