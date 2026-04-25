@@ -711,6 +711,7 @@ public:
       if (!_claimer.claim_region(i)) continue;
       HeapRegion* hr = _g1h->region_at(i);
       if (hr->is_empty() || hr->is_free()) continue;
+      if (hr->is_continues_humongous()) continue;
       scan_region_for_eviction_tags(hr, &cl);
     }
     Atomic::add(&_total_tagged, cl.tagged());
@@ -749,6 +750,7 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     for (uint i = 0; i < _g1h->num_regions(); i++) {
       HeapRegion* hr = _g1h->region_at(i);
       if (hr->is_empty() || hr->is_free()) continue;
+      if (hr->is_continues_humongous()) continue;
       scan_region_for_eviction_tags(hr, &cl);
     }
     for (int j = 0; j < cl.local_count(); j++) {

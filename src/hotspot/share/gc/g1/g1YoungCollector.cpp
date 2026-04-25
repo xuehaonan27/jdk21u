@@ -1469,14 +1469,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           total_evicted += rcount;
           regions_evicted++;
           size_t region_used = hr->used();
+          total_freed_bytes += region_used;
           size_t poison_bytes = (size_t)((char*)hr->top() - (char*)hr->bottom());
           memset((void*)hr->bottom(), 0x5A, poison_bytes);
-          hr->set_top(hr->bottom());
           rmm->invalidate_fcr_if_freed(hr);
-          log_info(gc)("Evicted+QUARANTINED region %u (%d objects, " SIZE_FORMAT "KB) "
+          log_info(gc)("Evicted region %u (%d objects, " SIZE_FORMAT "KB) "
                        "[" PTR_FORMAT ", " PTR_FORMAT ")",
                        hr->hrm_index(), rcount, region_used / K,
                        p2i(hr->bottom()), p2i((char*)hr->bottom() + poison_bytes));
+          // Properly free: clear RSet, card table, set type → Free, add to free list.
+          // Fixes GC(N+1) hang: stale RSet/card entries in quarantined regions
+          // caused subsequent GC to scan poisoned memory.
+          _g1h->free_region(hr, &freed_list);
+          freed_regions++;
         } else {
           hr->clear_cold_destination();
         }
@@ -1498,7 +1503,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     }
 
     // Post-eviction diagnostic: verify no root oops point into freed regions.
-    // Run BEFORE freeing so region metadata is still valid.
+    // Uses eviction_candidates boolean array (independent of region state).
     if (regions_evicted > 0) {
       class VerifyNoRootToFreedClosure : public OopClosure {
         G1CollectedHeap* _g1h;
