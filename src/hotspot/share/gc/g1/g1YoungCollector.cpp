@@ -1059,7 +1059,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // as we may have to copy some 'reachable' referent
   // objects (and their reachable sub-graphs) that were
   // not copied during the pause.
+  log_info(gc)(">>>   process_discovered_references START");
   process_discovered_references(per_thread_states);
+  log_info(gc)(">>>   process_discovered_references DONE");
 
   // Fixup tagged field Handles: update any LOCAL Handle whose target was
   // forwarded during evacuation. The root scan in G1EvacuateRegionsTask
@@ -1075,7 +1077,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   G1STWIsAliveClosure is_alive(_g1h);
   G1KeepAliveClosure keep_alive(_g1h);
 
+  log_info(gc)(">>>   WeakProcessor START");
   WeakProcessor::weak_oops_do(workers(), &is_alive, &keep_alive, p->weak_phase_times());
+  log_info(gc)(">>>   WeakProcessor DONE");
 
   allocator()->release_gc_alloc_regions(evacuation_info);
 
@@ -1116,9 +1120,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     }
   }
 
+  log_info(gc)(">>>   post_evacuate_cleanup_1 START");
   post_evacuate_cleanup_1(per_thread_states);
+  log_info(gc)(">>>   post_evacuate_cleanup_1 DONE");
 
+  log_info(gc)(">>>   post_evacuate_cleanup_2 START");
   post_evacuate_cleanup_2(per_thread_states, evacuation_info);
+  log_info(gc)(">>>   post_evacuate_cleanup_2 DONE");
 
   _evac_failure_regions.post_collection();
 
@@ -1130,7 +1138,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
+      log_info(gc)(">>>   collect_dead_remote_objects START");
       rmm->collect_dead_remote_objects();
+      log_info(gc)(">>>   collect_dead_remote_objects DONE");
     }
   }
 
@@ -1683,12 +1693,18 @@ void G1YoungCollector::collect() {
 
     bool may_do_optional_evacuation = collection_set()->optional_region_length() != 0;
     // Actually do the work...
+    log_info(gc)(">>> evacuate_initial_collection_set START");
     evacuate_initial_collection_set(&per_thread_states, may_do_optional_evacuation);
+    log_info(gc)(">>> evacuate_initial_collection_set DONE");
 
     if (may_do_optional_evacuation) {
+      log_info(gc)(">>> evacuate_optional START");
       evacuate_optional_collection_set(&per_thread_states);
+      log_info(gc)(">>> evacuate_optional DONE");
     }
+    log_info(gc)(">>> post_evacuate_collection_set START");
     post_evacuate_collection_set(jtm.evacuation_info(), &per_thread_states);
+    log_info(gc)(">>> post_evacuate_collection_set DONE");
     FREE_C_HEAP_ARRAY(HeapWord*, _pre_evac_tops);
     _pre_evac_tops = nullptr;
 
