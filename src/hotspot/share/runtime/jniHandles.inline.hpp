@@ -118,6 +118,8 @@ inline oop JNIHandles::resolve_non_null(jobject handle) {
   oop result = resolve_impl<DECORATORS_NONE, false /* external_guard */>(handle);
   assert(result != nullptr, "null read from jni handle");
   result = resolve_oop_full(result);
+  guarantee(result != nullptr,
+            "JNI resolve_non_null: tagged oop resolved to null (DEAD remote handle?)");
   return result;
 }
 

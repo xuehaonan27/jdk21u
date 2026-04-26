@@ -1077,8 +1077,8 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
                        slot_id, expected_ws, word_size);
       return nullptr;
     }
-    log_info(gc)("Remote fetch: slot=" SIZE_FORMAT " -> dest=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w",
-                 slot_id, p2i(dest), klass->external_name(), word_size);
+    log_trace(gc)("Remote fetch: slot=" SIZE_FORMAT " -> dest=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w",
+                  slot_id, p2i(dest), klass->external_name(), word_size);
   } else {
     log_warning(gc)("Remote fetch FAILED: slot=" SIZE_FORMAT, slot_id);
   }
