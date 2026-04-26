@@ -848,20 +848,42 @@ void RDMAExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, si
 
   io_lock();
 
-  size_t msg_size = 20 + count * 8;
-  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
-  *(uint32_t*)(msg + 0)  = RE_CMD_REPORT_REMOTE_ROOTS_V2;
-  *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
-  *(uint64_t*)(msg + 8)  = _seq_id++;
-  *(uint32_t*)(msg + 16) = (uint32_t)count;
-  memcpy(msg + 20, handle_ids, count * 8);
+  // Max roots per message: (RDMAMsgBufSize - 20 header) / 8 bytes per root
+  size_t max_per_msg = (RDMAMsgBufSize - 20) / 8;
+  size_t remaining = count;
+  size_t offset = 0;
 
-  rdma_send_msg(msg, msg_size);
-  os::free(msg);
+  // Always clear first so executor doesn't accumulate across GC cycles
+  {
+    uint8_t clear_msg[20];
+    *(uint32_t*)(clear_msg + 0)  = RE_CMD_REPORT_REMOTE_ROOTS_V2;
+    *(uint32_t*)(clear_msg + 4)  = 20;
+    *(uint64_t*)(clear_msg + 8)  = _seq_id++;
+    *(uint32_t*)(clear_msg + 16) = 0;  // clear
+    rdma_send_msg(clear_msg, 20);
+    uint8_t resp[64]; size_t resp_len = 0;
+    rdma_recv_msg(resp, sizeof(resp), &resp_len);
+  }
 
-  uint8_t resp[64];
-  size_t resp_len = 0;
-  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+  while (remaining > 0) {
+    size_t chunk = MIN2(remaining, max_per_msg);
+    size_t msg_size = 20 + chunk * 8;
+    uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+    *(uint32_t*)(msg + 0)  = RE_CMD_REPORT_REMOTE_ROOTS_V2;
+    *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
+    *(uint64_t*)(msg + 8)  = _seq_id++;
+    *(uint32_t*)(msg + 16) = (uint32_t)chunk;
+    memcpy(msg + 20, handle_ids + offset, chunk * 8);
+
+    rdma_send_msg(msg, msg_size);
+    os::free(msg);
+
+    uint8_t resp[64]; size_t resp_len = 0;
+    rdma_recv_msg(resp, sizeof(resp), &resp_len);
+
+    offset += chunk;
+    remaining -= chunk;
+  }
 
   io_unlock();
 }
