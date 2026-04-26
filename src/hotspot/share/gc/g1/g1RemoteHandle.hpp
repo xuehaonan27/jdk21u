@@ -52,6 +52,7 @@ struct RemoteHandle {
   volatile uintptr_t _state_and_addr;  // [63:62]=state, [47:0]=addr or remote_loc
   uint32_t           _remote_refcount; // Count of remote oop fields pointing to this Handle
   uint32_t           _flags;           // REMOTE_HANDLE_FLAG_* bits
+  uintptr_t          _eviction_addr;   // Local address at eviction time (for O(1) table rekey)
 
   // State queries (non-atomic, for use under lock or single-threaded)
   uintptr_t state() const { return _state_and_addr & REMOTE_HANDLE_STATE_MASK; }
@@ -98,9 +99,11 @@ struct RemoteHandle {
   }
 
   // Set to remote (used during eviction).
+  // Saves the current local address for O(1) handle table rekey at fetch time.
   // Release store: ensures prior writes (e.g. set_eviction_word_size)
   // are visible to readers who see REMOTE via load_state_and_addr_acquire.
   void set_remote(uintptr_t remote_id) {
+    _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
     Atomic::release_store(&_state_and_addr,
       (uintptr_t)(REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK)));
   }
@@ -144,6 +147,7 @@ struct RemoteHandle {
     set_local(obj_addr);
     _remote_refcount = 0;
     _flags = 0;
+    _eviction_addr = 0;
   }
 
   // Initialize as dormant anchor (local object referenced by remote)
@@ -151,6 +155,7 @@ struct RemoteHandle {
     set_local(obj_addr);
     _remote_refcount = 0;
     _flags = REMOTE_HANDLE_FLAG_DORMANT;
+    _eviction_addr = 0;
   }
 };
 
@@ -159,7 +164,7 @@ struct RemoteHandle {
 // RemoteHandleChunk: fixed-size chunk of Handles
 // ============================================================
 
-const size_t REMOTE_HANDLE_CHUNK_CAPACITY = 256;  // 256 * 16B = 4KB per chunk
+const size_t REMOTE_HANDLE_CHUNK_CAPACITY = 256;  // 256 * 24B = 6KB per chunk
 
 struct RemoteHandleChunk : public CHeapObj<mtGC> {
   RemoteHandle    _handles[REMOTE_HANDLE_CHUNK_CAPACITY];

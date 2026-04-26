@@ -336,19 +336,18 @@ public:
   }
 
   // Rekey a Handle entry when an object is fetched to a new local address.
-  // The table still has the old (evicted/filler) address; update to the new FCR address.
+  // Uses the Handle's saved _eviction_addr for O(1) old-bucket lookup.
   void rekey_handle_on_fetch(RemoteHandle* h, void* new_addr) {
     uintptr_t new_uaddr = (uintptr_t)new_addr;
+    uintptr_t old_addr = h->_eviction_addr;
     table_lock();
-    // Find the entry by Handle pointer (not by address, since old address is stale)
-    for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-      HandleEntry* e = _table[idx];
-      HandleEntry** pp = &_table[idx];
-      while (e != nullptr) {
-        if (e->_handle == h) {
-          // Unlink from old bucket
+    if (old_addr != 0) {
+      size_t old_idx = hash_obj(old_addr);
+      HandleEntry** pp = &_table[old_idx];
+      while (*pp != nullptr) {
+        if ((*pp)->_handle == h) {
+          HandleEntry* e = *pp;
           *pp = e->_next;
-          // Rekey and insert into new bucket
           e->_obj_addr = new_uaddr;
           size_t new_idx = hash_obj(new_uaddr);
           e->_next = _table[new_idx];
@@ -356,12 +355,9 @@ public:
           table_unlock();
           return;
         }
-        pp = &e->_next;
-        e = e->_next;
+        pp = &(*pp)->_next;
       }
     }
-    // Handle not found in table — it was a dormant anchor or already removed.
-    // Insert a new entry for this address.
     HandleEntry* entry = alloc_entry();
     entry->init(new_uaddr, h, _table[hash_obj(new_uaddr)]);
     _table[hash_obj(new_uaddr)] = entry;
