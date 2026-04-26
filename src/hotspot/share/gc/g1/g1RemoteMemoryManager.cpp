@@ -1558,50 +1558,21 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   if (cross_src) os::free(cross_src);
   if (cross_tgt) os::free(cross_tgt);
 
-  // Step 3: Clean up Handle entries for dead objects.
-  size_t collected = 0;
-  if (num_dead > 0) {
-    table_lock();
-    for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-      HandleEntry** pp = &_table[idx];
-      while (*pp != nullptr) {
-        HandleEntry* entry = *pp;
-        if (entry->_handle != nullptr && entry->_handle->is_remote()) {
-          uintptr_t handle_addr = (uintptr_t)entry->_handle;
-          uintptr_t sa = entry->_handle->load_state_and_addr_acquire();
-          size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
-
-          bool is_dead = false;
-          for (size_t d = 0; d < num_dead; d++) {
-            if (dead_ids[d] == handle_addr || dead_ids[d] == (uintptr_t)slot_id) {
-              is_dead = true; break;
-            }
-          }
-
-          if (is_dead) {
-            entry->_handle->set_dead();
-            remove_edge_table(entry->_handle);
-            *pp = entry->_next;
-            free_entry(entry);
-            collected++;
-            continue;
-          }
-        }
-        pp = &(*pp)->_next;
-      }
-    }
-    table_unlock();
-  }
-
+  // Step 3: Log dead handles but do NOT free them yet.
+  // Freeing handles while shared_oops in the heap still reference them causes
+  // SIGSEGV: mutators/GC closures dereference stale tagged oops to freed memory.
+  // _tagged_fields doesn't capture all references (stack oops, moved objects).
+  // Safe collection requires a full-heap scan to clear all shared_oops first.
+  // TODO: implement full-heap dead-handle sweep before freeing handles.
   if (dead_ids) os::free(dead_ids);
 
-  size_t retained = total_remote - collected;
-  if (collected > 0 || retained > 0) {
-    log_info(gc)("Remote collection: " SIZE_FORMAT " dead objects freed (" SIZE_FORMAT " bytes reclaimed remotely), "
-                 SIZE_FORMAT " live objects retained, %d cross-boundary roots",
-                 collected, bytes_freed, retained, _cross_roots_count);
+  size_t retained = total_remote;
+  if (num_dead > 0 || retained > 0) {
+    log_info(gc)("Remote collection: %zu dead identified (NOT freed — unsafe), "
+                 "%zu live, %zu total remote, %d cross-boundary roots",
+                 num_dead, retained - num_dead, retained, _cross_roots_count);
   }
-  return collected;
+  return 0;
 }
 
 int G1RemoteMemoryManager::fixup_tagged_field_handles() {
@@ -1622,9 +1593,9 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
       continue;
     }
 
-    // Handle must be LOCAL for fixup (REMOTE/DEAD handles don't need it)
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    // Handle must be LOCAL for fixup (REMOTE/FETCHING/DEAD don't need it)
     if (state != REMOTE_HANDLE_LOCAL) {
       _tagged_fields[write_idx++] = _tagged_fields[i];
       continue;
