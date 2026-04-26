@@ -1382,8 +1382,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         log_info(gc)("Phase C fast scan: %.1fms (%u workers)", phase_c_ms, nworkers);
       }
 
-      // ---- Phase C.5: Verify no untagged refs remain (diagnostic only) ----
-      if (G1SimulateRemoteEviction) {
+      // ---- Phase C.5: Verify no untagged refs remain ----
+      {
         int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates, num_regions);
         if (missed > 0) {
           log_warning(gc)("Eviction ABORTED: %d untagged refs found after tagging", missed);
