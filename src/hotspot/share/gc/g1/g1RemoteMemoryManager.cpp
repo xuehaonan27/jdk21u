@@ -899,7 +899,7 @@ public:
         continue;
       }
 
-      if (hr->is_old() && !hr->is_empty() && !hr->is_continues_humongous()) {
+      if (hr->is_old_or_humongous() && !hr->is_empty() && !hr->is_continues_humongous()) {
         scan_region_for_eviction_tags(hr, &cl, _bitmap);
         scanned++;
         continue;
@@ -971,7 +971,7 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
         continue;
       }
 
-      if (hr->is_old() && !hr->is_empty() && !hr->is_continues_humongous()) {
+      if (hr->is_old_or_humongous() && !hr->is_empty() && !hr->is_continues_humongous()) {
         scan_region_for_eviction_tags(hr, &cl, bitmap);
         scanned++;
         continue;
