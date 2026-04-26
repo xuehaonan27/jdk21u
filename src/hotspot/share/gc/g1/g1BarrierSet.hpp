@@ -32,7 +32,6 @@
 #include "gc/shared/bufferNode.hpp"
 
 class G1CardTable;
-struct RemoteHandle;
 
 // This barrier is specialized to use a logging barrier to support
 // snapshot-at-the-beginning marking.
@@ -82,21 +81,6 @@ class G1BarrierSet: public CardTableBarrierSet {
   template <DecoratorSet decorators, typename T>
   void write_ref_field_post(T* field);
   void write_ref_field_post_slow(volatile CardValue* byte);
-
-  // Disaggregated memory: remote object fetch (Tier 2 slow path).
-  static oop resolve_remote_fetch(RemoteHandle* h);
-  static oop wait_for_fetch(RemoteHandle* h);
-
-  // Full tagged oop resolution for VM context (JNI handles, runtime calls).
-  // Handles LOCAL, REMOTE (fetch), FETCHING (wait), and Unique (strip tags).
-  static oop resolve_tagged_oop_in_vm(oop tagged);
-
-  // DEPRECATED: resolve_managed_store was the write barrier that re-encoded
-  // clean oops as shared_oop(handle) on every store. Removed in the
-  // invisible-handle design — handleification is now eviction-time only.
-  // The implementation is kept in g1BarrierSet.cpp for reference but is
-  // no longer called from the write barrier path.
-  static oop resolve_managed_store(oop new_value);
 
   virtual void on_thread_create(Thread* thread);
   virtual void on_thread_destroy(Thread* thread);

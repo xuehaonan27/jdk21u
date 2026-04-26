@@ -322,7 +322,3 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
   }
 }
 
-// JRT_ENTRY wrapper for interpreter call_VM.
-JRT_ENTRY(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop_slow_vm(JavaThread* current, oopDesc* tagged))
-  return resolve_tagged_oop_slow(tagged);
-JRT_END

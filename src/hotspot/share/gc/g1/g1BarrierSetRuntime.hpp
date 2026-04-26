@@ -66,8 +66,6 @@ public:
   // The thread stays in _thread_in_Java; blocking I/O adds at most ~50us
   // to safepoint initiation, which is acceptable.
   static oopDesc* resolve_tagged_oop_no_safepoint(oopDesc* tagged);
-  // JRT_ENTRY wrapper for interpreter call_VM.
-  static oopDesc* resolve_tagged_oop_slow_vm(JavaThread* current, oopDesc* tagged);
 };
 
 #endif // SHARE_GC_G1_G1BARRIERSETRUNTIME_HPP
