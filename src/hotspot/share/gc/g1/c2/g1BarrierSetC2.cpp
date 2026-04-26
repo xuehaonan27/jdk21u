@@ -61,23 +61,24 @@ Label* G1TagResolveStubC2::continuation() { return &_continuation; }
 Register G1TagResolveStubC2::ref() const { return _ref; }
 
 void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
-  // Frame layout strategy: we must NOT push anything onto the nmethod's
-  // stack before set_last_Java_frame, because sender_for_compiled_frame
-  // uses _last_Java_sp + nmethod->frame_size() to find the caller.
-  // Any extra pushes shift _last_Java_sp below nmethod_sp and break
-  // the sender computation.
+  // Register save strategy: push_call_clobbered_registers once on entry,
+  // pop once on exit.  Both the leaf call (Phase 1) and the slow-path
+  // call (Phase 2) execute while the caller's registers are saved on
+  // the stack, so neither call can corrupt live values.
   //
-  // Instead of push(rbx) we save rbx to G1ThreadLocalData::_barrier_scratch,
-  // keeping RSP == nmethod_sp after pop_call_clobbered_registers.
-  // nmethod_sp is 16-byte aligned (nmethod prologue guarantees this),
-  // so no alignment padding is needed before the slow-path CALL.
+  // rbx is callee-saved (survives both calls) and is used to shuttle
+  // the result from rax across the pop.  The original rbx is stashed
+  // in G1ThreadLocalData::_barrier_scratch before the push.
+  //
+  // resolve_tagged_oop_no_safepoint stays in _thread_in_Java without
+  // thread transitions, so no safepoint can occur during the slow-path
+  // call and no set_last_Java_frame is needed.
 
   Address barrier_scratch(r15_thread, G1ThreadLocalData::barrier_scratch_offset());
 
   masm.bind(_entry);
-  Label leaf_ok;
+  Label slow_path, done;
 
-  // Save rbx to thread-local scratch (avoids push that shifts RSP)
   masm.movptr(barrier_scratch, rbx);
   masm.push_call_clobbered_registers(false /* save_fpu */);
 
@@ -87,39 +88,20 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   }
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop)));
   masm.testptr(rax, rax);
-  masm.jcc(Assembler::positive, leaf_ok);
+  masm.jcc(Assembler::negative, slow_path);
+  masm.jmp(done);
 
   // Phase 2: Slow path — leaf returned tagged oop (REMOTE/FETCHING).
-  // Stash tagged oop in rbx (callee-saved, survives pop).
-  masm.movptr(rbx, rax);
-  masm.pop_call_clobbered_registers(false);
-  // RSP == nmethod_sp (0 mod 16). No alignment needed.
-
-  // set_last_Java_frame with RSP == nmethod_sp.
-  // make_walkable reads _last_Java_sp[-1] which, after the CALL below
-  // pushes its return address, gives the correct return PC.
-  // sender_for_compiled_frame: nmethod_sp + frame_size → correct caller.
-  masm.set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
-  masm.movptr(c_rarg0, rbx);
+  // Call-clobbered registers are STILL SAVED on the stack from the
+  // push above; the slow-path call may clobber them freely.
+  masm.bind(slow_path);
+  masm.movptr(c_rarg0, rax);
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint)));
-  // No OopMap needed: resolve_tagged_oop_no_safepoint stays in _thread_in_Java
-  // without thread transitions, so no safepoint can occur during the call.
-  // The empty OopMap(0,0) that was here previously caused GC corruption when
-  // the old safepoint-safe slow path allowed GC to run mid-fetch.
-  masm.reset_last_Java_frame(r15_thread, false);
+  // Fall through to common exit.
 
-  // Result in rax → _ref.  Restore original rbx from thread scratch.
-  masm.movptr(_ref, rax);
-  if (_ref != rbx) {
-    masm.movptr(rbx, barrier_scratch);
-  }
-  // If _ref == rbx, the nmethod allocated rbx for this load result,
-  // so the original rbx value is dead — no restore needed.
-  masm.jmp(_continuation);
-
-  // Leaf resolved fast path
-  masm.bind(leaf_ok);
-  masm.movptr(rbx, rax);  // stash result in callee-saved rbx
+  // === Common exit: resolved oop in rax ===
+  masm.bind(done);
+  masm.movptr(rbx, rax);
   masm.pop_call_clobbered_registers(false);
   if (_ref == rbx) {
     // Result already in _ref (rbx). Original rbx is dead.

@@ -239,30 +239,27 @@ void G1BarrierSetAssembler::copy_load_at(MacroAssembler* masm, DecoratorSet deco
 
   // Only apply the tag-resolve barrier to reference types.
   if (is_reference_type(type)) {
-    Label done, leaf_ok;
+    Label done, slow_path, resolved;
     __ testptr(dst, dst);
     __ jcc(Assembler::positive, done);
-    // Save state for two-phase resolution
+    // Save all call-clobbered registers once. They stay saved through
+    // both the leaf call and the slow-path call so neither can corrupt
+    // live values in the arraycopy stub.
     __ push(rbx);
     __ push_call_clobbered_registers(false /* save_fpu */);
     if (dst != c_rarg0) __ mov(c_rarg0, dst);
     // Phase 1: Leaf call
     __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
     __ testptr(rax, rax);
-    __ jcc(Assembler::positive, leaf_ok);
-    // Phase 2: Non-safepointing slow path (saved registers not in OopMap).
-    __ movptr(rbx, rax);   // rbx = still-tagged (callee-saved)
-    __ pop_call_clobbered_registers(false);
-    __ movptr(c_rarg0, rbx);
-    // push(rbx) = 8 bytes on stack. Pad RSP for x86-64 ABI alignment.
-    __ subptr(rsp, wordSize);
-    __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint)));
-    __ addptr(rsp, wordSize);
-    __ movptr(dst, rax);
-    __ pop(rbx);
-    __ jmp(done);
-    // Leaf resolved
-    __ bind(leaf_ok);
+    __ jcc(Assembler::negative, slow_path);
+    __ jmp(resolved);
+    // Phase 2: Slow path — call-clobbered regs still saved on stack.
+    // Use call_VM_leaf for automatic RSP alignment (push(rbx) + push_ccr
+    // may leave RSP 8 mod 16 depending on caller alignment).
+    __ bind(slow_path);
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+    // Fall through to common exit.
+    __ bind(resolved);
     __ movptr(rbx, rax);
     __ pop_call_clobbered_registers(false);
     __ movptr(dst, rbx);
@@ -762,51 +759,36 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_runtime_stub(StubAssembler* 
   //   For REMOTE/FETCHING, returns the tagged oop unchanged.
   //   JRT_LEAF: no safepoint, no thread transition, no GC.
   //
-  // Phase 2 (slow): resolve_tagged_oop_slow handles REMOTE fetch with
-  //   ThreadInVMfromJava + ThreadBlockInVM for blocking I/O.
-  //   Requires set_last_Java_frame for GC stack walking.
+  // Phase 2 (slow): resolve_tagged_oop_no_safepoint handles REMOTE fetch.
+  //   Stays in _thread_in_Java, no safepoint, no OopMap needed.
   //
-  // Register protocol:
-  //   - rbx (callee-saved) stashes results across push/pop
-  //   - r12 (callee-saved) saves original tagged oop for phase 2
-  //   - All call-clobbered registers saved/restored around both calls
+  // Register protocol: call-clobbered registers saved once, popped
+  // once after both calls complete.  rbx (callee-saved) shuttles the
+  // result across the pop.
 
-  Label leaf_resolved;
+  Label slow_path, done;
 
   __ push(rbx);
-  __ push(r12);
   __ push_call_clobbered_registers();
 
-  // Load tagged oop from parameter area: [rbp + (0+2)*8] = [rbp+16]
   __ load_parameter(0, c_rarg0);
-  __ movptr(r12, c_rarg0);  // save original tagged oop for phase 2
 
   // Phase 1: leaf call
   __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
-
-  // Check: did leaf resolve? (bit 63 clear = resolved)
   __ testptr(rax, rax);
-  __ jcc(Assembler::positive, leaf_resolved);
+  __ jcc(Assembler::negative, slow_path);
+  __ jmp(done);
 
-  // Phase 2: slow path — still tagged (REMOTE/FETCHING).
-  // Non-safepointing: stays in _thread_in_Java, no OopMap needed.
-  __ movptr(rbx, r12);  // tagged oop (for the slow call argument)
-  __ pop_call_clobbered_registers();
+  // Phase 2: slow path — call-clobbered regs still saved on stack.
+  // Use call_VM_leaf for automatic RSP alignment.
+  __ bind(slow_path);
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+  // Fall through to common exit.
 
-  __ movptr(c_rarg0, rbx);  // tagged oop argument
-  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint)));
-
-  // Result in rax.
-  __ pop(r12);
-  __ pop(rbx);
-  __ epilogue();
-
-  // --- Leaf resolved fast path ---
-  __ bind(leaf_resolved);
-  __ movptr(rbx, rax);  // stash resolved oop
+  __ bind(done);
+  __ movptr(rbx, rax);
   __ pop_call_clobbered_registers();
   __ movptr(rax, rbx);
-  __ pop(r12);
   __ pop(rbx);
   __ epilogue();
 }
