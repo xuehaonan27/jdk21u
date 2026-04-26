@@ -1496,13 +1496,19 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   table_unlock();
 
   // Step 2: Report roots to backend and request collection.
+  log_info(gc)("collect_dead: step2a report_roots V1 (%zu roots, %zu remote)", num_roots, total_remote);
   // V1: slot-id based roots
   _backend->report_roots(root_ids, num_roots);
   os::free(root_ids);
+  log_info(gc)("collect_dead: step2a report_roots V1 DONE");
 
   // V2: also report handle-id based roots from P12 concurrent marking
   if (_remote_roots_count > 0) {
+    log_info(gc)("collect_dead: step2a report_remote_roots_v2 (%d roots)", _remote_roots_count);
     _backend->report_remote_roots_v2(_remote_roots, _remote_roots_count);
+    log_info(gc)("collect_dead: step2a report_remote_roots_v2 DONE");
+  } else {
+    log_info(gc)("collect_dead: SKIP report_remote_roots_v2 (no concurrent marking roots)");
   }
 
   // Step 2b: trace_and_report — get dead handles + cross-boundary edges
@@ -1513,8 +1519,11 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   uintptr_t* cross_tgt = nullptr;
   size_t num_cross = 0;
 
+  log_info(gc)("collect_dead: step2b trace_and_report START");
   _backend->trace_and_report(&dead_ids, &num_dead, &bytes_freed,
                              &cross_src, &cross_tgt, &num_cross);
+  log_info(gc)("collect_dead: step2b trace_and_report DONE (dead=%zu freed=%zu cross=%zu)",
+               num_dead, bytes_freed, num_cross);
 
   // Step 2c: Populate cross-boundary roots.
   // Cross-edges: live REMOTE handle → LOCAL handle.
