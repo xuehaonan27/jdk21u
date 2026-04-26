@@ -792,29 +792,6 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
   return total_tagged;
 }
 
-// Scan a sub-range [start, end) of a region with EvictionSetTagClosure.
-// All objects in [start, end) must be parsable (no bitmap needed).
-static void scan_range_for_eviction_tags(HeapRegion* hr, HeapWord* start,
-                                         HeapWord* end,
-                                         EvictionSetTagClosure* cl) {
-  HeapWord* const region_end = hr->end();
-  HeapWord* p = start;
-  while (p < end) {
-    if (p >= region_end) break;
-    oop obj = cast_to_oop(p);
-    Klass* k = obj->klass_or_null();
-    if (k == nullptr) break;
-    size_t sz = obj->size();
-    if (sz == 0) break;
-    if (sz > (size_t)(region_end - p)) {
-      obj->oop_iterate(cl);
-      break;
-    }
-    obj->oop_iterate(cl);
-    p += sz;
-  }
-}
-
 // RSet visitor: for each card in a candidate's RSet, scan with
 // EvictionSetTagClosure to tag refs pointing to ANY candidate.
 class EvictionSetRsetScanner {
@@ -922,9 +899,8 @@ public:
         continue;
       }
 
-      if (hr->is_old() && !hr->is_empty() && !hr->is_continues_humongous() &&
-          hr->top() > _pre_evac_tops[i]) {
-        scan_range_for_eviction_tags(hr, _pre_evac_tops[i], hr->top(), &cl);
+      if (hr->is_old() && !hr->is_empty() && !hr->is_continues_humongous()) {
+        scan_region_for_eviction_tags(hr, &cl, _bitmap);
         scanned++;
         continue;
       }
@@ -995,9 +971,8 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
         continue;
       }
 
-      if (hr->is_old() && !hr->is_empty() && !hr->is_continues_humongous() &&
-          pre_evac_tops != nullptr && hr->top() > pre_evac_tops[i]) {
-        scan_range_for_eviction_tags(hr, pre_evac_tops[i], hr->top(), &cl);
+      if (hr->is_old() && !hr->is_empty() && !hr->is_continues_humongous()) {
+        scan_region_for_eviction_tags(hr, &cl, bitmap);
         scanned++;
         continue;
       }
