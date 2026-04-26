@@ -1015,6 +1015,44 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     }
   }
 
+  // Phase C root scan: tag references from non-heap root sources
+  // (thread stacks, JNI handles, ClassLoaderData, CodeCache, OopStorages)
+  {
+    EvictionSetTagClosure root_cl(this, _g1h, eviction_set, num_regions);
+
+    Threads::oops_do(&root_cl, nullptr);
+    JNIHandles::oops_do(&root_cl);
+    OopStorageSet::strong_oops_do(&root_cl);
+    for (auto id : EnumRange<OopStorageSet::WeakId>()) {
+      OopStorageSet::storage(id)->oops_do(&root_cl);
+    }
+    oops_do_remote_anchors(&root_cl);
+    {
+      CLDToOopClosure cld_cl(&root_cl, ClassLoaderData::_claim_none);
+      ClassLoaderDataGraph::cld_do(&cld_cl);
+    }
+    {
+      CodeBlobToOopClosure code_cl(&root_cl, false);
+      CodeCache::blobs_do(&code_cl);
+    }
+
+    for (int j = 0; j < root_cl.local_count(); j++) {
+      add_tagged_field(root_cl.local_buf()[j]._field_addr, root_cl.local_buf()[j]._handle);
+    }
+
+    int root_tagged = root_cl.tagged();
+    total_tagged += root_tagged;
+    total_no_handle += root_cl.no_handle();
+
+    if (root_tagged > 0 || root_cl.no_handle() > 0) {
+      log_info(gc)("Phase C root scan: tagged %d refs, %d no handle",
+                   root_tagged, root_cl.no_handle());
+    }
+
+    TaggedFieldEntry* buf = root_cl.release_local_buf();
+    if (buf != nullptr) FREE_C_HEAP_ARRAY(TaggedFieldEntry, buf);
+  }
+
   return total_tagged;
 }
 
