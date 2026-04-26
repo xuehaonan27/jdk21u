@@ -1438,15 +1438,44 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   }
   table_unlock();
 
-  // Without concurrent marking data, we cannot determine which remote
-  // objects are dead. Skip collection entirely — all stay alive.
+  // Supplement CM roots with handles from tagged fields (Phase C shared_oops).
+  // CM roots capture handles seen during the last marking cycle, but Phase C
+  // creates new shared_oops each GC that reference handles not in the CM set.
+  // Without this, the executor marks those handles dead → barrier returns null.
+  int phase_c_added = 0;
+  for (int i = 0; i < _tagged_field_count; i++) {
+    RemoteHandle* h = _tagged_fields[i]._handle;
+    if (h != nullptr && h->is_remote()) {
+      add_remote_root((uintptr_t)h);
+      phase_c_added++;
+    }
+  }
+  // Also scan handle table for any REMOTE handle with remote_refcount > 0
+  // (referenced by edges from other evicted objects).
+  int refcount_added = 0;
+  table_lock();
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+      if (e->_handle != nullptr && e->_handle->is_remote() &&
+          e->_handle->remote_refcount() > 0) {
+        add_remote_root((uintptr_t)e->_handle);
+        refcount_added++;
+      }
+    }
+  }
+  table_unlock();
+  if (phase_c_added > 0 || refcount_added > 0) {
+    log_info(gc)("collect_dead: supplemented roots: %d from tagged fields, %d from refcounts "
+                 "(total roots now %d)", phase_c_added, refcount_added, _remote_roots_count);
+  }
+
   if (_remote_roots_count == 0) {
-    log_info(gc)("collect_dead: SKIP (no concurrent marking roots, %zu remote handles retained)", total_remote);
+    log_info(gc)("collect_dead: SKIP (no roots after supplementation, %zu remote handles retained)", total_remote);
     return 0;
   }
 
-  // Send V2 roots from concurrent marking to executor
-  log_info(gc)("collect_dead: report_remote_roots_v2 (%d marking roots, %zu remote handles)",
+  // Send roots to executor (CM roots + Phase C roots + refcount roots)
+  log_info(gc)("collect_dead: report_remote_roots_v2 (%d roots, %zu remote handles)",
                _remote_roots_count, total_remote);
   _backend->report_remote_roots_v2(_remote_roots, _remote_roots_count);
   log_info(gc)("collect_dead: report_remote_roots_v2 DONE");

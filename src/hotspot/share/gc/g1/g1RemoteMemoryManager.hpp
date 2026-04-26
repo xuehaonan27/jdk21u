@@ -639,6 +639,9 @@ public:
         if (_remote_roots[i] == handle_id) return;
       }
       _remote_roots[_remote_roots_count++] = handle_id;
+    } else if (_remote_roots_count == MAX_REMOTE_ROOTS) {
+      log_warning(gc)("add_remote_root: MAX_REMOTE_ROOTS (%d) exceeded — dropping roots!", MAX_REMOTE_ROOTS);
+      _remote_roots_count++;
     }
   }
   int remote_roots_count() const { return _remote_roots_count; }
