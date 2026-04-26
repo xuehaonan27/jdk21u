@@ -49,7 +49,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _table_lock(0), _alloc_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
-    _remote_roots_count(0), _cross_roots_count(0), _deferred_decrement_count(0),
+    _remote_roots(nullptr), _remote_roots_count(0), _remote_roots_capacity(0),
+    _cross_roots_count(0), _deferred_decrement_count(0),
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
     _current_fcr(nullptr), _fcr_lock(0),
     _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
@@ -1426,7 +1427,12 @@ HeapRegion* G1RemoteMemoryManager::allocate_new_fcr_region() {
 // Key principle: dead objects' bytes NEVER cross the network.
 
 size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
-  // Count remote handles for logging
+  // Build deduplicated root set from three sources:
+  //   1. CM roots (from concurrent marking — already in _remote_roots)
+  //   2. Phase C tagged field handles (shared_oops in heap)
+  //   3. REMOTE handles with remote_refcount > 0 (edge-table references)
+  //
+  // Use a power-of-2 hash set for O(1) dedup. Sized to 2x expected entries.
   size_t total_remote = 0;
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
@@ -1438,43 +1444,79 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   }
   table_unlock();
 
-  // Supplement CM roots with handles from tagged fields (Phase C shared_oops).
-  // CM roots capture handles seen during the last marking cycle, but Phase C
-  // creates new shared_oops each GC that reference handles not in the CM set.
-  // Without this, the executor marks those handles dead → barrier returns null.
+  // Hash set for dedup: open addressing with linear probing
+  size_t set_capacity = 1;
+  while (set_capacity < (total_remote + _remote_roots_count) * 2 + 64) {
+    set_capacity <<= 1;
+  }
+  uintptr_t* dedup_set = NEW_C_HEAP_ARRAY(uintptr_t, set_capacity, mtGC);
+  memset(dedup_set, 0, set_capacity * sizeof(uintptr_t));
+  size_t set_mask = set_capacity - 1;
+
+  // Collect unique roots into _remote_roots (dynamically grown)
+  int cm_count = _remote_roots_count;  // CM roots already present
+  int old_count = _remote_roots_count;
+
+  // Insert existing CM roots into dedup set
+  for (int i = 0; i < cm_count; i++) {
+    uintptr_t id = _remote_roots[i];
+    size_t slot = (id >> 4) & set_mask;
+    while (dedup_set[slot] != 0 && dedup_set[slot] != id) {
+      slot = (slot + 1) & set_mask;
+    }
+    dedup_set[slot] = id;
+  }
+
+  // Source 2: Phase C tagged field handles
   int phase_c_added = 0;
   for (int i = 0; i < _tagged_field_count; i++) {
     RemoteHandle* h = _tagged_fields[i]._handle;
     if (h != nullptr && h->is_remote()) {
-      add_remote_root((uintptr_t)h);
-      phase_c_added++;
+      uintptr_t id = (uintptr_t)h;
+      size_t slot = (id >> 4) & set_mask;
+      while (dedup_set[slot] != 0 && dedup_set[slot] != id) {
+        slot = (slot + 1) & set_mask;
+      }
+      if (dedup_set[slot] == 0) {
+        dedup_set[slot] = id;
+        add_remote_root(id);
+        phase_c_added++;
+      }
     }
   }
-  // Also scan handle table for any REMOTE handle with remote_refcount > 0
-  // (referenced by edges from other evicted objects).
+
+  // Source 3: REMOTE handles with remote_refcount > 0
   int refcount_added = 0;
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
     for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
       if (e->_handle != nullptr && e->_handle->is_remote() &&
           e->_handle->remote_refcount() > 0) {
-        add_remote_root((uintptr_t)e->_handle);
-        refcount_added++;
+        uintptr_t id = (uintptr_t)e->_handle;
+        size_t slot = (id >> 4) & set_mask;
+        while (dedup_set[slot] != 0 && dedup_set[slot] != id) {
+          slot = (slot + 1) & set_mask;
+        }
+        if (dedup_set[slot] == 0) {
+          dedup_set[slot] = id;
+          add_remote_root(id);
+          refcount_added++;
+        }
       }
     }
   }
   table_unlock();
-  if (phase_c_added > 0 || refcount_added > 0) {
-    log_info(gc)("collect_dead: supplemented roots: %d from tagged fields, %d from refcounts "
-                 "(total roots now %d)", phase_c_added, refcount_added, _remote_roots_count);
-  }
+  FREE_C_HEAP_ARRAY(uintptr_t, dedup_set);
+
+  log_info(gc)("collect_dead: roots: %d CM + %d tagged-fields + %d refcount = %d unique "
+               "(%zu remote handles)",
+               cm_count, phase_c_added, refcount_added, _remote_roots_count, total_remote);
 
   if (_remote_roots_count == 0) {
-    log_info(gc)("collect_dead: SKIP (no roots after supplementation, %zu remote handles retained)", total_remote);
+    log_info(gc)("collect_dead: SKIP (no roots, %zu remote handles retained)", total_remote);
     return 0;
   }
 
-  // Send roots to executor (CM roots + Phase C roots + refcount roots)
   log_info(gc)("collect_dead: report_remote_roots_v2 (%d roots, %zu remote handles)",
                _remote_roots_count, total_remote);
   _backend->report_remote_roots_v2(_remote_roots, _remote_roots_count);

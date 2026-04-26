@@ -545,11 +545,12 @@ public:
   HotnessLevelStats _prev_hotness_stats[HOTNESS_LEVELS]; // previous GC's data (for eviction decisions)
 
 public:
-  // Remote root set: handle_ids logged during concurrent marking.
-  // Collected after remark, used for CMD_REPORT_REMOTE_ROOTS_V2.
-  static const int MAX_REMOTE_ROOTS = 8192;
-  uintptr_t _remote_roots[MAX_REMOTE_ROOTS];
-  int       _remote_roots_count;
+  // Remote root set: handle_ids for CMD_REPORT_REMOTE_ROOTS_V2.
+  // Sources: concurrent marking logs + Phase C tagged fields + refcount>0.
+  // Dynamically allocated per collect_dead cycle.
+  uintptr_t* _remote_roots;
+  int        _remote_roots_count;
+  int        _remote_roots_capacity;
 
   // Cross-boundary roots: LOCAL handles referenced by live REMOTE objects.
   // Populated by trace_and_report(), consumed as GC roots during Phase D.
@@ -631,18 +632,23 @@ public:
   bool concurrent_marking_active() const;
 
   void clear_remote_roots() { _remote_roots_count = 0; }
-  void add_remote_root(uintptr_t handle_id) {
-    if (_remote_roots_count < MAX_REMOTE_ROOTS) {
-      // Simple dedup: check last few entries (most duplicates are adjacent)
-      for (int i = (_remote_roots_count > 8 ? _remote_roots_count - 8 : 0);
-           i < _remote_roots_count; i++) {
-        if (_remote_roots[i] == handle_id) return;
+  void ensure_remote_roots_capacity(int needed) {
+    if (needed <= _remote_roots_capacity) return;
+    int new_cap = MAX2(needed, _remote_roots_capacity * 2);
+    if (new_cap < 16384) new_cap = 16384;
+    uintptr_t* new_buf = NEW_C_HEAP_ARRAY(uintptr_t, new_cap, mtGC);
+    if (_remote_roots != nullptr) {
+      if (_remote_roots_count > 0) {
+        memcpy(new_buf, _remote_roots, _remote_roots_count * sizeof(uintptr_t));
       }
-      _remote_roots[_remote_roots_count++] = handle_id;
-    } else if (_remote_roots_count == MAX_REMOTE_ROOTS) {
-      log_warning(gc)("add_remote_root: MAX_REMOTE_ROOTS (%d) exceeded — dropping roots!", MAX_REMOTE_ROOTS);
-      _remote_roots_count++;
+      FREE_C_HEAP_ARRAY(uintptr_t, _remote_roots);
     }
+    _remote_roots = new_buf;
+    _remote_roots_capacity = new_cap;
+  }
+  void add_remote_root(uintptr_t handle_id) {
+    ensure_remote_roots_capacity(_remote_roots_count + 1);
+    _remote_roots[_remote_roots_count++] = handle_id;
   }
   int remote_roots_count() const { return _remote_roots_count; }
   const uintptr_t* remote_roots() const { return _remote_roots; }
