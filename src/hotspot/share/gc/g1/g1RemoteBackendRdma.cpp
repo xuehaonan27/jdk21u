@@ -38,8 +38,12 @@ static const uint32_t RE_CMD_SHUTDOWN           = 0xFF;
 static const uint32_t RE_RESP_OK                = 0x81;
 static const uint32_t RE_RESP_OBJECT_DATA       = 0x83;
 static const uint32_t RE_RESP_COLLECTION_RESULT = 0x84;
-static const uint32_t RE_CMD_TRACE_AND_REPORT   = 0x17;
-static const uint32_t RE_RESP_TRACE_RESULT       = 0x86;
+static const uint32_t RE_CMD_DIRECTORY_UPSERT       = 0x10;
+static const uint32_t RE_CMD_LOCALIZE_BATCH         = 0x11;
+static const uint32_t RE_CMD_EVICT_WITH_EDGES       = 0x12;
+static const uint32_t RE_CMD_REPORT_REMOTE_ROOTS_V2 = 0x13;
+static const uint32_t RE_CMD_TRACE_AND_REPORT       = 0x17;
+static const uint32_t RE_RESP_TRACE_RESULT           = 0x86;
 
 // RDMA parameters are set via JVM flags (g1_globals.hpp):
 //   -XX:RDMAMsgBufSize=65536    (SEND/RECV buffer, default 64K)
@@ -762,6 +766,137 @@ int RDMAExecutorBackend::batch_evict(const void* msg_buf, size_t msg_len) {
 
 size_t RDMAExecutorBackend::slot_word_size(size_t /*slot_id*/) const {
   return 0;  // Remote metadata — fetch response includes size
+}
+
+// ============================================================
+// V2 Protocol Implementations
+// ============================================================
+
+size_t RDMAExecutorBackend::evict_with_edges(const void* obj_bytes, size_t word_size,
+                                             Klass* klass, uintptr_t handle_id,
+                                             const EdgeInfo* edges, uint32_t num_edges,
+                                             size_t hint_slot_id) {
+  if (!_connected) return (size_t)-1;
+
+  io_lock();
+
+  size_t slot_id = (hint_slot_id == (size_t)-1) ? _next_slot++ : hint_slot_id;
+  size_t byte_size = word_size * HeapWordSize;
+  size_t edge_bytes = num_edges * 12;  // field_offset(4) + target_handle_id(8)
+  size_t msg_size = 48 + byte_size + edge_bytes;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+
+  *(uint32_t*)(msg + 0)  = RE_CMD_EVICT_WITH_EDGES;
+  *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8)  = _seq_id++;
+  *(uint64_t*)(msg + 16) = slot_id;
+  *(uint64_t*)(msg + 24) = handle_id;
+  *(uint64_t*)(msg + 32) = (uint64_t)(uintptr_t)klass;
+  *(uint32_t*)(msg + 40) = (uint32_t)word_size;
+  *(uint32_t*)(msg + 44) = num_edges;
+  memcpy(msg + 48, obj_bytes, byte_size);
+
+  uint8_t* edge_ptr = msg + 48 + byte_size;
+  for (uint32_t i = 0; i < num_edges; i++) {
+    *(uint32_t*)(edge_ptr)     = edges[i].field_offset;
+    *(uint64_t*)(edge_ptr + 4) = edges[i].target_handle_id;
+    edge_ptr += 12;
+  }
+
+  bool ok = rdma_send_msg(msg, msg_size);
+  os::free(msg);
+  if (!ok) { io_unlock(); return (size_t)-1; }
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) { io_unlock(); return (size_t)-1; }
+
+  io_unlock();
+
+  if (resp_len >= 4 && *(uint32_t*)resp == RE_RESP_OK) {
+    _total_evicted++;
+    return slot_id;
+  }
+  return (size_t)-1;
+}
+
+void RDMAExecutorBackend::localize_batch(const uintptr_t* handle_ids, size_t count) {
+  if (!_connected || count == 0) return;
+
+  io_lock();
+
+  size_t msg_size = 20 + count * 8;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  *(uint32_t*)(msg + 0)  = RE_CMD_LOCALIZE_BATCH;
+  *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8)  = _seq_id++;
+  *(uint32_t*)(msg + 16) = (uint32_t)count;
+  memcpy(msg + 20, handle_ids, count * 8);
+
+  rdma_send_msg(msg, msg_size);
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
+}
+
+void RDMAExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, size_t count) {
+  if (!_connected) return;
+
+  io_lock();
+
+  size_t msg_size = 20 + count * 8;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  *(uint32_t*)(msg + 0)  = RE_CMD_REPORT_REMOTE_ROOTS_V2;
+  *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8)  = _seq_id++;
+  *(uint32_t*)(msg + 16) = (uint32_t)count;
+  memcpy(msg + 20, handle_ids, count * 8);
+
+  rdma_send_msg(msg, msg_size);
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
+}
+
+void RDMAExecutorBackend::directory_upsert(const uintptr_t* handle_ids,
+                                           const uint32_t* states,
+                                           const size_t* slot_ids,
+                                           size_t count) {
+  if (!_connected || count == 0) return;
+
+  io_lock();
+
+  size_t msg_size = 20 + count * 20;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  *(uint32_t*)(msg + 0)  = RE_CMD_DIRECTORY_UPSERT;
+  *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8)  = _seq_id++;
+  *(uint32_t*)(msg + 16) = (uint32_t)count;
+
+  uint8_t* ptr = msg + 20;
+  for (size_t i = 0; i < count; i++) {
+    *(uint64_t*)(ptr)      = handle_ids[i];
+    *(uint32_t*)(ptr + 8)  = states[i];
+    *(uint64_t*)(ptr + 12) = slot_ids[i];
+    ptr += 20;
+  }
+
+  rdma_send_msg(msg, msg_size);
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 #endif // REMOTE_EXECUTOR_USE_RDMA

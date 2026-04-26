@@ -93,6 +93,15 @@ public:
                         size_t* out_bytes_freed,
                         uintptr_t** out_cross_src, uintptr_t** out_cross_tgt,
                         size_t* out_num_cross) override;
+
+  size_t evict_with_edges(const void* obj_bytes, size_t word_size,
+                          Klass* klass, uintptr_t handle_id,
+                          const EdgeInfo* edges, uint32_t num_edges,
+                          size_t hint_slot_id) override;
+  void localize_batch(const uintptr_t* handle_ids, size_t count) override;
+  void report_remote_roots_v2(const uintptr_t* handle_ids, size_t count) override;
+  void directory_upsert(const uintptr_t* handle_ids, const uint32_t* states,
+                        const size_t* slot_ids, size_t count) override;
 };
 
 #else // !REMOTE_EXECUTOR_USE_RDMA
