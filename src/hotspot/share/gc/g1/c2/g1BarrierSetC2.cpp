@@ -83,12 +83,13 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   masm.pop_call_clobbered_registers(false);
   // rbx still has the tagged oop (callee-saved, survived pop)
   // Call slow path (single-arg, does ThreadInVMfromJava internally)
-  masm.set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
   // After pop_call_clobbered_registers, RSP = RSP0 - 8 (from push(rbx)).
-  // The call instruction will push the return address, making callee entry
-  // RSP = RSP0 - 16 = 0 mod 16, but x86-64 ABI requires 8 mod 16.
-  // Pad RSP by 8 so the call enters the callee with correct alignment.
+  // Pad RSP by 8 for x86-64 ABI alignment (callee entry RSP = 8 mod 16).
+  // set_last_Java_frame MUST be after subptr so that _last_Java_sp[-1]
+  // (used by make_walkable) reads the return address from the CALL, not
+  // the uninitialized alignment padding.
   masm.subptr(rsp, wordSize);
+  masm.set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
   masm.movptr(c_rarg0, rbx);          // tagged oop (single arg)
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
   masm.addptr(rsp, wordSize);
