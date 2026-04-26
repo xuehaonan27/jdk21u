@@ -52,8 +52,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _remote_roots(nullptr), _remote_roots_count(0), _remote_roots_capacity(0),
     _cross_roots_count(0), _deferred_decrement_count(0),
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
-    _current_fcr(nullptr), _fcr_lock(0),
-    _executor_fd(-1), _executor_connected(false), _executor_seq_id(0) {
+    _current_fcr(nullptr), _fcr_lock(0) {
   _table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
   memset(_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
   memset((void*)_stripe_locks, 0, sizeof(_stripe_locks));
@@ -280,88 +279,6 @@ G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
   log_debug(gc)("Edge table built: obj=" PTR_FORMAT " edges=%d",
                 p2i((void*)obj), cl.count());
   return et;
-}
-
-bool G1RemoteMemoryManager::evict_object(oop obj, RemoteHandleAllocBuffer* hab) {
-  // Safety checks
-  if (obj == nullptr) return false;
-
-  markWord mw = obj->mark();
-  // Don't evict locked/inflated objects
-  if (!mw.is_unlocked()) {
-    log_debug(gc, remset)("evict_object: skipping locked object " PTR_FORMAT, p2i((void*)obj));
-    return false;
-  }
-
-  Klass* klass = obj->klass();
-  size_t word_size = obj->size_given_klass(klass);
-
-  // 1. Create Handle if not already managed
-  RemoteHandle* h = handle_for(obj);
-  if (h == nullptr) {
-    h = create_handle_for(obj, hab);
-  }
-
-  // 2. Build sidecar edge table BEFORE eviction (object bytes still readable).
-  //    Scans oop fields, creates dormant anchors for targets, records edges.
-  ObjectEdgeTable* et = build_edge_table(obj, h, hab);
-  if (et == nullptr) {
-    return false;  // too many oop fields — cannot safely evict
-  }
-  store_edge_table(et);
-
-  // 3. Evict object bytes via backend (V2: with edges, V1: fallback)
-  size_t slot_id;
-  if (et->_entry_count > 0) {
-    // V2: send edge table alongside object bytes
-    G1RemoteBackend::EdgeInfo* edges = nullptr;
-    if (et->_entry_count > 0) {
-      edges = (G1RemoteBackend::EdgeInfo*)os::malloc(et->_entry_count * sizeof(G1RemoteBackend::EdgeInfo), mtGC);
-      for (uint32_t i = 0; i < et->_entry_count; i++) {
-        edges[i].field_offset = et->_entries[i]._field_offset;
-        edges[i].target_handle_id = (uintptr_t)et->_entries[i]._target_handle;
-      }
-    }
-    slot_id = _backend->evict_with_edges(cast_from_oop<void*>(obj), word_size, klass,
-                                          (uintptr_t)h, edges, et->_entry_count, (size_t)-1);
-    if (edges != nullptr) os::free(edges);
-  } else {
-    slot_id = _backend->evict(cast_from_oop<void*>(obj), word_size, klass, (size_t)-1);
-  }
-  if (slot_id == (size_t)-1) {
-    log_warning(gc)("Remote evict failed for obj=" PTR_FORMAT, p2i((void*)obj));
-    return false;
-  }
-
-  // 4. Store word_size FIRST, then publish REMOTE state (release store).
-  //    Readers (resolve_tagged_oop_slow) see REMOTE via acquire load, then
-  //    read eviction_word_size(). Size must be visible before REMOTE.
-  h->set_eviction_word_size(word_size);
-  h->set_remote(slot_id);
-
-  // 5. Set classification in mark word + per-region bitmap.
-  //    Mark word: fast per-object check for mutators (same cache line as header)
-  //    Bitmap: region-level iteration for GC
-  //    Re-read mark word (it may have changed since our earlier is_unlocked check,
-  //    though during STW eviction trigger this is unlikely).
-  mw = obj->mark();
-  if (mw.is_unlocked()) {
-    obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
-  }
-  HeapRegion* hr = _g1h->heap_region_containing(obj);
-  if (hr != nullptr) {
-    hr->set_has_classified_objects();
-  }
-
-  // 6. Overwrite local bytes with filler to poison stale clean oops.
-  //    After this, any reference that bypassed Handle-based access will see
-  //    a filler object, causing a visible crash instead of silent corruption.
-  CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(obj), word_size, false);
-
-  log_trace(gc)("Remote evict: obj=" PTR_FORMAT " klass=%s size=" SIZE_FORMAT "w slot=" SIZE_FORMAT " edges=%u (filled)",
-                p2i((void*)obj), klass->external_name(), word_size, slot_id, et->_entry_count);
-
-  return true;
 }
 
 bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* hab,
@@ -1137,89 +1054,6 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
                     cl.missed());
   }
   return cl.missed();
-}
-
-int G1RemoteMemoryManager::evict_region(HeapRegion* hr, RemoteHandleAllocBuffer* hab) {
-  assert(hr->is_old(), "can only evict Old regions");
-  assert(!hr->is_humongous(), "cannot evict humongous regions");
-
-  // All-or-nothing: validate ALL objects before evicting any.
-  // If any object is unevictable, abort the entire region.
-  HeapWord* p = hr->bottom();
-  HeapWord* region_end = hr->end();
-  int total_objects = 0;
-  while (p < hr->top()) {
-    if (p < hr->bottom() || p >= region_end) return 0;
-    oop obj = cast_to_oop(p);
-    if (obj->klass_or_null() == nullptr) {
-      log_debug(gc)("evict_region: null klass at " PTR_FORMAT " in region %u — aborting",
-                     p2i(p), hr->hrm_index());
-      return 0;
-    }
-    size_t sz = obj->size();
-    if (sz == 0) {
-      log_debug(gc)("evict_region: unparseable object at " PTR_FORMAT " in region %u — aborting",
-                     p2i(p), hr->hrm_index());
-      return 0;
-    }
-    markWord mw = obj->mark();
-    // Locked/inflated objects can't be evicted (mark word holds pointer)
-    if (!mw.is_unlocked()) {
-      log_debug(gc)("evict_region: locked object at " PTR_FORMAT " in region %u — aborting",
-                     p2i(p), hr->hrm_index());
-      return 0;
-    }
-    total_objects++;
-    p += sz;
-  }
-
-  if (total_objects == 0) return 0;
-
-  // Phase 1: Create Handles + build edge tables for all objects
-  p = hr->bottom();
-  while (p < hr->top()) {
-    oop obj = cast_to_oop(p);
-    ensure_handle_for(obj, hab);
-    p += obj->size();
-  }
-
-  // Phase 2: Tag incoming refs from other regions BEFORE eviction
-  // (objects still readable, Handles created, so tag_incoming_refs can find them)
-  tag_incoming_refs_to_region(hr);
-
-  // If tagging found untaggable refs, the region was pinned — abort
-  if (hr->is_root_pinned()) {
-    log_debug(gc)("evict_region: region %u pinned by untaggable refs — aborting",
-                   hr->hrm_index());
-    return 0;
-  }
-
-  // Phase 3: Evict all objects (send to backend + fill with filler)
-  int evicted = 0;
-  p = hr->bottom();
-  while (p < hr->top()) {
-    oop obj = cast_to_oop(p);
-    size_t sz = obj->size();
-    if (evict_object(obj, hab)) {
-      evicted++;
-    } else {
-      // Backend failure — abort. Objects already evicted in this pass
-      // are lost (handles point to remote, local is filler). This is a
-      // hard failure; log and stop.
-      log_warning(gc)("evict_region: backend evict failed at object " PTR_FORMAT
-                      " in region %u after %d objects — partial eviction!",
-                      p2i((void*)obj), hr->hrm_index(), evicted);
-      break;
-    }
-    p += sz;
-  }
-
-  if (evicted > 0) {
-    log_info(gc)("Region eviction: region %u [" PTR_FORMAT "] — %d/%d objects evicted",
-                 hr->hrm_index(), p2i(hr->bottom()), evicted, total_objects);
-  }
-
-  return evicted;
 }
 
 Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {

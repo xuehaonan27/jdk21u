@@ -55,32 +55,6 @@
 //
 // Ladder: shared_oop(handle) → unique_oop(addr) → clean oop(addr)
 // For prototype simplicity, go directly shared → clean when safe.
-//
-// Called during GC oop closure scanning (STW, safe to write fields).
-// Only applies to wide oop fields (UseCompressedOops=false).
-template <class T>
-inline void g1_try_dehandleify(T* p, oop resolved) {
-  // Only for wide oops
-  if (sizeof(T) != sizeof(uintptr_t)) return;
-
-  uintptr_t raw = *(uintptr_t*)p;
-  // Only process shared_oops (bit 63 + bit 62 set)
-  if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) !=
-      (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
-
-  // Extract Handle
-  RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
-
-  // Only de-handleify if:
-  // 1. Handle is LOCAL (target is not remote)
-  // 2. remote_refcount == 0 (no remote object's edge table references this Handle)
-  if (!h->is_local()) return;
-  if (h->remote_refcount() > 0) return;
-
-  // Safe to de-handleify: write clean oop directly
-  *(uintptr_t*)p = cast_from_oop<uintptr_t>(resolved);
-}
-
 template <class T>
 inline void G1ScanClosureBase::prefetch_and_push(T* p, const oop obj) {
   // We're not going to even bother checking whether the object is

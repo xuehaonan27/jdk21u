@@ -275,16 +275,4 @@ public:
 };
 
 
-// ============================================================
-// RemoteObjectMetadata: tracks size/klass for remote objects
-// ============================================================
-// When an object is evicted to remote, its size and Klass pointer
-// (both local metadata) must be recorded because the Klass pointer
-// is in the object header which is now remote.
-
-struct RemoteObjectMetadata {
-  size_t  _word_size;   // Object size in HeapWords
-  Klass*  _klass;       // Klass pointer (always local, in metaspace)
-};
-
 #endif // SHARE_GC_G1_G1REMOTEHANDLE_HPP

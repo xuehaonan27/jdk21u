@@ -368,34 +368,6 @@ public:
     table_unlock();
   }
 
-  // Remove Handle mapping and return entry to free list.
-  // Handle is NOT freed (chunks are pool-managed). Handle state should be set
-  // to DEAD by caller before removing.
-  void remove_handle_for(oop obj) {
-    uintptr_t addr = cast_from_oop<uintptr_t>(obj);
-    size_t idx = hash_obj(addr);
-
-    table_lock();
-    HandleEntry** pp = &_table[idx];
-    while (*pp != nullptr) {
-      if ((*pp)->_obj_addr == addr) {
-        HandleEntry* entry = *pp;
-        *pp = entry->_next;
-        free_entry(entry);
-        table_unlock();
-        return;
-      }
-      pp = &((*pp)->_next);
-    }
-    table_unlock();
-  }
-
-  // Legacy: register_unique (no longer needed, but kept for compat)
-  void register_unique(oop obj) {
-    // In the new design, Unique objects don't need Handle table entries.
-    // Classification is in the mark word only.
-  }
-
   // ============================================================
   // Sidecar Edge Tables (P3)
   // ============================================================
@@ -741,12 +713,6 @@ public:
     return handle_for(obj) != nullptr;
   }
 
-  // Legacy fields (kept for struct layout compat; unused when backend is active):
-private:
-  int      _executor_fd;
-  bool     _executor_connected;
-  uint64_t _executor_seq_id;
-
 public:
   size_t sim_remote_evicted_count() const { return _sim_remote_evicted_count; }
   size_t sim_remote_fetched_count() const { return _sim_remote_fetched_count; }
@@ -760,13 +726,6 @@ public:
   // ============================================================
 
   // Evict an object to simulated remote memory:
-  // 1. Create Handle (if not already managed)
-  // 2. Copy object bytes to simulated remote slot
-  // 3. Set Handle to REMOTE state with slot_id
-  // 4. Set mark word oop_managed bit
-  // Returns true on success.
-  bool evict_object(oop obj, RemoteHandleAllocBuffer* hab);
-
   // ============================================================
   // Batch Eviction API
   // ============================================================
@@ -818,11 +777,6 @@ public:
   template <typename OopClosureType>
   void oops_do_remote_cross_roots(OopClosureType* cl);
 
-  // Evict an entire region: evict all objects, tag incoming refs, free region.
-  // Called during STW post-GC when heap pressure exceeds threshold.
-  // Returns the number of objects evicted.
-  int evict_region(HeapRegion* hr, RemoteHandleAllocBuffer* hab);
-
   // Tag incoming refs: scan heap for refs pointing into the given region,
   // replace them with shared_oop(handle). Called during STW.
   void tag_incoming_refs_to_region(HeapRegion* target_hr);
@@ -843,12 +797,6 @@ public:
                                     WorkerThreads* workers = nullptr, uint num_workers = 0);
 
   int verify_no_untagged_refs_to_eviction_set(const bool* eviction_set, uint num_regions);
-
-  void add_tagged_field_locked(oop* field_addr, RemoteHandle* h) {
-    table_lock();
-    add_tagged_field(field_addr, h);
-    table_unlock();
-  }
 
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
