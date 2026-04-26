@@ -36,6 +36,7 @@ class G1ThreadLocalData {
 private:
   SATBMarkQueue _satb_mark_queue;
   G1DirtyCardQueue _dirty_card_queue;
+  intptr_t _barrier_scratch;
 
   G1ThreadLocalData() :
       _satb_mark_queue(&G1BarrierSet::satb_mark_queue_set()),
@@ -89,6 +90,10 @@ public:
 
   static ByteSize dirty_card_queue_buffer_offset() {
     return dirty_card_queue_offset() + G1DirtyCardQueue::byte_offset_of_buf();
+  }
+
+  static ByteSize barrier_scratch_offset() {
+    return Thread::gc_data_offset() + byte_offset_of(G1ThreadLocalData, _barrier_scratch);
   }
 };
 

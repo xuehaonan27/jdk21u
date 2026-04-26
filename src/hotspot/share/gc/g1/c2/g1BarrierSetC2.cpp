@@ -28,6 +28,7 @@
 #include "gc/g1/c2/g1BarrierSetC2.hpp"
 #include "gc/g1/g1BarrierSet.hpp"
 #include "gc/g1/g1BarrierSetRuntime.hpp"
+#include "compiler/oopMap.hpp"
 #include "gc/g1/g1CardTable.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/heapRegion.hpp"
@@ -60,11 +61,24 @@ Label* G1TagResolveStubC2::continuation() { return &_continuation; }
 Register G1TagResolveStubC2::ref() const { return _ref; }
 
 void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
+  // Frame layout strategy: we must NOT push anything onto the nmethod's
+  // stack before set_last_Java_frame, because sender_for_compiled_frame
+  // uses _last_Java_sp + nmethod->frame_size() to find the caller.
+  // Any extra pushes shift _last_Java_sp below nmethod_sp and break
+  // the sender computation.
+  //
+  // Instead of push(rbx) we save rbx to G1ThreadLocalData::_barrier_scratch,
+  // keeping RSP == nmethod_sp after pop_call_clobbered_registers.
+  // nmethod_sp is 16-byte aligned (nmethod prologue guarantees this),
+  // so no alignment padding is needed before the slow-path CALL.
+
+  Address barrier_scratch(r15_thread, G1ThreadLocalData::barrier_scratch_offset());
+
   masm.bind(_entry);
   Label leaf_ok;
-  // Save rbx (callee-saved) for stashing results
-  masm.push(rbx);
-  // Save all call-clobbered registers
+
+  // Save rbx to thread-local scratch (avoids push that shifts RSP)
+  masm.movptr(barrier_scratch, rbx);
   masm.push_call_clobbered_registers(false /* save_fpu */);
 
   // Phase 1: Leaf call (handles LOCAL + Unique)
@@ -72,48 +86,49 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
     masm.movptr(c_rarg0, _ref);
   }
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop)));
-  // Check: did leaf resolve? (bit 63 clear = resolved)
   masm.testptr(rax, rax);
   masm.jcc(Assembler::positive, leaf_ok);
 
   // Phase 2: Slow path — leaf returned tagged oop (REMOTE/FETCHING).
-  // Need JRT_ENTRY call. Pop saved state first, then call_VM.
-  // Save the original tagged oop in rbx for the slow call.
-  masm.movptr(rbx, rax);  // rbx = still-tagged oop (sentinel)
+  // Stash tagged oop in rbx (callee-saved, survives pop).
+  masm.movptr(rbx, rax);
   masm.pop_call_clobbered_registers(false);
-  // rbx still has the tagged oop (callee-saved, survived pop)
-  // Call slow path (single-arg, does ThreadInVMfromJava internally)
-  // After pop_call_clobbered_registers, RSP = RSP0 - 8 (from push(rbx)).
-  // Pad RSP by 8 for x86-64 ABI alignment (callee entry RSP = 8 mod 16).
-  // set_last_Java_frame MUST be after subptr so that _last_Java_sp[-1]
-  // (used by make_walkable) reads the return address from the CALL, not
-  // the uninitialized alignment padding.
-  masm.subptr(rsp, wordSize);
+  // RSP == nmethod_sp (0 mod 16). No alignment needed.
+
+  // set_last_Java_frame with RSP == nmethod_sp.
+  // make_walkable reads _last_Java_sp[-1] which, after the CALL below
+  // pushes its return address, gives the correct return PC.
+  // sender_for_compiled_frame: nmethod_sp + frame_size → correct caller.
   masm.set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
-  masm.movptr(c_rarg0, rbx);          // tagged oop (single arg)
+  masm.movptr(c_rarg0, rbx);
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
-  masm.addptr(rsp, wordSize);
-  masm.reset_last_Java_frame(r15_thread, false);
-  // Result in rax. Put into _ref.
-  if (_ref == rbx) {
-    masm.movptr(rbx, rax);
-    masm.addptr(rsp, wordSize);  // discard saved rbx
-  } else {
-    masm.movptr(_ref, rax);
-    masm.pop(rbx);
+  {
+    Compile* C = Compile::current();
+    if (!C->output()->in_scratch_emit_size()) {
+      OopMap* map = new OopMap(0, 0);
+      C->output()->oop_map_set()->add_gc_map(masm.offset(), map);
+    }
   }
+  masm.reset_last_Java_frame(r15_thread, false);
+
+  // Result in rax → _ref.  Restore original rbx from thread scratch.
+  masm.movptr(_ref, rax);
+  if (_ref != rbx) {
+    masm.movptr(rbx, barrier_scratch);
+  }
+  // If _ref == rbx, the nmethod allocated rbx for this load result,
+  // so the original rbx value is dead — no restore needed.
   masm.jmp(_continuation);
 
   // Leaf resolved fast path
   masm.bind(leaf_ok);
-  masm.movptr(rbx, rax);  // stash resolved oop
+  masm.movptr(rbx, rax);  // stash result in callee-saved rbx
   masm.pop_call_clobbered_registers(false);
   if (_ref == rbx) {
-    // _ref IS rbx — result already in rbx, discard saved rbx
-    masm.addptr(rsp, wordSize);
+    // Result already in _ref (rbx). Original rbx is dead.
   } else {
     masm.movptr(_ref, rbx);
-    masm.pop(rbx);
+    masm.movptr(rbx, barrier_scratch);
   }
   masm.jmp(_continuation);
 }
