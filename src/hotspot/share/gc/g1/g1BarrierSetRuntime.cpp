@@ -114,158 +114,150 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
 JRT_END
 
 // ============================================================
-// NON-LEAF slow path: blocking fetch from remote storage.
-// NOT JRT_ENTRY — manages thread state transition internally.
-// Same calling convention as the leaf (single oopDesc* arg, result in rax).
-// Callers: interpreter call_VM, C1 call_runtime_leaf, C2 stub raw call.
+// Shared fetch helpers — used by both safepoint-safe and
+// non-safepointing slow paths to avoid logic duplication.
 // ============================================================
-// Non-leaf slow path for REMOTE Handle fetch.
-// Same C calling convention as the leaf (single oopDesc* arg) for uniform
-// calling from all tiers (interpreter, C1, C2, arraycopy).
-// Internally transitions _thread_in_Java → _thread_in_vm via ThreadInVMfromJava.
-// This enables Heap_lock acquisition for FCR allocation and ThreadBlockInVM
-// for safepoint-aware blocking I/O.
-//
-// Safety: sets last_Java_frame BEFORE ThreadInVMfromJava to ensure GC can
-// walk the stack even when called from C1's call_runtime_leaf (which doesn't
-// set last_Java_frame). The frame pointer chain (rbp) is valid because
-// all callers (interpreter templates, C1 compiled code, C2 stubs) maintain
-// proper frame pointers.
-oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
-  uintptr_t v = (uintptr_t)tagged;
 
-  // Fast path: clean oop / null — no thread transition needed.
-  if ((v >> 63) == 0) return tagged;
-
-  // Unique/Direct: strip tags (no thread transition needed).
-  if (!(v & G1_OOP_INDIRECT_BIT)) {
-    return (oopDesc*)(v & G1_OOP_ADDR_MASK);
+class PostFetchValidateClosure : public BasicOopIterateClosure {
+  G1CollectedHeap* _g1h;
+  oop _obj;
+  int _bad;
+public:
+  PostFetchValidateClosure(G1CollectedHeap* g1h, oop obj) : _g1h(g1h), _obj(obj), _bad(0) {}
+  virtual void do_oop(oop* p) {
+    uintptr_t raw = *(uintptr_t*)p;
+    if (raw == 0) return;
+    if ((raw >> 63) != 0) return;
+    if (!_g1h->is_in((void*)raw)) {
+      uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
+      log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
+                      "field_val=" PTR_FORMAT " not in heap",
+                      p2i((void*)_obj), _obj->klass()->external_name(), off, raw);
+      *(uintptr_t*)p = 0;
+      _bad++;
+      return;
+    }
+    oop target = cast_to_oop(raw);
+    Klass* tk = target->klass_or_null();
+    if (tk == nullptr) {
+      uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
+      log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
+                      "target=" PTR_FORMAT " has null klass",
+                      p2i((void*)_obj), _obj->klass()->external_name(), off, raw);
+      *(uintptr_t*)p = 0;
+      _bad++;
+    }
   }
+  virtual void do_oop(narrowOop* p) {}
+  int bad() const { return _bad; }
+};
 
-  // Shared: follow Handle — fast check before thread transition.
-  RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
-  uintptr_t sa = h->load_state_and_addr_acquire();
-  uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-  if (state == REMOTE_HANDLE_LOCAL) {
-    return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-  }
-  if (state == REMOTE_HANDLE_DEAD) {
+// Fetch a REMOTE object, install it locally, and publish the Handle as LOCAL.
+// Caller must have already CAS'd the Handle to FETCHING.
+// Returns the local oop on success, nullptr on failure (Handle set to DEAD
+// after max retries, or set back to REMOTE for caller to retry).
+// *out_retry is set to true if the caller should re-enter the state machine.
+static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* out_retry) {
+  *out_retry = false;
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+  size_t word_size = h->eviction_word_size();
+
+  HeapWord* dest = rmm->allocate_in_fcr(word_size);
+  guarantee(dest != nullptr, "FCR allocation failed for fetch");
+
+  Klass* fetched_klass = rmm->fetch_remote_object(h, dest);
+
+  if (fetched_klass == nullptr) {
+    fetch_attempts++;
+    if (fetch_attempts >= 3) {
+      h->set_dead();
+      log_warning(gc)("Fetch failed %d times for handle " PTR_FORMAT " — marking DEAD",
+                      fetch_attempts, p2i(h));
+      return nullptr;
+    }
+    uintptr_t sa2 = h->load_state_and_addr_acquire();
+    h->set_remote(sa2 & REMOTE_HANDLE_ADDR_MASK);
+    log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — retry %d/3",
+                    p2i(h), fetch_attempts);
+    *out_retry = true;
     return nullptr;
   }
 
-  // Slow path: REMOTE/FETCHING — requires ThreadInVMfromJava for blocking I/O.
+  cast_to_oop(dest)->set_mark(markWord::prototype());
+  cast_to_oop(dest)->set_klass(fetched_klass);
+  rmm->patch_fetched_fields(h, dest);
+
+  {
+    oop fetched = cast_to_oop(dest);
+    PostFetchValidateClosure vcl(g1h, fetched);
+    fetched->oop_iterate(&vcl);
+    if (vcl.bad() > 0) {
+      log_warning(gc)("POST-FETCH: %d corrupt fields nulled in obj=" PTR_FORMAT
+                      " klass=%s", vcl.bad(), p2i(dest), fetched->klass()->external_name());
+    }
+  }
+
+  rmm->rekey_handle_on_fetch(h, (void*)dest);
+
+  uintptr_t handle_id = (uintptr_t)h;
+  rmm->backend()->localize_batch(&handle_id, 1);
+
+  h->set_local_release(dest);
+  return (oopDesc*)dest;
+}
+
+// Shared fast-path checks for both slow-path variants.
+// Returns non-null oop if resolved without needing the state machine.
+// Returns nullptr if the caller must enter the state machine.
+// Sets *handle_out to the RemoteHandle* if state machine is needed.
+static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) {
+  uintptr_t v = (uintptr_t)tagged;
+  if ((v >> 63) == 0) return tagged;
+  if (!(v & G1_OOP_INDIRECT_BIT)) return (oopDesc*)(v & G1_OOP_ADDR_MASK);
+
+  RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+  if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+  if (state == REMOTE_HANDLE_DEAD) return nullptr;
+
+  *handle_out = h;
+  return nullptr;
+}
+
+// ============================================================
+// Safepoint-safe slow path: REMOTE fetch with thread transitions.
+// Called from interpreter C++ barrier (oop_load_in_heap) where
+// the interpreter frame anchor is set and GC can walk the stack.
+// ============================================================
+oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
+  RemoteHandle* h = nullptr;
+  oopDesc* fast = resolve_fast_checks(tagged, &h);
+  if (h == nullptr) return fast;
+
   JavaThread* current = JavaThread::current();
   ThreadInVMfromJava tiv(current);
 
   int fetch_attempts = 0;
-  // State machine loop: handles all transitions including re-eviction
-  // during safepoints and handle death from remote GC.
   while (true) {
-    sa = h->load_state_and_addr_acquire();
-    state = sa & REMOTE_HANDLE_STATE_MASK;
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
 
-    if (state == REMOTE_HANDLE_LOCAL) {
-      return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-    }
-
-    if (state == REMOTE_HANDLE_DEAD) {
-      return nullptr;
-    }
+    if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+    if (state == REMOTE_HANDLE_DEAD)  return nullptr;
 
     if (state == REMOTE_HANDLE_REMOTE) {
       if (h->cas_remote_to_fetching()) {
-        G1CollectedHeap* g1h = G1CollectedHeap::heap();
-        G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-        size_t word_size = h->eviction_word_size();
-
-        HeapWord* dest = rmm->allocate_in_fcr(word_size);
-        guarantee(dest != nullptr, "FCR allocation failed for fetch");
-
-        Klass* fetched_klass = nullptr;
+        bool retry = false;
+        oopDesc* result;
         {
           ThreadBlockInVM tbivm(current);
-          fetched_klass = rmm->fetch_remote_object(h, dest);
+          result = fetch_and_install(h, fetch_attempts, &retry);
         }
-
-        if (fetched_klass == nullptr) {
-          fetch_attempts++;
-          if (fetch_attempts >= 3) {
-            h->set_dead();
-            log_warning(gc)("Fetch failed %d times for handle " PTR_FORMAT " — marking DEAD", fetch_attempts, p2i(h));
-            return nullptr;
-          }
-          uintptr_t sa2 = h->load_state_and_addr_acquire();
-          uintptr_t remote_id = sa2 & REMOTE_HANDLE_ADDR_MASK;
-          h->set_remote(remote_id);
-          log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — retry %d/3", p2i(h), fetch_attempts);
-          continue;
-        }
-
-        // Overwrite stale eviction-time header with known-good values.
-        // The raw bytes from remote contain the mark word and klass from
-        // eviction time — stale classification bits, hash, etc.
-        cast_to_oop(dest)->set_mark(markWord::prototype());
-        cast_to_oop(dest)->set_klass(fetched_klass);
-
-        rmm->patch_fetched_fields(h, dest);
-
-        // Post-fetch validation: scan all oop fields of the fetched object
-        // and verify each is null, a valid heap oop, or a valid tagged oop.
-        {
-          oop fetched = cast_to_oop(dest);
-          Klass* fk = fetched->klass();
-          class ValidateOopClosure : public BasicOopIterateClosure {
-            G1CollectedHeap* _g1h;
-            oop _obj;
-            int _bad;
-          public:
-            ValidateOopClosure(G1CollectedHeap* g1h, oop obj) : _g1h(g1h), _obj(obj), _bad(0) {}
-            virtual void do_oop(oop* p) {
-              uintptr_t raw = *(uintptr_t*)p;
-              if (raw == 0) return;
-              if ((raw >> 63) != 0) return; // tagged — OK
-              if (!_g1h->is_in((void*)raw)) {
-                uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
-                log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
-                                "field_val=" PTR_FORMAT " not in heap",
-                                p2i((void*)_obj), _obj->klass()->external_name(),
-                                off, raw);
-                *(uintptr_t*)p = 0;
-                _bad++;
-                return;
-              }
-              oop target = cast_to_oop(raw);
-              Klass* tk = target->klass_or_null();
-              if (tk == nullptr) {
-                uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
-                log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
-                                "target=" PTR_FORMAT " has null klass",
-                                p2i((void*)_obj), _obj->klass()->external_name(),
-                                off, raw);
-                *(uintptr_t*)p = 0;
-                _bad++;
-              }
-            }
-            virtual void do_oop(narrowOop* p) {}
-            int bad() const { return _bad; }
-          };
-          ValidateOopClosure vcl(g1h, fetched);
-          fetched->oop_iterate(&vcl);
-          if (vcl.bad() > 0) {
-            log_warning(gc)("POST-FETCH: %d corrupt fields nulled in obj=" PTR_FORMAT
-                            " klass=%s", vcl.bad(), p2i(dest), fk->external_name());
-          }
-        }
-
-        rmm->rekey_handle_on_fetch(h, (void*)dest);
-
-        uintptr_t handle_id = (uintptr_t)h;
-        rmm->backend()->localize_batch(&handle_id, 1);
-
-        h->set_local_release(dest);
-        return (oopDesc*)dest;
+        if (retry) continue;
+        return result;
       }
-      // CAS failed — another thread is fetching. Re-read and retry.
       continue;
     }
 
@@ -277,18 +269,60 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
         if (state != REMOTE_HANDLE_FETCHING) break;
         os::naked_yield();
       }
-      // State changed — might be LOCAL, REMOTE (re-evicted), or DEAD.
       continue;
     }
 
-    // Unknown state — log and retry.
     log_warning(gc)("resolve_tagged_oop_slow: unexpected state 0x%lx for handle " PTR_FORMAT,
                     (unsigned long)state, p2i(h));
     os::naked_yield();
   }
 }
 
-// JRT_ENTRY wrapper for interpreter call_VM (proper oop map + frame anchor).
+// ============================================================
+// Non-safepointing slow path: REMOTE fetch WITHOUT thread transitions.
+// Called from C1/C2/assembler barrier stubs where the OopMap does not
+// describe all live oop registers. By staying in _thread_in_Java
+// and not allowing safepoints, the empty OopMap is harmless.
+// Blocking I/O (RDMA/TCP) adds at most ~50us to safepoint initiation.
+// ============================================================
+oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
+  RemoteHandle* h = nullptr;
+  oopDesc* fast = resolve_fast_checks(tagged, &h);
+  if (h == nullptr) return fast;
+
+  int fetch_attempts = 0;
+  while (true) {
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+
+    if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+    if (state == REMOTE_HANDLE_DEAD)  return nullptr;
+
+    if (state == REMOTE_HANDLE_REMOTE) {
+      if (h->cas_remote_to_fetching()) {
+        bool retry = false;
+        oopDesc* result = fetch_and_install(h, fetch_attempts, &retry);
+        if (retry) continue;
+        return result;
+      }
+      continue;
+    }
+
+    if (state == REMOTE_HANDLE_FETCHING) {
+      while (true) {
+        sa = h->load_state_and_addr_acquire();
+        state = sa & REMOTE_HANDLE_STATE_MASK;
+        if (state != REMOTE_HANDLE_FETCHING) break;
+        SpinPause();
+      }
+      continue;
+    }
+
+    SpinPause();
+  }
+}
+
+// JRT_ENTRY wrapper for interpreter call_VM.
 JRT_ENTRY(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop_slow_vm(JavaThread* current, oopDesc* tagged))
   return resolve_tagged_oop_slow(tagged);
 JRT_END

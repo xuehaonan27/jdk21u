@@ -165,10 +165,11 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
       Label leaf_resolved;
       __ testptr(rax, rax);
       __ jcc(Assembler::positive, leaf_resolved);
-      // Still tagged — REMOTE object needs fetch. Call slow path.
+      // Still tagged — REMOTE object needs fetch. Call non-safepointing
+      // slow path (no thread transitions, so saved registers are safe).
       __ mov(c_rarg0, rax);
       masm->MacroAssembler::call_VM_leaf_base(
-          CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow), 1);
+          CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), 1);
       __ bind(leaf_resolved);
     }
     // rax = fully resolved oop. Stash in rbx (callee-saved, survives pops).
@@ -249,20 +250,14 @@ void G1BarrierSetAssembler::copy_load_at(MacroAssembler* masm, DecoratorSet deco
     __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
     __ testptr(rax, rax);
     __ jcc(Assembler::positive, leaf_ok);
-    // Phase 2: Slow path (single-arg, ThreadInVMfromJava internal)
+    // Phase 2: Non-safepointing slow path (saved registers not in OopMap).
     __ movptr(rbx, rax);   // rbx = still-tagged (callee-saved)
     __ pop_call_clobbered_registers(false);
-    // After pop, only push(rbx) remains (8 bytes). Pad RSP so the call
-    // enters the callee with RSP = 8 mod 16 per x86-64 ABI.
-    // set_last_Java_frame MUST be after subptr so that _last_Java_sp[-1]
-    // (used by make_walkable) reads the return address from the CALL, not
-    // the uninitialized alignment padding.
+    __ movptr(c_rarg0, rbx);
+    // push(rbx) = 8 bytes on stack. Pad RSP for x86-64 ABI alignment.
     __ subptr(rsp, wordSize);
-    __ set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
-    __ movptr(c_rarg0, rbx);           // tagged oop (single arg)
-    __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
+    __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint)));
     __ addptr(rsp, wordSize);
-    __ reset_last_Java_frame(r15_thread, false);
     __ movptr(dst, rax);
     __ pop(rbx);
     __ jmp(done);
@@ -794,17 +789,12 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_runtime_stub(StubAssembler* 
   __ jcc(Assembler::positive, leaf_resolved);
 
   // Phase 2: slow path — still tagged (REMOTE/FETCHING).
-  // Restore C1 state first, then call with proper frame anchor.
+  // Non-safepointing: stays in _thread_in_Java, no OopMap needed.
   __ movptr(rbx, r12);  // tagged oop (for the slow call argument)
   __ pop_call_clobbered_registers();
 
-  // set_last_Java_frame: enables GC to walk through this C1 frame
-  // during a safepoint inside resolve_tagged_oop_slow's ThreadInVMfromJava.
-  // Uses the same pattern as C2's G1TagResolveStubC2.
-  __ set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
   __ movptr(c_rarg0, rbx);  // tagged oop argument
-  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
-  __ reset_last_Java_frame(r15_thread, false);
+  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint)));
 
   // Result in rax.
   __ pop(r12);

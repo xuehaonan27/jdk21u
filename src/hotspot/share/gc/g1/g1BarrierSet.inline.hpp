@@ -27,6 +27,7 @@
 
 #include "gc/g1/g1BarrierSet.hpp"
 
+#include "gc/g1/g1BarrierSetRuntime.hpp"
 #include "gc/g1/g1CardTable.hpp"
 #include "gc/g1/g1CollectedHeap.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
@@ -128,42 +129,12 @@ oop_load_in_heap(T* addr) {
   oop value = ModRef::oop_load_in_heap(addr);
 
   // === Disaggregated Memory Load Barrier ===
-  // Resolve tag bits. For REMOTE objects, trigger simulated fetch.
+  // Resolve tagged oops via the centralized runtime.
+  // resolve_tagged_oop_slow handles LOCAL (fast), Unique (strip tags),
+  // and REMOTE (blocking fetch with proper safepoint transitions).
   uintptr_t v = cast_from_oop<uintptr_t>(value);
   if ((v & G1_OOP_TAG_MASK) != 0) {
-    if (v & G1_OOP_INDIRECT_BIT) {
-      RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
-      int fetch_attempts = 0;
-      while (true) {
-        uintptr_t sa = h->load_state_and_addr_acquire();
-        uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-        if (state == REMOTE_HANDLE_LOCAL) {
-          value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
-          break;
-        } else if (state == REMOTE_HANDLE_DEAD) {
-          value = nullptr;
-          break;
-        } else if (state == REMOTE_HANDLE_REMOTE) {
-          if (h->cas_remote_to_fetching()) {
-            value = G1BarrierSet::resolve_remote_fetch(h);
-            if (value != nullptr) break;
-            fetch_attempts++;
-            if (fetch_attempts >= 3) { h->set_dead(); value = nullptr; break; }
-            continue;
-          } else {
-            value = G1BarrierSet::wait_for_fetch(h);
-            if (value != nullptr) break;
-            continue;
-          }
-        } else {
-          value = G1BarrierSet::wait_for_fetch(h);
-          if (value != nullptr) break;
-          continue;
-        }
-      }
-    } else {
-      value = cast_to_oop(v & G1_OOP_ADDR_MASK);
-    }
+    value = cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_slow((oopDesc*)v));
   }
 
   guarantee(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
@@ -183,43 +154,10 @@ oop_load_in_heap_at(oop base, ptrdiff_t offset) {
             "oop_load_in_heap_at: tagged base oop " PTR_FORMAT " at offset " INTX_FORMAT,
             cast_from_oop<uintptr_t>(base), (intx)offset);
   oop value = ModRef::oop_load_in_heap_at(base, offset);
-  // Resolve tagged oops — same full barrier as oop_load_in_heap.
-  // Must handle REMOTE (trigger fetch), not just strip tags.
+  // Resolve tagged oops via the centralized runtime (same as oop_load_in_heap).
   uintptr_t v = cast_from_oop<uintptr_t>(value);
   if ((v & G1_OOP_TAG_MASK) != 0) {
-    if (v & G1_OOP_INDIRECT_BIT) {
-      RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
-      int fetch_attempts = 0;
-      while (true) {
-        uintptr_t sa = h->load_state_and_addr_acquire();
-        uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-        if (state == REMOTE_HANDLE_LOCAL) {
-          value = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
-          break;
-        } else if (state == REMOTE_HANDLE_DEAD) {
-          value = nullptr;
-          break;
-        } else if (state == REMOTE_HANDLE_REMOTE) {
-          if (h->cas_remote_to_fetching()) {
-            value = G1BarrierSet::resolve_remote_fetch(h);
-            if (value != nullptr) break;
-            fetch_attempts++;
-            if (fetch_attempts >= 3) { h->set_dead(); value = nullptr; break; }
-            continue;
-          } else {
-            value = G1BarrierSet::wait_for_fetch(h);
-            if (value != nullptr) break;
-            continue;
-          }
-        } else {
-          value = G1BarrierSet::wait_for_fetch(h);
-          if (value != nullptr) break;
-          continue;
-        }
-      }
-    } else {
-      value = cast_to_oop(v & G1_OOP_ADDR_MASK);
-    }
+    value = cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_slow((oopDesc*)v));
   }
   assert(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
          "oop_load_in_heap_at: barrier returned tagged " PTR_FORMAT " base=" PTR_FORMAT " off=" INTX_FORMAT,

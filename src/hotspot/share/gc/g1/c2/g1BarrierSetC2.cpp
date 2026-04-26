@@ -101,14 +101,11 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   // sender_for_compiled_frame: nmethod_sp + frame_size → correct caller.
   masm.set_last_Java_frame(rsp, rbp, nullptr, rscratch1);
   masm.movptr(c_rarg0, rbx);
-  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_slow)));
-  {
-    Compile* C = Compile::current();
-    if (!C->output()->in_scratch_emit_size()) {
-      OopMap* map = new OopMap(0, 0);
-      C->output()->oop_map_set()->add_gc_map(masm.offset(), map);
-    }
-  }
+  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint)));
+  // No OopMap needed: resolve_tagged_oop_no_safepoint stays in _thread_in_Java
+  // without thread transitions, so no safepoint can occur during the call.
+  // The empty OopMap(0,0) that was here previously caused GC corruption when
+  // the old safepoint-safe slow path allowed GC to run mid-fetch.
   masm.reset_last_Java_frame(r15_thread, false);
 
   // Result in rax → _ref.  Restore original rbx from thread scratch.

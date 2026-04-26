@@ -58,10 +58,16 @@ public:
   //     a still-tagged result.
   // Leaf fast path: handles LOCAL + Unique. Returns tagged oop for REMOTE.
   static oopDesc* resolve_tagged_oop(oopDesc* tagged);
-  // Non-leaf slow path: handles REMOTE fetch with Heap_lock + ThreadBlockInVM.
-  // Two entry points for different calling conventions:
-  static oopDesc* resolve_tagged_oop_slow(oopDesc* tagged);           // C1/C2/arraycopy: plain + ThreadInVMfromJava
-  static oopDesc* resolve_tagged_oop_slow_vm(JavaThread* current, oopDesc* tagged); // interpreter: JRT_ENTRY via call_VM
+  // Safepoint-safe slow path: REMOTE fetch with ThreadInVMfromJava + ThreadBlockInVM.
+  // Called from interpreter barrier (C++ inline) where the frame is GC-walkable.
+  static oopDesc* resolve_tagged_oop_slow(oopDesc* tagged);
+  // Non-safepointing slow path: REMOTE fetch WITHOUT thread state transitions.
+  // Called from C1/C2/assembler stubs where the OopMap may be incomplete.
+  // The thread stays in _thread_in_Java; blocking I/O adds at most ~50us
+  // to safepoint initiation, which is acceptable.
+  static oopDesc* resolve_tagged_oop_no_safepoint(oopDesc* tagged);
+  // JRT_ENTRY wrapper for interpreter call_VM.
+  static oopDesc* resolve_tagged_oop_slow_vm(JavaThread* current, oopDesc* tagged);
 };
 
 #endif // SHARE_GC_G1_G1BARRIERSETRUNTIME_HPP
