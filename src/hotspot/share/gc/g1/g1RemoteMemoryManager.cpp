@@ -1447,71 +1447,32 @@ HeapRegion* G1RemoteMemoryManager::allocate_new_fcr_region() {
 // Key principle: dead objects' bytes NEVER cross the network.
 
 size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
-  // Handle-id-based liveness: a remote object is alive if its handle_id
-  // appears in _remote_roots (logged during P12 concurrent marking) OR
-  // if it has a dormant anchor with remote_refcount > 0 (referenced by
-  // another remote object's edge table that was itself rooted).
-  //
-  // For prototype: use _remote_roots as the live set. Objects not in this
-  // set are considered dead. This is correct after a completed concurrent
-  // marking cycle (remark collected the roots).
-
-  // Build live handle set from _remote_roots
+  // Count remote handles for logging
   size_t total_remote = 0;
-
-  // Step 1: Build root slot_ids from live handle_ids for backend
-  size_t root_capacity = 256;
-  size_t* root_ids = (size_t*)os::malloc(root_capacity * sizeof(size_t), mtGC);
-  size_t num_roots = 0;
-
-  // Include handles from _remote_roots (P12 concurrent marking log)
-  for (int i = 0; i < _remote_roots_count; i++) {
-    RemoteHandle* h = (RemoteHandle*)_remote_roots[i];
-    if (h != nullptr && h->is_remote()) {
-      if (num_roots >= root_capacity) {
-        root_capacity *= 2;
-        root_ids = (size_t*)os::realloc(root_ids, root_capacity * sizeof(size_t), mtGC);
-      }
-      root_ids[num_roots++] = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
-    }
-  }
-
-  // Report ALL remote handles as roots. Without a completed concurrent
-  // marking cycle, _remote_roots is empty/stale and we cannot determine
-  // which handles are truly dead. Reporting all as alive is conservative
-  // but correct — the executor will only free objects not in the root set.
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
     for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
       if (e->_handle != nullptr && e->_handle->is_remote()) {
         total_remote++;
-        if (num_roots >= root_capacity) {
-          root_capacity *= 2;
-          root_ids = (size_t*)os::realloc(root_ids, root_capacity * sizeof(size_t), mtGC);
-        }
-        root_ids[num_roots++] = e->_handle->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
       }
     }
   }
   table_unlock();
 
-  // Step 2: Report roots to backend and request collection.
-  log_info(gc)("collect_dead: step2a report_roots V1 (%zu roots, %zu remote)", num_roots, total_remote);
-  // V1: slot-id based roots
-  _backend->report_roots(root_ids, num_roots);
-  os::free(root_ids);
-  log_info(gc)("collect_dead: step2a report_roots V1 DONE");
-
-  // V2: also report handle-id based roots from P12 concurrent marking
-  if (_remote_roots_count > 0) {
-    log_info(gc)("collect_dead: step2a report_remote_roots_v2 (%d roots)", _remote_roots_count);
-    _backend->report_remote_roots_v2(_remote_roots, _remote_roots_count);
-    log_info(gc)("collect_dead: step2a report_remote_roots_v2 DONE");
-  } else {
-    log_info(gc)("collect_dead: SKIP report_remote_roots_v2 (no concurrent marking roots)");
+  // Without concurrent marking data, we cannot determine which remote
+  // objects are dead. Skip collection entirely — all stay alive.
+  if (_remote_roots_count == 0) {
+    log_info(gc)("collect_dead: SKIP (no concurrent marking roots, %zu remote handles retained)", total_remote);
+    return 0;
   }
 
-  // Step 2b: trace_and_report — get dead handles + cross-boundary edges
+  // Send V2 roots from concurrent marking to executor
+  log_info(gc)("collect_dead: report_remote_roots_v2 (%d marking roots, %zu remote handles)",
+               _remote_roots_count, total_remote);
+  _backend->report_remote_roots_v2(_remote_roots, _remote_roots_count);
+  log_info(gc)("collect_dead: report_remote_roots_v2 DONE");
+
+  // trace_and_report — get dead handles + cross-boundary edges
   uintptr_t* dead_ids = nullptr;
   size_t num_dead = 0;
   size_t bytes_freed = 0;
@@ -1519,10 +1480,10 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   uintptr_t* cross_tgt = nullptr;
   size_t num_cross = 0;
 
-  log_info(gc)("collect_dead: step2b trace_and_report START");
+  log_info(gc)("collect_dead: trace_and_report START");
   _backend->trace_and_report(&dead_ids, &num_dead, &bytes_freed,
                              &cross_src, &cross_tgt, &num_cross);
-  log_info(gc)("collect_dead: step2b trace_and_report DONE (dead=%zu freed=%zu cross=%zu)",
+  log_info(gc)("collect_dead: trace_and_report DONE (dead=%zu freed=%zu cross=%zu)",
                num_dead, bytes_freed, num_cross);
 
   // Step 2c: Populate cross-boundary roots.
