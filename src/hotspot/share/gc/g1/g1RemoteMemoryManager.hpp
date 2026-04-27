@@ -795,6 +795,10 @@ public:
 
   int verify_no_untagged_refs_to_eviction_set(const bool* eviction_set, uint num_regions);
 
+  // Untag all tagged oop fields in the heap. Called on eviction abort to
+  // restore clean oops, preventing barrier gaps from causing crashes.
+  int untag_all_heap_refs(WorkerThreads* workers = nullptr, uint num_workers = 0);
+
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
   // For each edge entry:

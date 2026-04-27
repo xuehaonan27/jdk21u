@@ -983,6 +983,55 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
   return total_tagged;
 }
 
+int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_workers) {
+  class UntagClosure : public BasicOopIterateClosure {
+    int _untagged;
+  public:
+    UntagClosure() : _untagged(0) {}
+
+    virtual void do_oop(oop* p) {
+      uintptr_t raw = *(uintptr_t*)p;
+      if (raw == 0) return;
+      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) !=
+          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+
+      RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) {
+        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+        *(uintptr_t*)p = addr;
+        _untagged++;
+      }
+    }
+    virtual void do_oop(narrowOop* p) { }
+    int untagged() const { return _untagged; }
+  };
+
+  UntagClosure cl;
+  for (uint i = 0; i < _g1h->num_regions(); i++) {
+    HeapRegion* hr = _g1h->region_at(i);
+    if (hr->is_empty() || hr->is_free()) continue;
+    HeapWord* p = hr->bottom();
+    HeapWord* region_end = hr->end();
+    while (p < hr->top()) {
+      if (p < hr->bottom() || p >= region_end) break;
+      oop obj = cast_to_oop(p);
+      Klass* k = obj->klass_or_null();
+      if (k == nullptr) break;
+      size_t sz = obj->size();
+      if (sz == 0 || sz > (size_t)(region_end - p)) break;
+      obj->oop_iterate(&cl);
+      p += sz;
+    }
+  }
+
+  if (cl.untagged() > 0) {
+    log_info(gc)("Untag cleanup: restored %d tagged refs to clean oops", cl.untagged());
+  }
+  return cl.untagged();
+}
+
 int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     const bool* eviction_set, uint num_regions) {
 
@@ -1067,7 +1116,10 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     }
   }
 
-  // 2. Verify roots: check thread stacks, JNI, OopStorages
+  int heap_missed = cl.missed();
+
+  // 2. Verify roots (informational only — root refs are handled by
+  // root-catch relocation and Pre-E guard, not by Phase C tagging).
   cl.set_cur_obj(nullptr);
   Threads::oops_do(&cl, nullptr);
   JNIHandles::oops_do(&cl);
@@ -1080,15 +1132,18 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     CLDToOopClosure cld_cl(&cl, ClassLoaderData::_claim_none);
     ClassLoaderDataGraph::cld_do(&cld_cl);
   }
-  // CodeCache NOT verified — nmethod oops are handled by Phase D root-catch,
-  // not Phase C tagging (tagging nmethod oops corrupts compiled code).
   _g1h->ref_processor_cm()->weak_oops_do(&cl);
 
-  if (cl.missed() > 0) {
-    log_warning(gc)("VERIFY: %d untagged refs to eviction candidates AFTER tagging!",
-                    cl.missed());
+  int root_missed = cl.missed() - heap_missed;
+  if (heap_missed > 0) {
+    log_warning(gc)("VERIFY: %d untagged HEAP refs to eviction candidates AFTER tagging!",
+                    heap_missed);
   }
-  return cl.missed();
+  if (root_missed > 0) {
+    log_info(gc)("VERIFY: %d root refs to candidates (handled by Pre-E guard, not Phase C)",
+                 root_missed);
+  }
+  return heap_missed;
 }
 
 Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {

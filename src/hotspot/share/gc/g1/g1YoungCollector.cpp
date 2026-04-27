@@ -1586,7 +1586,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       {
         int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates, num_regions);
         if (missed > 0) {
-          log_warning(gc)("Eviction ABORTED: %d untagged refs found after tagging", missed);
+          log_warning(gc)("Eviction ABORTED: %d untagged HEAP refs found after tagging", missed);
           for (uint i = 0; i < num_regions; i++) {
             if (eviction_candidates[i]) {
               HeapRegion* hr = _g1h->region_at(i);
@@ -1595,6 +1595,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             }
           }
           total_candidates = 0;
+          rmm->untag_all_heap_refs();
         }
       }
 
