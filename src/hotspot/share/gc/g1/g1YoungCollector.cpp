@@ -1304,7 +1304,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // objects to a dedicated "root-catch" region. This allows eviction of
     // regions that previously had 1-2 root refs blocking them.
     if (total_candidates > 0) {
-      const int max_pins = 8192;
+      const int max_pins = 131072;
       RootPinEntry* pins = NEW_C_HEAP_ARRAY(RootPinEntry, max_pins, mtGC);
       int num_pins = 0;
 
@@ -1568,15 +1568,18 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
-      // ---- Phase C: Fast targeted scan — RSet + young + candidate + destination ----
+      // ---- Phase C: Full heap scan for tagging refs to eviction candidates ----
+      // Full scan is O(entire_heap) but guarantees all references are found.
+      // The fast scan missed references in edge cases (root-catch regions,
+      // FCR regions, newly promoted objects).
       {
         Ticks phase_c_start = Ticks::now();
         uint nworkers = _g1h->workers()->active_workers();
-        rmm->tag_refs_to_eviction_set_fast(eviction_candidates, num_regions,
-                                           _pre_evac_tops,
-                                           _g1h->workers(), nworkers);
+        int tagged = rmm->tag_all_heap_refs_to_eviction_set(eviction_candidates,
+                                                            num_regions,
+                                                            _g1h->workers(), nworkers);
         double phase_c_ms = (Ticks::now() - phase_c_start).seconds() * 1000.0;
-        log_info(gc)("Phase C fast scan: %.1fms (%u workers)", phase_c_ms, nworkers);
+        log_info(gc)("Phase C full scan: %.1fms (%u workers, %d tagged)", phase_c_ms, nworkers, tagged);
       }
 
       // ---- Phase C.5: Verify no untagged refs remain ----
