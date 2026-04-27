@@ -544,6 +544,16 @@ public:
     uint idx = target_hr->hrm_index();
     if (idx >= _num_regions || !_eviction_set[idx]) return;
 
+    // Root-catch relocated: object has forwarding pointer → redirect to new address
+    if (target->is_forwarded()) {
+      oop fwd = target->forwardee();
+      uintptr_t tag_bits = raw & G1_OOP_TAG_MASK;
+      uintptr_t new_addr = cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK;
+      *(uintptr_t*)p = tag_bits | new_addr;
+      _tagged++;
+      return;
+    }
+
     RemoteHandle* h = _rmm->handle_for(target);
     if (h != nullptr) {
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
@@ -983,6 +993,9 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       HeapRegion* target_hr = _g1h->heap_region_containing(target);
       uint idx = target_hr->hrm_index();
       if (idx >= _num_regions || !_eviction_set[idx]) return;
+
+      // Root-catch relocated objects have forwarding pointers — OK
+      if (target->is_forwarded()) return;
 
       _missed++;
       if (_missed <= 20) {

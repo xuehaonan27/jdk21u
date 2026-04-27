@@ -1019,6 +1019,16 @@ void G1YoungCollector::post_evacuate_cleanup_2(G1ParScanThreadStateSet* per_thre
   phase_times()->record_post_evacuate_cleanup_task_2_time((Ticks::now() - start).seconds() * 1000.0);
 }
 
+struct RootPinEntry {
+  oop*      root;
+  uintptr_t obj_addr;
+};
+static int rpe_cmp(const void* a, const void* b) {
+  uintptr_t aa = ((const RootPinEntry*)a)->obj_addr;
+  uintptr_t bb = ((const RootPinEntry*)b)->obj_addr;
+  return (aa < bb) ? -1 : (aa > bb) ? 1 : 0;
+}
+
 // Closure that checks if a root oop targets a cold-destination region.
 // Used by both Path 1 (root-pinning) and Path 2 (existing region pinning).
 class ColdRegionPinClosure : public OopClosure {
@@ -1224,20 +1234,29 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     int total_candidates = path1_candidates + path2_candidates;
 
-    // ---- Phase D (early): Root-pin check BEFORE expensive heap scan ----
-    // Pin ALL candidates (path1 AND path2) that have root references.
-    // Root oops (thread stacks, JNI handles, etc.) bypass the load barrier,
-    // so evicting a region with root refs causes SIGSEGV on mprotect-guarded pages.
+    // ---- Phase D: Root-catch relocation ----
+    // Instead of pinning entire 16MB regions for a few root-referenced
+    // objects (often just a Double or small array), relocate root-pinned
+    // objects to a dedicated "root-catch" region. This allows eviction of
+    // regions that previously had 1-2 root refs blocking them.
     if (total_candidates > 0) {
-      class EvictionCandidatePinClosure : public OopClosure {
+      const int max_pins = 8192;
+      RootPinEntry* pins = NEW_C_HEAP_ARRAY(RootPinEntry, max_pins, mtGC);
+      int num_pins = 0;
+
+      class EvictionRootCollectClosure : public OopClosure {
         G1CollectedHeap* _g1h;
-        bool*            _eviction_candidates;
+        const bool*      _eviction_candidates;
         uint             _num_regions;
-        int              _pinned;
+        RootPinEntry*    _pins;
+        int&             _num_pins;
+        int              _max_pins;
       public:
-        EvictionCandidatePinClosure(G1CollectedHeap* g1h, bool* candidates, uint num_regions)
-          : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions), _pinned(0) {}
-        int pinned() const { return _pinned; }
+        EvictionRootCollectClosure(G1CollectedHeap* g1h, const bool* candidates,
+                                   uint num_regions, RootPinEntry* pins,
+                                   int& num_pins, int max_pins)
+          : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
+            _pins(pins), _num_pins(num_pins), _max_pins(max_pins) {}
         void do_oop(oop* p) {
           oop obj = *p;
           if (obj == nullptr) return;
@@ -1251,34 +1270,141 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           HeapRegion* hr = _g1h->heap_region_containing(obj);
           if (hr == nullptr) return;
           uint idx = hr->hrm_index();
-          if (idx < _num_regions && _eviction_candidates[idx]) {
-            _eviction_candidates[idx] = false;
-            _pinned++;
-            log_info(gc)("Root-pinned eviction candidate region %u (root " PTR_FORMAT " -> obj " PTR_FORMAT ")",
-                         idx, p2i(p), p2i((void*)obj));
+          if (idx < _num_regions && _eviction_candidates[idx] && _num_pins < _max_pins) {
+            _pins[_num_pins] = {p, cast_from_oop<uintptr_t>(obj)};
+            _num_pins++;
           }
         }
         void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
       };
 
-      EvictionCandidatePinClosure pin_cl(_g1h, eviction_candidates, num_regions);
-      Threads::oops_do(&pin_cl, nullptr);
-      JNIHandles::oops_do(&pin_cl);
-      OopStorageSet::strong_oops_do(&pin_cl);
+      EvictionRootCollectClosure collect_cl(_g1h, eviction_candidates, num_regions,
+                                             pins, num_pins, max_pins);
+      Threads::oops_do(&collect_cl, nullptr);
+      JNIHandles::oops_do(&collect_cl);
+      OopStorageSet::strong_oops_do(&collect_cl);
       for (auto id : EnumRange<OopStorageSet::WeakId>()) {
-        OopStorageSet::storage(id)->oops_do(&pin_cl);
+        OopStorageSet::storage(id)->oops_do(&collect_cl);
       }
       {
-        CLDToOopClosure cld_cl(&pin_cl, ClassLoaderData::_claim_none);
+        CLDToOopClosure cld_cl(&collect_cl, ClassLoaderData::_claim_none);
         ClassLoaderDataGraph::cld_do(&cld_cl);
       }
       {
-        CodeBlobToOopClosure code_cl(&pin_cl, false);
+        CodeBlobToOopClosure code_cl(&collect_cl, false);
         CodeCache::blobs_do(&code_cl);
       }
-      _g1h->ref_processor_cm()->weak_oops_do(&pin_cl);
-      rmm->oops_do_remote_anchors(&pin_cl);
-      rmm->oops_do_remote_cross_roots(&pin_cl);
+      _g1h->ref_processor_cm()->weak_oops_do(&collect_cl);
+      rmm->oops_do_remote_anchors(&collect_cl);
+      rmm->oops_do_remote_cross_roots(&collect_cl);
+
+      // Relocate collected root-pinned objects to a catch region
+      if (num_pins > 0) {
+        qsort(pins, num_pins, sizeof(RootPinEntry), rpe_cmp);
+
+        HeapRegion* root_catch = _g1h->allocate_fcr_region();
+        if (root_catch == nullptr) {
+          // Fallback: pin regions the old way
+          for (int i = 0; i < num_pins; i++) {
+            oop obj = cast_to_oop(pins[i].obj_addr);
+            if (!_g1h->is_in(obj)) continue;
+            HeapRegion* hr = _g1h->heap_region_containing(obj);
+            uint idx = hr->hrm_index();
+            if (idx < num_regions && eviction_candidates[idx]) {
+              eviction_candidates[idx] = false;
+              regions_pinned++;
+              total_candidates--;
+            }
+          }
+          log_warning(gc)("Root-catch: cannot allocate catch region, pinned %d regions", regions_pinned);
+        } else {
+          HeapWord* catch_top = root_catch->bottom();
+          int relocated = 0;
+          int roots_updated = 0;
+          int fallback_pinned = 0;
+
+          uintptr_t prev_addr = 0;
+          HeapWord* prev_new = nullptr;
+
+          for (int i = 0; i < num_pins; i++) {
+            uintptr_t obj_addr = pins[i].obj_addr;
+            oop* root_p = pins[i].root;
+
+            if (obj_addr == prev_addr && prev_new != nullptr) {
+              // Duplicate root to same object — update this root too
+              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+              uintptr_t tags = raw & G1_OOP_TAG_MASK;
+              *root_p = cast_to_oop(tags | ((uintptr_t)prev_new & G1_OOP_ADDR_MASK));
+              roots_updated++;
+              continue;
+            }
+
+            oop obj = cast_to_oop(obj_addr);
+            if (obj->is_forwarded()) {
+              // Already relocated by an earlier entry — update root to forwardee
+              oop fwd = obj->forwardee();
+              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+              uintptr_t tags = raw & G1_OOP_TAG_MASK;
+              *root_p = cast_to_oop(tags | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK));
+              prev_addr = obj_addr;
+              prev_new = cast_from_oop<HeapWord*>(fwd);
+              roots_updated++;
+              continue;
+            }
+
+            size_t word_sz = obj->size();
+            if (catch_top + word_sz > root_catch->end()) {
+              // Catch region full — fallback pin for this region
+              HeapRegion* hr = _g1h->heap_region_containing(obj);
+              uint idx = hr->hrm_index();
+              if (idx < num_regions && eviction_candidates[idx]) {
+                eviction_candidates[idx] = false;
+                regions_pinned++;
+                total_candidates--;
+                fallback_pinned++;
+              }
+              prev_addr = obj_addr;
+              prev_new = nullptr;
+              continue;
+            }
+
+            // Copy object to catch region
+            Copy::aligned_disjoint_words((HeapWord*)obj_addr, catch_top, word_sz);
+            oop new_obj = cast_to_oop(catch_top);
+            root_catch->update_bot_for_obj(catch_top, word_sz);
+
+            // Install forwarding pointer in old location (Phase B/C/E check this)
+            obj->forward_to(new_obj);
+
+            // Update root (preserve tag bits)
+            uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+            uintptr_t tags = raw & G1_OOP_TAG_MASK;
+            *root_p = cast_to_oop(tags | ((uintptr_t)catch_top & G1_OOP_ADDR_MASK));
+
+            // Rekey handle table (old_addr → new_addr)
+            rmm->update_handle_for_evacuation(obj, new_obj);
+
+            prev_addr = obj_addr;
+            prev_new = catch_top;
+            catch_top += word_sz;
+            relocated++;
+            roots_updated++;
+          }
+
+          root_catch->set_top(catch_top);
+          if (relocated > 0 || fallback_pinned > 0) {
+            log_info(gc)("Root-catch relocation: %d objects (%zuKB) relocated to region %u, "
+                         "%d roots updated, %d regions fallback-pinned",
+                         relocated,
+                         (size_t)(catch_top - root_catch->bottom()) * HeapWordSize / K,
+                         root_catch->hrm_index(), roots_updated, fallback_pinned);
+          }
+          if (catch_top == root_catch->bottom()) {
+            FreeRegionList tmp("tmp");
+            _g1h->free_region(root_catch, &tmp);
+          }
+        }
+      }
 
       // Clean up cold_destination/root_pinned flags from earlier scan
       for (uint i = 0; i < num_regions; i++) {
@@ -1288,8 +1414,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           hr->clear_root_pinned();
         }
       }
-      regions_pinned += pin_cl.pinned();
-      total_candidates -= pin_cl.pinned();
+      FREE_C_HEAP_ARRAY(RootPinEntry, pins);
     }
 
     if (total_candidates > 0) {
@@ -1329,6 +1454,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               while (p < hr->top()) {
                 if (p < hr->bottom() || p >= region_end) break;
                 oop obj = cast_to_oop(p);
+                if (obj->is_forwarded()) {
+                  p += obj->size_given_klass(obj->klass());
+                  continue;
+                }
                 if (obj->klass_or_null() == nullptr) break;
                 size_t sz = obj->size();
                 if (sz == 0 || sz > (size_t)(region_end - p)) break;
@@ -1358,6 +1487,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             while (p < hr->top()) {
               if (p < hr->bottom() || p >= region_end) break;
               oop obj = cast_to_oop(p);
+              if (obj->is_forwarded()) {
+                p += obj->size_given_klass(obj->klass());
+                continue;
+              }
               if (obj->klass_or_null() == nullptr) break;
               size_t sz = obj->size();
               if (sz == 0 || sz > (size_t)(region_end - p)) break;
@@ -1429,6 +1562,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         HeapWord* p = hr->bottom();
         while (p < hr->top() && num_entries < max_entries) {
           oop obj = cast_to_oop(p);
+          if (obj->is_forwarded()) {
+            p += obj->size_given_klass(obj->klass());
+            continue;
+          }
           size_t sz = obj->size();
           if (rmm->prepare_eviction(obj, &hab, &entries[num_entries])) {
             num_entries++;
