@@ -294,6 +294,12 @@
           "evict when heap is >75% full. Requires UseRemoteExecutor or "   \
           "G1SimulateRemoteEviction.")                                     \
                                                                             \
+  product(uint, LocalMemoryRatio, 100, DIAGNOSTIC,                          \
+          "Percentage of Xmx available as local memory (1-100). "           \
+          "local_capacity = Xmx * LocalMemoryRatio / 100. When < 100, "    \
+          "enables tiered eviction: Tier1 (>60% local), Tier2 (>85%), "    \
+          "Tier3 (>95%). Overrides G1RemoteEvictionThreshold.")                                     \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \

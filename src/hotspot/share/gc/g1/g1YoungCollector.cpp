@@ -38,6 +38,7 @@
 #include "gc/g1/g1HRPrinter.hpp"
 #include "gc/g1/g1MonitoringSupport.hpp"
 #include "gc/g1/g1ParScanThreadState.inline.hpp"
+#include "gc/g1/g1Analytics.hpp"
 #include "gc/g1/g1Policy.hpp"
 #include "gc/g1/g1RemoteBackend.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
@@ -1161,7 +1162,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // to tag every reference to eviction targets. This catches refs that
   // remset-only tagging misses (dirty cards not refined, post-evacuation
   // card dirtying, cross-region refs from non-collected regions).
-  if (G1RemoteEvictionThreshold > 0 || G1SimulateRemoteEviction) {
+  if (G1RemoteEvictionThreshold > 0 || G1SimulateRemoteEviction || LocalMemoryRatio < 100) {
     guarantee(!UseCompressedOops,
               "Remote eviction requires -XX:-UseCompressedOops "
               "(tagged oops need 64-bit pointers)");
@@ -1205,20 +1206,75 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       path1_candidates++;
     }
 
-    // Path 2: existing old regions above threshold
-    if (G1RemoteEvictionThreshold > 0) {
+    // Path 2: tiered eviction based on local memory pressure
+    //
+    // When LocalMemoryRatio < 100, the real deadline is local_capacity, not Xmx.
+    // Three tiers based on local pressure (with allocation rate lookahead):
+    //   Tier 1 (>60%): proactive — evict cold old regions to 50% target
+    //   Tier 2 (>85%): aggressive — evict all old regions to 50% target
+    //   Tier 3 (>95%): emergency — evict everything evictable
+    //
+    // Falls back to G1RemoteEvictionThreshold if LocalMemoryRatio == 100.
+    {
       size_t heap_capacity = _g1h->max_capacity();
-      size_t threshold_bytes = (heap_capacity * G1RemoteEvictionThreshold) / 100;
+      size_t local_used = pre_cleanup_heap_used;
+      int eviction_tier = 0;
+      size_t evict_target_bytes = 0;
 
-      if (pre_cleanup_heap_used > threshold_bytes) {
-        size_t to_free = pre_cleanup_heap_used - threshold_bytes;
-        log_info(gc)("Path 2 eviction: heap " SIZE_FORMAT "MB / " SIZE_FORMAT "MB "
-                     "(threshold %u%% = " SIZE_FORMAT "MB), need " SIZE_FORMAT "KB",
-                     pre_cleanup_heap_used / M, heap_capacity / M,
-                     G1RemoteEvictionThreshold, threshold_bytes / M, to_free / K);
+      if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
+        size_t local_capacity = (heap_capacity * LocalMemoryRatio) / 100;
 
+        // Allocation rate lookahead: predict bytes allocated before next GC.
+        // predict_alloc_rate_ms() returns bytes/ms; multiply by 2000ms lookahead.
+        double alloc_rate_ms = _g1h->policy()->analytics()->predict_alloc_rate_ms();
+        size_t lookahead_alloc = (size_t)(alloc_rate_ms * 2000.0);
+        size_t effective_used = local_used + lookahead_alloc;
+
+        double pressure = (double)effective_used / (double)local_capacity;
+        size_t target_50pct = local_capacity / 2;
+
+        if (pressure > 0.95) {
+          eviction_tier = 3;
+          evict_target_bytes = (local_used > target_50pct) ? (local_used - target_50pct) : local_used;
+        } else if (pressure > 0.85) {
+          eviction_tier = 2;
+          evict_target_bytes = (local_used > target_50pct) ? (local_used - target_50pct) : 0;
+        } else if (pressure > 0.60) {
+          eviction_tier = 1;
+          evict_target_bytes = (local_used > target_50pct) ? (local_used - target_50pct) : 0;
+        }
+
+        if (eviction_tier > 0) {
+          log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB / local_cap=" SIZE_FORMAT "MB "
+                       "(%.1f%%), alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, "
+                       "effective=%.1f%%, evict_target=" SIZE_FORMAT "MB",
+                       eviction_tier, local_used / M, local_capacity / M,
+                       pressure * 100.0, alloc_rate_ms / 1024.0,
+                       lookahead_alloc / M,
+                       (double)effective_used / (double)local_capacity * 100.0,
+                       evict_target_bytes / M);
+        }
+      } else if (G1RemoteEvictionThreshold > 0) {
+        // Legacy threshold mode: evict when total heap > threshold% of Xmx
+        size_t threshold_bytes = (heap_capacity * G1RemoteEvictionThreshold) / 100;
+        if (local_used > threshold_bytes) {
+          eviction_tier = 2;
+          evict_target_bytes = local_used - threshold_bytes;
+          log_info(gc)("Legacy eviction: heap " SIZE_FORMAT "MB / " SIZE_FORMAT "MB "
+                       "(threshold %u%% = " SIZE_FORMAT "MB), need " SIZE_FORMAT "MB",
+                       local_used / M, heap_capacity / M,
+                       G1RemoteEvictionThreshold, threshold_bytes / M,
+                       evict_target_bytes / M);
+        }
+      }
+
+      if (eviction_tier > 0 && evict_target_bytes > 0) {
         size_t path2_bytes = 0;
-        for (uint i = 0; i < num_regions && path2_bytes < to_free; i++) {
+        bool unlimited = (eviction_tier >= 3);
+
+        for (uint i = 0; i < num_regions; i++) {
+          if (!unlimited && path2_bytes >= evict_target_bytes) break;
+
           HeapRegion* hr = _g1h->region_at(i);
           if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
           if (hr->is_cold_destination() || hr->is_fetch_cache()) continue;
@@ -1228,6 +1284,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           eviction_candidates[i] = true;
           path2_candidates++;
           path2_bytes += hr->used();
+        }
+
+        if (path2_candidates > 0) {
+          log_info(gc)("Path 2 selected %d regions (" SIZE_FORMAT "MB) for T%d eviction",
+                       path2_candidates, path2_bytes / M, eviction_tier);
         }
       }
     }
@@ -1543,7 +1604,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         HeapRegion* hr = _g1h->region_at(i);
         max_entries += (int)((hr->top() - hr->bottom()) / MinObjAlignmentInBytes) + 1;
       }
-      if (max_entries > 2 * 1024 * 1024) max_entries = 2 * 1024 * 1024;
+      if (max_entries > 8 * 1024 * 1024) max_entries = 8 * 1024 * 1024;
       PreparedEviction* entries = NEW_C_HEAP_ARRAY(PreparedEviction, max_entries, mtGC);
       int* region_start = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
       int* region_count_arr = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
