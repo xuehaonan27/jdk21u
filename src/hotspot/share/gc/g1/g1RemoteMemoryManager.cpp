@@ -1263,6 +1263,43 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
                           (unsigned)card_val,
                           has_tagged_fields ? "yes" : "no",
                           src_hr != nullptr ? src_hr->get_short_type_str() : "?");
+
+          // Dump all oop-width slots on the same card as this stale ref
+          if (_cur_obj != nullptr && _g1h->is_in(_cur_obj)) {
+            HeapWord* card_start = ct->addr_for(ct->byte_for((HeapWord*)p));
+            HeapWord* card_end = card_start + G1CardTable::card_size_in_words();
+            HeapWord* obj_start = (HeapWord*)_cur_obj;
+            HeapWord* obj_end = obj_start + _cur_obj->size();
+            // Clamp to object bounds (skip header: mark + klass = 2 words)
+            HeapWord* scan_start = MAX2(card_start, obj_start + 2);
+            HeapWord* scan_end = MIN2(card_end, obj_end);
+            int n_null = 0, n_tagged = 0, n_live = 0, n_stale_card = 0;
+            for (HeapWord* w = scan_start; w < scan_end; w++) {
+              uintptr_t v = *(uintptr_t*)w;
+              if (v == 0) { n_null++; continue; }
+              if ((v & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+                  (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) { n_tagged++; continue; }
+              oop slot_target;
+              if ((v >> 63) != 0) { slot_target = cast_to_oop(v & G1_OOP_ADDR_MASK); }
+              else { slot_target = cast_to_oop(v); }
+              if (!_g1h->is_in(slot_target)) { continue; }
+              HeapRegion* slot_hr = _g1h->heap_region_containing(slot_target);
+              if (slot_hr != nullptr && (slot_hr->is_free() || slot_hr->is_evict_guarded())) {
+                n_stale_card++;
+              } else {
+                n_live++;
+              }
+            }
+            log_warning(gc)("STALE-REF-SWEEP card dump: card=[" PTR_FORMAT "," PTR_FORMAT
+                            ") obj=[" PTR_FORMAT "," PTR_FORMAT
+                            ") scan=[" PTR_FORMAT "," PTR_FORMAT
+                            "): %d null, %d tagged, %d live, %d stale (of %d slots)",
+                            p2i(card_start), p2i(card_end),
+                            p2i(obj_start), p2i(obj_end),
+                            p2i(scan_start), p2i(scan_end),
+                            n_null, n_tagged, n_live, n_stale_card,
+                            (int)(scan_end - scan_start));
+          }
         }
       }
     }
