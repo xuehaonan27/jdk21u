@@ -184,7 +184,16 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
     return nullptr;
   }
 
-  cast_to_oop(dest)->set_mark(markWord::prototype());
+  {
+    markWord fetched_mw = cast_to_oop(dest)->mark();
+    if (fetched_mw.is_unlocked()) {
+      // Preserve unlocked mark word from remote — keeps identity hash + age
+    } else {
+      // Stale lock/monitor pointer from eviction time — cannot dereference
+      cast_to_oop(dest)->set_mark(markWord::prototype());
+      log_trace(gc)("Fetch: normalized locked mark 0x%lx", (unsigned long)fetched_mw.value());
+    }
+  }
   cast_to_oop(dest)->set_klass(fetched_klass);
   rmm->patch_fetched_fields(h, dest);
 

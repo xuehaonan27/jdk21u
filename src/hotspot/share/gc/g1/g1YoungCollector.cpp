@@ -1760,6 +1760,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           *(uint32_t*)(batch_buf + batch_offset + 24)  = (uint32_t)pe->word_size;
           *(uint32_t*)(batch_buf + batch_offset + 28)  = num_edges;
           memcpy(batch_buf + batch_offset + 32, cast_from_oop<void*>(pe->obj), byte_size);
+          {
+            uintptr_t* mw_in_buf = (uintptr_t*)(batch_buf + batch_offset + 32);
+            markWord mw(*mw_in_buf);
+            if (!mw.is_unlocked()) {
+              *mw_in_buf = markWord::prototype().value();
+            }
+          }
           uint8_t* edge_ptr = batch_buf + batch_offset + 32 + byte_size;
           if (pe->edge_table != nullptr) {
             for (uint32_t j = 0; j < num_edges; j++) {
@@ -1819,6 +1826,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           hr->clear_cardtable();
           _g1h->free_region(hr, &freed_list);
           ::madvise((char*)hr->bottom(), HeapRegion::GrainBytes, MADV_DONTNEED);
+          os::guard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+          hr->set_evict_guarded();
           freed_regions++;
         } else if (rcount > 0 && !region_complete[i]) {
           log_info(gc)("Region %u kept alive: %d objects prepared but some failed "
