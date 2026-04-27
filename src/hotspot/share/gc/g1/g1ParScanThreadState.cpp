@@ -836,6 +836,14 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
               oop resolved = resolve_oop_raw(cast_to_oop(*(uintptr_t*)p));
               if (resolved == obj) {
                 *p = g1_make_unique_oop(obj);
+                // Dirty card so future GCs discover this tagged cross-region ref.
+                // The evacuation write_ref_field_post dirtied the card earlier,
+                // but classification overwrites the value; ensure the card stays
+                // dirty for concurrent refinement to build the correct remset entry.
+                CardTable::CardValue* card = _g1h->card_table()->byte_for((HeapWord*)p);
+                if (*card != G1CardTable::g1_young_card_val()) {
+                  *card = CardTable::dirty_card_val();
+                }
               } else {
                 // Stale ref-site: value doesn't match expected object.
                 // This ref-site was recorded during evacuation but the slot
@@ -863,6 +871,10 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
                 oop resolved = resolve_oop_raw(cast_to_oop(*(uintptr_t*)p));
                 if (resolved == obj) {
                   *p = g1_make_shared_oop((void*)h);
+                  CardTable::CardValue* card = _g1h->card_table()->byte_for((HeapWord*)p);
+                  if (*card != G1CardTable::g1_young_card_val()) {
+                    *card = CardTable::dirty_card_val();
+                  }
                 } else {
                   log_warning(gc)("TagRefSite SKIP stale SHARED: p=" PTR_FORMAT
                     " expected=" PTR_FORMAT " resolved=" PTR_FORMAT, p2i(p), p2i((void*)obj), p2i((void*)resolved));
@@ -877,6 +889,10 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
                   oop resolved = resolve_oop_raw(cast_to_oop(*(uintptr_t*)p));
                   if (resolved == obj) {
                     *p = g1_make_shared_oop((void*)h);
+                    CardTable::CardValue* card = _g1h->card_table()->byte_for((HeapWord*)p);
+                    if (*card != G1CardTable::g1_young_card_val()) {
+                      *card = CardTable::dirty_card_val();
+                    }
                   } else {
                     stale_skip++;
                   }
