@@ -752,9 +752,12 @@ void G1YoungCollector::evacuate_initial_collection_set(G1ParScanThreadStateSet* 
   G1GCPhaseTimes* p = phase_times();
 
   {
+    log_info(gc)("DIAG: merge_heap_roots START");
     Ticks start = Ticks::now();
     rem_set()->merge_heap_roots(true /* initial_evacuation */);
-    p->record_merge_heap_roots_time((Ticks::now() - start).seconds() * 1000.0);
+    double merge_ms = (Ticks::now() - start).seconds() * 1000.0;
+    p->record_merge_heap_roots_time(merge_ms);
+    log_info(gc)("DIAG: merge_heap_roots DONE (%.1fms)", merge_ms);
   }
 
   Tickspan task_time;
@@ -769,7 +772,9 @@ void G1YoungCollector::evacuate_initial_collection_set(G1ParScanThreadStateSet* 
                                       &root_processor,
                                       num_workers,
                                       has_optional_evacuation_work);
+    log_info(gc)("DIAG: G1EvacuateRegionsTask START (%u workers)", num_workers);
     task_time = run_task_timed(&g1_par_task);
+    log_info(gc)("DIAG: G1EvacuateRegionsTask DONE (%.1fms)", task_time.seconds() * 1000.0);
     // Closing the inner scope will execute the destructor for the
     // G1RootProcessor object. By subtracting the WorkerThreads task from the total
     // time of this scope, we get the "NMethod List Cleanup" time. This list is
@@ -2016,7 +2021,9 @@ void G1YoungCollector::collect() {
   // Wait for root region scan here to make sure that it is done before any
   // use of the STW workers to maximize cpu use (i.e. all cores are available
   // just to do that).
+  log_info(gc)("DIAG: wait_for_root_region_scanning START");
   wait_for_root_region_scanning();
+  log_info(gc)("DIAG: wait_for_root_region_scanning DONE");
 
   G1YoungGCVerifierMark vm(this);
   {
@@ -2030,7 +2037,9 @@ void G1YoungCollector::collect() {
     // Increment hotness epoch for recency tracking.
     _g1h->remote_memory_manager()->increment_gc_epoch();
 
+    log_info(gc)("DIAG: pre_evacuate_collection_set START");
     pre_evacuate_collection_set(jtm.evacuation_info());
+    log_info(gc)("DIAG: pre_evacuate_collection_set DONE");
 
     // Save region tops before evacuation for fast Phase C destination scan.
     uint num_regions = _g1h->num_regions();
@@ -2047,9 +2056,9 @@ void G1YoungCollector::collect() {
 
     bool may_do_optional_evacuation = collection_set()->optional_region_length() != 0;
     // Actually do the work...
-    log_trace(gc)(">>> evacuate_initial_collection_set START");
+    log_info(gc)("DIAG: evacuate_initial_collection_set START");
     evacuate_initial_collection_set(&per_thread_states, may_do_optional_evacuation);
-    log_trace(gc)(">>> evacuate_initial_collection_set DONE");
+    log_info(gc)("DIAG: evacuate_initial_collection_set DONE");
 
     if (may_do_optional_evacuation) {
       log_trace(gc)(">>> evacuate_optional START");
