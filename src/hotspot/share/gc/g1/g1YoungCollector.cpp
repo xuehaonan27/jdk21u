@@ -28,6 +28,8 @@
 #include "classfile/javaClasses.inline.hpp"
 #include "compiler/oopMap.hpp"
 #include "gc/g1/g1Allocator.hpp"
+#include "gc/g1/g1BarrierSet.hpp"
+#include "gc/g1/g1DirtyCardQueue.hpp"
 #include "gc/g1/g1CardSetMemory.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1CollectorState.hpp"
@@ -1464,6 +1466,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             CardTable::CardValue* start_card = ct->byte_for(root_catch->bottom());
             CardTable::CardValue* end_card   = ct->byte_for(catch_top - 1) + 1;
             memset(start_card, CardTable::dirty_card_val(), end_card - start_card);
+            // Enqueue to dirty card queue so next GC's Merge Heap Roots scans them.
+            // Raw card table dirtying alone is invisible to G1's remset processing.
+            G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
+            G1DirtyCardQueue tmp_queue(&dcqs);
+            for (CardTable::CardValue* card = start_card; card < end_card; card++) {
+              dcqs.enqueue(tmp_queue, card);
+            }
+            dcqs.flush_queue(tmp_queue);
           }
           if (relocated > 0 || fallback_pinned > 0) {
             log_info(gc)("Root-catch relocation: %d objects (%zuKB) relocated to region %u, "
