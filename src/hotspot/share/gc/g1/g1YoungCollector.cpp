@@ -1459,6 +1459,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
 
           root_catch->set_top(catch_top);
+          if (relocated > 0) {
+            G1CardTable* ct = _g1h->card_table();
+            CardTable::CardValue* start_card = ct->byte_for(root_catch->bottom());
+            CardTable::CardValue* end_card   = ct->byte_for(catch_top - 1) + 1;
+            memset(start_card, CardTable::dirty_card_val(), end_card - start_card);
+          }
           if (relocated > 0 || fallback_pinned > 0) {
             log_info(gc)("Root-catch relocation: %d objects (%zuKB) relocated to region %u, "
                          "%d roots updated, %d regions fallback-pinned",
