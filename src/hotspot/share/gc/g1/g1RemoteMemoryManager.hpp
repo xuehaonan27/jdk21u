@@ -597,6 +597,10 @@ public:
   int fixup_tagged_field_handles();
   int fixup_all_local_handles();
 
+  // Post-eviction diagnostic: full heap + root sweep for stale pointers
+  // into freed/guarded regions. O(heap) — gated by G1VerifyAfterEviction.
+  int verify_no_stale_refs_to_freed_regions();
+
   // Check if concurrent marking is in progress
   bool concurrent_marking_active() const;
 

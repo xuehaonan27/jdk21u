@@ -328,6 +328,10 @@
   product(uint, RDMARQDepth, 128, DIAGNOSTIC,                               \
           "Depth of RDMA receive queue.")                \
                                                                             \
+  product(bool, G1VerifyAfterEviction, false, DIAGNOSTIC,                    \
+          "After eviction, scan entire heap + roots for stale pointers "     \
+          "into freed regions. Expensive (O(heap)), debug only.")            \
+                                                                            \
   product(uintx, G1PeriodicGCInterval, 0, MANAGEABLE,                       \
           "Number of milliseconds after a previous GC to wait before "      \
           "triggering a periodic gc. A value of zero disables periodically "\

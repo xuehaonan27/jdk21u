@@ -1918,6 +1918,16 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
     }
 
+    if (G1VerifyAfterEviction && regions_evicted > 0) {
+      log_info(gc)("G1VerifyAfterEviction: running full heap+root sweep for stale refs...");
+      int stale = rmm->verify_no_stale_refs_to_freed_regions();
+      if (stale > 0) {
+        log_warning(gc)("G1VerifyAfterEviction: found %d stale references into freed/guarded regions!", stale);
+      } else {
+        log_info(gc)("G1VerifyAfterEviction: sweep clean — no stale refs detected.");
+      }
+    }
+
     FREE_C_HEAP_ARRAY(bool, eviction_candidates);
 
     // Return freed regions to the free pool

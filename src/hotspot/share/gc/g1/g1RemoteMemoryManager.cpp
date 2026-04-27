@@ -605,6 +605,7 @@ static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure*
   HeapWord* const pb = hr->parsable_bottom_acquire();
   HeapWord* const region_top = hr->top();
   HeapWord* const region_end = hr->end();
+  int objects_scanned = 0;
 
   // Below parsable_bottom: dead objects may have dangling klasses (class unloaded,
   // concurrent rebuild hasn't filled them yet). Use the mark bitmap to find live
@@ -615,6 +616,7 @@ static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure*
       oop obj = cast_to_oop(p);
       size_t sz = obj->size();
       obj->oop_iterate(cl);
+      objects_scanned++;
       p += sz;
     } else {
       p = bitmap->get_next_marked_addr(p, pb);
@@ -623,18 +625,36 @@ static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure*
 
   // Above parsable_bottom: all objects are live, sequential scan is safe.
   if (p < pb) p = pb;
+  HeapWord* seq_start = p;
   while (p < region_top) {
     if (p >= region_end) break;
     oop obj = cast_to_oop(p);
     Klass* k = obj->klass_or_null();
-    if (k == nullptr) break;
+    if (k == nullptr) {
+      size_t skipped_words = pointer_delta(region_top, p);
+      log_warning(gc)("Phase C scan TRUNCATED: region %u null klass at " PTR_FORMAT
+                      " (scanned %d objs, skipping " SIZE_FORMAT " words to top " PTR_FORMAT
+                      ", pb=" PTR_FORMAT ")",
+                      hr->hrm_index(), p2i(p), objects_scanned, skipped_words,
+                      p2i(region_top), p2i(pb));
+      break;
+    }
     size_t sz = obj->size();
-    if (sz == 0) break;
+    if (sz == 0) {
+      size_t skipped_words = pointer_delta(region_top, p);
+      log_warning(gc)("Phase C scan TRUNCATED: region %u zero size at " PTR_FORMAT
+                      " klass=%s (scanned %d objs, skipping " SIZE_FORMAT " words)",
+                      hr->hrm_index(), p2i(p), k->external_name(),
+                      objects_scanned, skipped_words);
+      break;
+    }
     if (sz > (size_t)(region_end - p)) {
       obj->oop_iterate(cl);
+      objects_scanned++;
       break;
     }
     obj->oop_iterate(cl);
+    objects_scanned++;
     p += sz;
   }
 }
@@ -1091,21 +1111,48 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
   };
 
   VerifyTagClosure cl(_g1h, eviction_set, num_regions);
+  const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
-  // 1. Verify heap: same walk as tagging scan (including candidate regions)
+  // 1. Verify heap: use SAME walk as Phase C tagging to avoid blind spots
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
+    if (hr->is_continues_humongous()) continue;
+
+    HeapWord* const pb = hr->parsable_bottom_acquire();
+    HeapWord* const region_top = hr->top();
+    HeapWord* const region_end = hr->end();
 
     HeapWord* p = hr->bottom();
-    HeapWord* region_end = hr->end();
-    while (p < hr->top()) {
-      if (p < hr->bottom() || p >= region_end) break;
+    while (p < pb && p < region_top) {
+      if (bitmap->is_marked(p)) {
+        oop obj = cast_to_oop(p);
+        size_t sz = obj->size();
+        cl.set_cur_obj(obj);
+        obj->oop_iterate(&cl);
+        p += sz;
+      } else {
+        p = bitmap->get_next_marked_addr(p, pb);
+      }
+    }
+
+    if (p < pb) p = pb;
+    while (p < region_top) {
+      if (p >= region_end) break;
       oop obj = cast_to_oop(p);
       Klass* k = obj->klass_or_null();
-      if (k == nullptr) break;
+      if (k == nullptr) {
+        log_warning(gc)("VERIFY scan TRUNCATED: region %u null klass at " PTR_FORMAT
+                        " (pb=" PTR_FORMAT " top=" PTR_FORMAT ")",
+                        hr->hrm_index(), p2i(p), p2i(pb), p2i(region_top));
+        break;
+      }
       size_t sz = obj->size();
-      if (sz == 0) break;
+      if (sz == 0) {
+        log_warning(gc)("VERIFY scan TRUNCATED: region %u zero size at " PTR_FORMAT
+                        " klass=%s", hr->hrm_index(), p2i(p), k->external_name());
+        break;
+      }
       cl.set_cur_obj(obj);
       if (sz > (size_t)(region_end - p)) {
         obj->oop_iterate(&cl);
@@ -1144,6 +1191,146 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
                  root_missed);
   }
   return heap_missed;
+}
+
+int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
+  class StaleRefSweepClosure : public BasicOopIterateClosure {
+    G1CollectedHeap* _g1h;
+    int              _stale;
+    oop              _cur_obj;
+    bool             _is_root;
+  public:
+    StaleRefSweepClosure(G1CollectedHeap* g1h)
+      : _g1h(g1h), _stale(0), _cur_obj(nullptr), _is_root(false) {}
+
+    void set_cur_obj(oop obj) { _cur_obj = obj; _is_root = false; }
+    void set_root_mode() { _cur_obj = nullptr; _is_root = true; }
+
+    virtual void do_oop(oop* p) {
+      uintptr_t raw = *(uintptr_t*)p;
+      if (raw == 0) return;
+      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+
+      oop target;
+      if ((raw >> 63) != 0) {
+        target = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+      } else {
+        target = cast_to_oop(raw);
+      }
+      if (!_g1h->is_in(target)) return;
+
+      HeapRegion* hr = _g1h->heap_region_containing(target);
+      if (hr == nullptr) return;
+
+      bool is_stale = hr->is_free() || hr->is_evict_guarded();
+      if (!is_stale) {
+        Klass* k = cast_to_oop(target)->klass_or_null();
+        if (k == nullptr) is_stale = true;
+      }
+
+      if (is_stale) {
+        _stale++;
+        if (_stale <= 50) {
+          const char* src_kind = _is_root ? "ROOT" : "HEAP";
+          HeapRegion* src_hr = nullptr;
+          const char* src_klass = "?";
+          uint src_region = 9999;
+          if (_cur_obj != nullptr && _g1h->is_in(_cur_obj)) {
+            src_hr = _g1h->heap_region_containing(_cur_obj);
+            src_region = src_hr->hrm_index();
+            Klass* sk = _cur_obj->klass_or_null();
+            if (sk != nullptr) src_klass = sk->external_name();
+          }
+          log_warning(gc)("STALE-REF-SWEEP [%s]: field=" PTR_FORMAT " raw=0x%lx -> target="
+                          PTR_FORMAT " in %s region %u (src_obj=" PTR_FORMAT " klass=%s region=%u)",
+                          src_kind, p2i(p), (unsigned long)raw,
+                          p2i((void*)target),
+                          hr->is_evict_guarded() ? "GUARDED" : "FREE",
+                          hr->hrm_index(),
+                          p2i((void*)_cur_obj), src_klass, src_region);
+        }
+      }
+    }
+    virtual void do_oop(narrowOop* p) {}
+    int stale() const { return _stale; }
+  };
+
+  Ticks start = Ticks::now();
+  StaleRefSweepClosure cl(_g1h);
+  const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
+  int regions_scanned = 0;
+
+  for (uint i = 0; i < _g1h->num_regions(); i++) {
+    HeapRegion* hr = _g1h->region_at(i);
+    if (hr->is_empty() || hr->is_free()) continue;
+    if (hr->is_continues_humongous()) continue;
+    if (hr->is_evict_guarded()) continue;
+
+    HeapWord* const pb = hr->parsable_bottom_acquire();
+    HeapWord* const region_top = hr->top();
+    HeapWord* const region_end = hr->end();
+
+    HeapWord* p = hr->bottom();
+    while (p < pb && p < region_top) {
+      if (bitmap->is_marked(p)) {
+        oop obj = cast_to_oop(p);
+        size_t sz = obj->size();
+        cl.set_cur_obj(obj);
+        obj->oop_iterate(&cl);
+        p += sz;
+      } else {
+        p = bitmap->get_next_marked_addr(p, pb);
+      }
+    }
+
+    if (p < pb) p = pb;
+    while (p < region_top) {
+      if (p >= region_end) break;
+      oop obj = cast_to_oop(p);
+      Klass* k = obj->klass_or_null();
+      if (k == nullptr) break;
+      size_t sz = obj->size();
+      if (sz == 0) break;
+      cl.set_cur_obj(obj);
+      if (sz > (size_t)(region_end - p)) {
+        obj->oop_iterate(&cl);
+        break;
+      }
+      obj->oop_iterate(&cl);
+      p += sz;
+    }
+    regions_scanned++;
+  }
+
+  int heap_stale = cl.stale();
+
+  cl.set_root_mode();
+  Threads::oops_do(&cl, nullptr);
+  JNIHandles::oops_do(&cl);
+  OopStorageSet::strong_oops_do(&cl);
+  {
+    CLDToOopClosure cld_cl(&cl, ClassLoaderData::_claim_none);
+    ClassLoaderDataGraph::cld_do(&cld_cl);
+  }
+  {
+    CodeBlobToOopClosure code_cl(&cl, false);
+    CodeCache::blobs_do(&code_cl);
+  }
+  _g1h->ref_processor_cm()->weak_oops_do(&cl);
+
+  int root_stale = cl.stale() - heap_stale;
+  double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
+
+  if (cl.stale() > 0) {
+    log_warning(gc)("STALE-REF-SWEEP: %d stale refs found (%d heap, %d root) in %.1fms "
+                    "(%d regions scanned)",
+                    cl.stale(), heap_stale, root_stale, elapsed_ms, regions_scanned);
+  } else {
+    log_info(gc)("STALE-REF-SWEEP: clean (0 stale refs) in %.1fms (%d regions scanned)",
+                 elapsed_ms, regions_scanned);
+  }
+  return cl.stale();
 }
 
 Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
