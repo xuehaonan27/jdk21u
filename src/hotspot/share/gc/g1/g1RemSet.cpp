@@ -1318,7 +1318,6 @@ public:
                                                      G1GCPhaseTimes::OptMergeRS;
 
     {
-      // Merge remset of ...
       G1GCParPhaseTimesTracker x(p, merge_remset_phase, worker_id, !_initial_evacuation /* allow_multiple_record */);
 
       {
@@ -1341,7 +1340,7 @@ public:
       }
 
       {
-        // 2. collection set
+        // 2. collection set remset merge
         G1MergeCardSetClosure merge(_scan_state);
         G1ClearBitmapClosure clear(g1h);
         G1CombinedClosure combined(&merge, &clear);
@@ -1353,6 +1352,7 @@ public:
           p->record_or_add_thread_work_item(merge_remset_phase, worker_id, stats.merged(i), i);
         }
       }
+      log_info(gc)("DIAG: worker %u remset merge done", worker_id);
     }
 
     // Now apply the closure to all remaining log entries.
@@ -1366,6 +1366,7 @@ public:
       p->record_thread_work_item(G1GCPhaseTimes::MergeLB, worker_id, cl.cards_dirty(), G1GCPhaseTimes::MergeLBDirtyCards);
       p->record_thread_work_item(G1GCPhaseTimes::MergeLB, worker_id, cl.cards_skipped(), G1GCPhaseTimes::MergeLBSkippedCards);
     }
+    log_info(gc)("DIAG: worker %u merge_heap_roots work() done", worker_id);
   }
 };
 
@@ -1395,6 +1396,7 @@ void G1RemSet::merge_heap_roots(bool initial_evacuation) {
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
 
   {
+    log_info(gc)("DIAG: merge_heap_roots prepare START");
     Ticks start = Ticks::now();
 
     _scan_state->prepare_for_merge_heap_roots();
@@ -1405,6 +1407,7 @@ void G1RemSet::merge_heap_roots(bool initial_evacuation) {
     } else {
       g1h->phase_times()->record_or_add_optional_prepare_merge_heap_roots_time(total.seconds() * 1000.0);
     }
+    log_info(gc)("DIAG: merge_heap_roots prepare DONE (%.1fms)", total.seconds() * 1000.0);
   }
 
   WorkerThreads* workers = g1h->workers();
@@ -1415,9 +1418,9 @@ void G1RemSet::merge_heap_roots(bool initial_evacuation) {
 
   {
     G1MergeHeapRootsTask cl(_scan_state, num_workers, initial_evacuation);
-    log_debug(gc, ergo)("Running %s using %u workers for " SIZE_FORMAT " regions",
-                        cl.name(), num_workers, increment_length);
+    log_info(gc)("DIAG: merge_heap_roots parallel task START (%u workers, " SIZE_FORMAT " regions)", num_workers, increment_length);
     workers->run_task(&cl, num_workers);
+    log_info(gc)("DIAG: merge_heap_roots parallel task DONE");
   }
 
   print_merge_heap_roots_stats();
