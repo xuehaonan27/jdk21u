@@ -35,6 +35,7 @@
 #include "memory/allocation.inline.hpp"
 #include "memory/resourceArea.hpp"
 #include "oops/access.inline.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "oops/fieldStreams.inline.hpp"
 #include "oops/instanceKlass.inline.hpp"
 #include "oops/klass.inline.hpp"
@@ -720,6 +721,7 @@ UNSAFE_ENTRY(jobject, Unsafe_CompareAndExchangeReference(JNIEnv *env, jobject un
   oop p = JNIHandles::resolve(obj);
   assert_field_offset_sane(p, offset);
   oop res = HeapAccess<ON_UNKNOWN_OOP_REF>::oop_atomic_cmpxchg_at(p, (ptrdiff_t)offset, e, x);
+  if (UseG1GC) res = resolve_oop_full(res);
   return JNIHandles::make_local(THREAD, res);
 } UNSAFE_END
 

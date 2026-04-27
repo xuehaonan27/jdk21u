@@ -1724,6 +1724,11 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
 
     // Check if target has been forwarded (mark word contains forwarding ptr)
     if (_g1h->is_in(target_oop)) {
+      HeapRegion* target_hr = _g1h->heap_region_containing(target);
+      if (target_hr != nullptr && (target_hr->is_free() || target_hr->is_evict_guarded())) {
+        removed++;
+        continue;
+      }
       markWord m = target_oop->mark();
       if (m.is_marked()) {
         oop forwardee = cast_to_oop(m.decode_pointer());

@@ -209,8 +209,8 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   // Reference should not be null here as such are never pushed to the task queue.
   oop obj = g1_resolved_load<IS_NOT_NULL>(p);
 
-  // Phase 6: skip remote objects (resolved to non-heap slot_id)
-  if (!_g1h->is_in(obj)) {
+  // Null from resolve_oop_raw (REMOTE handle) or non-heap address: skip.
+  if (obj == nullptr || !_g1h->is_in(obj)) {
     return;
   }
 
