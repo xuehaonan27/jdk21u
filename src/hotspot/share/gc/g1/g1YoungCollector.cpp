@@ -1592,6 +1592,70 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
+      // ---- Pre-E Safety Guard: remove candidate regions with dangling roots ----
+      // Root-catch should have relocated all root-referenced objects, but may
+      // miss some (catch region full, roots added during Phase B/C scanning).
+      // Any region with raw root oops MUST NOT be evicted — those roots bypass
+      // the load barrier and would SIGSEGV on madvise'd pages.
+      {
+        class PreEvictionRootGuardClosure : public OopClosure {
+          G1CollectedHeap* _g1h;
+          bool*            _eviction_candidates;
+          uint             _num_regions;
+          int              _regions_guarded;
+          int              _roots_found;
+        public:
+          PreEvictionRootGuardClosure(G1CollectedHeap* g1h, bool* candidates, uint num_regions)
+            : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
+              _regions_guarded(0), _roots_found(0) {}
+          void do_oop(oop* p) {
+            uintptr_t raw = *(uintptr_t*)p;
+            if (raw == 0) return;
+            if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+                (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+            oop obj;
+            if ((raw & G1_OOP_TAG_MASK) != 0) {
+              obj = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+            } else {
+              obj = (oop)raw;
+            }
+            if (!_g1h->is_in(obj)) return;
+            HeapRegion* hr = _g1h->heap_region_containing(obj);
+            uint idx = hr->hrm_index();
+            if (idx < _num_regions && _eviction_candidates[idx]) {
+              _eviction_candidates[idx] = false;
+              hr->clear_cold_destination();
+              _regions_guarded++;
+              _roots_found++;
+            } else if (idx < _num_regions) {
+              _roots_found++;
+            }
+          }
+          void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+          int regions_guarded() const { return _regions_guarded; }
+          int roots_found() const { return _roots_found; }
+        };
+
+        PreEvictionRootGuardClosure guard_cl(_g1h, eviction_candidates, num_regions);
+        Threads::oops_do(&guard_cl, nullptr);
+        JNIHandles::oops_do(&guard_cl);
+        OopStorageSet::strong_oops_do(&guard_cl);
+        {
+          CLDToOopClosure cld_cl(&guard_cl, ClassLoaderData::_claim_none);
+          ClassLoaderDataGraph::cld_do(&cld_cl);
+        }
+        {
+          CodeBlobToOopClosure code_cl(&guard_cl, false);
+          CodeCache::blobs_do(&code_cl);
+        }
+
+        if (guard_cl.regions_guarded() > 0) {
+          total_candidates -= guard_cl.regions_guarded();
+          log_info(gc)("Pre-E root guard: removed %d candidate regions with %d dangling roots",
+                       guard_cl.regions_guarded(), guard_cl.roots_found());
+        }
+      }
+
       // ---- Phase E: Evict non-pinned candidates (batched) ----
       {
       Ticks phase_e_start = Ticks::now();
