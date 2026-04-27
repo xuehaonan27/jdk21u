@@ -739,6 +739,7 @@ public:
   // Prepare: safety checks, handle lookup, edge table build.
   // Does NOT send to backend. Returns false if object is unevictable.
   bool prepare_eviction(oop obj, RemoteHandleAllocBuffer* hab, PreparedEviction* out);
+  static void log_prepare_eviction_stats();
 
   // Finalize: set handle remote, mark word, fill with filler.
   // Called after backend confirms batch eviction.

@@ -1580,6 +1580,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         region_complete[i] = all_prepared;
       }
       double e1_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
+      G1RemoteMemoryManager::log_prepare_eviction_stats();
 
       // E2: Batch-send to remote backend.
       Ticks e2_start = Ticks::now();

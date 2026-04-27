@@ -280,12 +280,25 @@ G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
   return et;
 }
 
+static volatile int _prep_fail_null = 0;
+static volatile int _prep_fail_locked = 0;
+static volatile int _prep_fail_edge = 0;
+static volatile int _prep_fail_slot = 0;
+static volatile int _prep_success = 0;
+static volatile int _prep_diag_logged = 0;
+
 bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* hab,
                                               PreparedEviction* out) {
-  if (obj == nullptr) return false;
+  if (obj == nullptr) { Atomic::add(&_prep_fail_null, 1); return false; }
 
   markWord mw = obj->mark();
-  if (!mw.is_unlocked()) return false;
+  if (!mw.is_unlocked()) {
+    if (Atomic::add(&_prep_fail_locked, 1) <= 3 && !_prep_diag_logged) {
+      log_info(gc)("prepare_eviction: locked obj=" PTR_FORMAT " mw=0x%lx klass=%s",
+                   p2i((void*)obj), (unsigned long)mw.value(), obj->klass()->external_name());
+    }
+    return false;
+  }
 
   Klass* klass = obj->klass();
   size_t word_size = obj->size_given_klass(klass);
@@ -294,12 +307,13 @@ bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* h
   if (h == nullptr) h = create_handle_for(obj, hab);
 
   ObjectEdgeTable* et = build_edge_table(obj, h, hab);
-  if (et == nullptr) return false;
+  if (et == nullptr) { Atomic::add(&_prep_fail_edge, 1); return false; }
   store_edge_table(et);
 
   size_t slot_id = _backend->allocate_slot_id();
-  if (slot_id == (size_t)-1) return false;
+  if (slot_id == (size_t)-1) { Atomic::add(&_prep_fail_slot, 1); return false; }
 
+  Atomic::add(&_prep_success, 1);
   out->obj = obj;
   out->handle = h;
   out->klass = klass;
@@ -307,6 +321,16 @@ bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* h
   out->slot_id = slot_id;
   out->edge_table = et;
   return true;
+}
+
+void G1RemoteMemoryManager::log_prepare_eviction_stats() {
+  if (_prep_fail_null + _prep_fail_locked + _prep_fail_edge + _prep_fail_slot + _prep_success > 0) {
+    log_info(gc)("prepare_eviction stats: success=%d null=%d locked=%d edge=%d slot=%d",
+                 _prep_success, _prep_fail_null, _prep_fail_locked, _prep_fail_edge, _prep_fail_slot);
+    _prep_diag_logged = 1;
+  }
+  _prep_fail_null = _prep_fail_locked = _prep_fail_edge = _prep_fail_slot = _prep_success = 0;
+  _prep_diag_logged = 0;
 }
 
 void G1RemoteMemoryManager::finalize_eviction(PreparedEviction* entry) {
