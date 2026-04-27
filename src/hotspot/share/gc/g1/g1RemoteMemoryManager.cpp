@@ -191,8 +191,7 @@ class EdgeTableBuildClosure : public BasicOopIterateClosure {
   RemoteHandleAllocBuffer* _hab;
   oop                    _base_obj;
 
-  // Temporary edge buffer (stack-allocated, fixed capacity)
-  static const int MAX_EDGES = 256;
+  static const int MAX_EDGES = 8192;
   G1RemoteMemoryManager::EdgeEntry _edges[MAX_EDGES];
   int _count;
 
@@ -263,7 +262,7 @@ G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
   obj->oop_iterate(&cl);
 
   if (cl.overflowed()) {
-    log_info(gc)("Edge table overflow: obj=" PTR_FORMAT " klass=%s has >256 oop fields — skipping eviction",
+    log_info(gc)("Edge table overflow: obj=" PTR_FORMAT " klass=%s has >8192 oop fields — skipping eviction",
                  p2i((void*)obj), obj->klass()->external_name());
     return nullptr;
   }
@@ -919,7 +918,12 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
   }
 
   // Phase C root scan: tag references from non-heap root sources
-  // (thread stacks, JNI handles, ClassLoaderData, CodeCache, OopStorages)
+  // (thread stacks, JNI handles, ClassLoaderData, OopStorages)
+  // NOTE: CodeCache is NOT scanned here. Nmethod oop constants are raw
+  // machine-code immediates — tagging them corrupts compiled code (the
+  // movabs constant becomes a non-canonical tagged address that #GPs on
+  // dereference). Phase D root-catch already relocates objects referenced
+  // by nmethod oops to the catch region, so no tagging is needed.
   {
     EvictionSetTagClosure root_cl(this, _g1h, eviction_set, num_regions);
 
@@ -933,10 +937,6 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     {
       CLDToOopClosure cld_cl(&root_cl, ClassLoaderData::_claim_none);
       ClassLoaderDataGraph::cld_do(&cld_cl);
-    }
-    {
-      CodeBlobToOopClosure code_cl(&root_cl, false);
-      CodeCache::blobs_do(&code_cl);
     }
 
     for (int j = 0; j < root_cl.local_count(); j++) {
@@ -1056,10 +1056,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     CLDToOopClosure cld_cl(&cl, ClassLoaderData::_claim_none);
     ClassLoaderDataGraph::cld_do(&cld_cl);
   }
-  {
-    CodeBlobToOopClosure code_cl(&cl, false);
-    CodeCache::blobs_do(&code_cl);
-  }
+  // CodeCache NOT verified — nmethod oops are handled by Phase D root-catch,
+  // not Phase C tagging (tagging nmethod oops corrupts compiled code).
   _g1h->ref_processor_cm()->weak_oops_do(&cl);
 
   if (cl.missed() > 0) {
