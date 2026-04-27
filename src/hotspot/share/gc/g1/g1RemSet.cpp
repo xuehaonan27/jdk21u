@@ -1285,9 +1285,14 @@ class G1MergeHeapRootsTask : public WorkerTask {
   void apply_closure_to_dirty_card_buffers(G1MergeLogBufferCardsClosure* cl, uint worker_id) {
     G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
     size_t buffer_capacity = dcqs.buffer_capacity();
+    size_t buffers_processed = 0;
     while (BufferNode* node = _dirty_card_buffers.pop()) {
       cl->apply_to_buffer(node, buffer_capacity, worker_id);
       dcqs.deallocate_buffer(node);
+      buffers_processed++;
+    }
+    if (buffers_processed > 100) {
+      log_info(gc)("DIAG: worker %u processed " SIZE_FORMAT " DCQ buffers", worker_id, buffers_processed);
     }
   }
 
@@ -1354,14 +1359,18 @@ public:
       }
       log_info(gc)("DIAG: worker %u remset merge done", worker_id);
     }
+    log_info(gc)("DIAG: worker %u remset scope closed", worker_id);
 
     // Now apply the closure to all remaining log entries.
     if (_initial_evacuation) {
       assert(merge_remset_phase == G1GCPhaseTimes::MergeRS, "Wrong merge phase");
+      log_info(gc)("DIAG: worker %u MergeLB START", worker_id);
       G1GCParPhaseTimesTracker x(p, G1GCPhaseTimes::MergeLB, worker_id);
 
       G1MergeLogBufferCardsClosure cl(g1h, _scan_state);
       apply_closure_to_dirty_card_buffers(&cl, worker_id);
+      log_info(gc)("DIAG: worker %u MergeLB DONE (dirty=" SIZE_FORMAT " skipped=" SIZE_FORMAT ")",
+                    worker_id, cl.cards_dirty(), cl.cards_skipped());
 
       p->record_thread_work_item(G1GCPhaseTimes::MergeLB, worker_id, cl.cards_dirty(), G1GCPhaseTimes::MergeLBDirtyCards);
       p->record_thread_work_item(G1GCPhaseTimes::MergeLB, worker_id, cl.cards_skipped(), G1GCPhaseTimes::MergeLBSkippedCards);
