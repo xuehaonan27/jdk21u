@@ -1231,17 +1231,20 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t effective_used = local_used + lookahead_alloc;
 
         double pressure = (double)effective_used / (double)local_capacity;
-        size_t target_50pct = local_capacity / 2;
+        // Eviction target: 30% of local_capacity. Must evict before swap builds up —
+        // the eviction process itself reads all candidate objects, so heavy swap during
+        // Phase B/C/E makes the STW pause catastrophically long (observed: 7.5s at 61%).
+        size_t target_low = (local_capacity * 30) / 100;
 
-        if (pressure > 0.95) {
+        if (pressure > 0.85) {
           eviction_tier = 3;
-          evict_target_bytes = (local_used > target_50pct) ? (local_used - target_50pct) : local_used;
-        } else if (pressure > 0.85) {
-          eviction_tier = 2;
-          evict_target_bytes = (local_used > target_50pct) ? (local_used - target_50pct) : 0;
+          evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : local_used;
         } else if (pressure > 0.60) {
+          eviction_tier = 2;
+          evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
+        } else if (pressure > 0.40) {
           eviction_tier = 1;
-          evict_target_bytes = (local_used > target_50pct) ? (local_used - target_50pct) : 0;
+          evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
         }
 
         if (eviction_tier > 0) {
