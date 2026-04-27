@@ -1153,6 +1153,21 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
   assert_used_and_recalculate_used_equal(_g1h);
 
+  // Early stale-ref sweep: run at every GC for first 20 cycles to catch first occurrence
+  {
+    static int _gc_count_for_sweep = 0;
+    G1RemoteMemoryManager* rmm_early = _g1h->remote_memory_manager();
+    if (rmm_early != nullptr && _gc_count_for_sweep < 20) {
+      int stale_early = rmm_early->verify_no_stale_refs_to_freed_regions();
+      if (stale_early > 0) {
+        log_warning(gc)("EARLY-SWEEP GC#%d: %d stale refs found!", _gc_count_for_sweep, stale_early);
+      } else {
+        log_info(gc)("EARLY-SWEEP GC#%d: clean", _gc_count_for_sweep);
+      }
+      _gc_count_for_sweep++;
+    }
+  }
+
   // Remote collection: free dead remote objects without fetching.
   // "Garbage never crosses the network" — dispatches to the selected backend
   // (sim, TCP executor, or RDMA executor) via G1RemoteMemoryManager.

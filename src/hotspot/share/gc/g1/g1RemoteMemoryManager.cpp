@@ -1236,19 +1236,33 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
           HeapRegion* src_hr = nullptr;
           const char* src_klass = "?";
           uint src_region = 9999;
+          bool has_tagged_fields = false;
           if (_cur_obj != nullptr && _g1h->is_in(_cur_obj)) {
             src_hr = _g1h->heap_region_containing(_cur_obj);
             src_region = src_hr->hrm_index();
             Klass* sk = _cur_obj->klass_or_null();
             if (sk != nullptr) src_klass = sk->external_name();
+            // Check if source obj has any tagged fields (indicates FCR-fetched)
+            HeapWord* obj_start = (HeapWord*)_cur_obj;
+            HeapWord* obj_end = obj_start + _cur_obj->size();
+            for (HeapWord* w = obj_start + 2; w < obj_end; w++) {
+              uintptr_t v = *(uintptr_t*)w;
+              if (v & G1_OOP_MANAGED_BIT) { has_tagged_fields = true; break; }
+            }
           }
+          G1CardTable* ct = _g1h->card_table();
+          G1CardTable::CardValue card_val = *ct->byte_for((HeapWord*)p);
           log_warning(gc)("STALE-REF-SWEEP [%s]: field=" PTR_FORMAT " raw=0x%lx -> target="
-                          PTR_FORMAT " in %s region %u (src_obj=" PTR_FORMAT " klass=%s region=%u)",
+                          PTR_FORMAT " in %s region %u (src_obj=" PTR_FORMAT " klass=%s region=%u"
+                          " card=0x%02x fcr_tagged=%s src_type=%s)",
                           src_kind, p2i(p), (unsigned long)raw,
                           p2i((void*)target),
                           hr->is_evict_guarded() ? "GUARDED" : "FREE",
                           hr->hrm_index(),
-                          p2i((void*)_cur_obj), src_klass, src_region);
+                          p2i((void*)_cur_obj), src_klass, src_region,
+                          (unsigned)card_val,
+                          has_tagged_fields ? "yes" : "no",
+                          src_hr != nullptr ? src_hr->get_short_type_str() : "?");
         }
       }
     }
