@@ -1557,6 +1557,37 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
   return updated;
 }
 
+int G1RemoteMemoryManager::fixup_all_local_handles() {
+  int updated = 0;
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+      RemoteHandle* h = e->_handle;
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state != REMOTE_HANDLE_LOCAL) continue;
+
+      uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      if (addr == 0) continue;
+      oop target = cast_to_oop(addr);
+      if (!_g1h->is_in(target)) continue;
+
+      HeapRegion* hr = _g1h->heap_region_containing(target);
+      if (hr != nullptr && (hr->is_free() || hr->is_evict_guarded())) continue;
+
+      markWord m = target->mark();
+      if (m.is_marked()) {
+        oop forwardee = cast_to_oop(m.decode_pointer());
+        h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
+        updated++;
+      }
+    }
+  }
+  if (updated > 0) {
+    log_info(gc)("Handle table fixup: %d LOCAL handles updated for forwarded objects", updated);
+  }
+  return updated;
+}
+
 HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
   // Fast path: try CAS bump pointer on existing FCR region (lock-free).
   HeapRegion* fcr = _current_fcr;

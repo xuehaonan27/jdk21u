@@ -1080,8 +1080,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // forwarded by other closures (e.g., through remset scanning).
   {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
-    if (rmm != nullptr && rmm->tagged_field_count() > 0) {
-      rmm->fixup_tagged_field_handles();
+    if (rmm != nullptr) {
+      if (rmm->tagged_field_count() > 0) {
+        rmm->fixup_tagged_field_handles();
+      }
+      rmm->fixup_all_local_handles();
     }
   }
 

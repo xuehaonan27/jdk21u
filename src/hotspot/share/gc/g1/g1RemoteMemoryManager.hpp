@@ -595,6 +595,7 @@ public:
   // targets have been forwarded during evacuation. Lazily removes stale
   // entries (fields no longer tagged). Returns number of handles updated.
   int fixup_tagged_field_handles();
+  int fixup_all_local_handles();
 
   // Check if concurrent marking is in progress
   bool concurrent_marking_active() const;
