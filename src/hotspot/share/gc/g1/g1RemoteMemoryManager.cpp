@@ -1508,6 +1508,13 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
     oop* field_addr = _tagged_fields[i]._field_addr;
     RemoteHandle* h = _tagged_fields[i]._handle;
 
+    // field_addr may be in an evicted (mprotected) region — skip without reading
+    HeapRegion* field_hr = _g1h->heap_region_containing((HeapWord*)field_addr);
+    if (field_hr != nullptr && (field_hr->is_free() || field_hr->is_evict_guarded())) {
+      removed++;
+      continue;
+    }
+
     uintptr_t raw = *(uintptr_t*)field_addr;
 
     // Stale entry: field no longer tagged or points to a different Handle
