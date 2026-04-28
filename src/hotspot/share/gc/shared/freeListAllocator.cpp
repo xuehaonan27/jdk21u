@@ -25,6 +25,7 @@
 #include "precompiled.hpp"
 #include "gc/shared/freeListAllocator.hpp"
 #include "logging/log.hpp"
+#include "runtime/safepoint.hpp"
 #include "utilities/globalCounter.inline.hpp"
 
 FreeListAllocator::NodeList::NodeList() :
@@ -154,7 +155,11 @@ void FreeListAllocator::release(void* free_node) {
     size_t count = _pending_lists[index].add(node);
     if (count <= _config->transfer_threshold()) return;
   }
-  // Attempt transfer when number pending exceeds the transfer threshold.
+  // During STW (safepoint), skip the transfer: write_synchronize() iterates
+  // all threads' RCU counters and can hang if a stopped thread has a stale
+  // active counter. The pending list grows larger but transfers on next
+  // non-STW release(). No ABA risk since no concurrent allocate() during STW.
+  if (SafepointSynchronize::is_at_safepoint()) return;
   try_transfer_pending();
 }
 
