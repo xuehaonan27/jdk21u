@@ -790,6 +790,13 @@ public:
   int tag_all_heap_refs_to_eviction_set(const bool* eviction_set, uint num_regions,
                                         WorkerThreads* workers = nullptr, uint num_workers = 0);
 
+  // Phase C.1 safety net: scan only the newly-evacuated area
+  // [pre_evac_tops[i], top()) of each region.  Catches refs that the
+  // general Phase C scan missed due to truncation or parse gaps.
+  int tag_evacuated_area_refs_to_eviction_set(
+      const bool* eviction_set, uint num_regions,
+      HeapWord* const* pre_evac_tops);
+
   // Fast Phase C: scan only RSet entries + young/candidate/destination regions.
   // O(rset + young + candidates + destinations) instead of O(entire_heap).
   // pre_evac_tops[i] is region i's top() before evacuation — old regions where

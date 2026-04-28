@@ -763,6 +763,53 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
   return total_tagged;
 }
 
+int G1RemoteMemoryManager::tag_evacuated_area_refs_to_eviction_set(
+    const bool* eviction_set, uint num_regions,
+    HeapWord* const* pre_evac_tops) {
+
+  EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
+  int regions_rescanned = 0;
+
+  for (uint i = 0; i < _g1h->num_regions(); i++) {
+    HeapRegion* hr = _g1h->region_at(i);
+    if (hr->is_empty() || hr->is_free()) continue;
+    if (hr->is_continues_humongous()) continue;
+
+    HeapWord* pre_top = pre_evac_tops[i];
+    HeapWord* cur_top = hr->top();
+    if (pre_top >= cur_top) continue;
+
+    HeapWord* p = pre_top;
+    HeapWord* region_end = hr->end();
+    while (p < cur_top) {
+      if (p >= region_end) break;
+      oop obj = cast_to_oop(p);
+      Klass* k = obj->klass_or_null();
+      if (k == nullptr) {
+        log_warning(gc)("Phase C.1: null klass at " PTR_FORMAT " in region %u "
+                        "(pre_top=" PTR_FORMAT " cur_top=" PTR_FORMAT ")",
+                        p2i(p), i, p2i(pre_top), p2i(cur_top));
+        break;
+      }
+      size_t sz = obj->size();
+      if (sz == 0 || sz > (size_t)(region_end - p)) break;
+      obj->oop_iterate(&cl);
+      p += sz;
+    }
+    regions_rescanned++;
+  }
+
+  int total_tagged = cl.tagged();
+  if (total_tagged > 0) {
+    for (int j = 0; j < cl.local_count(); j++) {
+      add_tagged_field(cl.local_buf()[j]._field_addr, cl.local_buf()[j]._handle);
+    }
+    log_warning(gc)("Phase C.1: re-scanned %d regions, tagged %d missed refs "
+                    "(%d no handle)", regions_rescanned, total_tagged, cl.no_handle());
+  }
+  return total_tagged;
+}
+
 // RSet visitor: for each card in a candidate's RSet, scan with
 // EvictionSetTagClosure to tag refs pointing to ANY candidate.
 class EvictionSetRsetScanner {

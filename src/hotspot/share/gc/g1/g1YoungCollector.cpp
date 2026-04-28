@@ -1621,6 +1621,25 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         log_info(gc)("Phase C full scan: %.1fms (%u workers, %d tagged)", phase_c_ms, nworkers, tagged);
       }
 
+      // ---- Phase C.1: Safety-net scan of newly-evacuated areas ----
+      // Objects evacuated during this GC land above _pre_evac_tops[i] in
+      // destination regions.  The general Phase C scan covers them via
+      // sequential iteration above parsable_bottom, but truncation on
+      // unexpected heap gaps can silently skip objects.  This targeted
+      // pass re-scans only the newly-evacuated portion of each region.
+      if (_pre_evac_tops != nullptr) {
+        Ticks phase_c1_start = Ticks::now();
+        int c1_tagged = rmm->tag_evacuated_area_refs_to_eviction_set(
+            eviction_candidates, num_regions, _pre_evac_tops);
+        double phase_c1_ms = (Ticks::now() - phase_c1_start).seconds() * 1000.0;
+        if (c1_tagged > 0) {
+          log_warning(gc)("Phase C.1 safety-net: %.1fms, tagged %d refs missed by general scan",
+                          phase_c1_ms, c1_tagged);
+        } else {
+          log_info(gc)("Phase C.1 safety-net: %.1fms, 0 missed refs", phase_c1_ms);
+        }
+      }
+
       // ---- Phase C.5: Verify no untagged refs remain ----
       {
         int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates, num_regions);
