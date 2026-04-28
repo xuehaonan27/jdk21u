@@ -625,20 +625,40 @@ Klass* RDMAExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_s
   *(uint64_t*)(msg + 16) = slot_id;
   if (!rdma_send_msg(msg, 24)) { io_unlock(); return nullptr; }
 
-  uint8_t* resp = (uint8_t*)os::malloc(128 * 1024, mtGC);
-  size_t resp_len = 0;
-  if (!rdma_wait_recv(resp, 128 * 1024, &resp_len)) { os::free(resp); io_unlock(); return nullptr; }
+  void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
+  struct ibv_wc wc;
+  if (!poll_cq_wait(_recv_cq, /*wr_id*/0, &wc)) { io_unlock(); return nullptr; }
 
-  io_unlock();
+  uint8_t* resp = (uint8_t*)recv_buf;
+  size_t resp_len = wc.byte_len;
+  if (resp_len < 36) {
+    log_warning(gc)("RDMAExecutor: fetch response too short: " SIZE_FORMAT " bytes", resp_len);
+    io_unlock();
+    return nullptr;
+  }
 
-  if (*(uint32_t*)resp != RE_RESP_OBJECT_DATA) { os::free(resp); return nullptr; }
+  if (*(uint32_t*)resp != RE_RESP_OBJECT_DATA) {
+    io_unlock();
+    return nullptr;
+  }
 
+  uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
   uint64_t resp_klass = *(uint64_t*)(resp + 24);
   uint32_t resp_ws = *(uint32_t*)(resp + 32);
-  memcpy(dest, resp + 36, resp_ws * HeapWordSize);
+  size_t byte_size = (size_t)resp_ws * HeapWordSize;
+
+  if (36 + byte_size > resp_len || 36 + byte_size > resp_msg_len) {
+    log_warning(gc)("RDMAExecutor: fetch resp_ws=%u claims " SIZE_FORMAT
+                    "B but response only " SIZE_FORMAT " bytes (header length %u)",
+                    resp_ws, byte_size, resp_len, resp_msg_len);
+    io_unlock();
+    return nullptr;
+  }
+
+  memcpy(dest, resp + 36, byte_size);
   if (out_word_size) *out_word_size = resp_ws;
 
-  os::free(resp);
+  io_unlock();
   _total_fetched++;
   return (Klass*)resp_klass;
 }
