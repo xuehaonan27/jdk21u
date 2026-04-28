@@ -25,6 +25,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/mman.h>
 #include <infiniband/verbs.h>
 
 // Protocol constants (match remote_protocol.h)
@@ -198,6 +199,21 @@ bool RDMAExecutorBackend::setup_rdma_resources() {
   if (!buf) { log_warning(gc)("RDMA: buffer malloc failed"); return false; }
   memset(buf, 0, total_size);
 
+  // Defense against fastswap (the custom kernel module that swaps pages over
+  // RDMA): mlock the buffer so the kernel cannot swap it out. Without this,
+  // fetch_remote_object → libc memcpy can SIGSEGV at SEGV_ACCERR when the
+  // recv buffer's page is reclaimed under cgroup memory pressure, despite
+  // ibv_reg_mr's pinning. Observed crash signature: libc.so.6+0x18b963 with
+  // si_addr in the recv buffer range.
+  if (mlock(buf, total_size) != 0) {
+    log_warning(gc)("RDMA: mlock failed for " SIZE_FORMAT " bytes (errno=%d: %s). "
+                    "Page faults during fetch may SIGSEGV under memory pressure. "
+                    "Fix: 'ulimit -l unlimited'.",
+                    total_size, errno, os::strerror(errno));
+    // Continue without mlock — registration may still work, and the SIGSEGV
+    // is intermittent. Better to attempt running than to refuse to start.
+  }
+
   _local_mr = ibv_reg_mr(_pd, buf, total_size,
                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                           IBV_ACCESS_REMOTE_READ);
@@ -207,6 +223,7 @@ bool RDMAExecutorBackend::setup_rdma_resources() {
                     "Fix: 'ulimit -l unlimited' or /etc/security/limits.conf. "
                     "Or reduce: -XX:RDMADataBufSize=<smaller> -XX:RDMAMsgBufSize=<smaller>",
                     total_size, errno, os::strerror(errno));
+    munlock(buf, total_size);
     os::free(buf);
     return false;
   }
@@ -521,7 +538,9 @@ void RDMAExecutorBackend::shutdown() {
   if (_recv_cq) { ibv_destroy_cq(_recv_cq); _recv_cq = nullptr; }
   if (_local_mr) {
     void* buf = _local_mr->addr;
+    size_t total_size = 2 * RDMAMsgBufSize + RDMADataBufSize;
     ibv_dereg_mr(_local_mr);
+    munlock(buf, total_size);
     os::free(buf);
     _local_mr = nullptr;
   }
