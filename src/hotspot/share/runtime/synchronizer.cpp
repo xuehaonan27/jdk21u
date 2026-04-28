@@ -919,6 +919,39 @@ intptr_t ObjectSynchronizer::FastHashCode(Thread* current, oop obj) {
     markWord temp, test;
     intptr_t hash;
     markWord mark = read_stable_mark(obj);
+    // ---- LIBAPTH diag: catch corrupt mark word before crashing ----
+    {
+      uintptr_t mv = mark.value();
+      uintptr_t lock = mv & 0x3;
+      uintptr_t pointer = mv & ~uintptr_t(0x7);
+      // Sanity check: if lock=10 (monitor) or 00 (lightweight), the upper bits
+      // must be a canonical address. Reject obviously bogus values.
+      bool bogus =
+        (lock == 0x2 || lock == 0x0) &&
+        (pointer != 0) &&
+        ((pointer >> 47) != 0 && (pointer >> 47) != 0x1FFFF);
+      if (bogus) {
+        Klass* k = obj->klass_or_null();
+        log_warning(gc)("FastHashCode CORRUPT MARK: obj=" PTR_FORMAT
+                        " mark=0x%lx (lock=%lu bogus_ptr=" PTR_FORMAT ") klass=%s",
+                        p2i((void*)obj), (unsigned long)mv,
+                        (unsigned long)lock, p2i((void*)pointer),
+                        k != nullptr ? k->external_name() : "<null>");
+        // Print 64 bytes around the object to see if it's a real header
+        if (Universe::heap()->is_in((void*)obj)) {
+          uintptr_t* p = (uintptr_t*)((uintptr_t)obj & ~uintptr_t(0x3F));
+          log_warning(gc)("  Memory dump @ " PTR_FORMAT ":", p2i(p));
+          for (int i = 0; i < 8; i++) {
+            log_warning(gc)("    [%2d] " PTR_FORMAT ": 0x%016lx 0x%016lx",
+                            i, p2i(p + i*2),
+                            (unsigned long)p[i*2], (unsigned long)p[i*2+1]);
+          }
+        }
+        // Mark this thread as having seen a corrupt obj — let the crash happen
+        // so we still get a useful hs_err. But the diagnostic is already in the
+        // GC log.
+      }
+    }
     if (VerifyHeavyMonitors) {
       assert(LockingMode == LM_MONITOR, "+VerifyHeavyMonitors requires LockingMode == 0 (LM_MONITOR)");
       guarantee((obj->mark().value() & markWord::lock_mask_in_place) != markWord::locked_value, "must not be lightweight/stack-locked");
