@@ -66,6 +66,12 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   // call (Phase 2) execute while the caller's registers are saved on
   // the stack, so neither call can corrupt live values.
   //
+  // C2 may keep live scalar oops in XMM registers at the barrier site.
+  // The runtime helpers follow the native ABI and may clobber caller-saved
+  // XMM state, so the C2 stub must save FP/vector registers as well as GP
+  // registers.  Otherwise a tagged-load slow path can corrupt an oop that
+  // is restored from XMM later in the compiled method.
+  //
   // rbx is callee-saved (survives both calls) and is used to shuttle
   // the result from rax across the pop.  The original rbx is stashed
   // in G1ThreadLocalData::_barrier_scratch before the push.
@@ -80,7 +86,7 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   Label slow_path, done;
 
   masm.movptr(barrier_scratch, rbx);
-  masm.push_call_clobbered_registers(false /* save_fpu */);
+  masm.push_call_clobbered_registers(true /* save_fpu */);
 
   // Phase 1: Leaf call (handles LOCAL + Unique)
   if (_ref != c_rarg0) {
@@ -102,7 +108,7 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   // === Common exit: resolved oop in rax ===
   masm.bind(done);
   masm.movptr(rbx, rax);
-  masm.pop_call_clobbered_registers(false);
+  masm.pop_call_clobbered_registers(true /* restore_fpu */);
   if (_ref == rbx) {
     // Result already in _ref (rbx). Original rbx is dead.
   } else {

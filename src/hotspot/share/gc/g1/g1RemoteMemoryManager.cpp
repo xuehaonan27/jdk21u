@@ -52,8 +52,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _remote_roots(nullptr), _remote_roots_count(0), _remote_roots_capacity(0),
     _cross_roots_count(0), _deferred_decrement_count(0),
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
-    _current_fcr(nullptr), _fcr_lock(0),
-    _fcr_evac_writes(0), _fcr_fixup_nulls(0) {
+    _fcr_evac_writes(0), _fcr_fixup_nulls(0),
+    _current_fcr(nullptr), _fcr_lock(0) {
   _table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
   memset(_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
   memset((void*)_stripe_locks, 0, sizeof(_stripe_locks));
@@ -2006,8 +2006,8 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
-    if (!hr->is_old()) continue;
     if (hr->is_continues_humongous()) continue;
+    if (!hr->is_old() && !hr->is_starts_humongous()) continue;
 
     cl.set_src_is_fcr(hr->is_fetch_cache());
 
@@ -2042,7 +2042,7 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
   }
 
   if (cl.fixed() > 0 || cl.skipped() > 0) {
-    log_warning(gc)("Old-region stale-ref fixup: %d fixed (forwardee or null), %d skipped"
+    log_warning(gc)("Old/humongous-region stale-ref fixup: %d fixed (forwardee or null), %d skipped"
                     " (FCR-source NULLs: %d / total-evac FCR writes: %llu vs total-fixup FCR NULLs: %llu)",
                     cl.fixed(), cl.skipped(), cl.fcr_nulls(),
                     (unsigned long long)fcr_evac_writes(),
