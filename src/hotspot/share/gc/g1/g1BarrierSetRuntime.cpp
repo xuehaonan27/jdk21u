@@ -262,7 +262,12 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
   if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-  if (state == REMOTE_HANDLE_DEAD) return nullptr;
+  if (state == REMOTE_HANDLE_DEAD) {
+    log_warning(gc)("resolve_fast_checks: DEAD handle " PTR_FORMAT
+                    " reached by mutator (slot=%lu) — returning nullptr",
+                    p2i(h), (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
+    return nullptr;
+  }
 
   *handle_out = h;
   return nullptr;
@@ -287,7 +292,16 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
 
     if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-    if (state == REMOTE_HANDLE_DEAD)  return nullptr;
+    if (state == REMOTE_HANDLE_DEAD)  {
+      // Returning nullptr here propagates into JIT-compiled callers and crashes
+      // them deep in the data flow (RAX=0 deref) because C2 may have elided the
+      // implicit null check on the load result. Log loudly so we know if DEAD
+      // mutator-reachability is the source of the next SIGSEGV.
+      log_warning(gc)("resolve_tagged_oop_slow: DEAD handle " PTR_FORMAT
+                      " reached by mutator (slot=%lu) — returning nullptr",
+                      p2i(h), (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
+      return nullptr;
+    }
 
     if (state == REMOTE_HANDLE_REMOTE) {
       if (h->cas_remote_to_fetching()) {
@@ -361,7 +375,15 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
 
     if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-    if (state == REMOTE_HANDLE_DEAD)  return nullptr;
+    if (state == REMOTE_HANDLE_DEAD)  {
+      // Same diagnostic as the safepointing variant. C2 callers have elided
+      // implicit null checks on the result, so a nullptr return manifests as
+      // SIGSEGV at offset N from null in JIT'd code. Log loudly.
+      log_warning(gc)("resolve_tagged_oop_no_safepoint: DEAD handle " PTR_FORMAT
+                      " reached by mutator (slot=%lu) — returning nullptr",
+                      p2i(h), (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
+      return nullptr;
+    }
 
     if (state == REMOTE_HANDLE_REMOTE) {
       if (h->cas_remote_to_fetching()) {
