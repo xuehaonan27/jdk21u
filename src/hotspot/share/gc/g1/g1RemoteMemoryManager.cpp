@@ -1878,6 +1878,85 @@ int G1RemoteMemoryManager::fixup_all_local_handles() {
   return updated;
 }
 
+// Closure that fixes untagged refs to cset regions by writing forwardees.
+class CSetRefFixupClosure : public BasicOopIterateClosure {
+  G1CollectedHeap* _g1h;
+  int _fixed;
+  int _nulled;
+public:
+  CSetRefFixupClosure(G1CollectedHeap* g1h)
+    : _g1h(g1h), _fixed(0), _nulled(0) {}
+
+  virtual void do_oop(oop* p) {
+    uintptr_t raw = *(uintptr_t*)p;
+    if (raw == 0) return;
+    if ((raw >> 63) != 0) return; // tagged — skip
+    if (!_g1h->is_in((void*)raw)) return;
+    oop target = cast_to_oop(raw);
+    const G1HeapRegionAttr attr = _g1h->region_attr(target);
+    if (!attr.is_in_cset()) return;
+    markWord mw = target->mark();
+    if (mw.is_marked()) {
+      oop fwd = cast_to_oop(mw.decode_pointer());
+      RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
+      _fixed++;
+    } else {
+      *(uintptr_t*)p = 0;
+      _nulled++;
+    }
+  }
+  virtual void do_oop(narrowOop* p) {}
+  int fixed() const { return _fixed; }
+  int nulled() const { return _nulled; }
+};
+
+int G1RemoteMemoryManager::fixup_stale_refs_in_fcr_regions() {
+  CSetRefFixupClosure cl(_g1h);
+  const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
+
+  for (uint i = 0; i < _g1h->num_regions(); i++) {
+    HeapRegion* hr = _g1h->region_at(i);
+    if (hr->is_empty() || hr->is_free()) continue;
+    if (!hr->is_fetch_cache()) continue;
+    if (hr->is_continues_humongous()) continue;
+
+    HeapWord* const pb = hr->parsable_bottom_acquire();
+    HeapWord* const region_top = hr->top();
+    HeapWord* const region_end = hr->end();
+
+    // Below pb: use bitmap
+    HeapWord* p = hr->bottom();
+    while (p < pb && p < region_top) {
+      if (bitmap->is_marked(p)) {
+        oop obj = cast_to_oop(p);
+        obj->oop_iterate(&cl);
+        p += obj->size();
+      } else {
+        p = bitmap->get_next_marked_addr(p, pb);
+      }
+    }
+
+    // Above pb: sequential scan
+    if (p < pb) p = pb;
+    while (p < region_top) {
+      if (p >= region_end) break;
+      oop obj = cast_to_oop(p);
+      Klass* k = obj->klass_or_null();
+      if (k == nullptr) break;
+      size_t sz = obj->size();
+      if (sz == 0) break;
+      obj->oop_iterate(&cl);
+      p += sz;
+    }
+  }
+
+  if (cl.fixed() > 0 || cl.nulled() > 0) {
+    log_warning(gc)("FCR stale-ref fixup: %d refs fixed (forwardee), %d nulled (evac-failed)",
+                    cl.fixed(), cl.nulled());
+  }
+  return cl.fixed() + cl.nulled();
+}
+
 HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
   // Fast path: try CAS bump pointer on existing FCR region (lock-free).
   HeapRegion* fcr = _current_fcr;
