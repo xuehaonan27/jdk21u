@@ -305,8 +305,6 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
 
     if (state == REMOTE_HANDLE_FETCHING) {
       ThreadBlockInVM tbivm(current);
-      // Bounded wait — same rationale as the no_safepoint variant below.
-      // Yield-based loop, so use lower thresholds (~10K yields ≈ 1s).
       const uint64_t YieldWarn = 10000;
       const uint64_t YieldHard = 100000;
       uint64_t yields = 0;
@@ -321,10 +319,18 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
                           (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
         }
         if (yields >= YieldHard) {
-          log_warning(gc)("FETCHING wait HARD LIMIT (%llu yields) for handle " PTR_FORMAT
-                          " — giving up, returning nullptr",
-                          (unsigned long long)yields, p2i(h));
-          return nullptr;
+          // Recovery: revert FETCHING → REMOTE so this or another thread
+          // can retry the fetch. Returning nullptr here corrupts caller
+          // (NPE deep in JIT/StringTable). If original fetcher is truly
+          // crashed, this revert lets us recover. If original fetcher
+          // resumes after revert, its set_local_release CAS will succeed
+          // (state is now REMOTE not FETCHING) and the work isn't lost.
+          if (h->cas_fetching_to_remote()) {
+            log_warning(gc)("FETCHING wait HARD LIMIT (%llu yields) for handle " PTR_FORMAT
+                            " — reverted to REMOTE, will retry",
+                            (unsigned long long)yields, p2i(h));
+          }
+          break;  // re-enter outer loop, will see REMOTE or whatever current state is
         }
         os::naked_yield();
       }
@@ -368,13 +374,6 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
     }
 
     if (state == REMOTE_HANDLE_FETCHING) {
-      // Bounded wait with diagnostic logging. Without the bound, threads can
-      // livelock here if the fetcher itself is stuck (RDMA never completes,
-      // GC takes the global lock, etc.). After SpinThreshold iterations, log
-      // the suspect handle so we can investigate. After a much larger limit,
-      // give up — return nullptr so Java code can throw NPE rather than hang
-      // the whole JVM. The fetcher's eventual set_local_release would then
-      // race against our state, but the handle's CAS protects integrity.
       const uint64_t SpinThreshold = 1ULL << 24;       // ~16M spins
       const uint64_t HardLimit     = 1ULL << 30;       // ~1B spins (~10s)
       uint64_t spins = 0;
@@ -389,10 +388,12 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
                           (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
         }
         if (spins >= HardLimit) {
-          log_warning(gc)("FETCHING wait HARD LIMIT (%llu spins) for handle " PTR_FORMAT
-                          " — giving up, returning nullptr",
-                          (unsigned long long)spins, p2i(h));
-          return nullptr;
+          if (h->cas_fetching_to_remote()) {
+            log_warning(gc)("FETCHING wait HARD LIMIT (%llu spins) for handle " PTR_FORMAT
+                            " — reverted to REMOTE, will retry",
+                            (unsigned long long)spins, p2i(h));
+          }
+          break;  // re-enter outer loop, retry with current state
         }
         SpinPause();
       }

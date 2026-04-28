@@ -90,6 +90,18 @@ struct RemoteHandle {
     return Atomic::cmpxchg(&_state_and_addr, expected, desired) == expected;
   }
 
+  // Try to revert FETCHING → REMOTE. Used by stuck-fetcher recovery: if the
+  // original fetcher hangs and waiters time out, revert the state so a new
+  // thread can retry. Returns true if this thread won the revert (state was
+  // FETCHING). If the original fetcher ran to set_local_release first,
+  // state is now LOCAL — CAS fails, no harm done.
+  bool cas_fetching_to_remote() {
+    uintptr_t expected = _state_and_addr;
+    if ((expected & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_FETCHING) return false;
+    uintptr_t desired = (expected & REMOTE_HANDLE_ADDR_MASK) | REMOTE_HANDLE_REMOTE;
+    return Atomic::cmpxchg(&_state_and_addr, expected, desired) == expected;
+  }
+
   // Release-store: publish local address after RDMA completion.
   // This is the publication point — threads doing acquire-load will see
   // all bytes written to FTLAB before this store.
