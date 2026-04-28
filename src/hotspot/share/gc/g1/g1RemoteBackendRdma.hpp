@@ -66,6 +66,9 @@ class RDMAExecutorBackend : public G1RemoteBackend {
   // RDMA SEND/RECV for control messages
   bool rdma_send_msg(const void* data, size_t len);
   bool rdma_recv_msg(void* buf, size_t max_len, size_t* actual_len);
+  // Split post/wait — post BEFORE the matching send to avoid RNR race.
+  bool rdma_post_recv();
+  bool rdma_wait_recv(void* buf, size_t max_len, size_t* actual_len);
 
 public:
   RDMAExecutorBackend();

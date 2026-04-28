@@ -356,10 +356,12 @@ bool RDMAExecutorBackend::rdma_send_msg(const void* data, size_t len) {
   return poll_cq_wait(_send_cq, wr.wr_id, &wc);
 }
 
-bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actual_len) {
-  // Post recv
-  void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;  // offset = recv buffer
-
+// Post a recv buffer WITHOUT waiting. Caller must follow with rdma_wait_recv.
+// Splitting post/wait lets callers post recv BEFORE send, avoiding the
+// race where peer's response arrives at our QP before our recv is posted
+// (results in RNR retries, possible silent loss, and eventual hang).
+bool RDMAExecutorBackend::rdma_post_recv() {
+  void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
   struct ibv_sge sge;
   sge.addr = (uintptr_t)recv_buf;
   sge.length = RDMAMsgBufSize;
@@ -369,19 +371,31 @@ bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actua
   memset(&wr, 0, sizeof(wr));
   wr.sg_list = &sge;
   wr.num_sge = 1;
+  /* wr.wr_id = 0 from memset — under io_lock there's at most one in-flight
+     recv at a time so wr_id collisions are impossible. */
 
   struct ibv_recv_wr* bad_wr = NULL;
-  if (ibv_post_recv(_qp, &wr, &bad_wr)) return false;
+  return ibv_post_recv(_qp, &wr, &bad_wr) == 0;
+}
 
-  // Wait for completion
+bool RDMAExecutorBackend::rdma_wait_recv(void* buf, size_t max_len, size_t* actual_len) {
+  void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
   struct ibv_wc wc;
-  if (!poll_cq_wait(_recv_cq, wr.wr_id, &wc)) return false;
+  if (!poll_cq_wait(_recv_cq, /*wr_id*/0, &wc)) return false;
 
   size_t len = wc.byte_len;
   if (len > max_len) len = max_len;
   memcpy(buf, recv_buf, len);
   if (actual_len) *actual_len = len;
   return true;
+}
+
+// Legacy combined post+wait. Keeps the old race for callers that haven't
+// migrated; new code should call rdma_post_recv() before the send and
+// rdma_wait_recv() after.
+bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actual_len) {
+  if (!rdma_post_recv()) return false;
+  return rdma_wait_recv(buf, max_len, actual_len);
 }
 
 // ================================================================
@@ -512,11 +526,13 @@ bool RDMAExecutorBackend::initialize() {
   *(uint32_t*)(hello + 36) = (uint32_t)MinObjAlignmentInBytes;   // min_obj_alignment
 
   log_info(gc)("RDMA: sending hello");
+  // Pre-post recv to avoid RNR race with peer's response.
+  if (!rdma_post_recv()) { log_warning(gc)("RDMA: hello post_recv failed"); return false; }
   if (!rdma_send_msg(hello, 40)) { log_warning(gc)("RDMA: hello send failed"); return false; }
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) { log_warning(gc)("RDMA: hello recv failed"); return false; }
+  if (!rdma_wait_recv(resp, sizeof(resp), &resp_len)) { log_warning(gc)("RDMA: hello recv failed"); return false; }
   if (*(uint32_t*)resp != RE_RESP_OK) { log_warning(gc)("RDMA: hello rejected"); return false; }
 
   _connected = true;
@@ -560,6 +576,9 @@ size_t RDMAExecutorBackend::evict(const void* obj_bytes, size_t word_size,
 
   io_lock();
 
+  // Pre-post recv to win the race vs. peer's response.
+  if (!rdma_post_recv()) { io_unlock(); return (size_t)-1; }
+
   size_t slot_id = (hint_slot_id != (size_t)-1) ? hint_slot_id : _next_slot++;
   size_t byte_size = word_size * HeapWordSize;
 
@@ -579,7 +598,7 @@ size_t RDMAExecutorBackend::evict(const void* obj_bytes, size_t word_size,
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) { io_unlock(); return (size_t)-1; }
+  if (!rdma_wait_recv(resp, sizeof(resp), &resp_len)) { io_unlock(); return (size_t)-1; }
 
   io_unlock();
 
@@ -592,6 +611,13 @@ Klass* RDMAExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_s
 
   io_lock();
 
+  // Post recv BEFORE send to eliminate the RNR race: if the executor
+  // responds before our recv is posted, the response triggers an RNR
+  // condition (or worse, silently drops if peer doesn't retry), causing
+  // our subsequent rdma_recv_msg to hang waiting for a completion that
+  // never arrives. Pre-posting guarantees the buffer is ready.
+  if (!rdma_post_recv()) { io_unlock(); return nullptr; }
+
   uint8_t msg[24];
   *(uint32_t*)(msg + 0) = RE_CMD_FETCH_OBJECT;
   *(uint32_t*)(msg + 4) = 24;
@@ -601,7 +627,7 @@ Klass* RDMAExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_s
 
   uint8_t* resp = (uint8_t*)os::malloc(128 * 1024, mtGC);
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, 128 * 1024, &resp_len)) { os::free(resp); io_unlock(); return nullptr; }
+  if (!rdma_wait_recv(resp, 128 * 1024, &resp_len)) { os::free(resp); io_unlock(); return nullptr; }
 
   io_unlock();
 
@@ -631,12 +657,14 @@ void RDMAExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_r
   uint64_t* ids = (uint64_t*)(msg + 20);
   for (size_t i = 0; i < num_roots; i++) ids[i] = (uint64_t)root_slot_ids[i];
 
+  // Pre-post recv to avoid RNR race.
+  if (!rdma_post_recv()) { os::free(msg); io_unlock(); return; }
   rdma_send_msg(msg, msg_size);
   os::free(msg);
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+  rdma_wait_recv(resp, sizeof(resp), &resp_len);
 
   io_unlock();
 }
@@ -650,6 +678,8 @@ void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_de
 
   io_lock();
 
+  if (!rdma_post_recv()) { io_unlock(); *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0; return; }
+
   uint8_t msg[16];
   *(uint32_t*)(msg + 0) = RE_CMD_REQUEST_COLLECTION;
   *(uint32_t*)(msg + 4) = 16;
@@ -658,7 +688,7 @@ void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_de
 
   uint8_t* resp = (uint8_t*)os::malloc(1024 * 1024, mtGC);
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, 1024 * 1024, &resp_len)) {
+  if (!rdma_wait_recv(resp, 1024 * 1024, &resp_len)) {
     os::free(resp);
     io_unlock();
     *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
@@ -696,6 +726,8 @@ void RDMAExecutorBackend::trace_and_report(uintptr_t** out_dead_ids, size_t* out
 
   io_lock();
 
+  if (!rdma_post_recv()) { io_unlock(); return; }
+
   uint8_t msg[16];
   *(uint32_t*)(msg + 0) = RE_CMD_TRACE_AND_REPORT;
   *(uint32_t*)(msg + 4) = 16;
@@ -704,7 +736,7 @@ void RDMAExecutorBackend::trace_and_report(uintptr_t** out_dead_ids, size_t* out
 
   uint8_t* resp = (uint8_t*)os::malloc(4 * 1024 * 1024, mtGC);
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, 4 * 1024 * 1024, &resp_len)) {
+  if (!rdma_wait_recv(resp, 4 * 1024 * 1024, &resp_len)) {
     os::free(resp);
     io_unlock();
     return;
@@ -755,6 +787,8 @@ void RDMAExecutorBackend::discard_slot(size_t slot_id) {
 
   io_lock();
 
+  if (!rdma_post_recv()) { io_unlock(); return; }
+
   uint8_t msg[24];
   *(uint32_t*)(msg + 0) = RE_CMD_DISCARD_SLOT;
   *(uint32_t*)(msg + 4) = 24;
@@ -763,7 +797,7 @@ void RDMAExecutorBackend::discard_slot(size_t slot_id) {
   rdma_send_msg(msg, 24);
   uint8_t resp[64];
   size_t resp_len = 0;
-  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+  rdma_wait_recv(resp, sizeof(resp), &resp_len);
 
   io_unlock();
 }
@@ -772,12 +806,13 @@ int RDMAExecutorBackend::batch_evict(const void* msg_buf, size_t msg_len) {
   if (!_connected) return -1;
 
   io_lock();
+  if (!rdma_post_recv()) { io_unlock(); return -1; }
   bool ok = rdma_send_msg(msg_buf, msg_len);
   if (!ok) { io_unlock(); return -1; }
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) { io_unlock(); return -1; }
+  if (!rdma_wait_recv(resp, sizeof(resp), &resp_len)) { io_unlock(); return -1; }
 
   io_unlock();
   return (*(uint32_t*)resp == RE_RESP_OK) ? 0 : -1;
@@ -822,13 +857,14 @@ size_t RDMAExecutorBackend::evict_with_edges(const void* obj_bytes, size_t word_
     edge_ptr += 12;
   }
 
+  if (!rdma_post_recv()) { os::free(msg); io_unlock(); return (size_t)-1; }
   bool ok = rdma_send_msg(msg, msg_size);
   os::free(msg);
   if (!ok) { io_unlock(); return (size_t)-1; }
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  if (!rdma_recv_msg(resp, sizeof(resp), &resp_len)) { io_unlock(); return (size_t)-1; }
+  if (!rdma_wait_recv(resp, sizeof(resp), &resp_len)) { io_unlock(); return (size_t)-1; }
 
   io_unlock();
 
@@ -852,12 +888,13 @@ void RDMAExecutorBackend::localize_batch(const uintptr_t* handle_ids, size_t cou
   *(uint32_t*)(msg + 16) = (uint32_t)count;
   memcpy(msg + 20, handle_ids, count * 8);
 
+  if (!rdma_post_recv()) { os::free(msg); io_unlock(); return; }
   rdma_send_msg(msg, msg_size);
   os::free(msg);
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+  rdma_wait_recv(resp, sizeof(resp), &resp_len);
 
   io_unlock();
 }
@@ -879,9 +916,10 @@ void RDMAExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, si
     *(uint32_t*)(clear_msg + 4)  = 20;
     *(uint64_t*)(clear_msg + 8)  = _seq_id++;
     *(uint32_t*)(clear_msg + 16) = 0;  // clear
+    if (!rdma_post_recv()) { io_unlock(); return; }
     rdma_send_msg(clear_msg, 20);
     uint8_t resp[64]; size_t resp_len = 0;
-    rdma_recv_msg(resp, sizeof(resp), &resp_len);
+    rdma_wait_recv(resp, sizeof(resp), &resp_len);
   }
 
   while (remaining > 0) {
@@ -894,11 +932,12 @@ void RDMAExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, si
     *(uint32_t*)(msg + 16) = (uint32_t)chunk;
     memcpy(msg + 20, handle_ids + offset, chunk * 8);
 
+    if (!rdma_post_recv()) { os::free(msg); io_unlock(); return; }
     rdma_send_msg(msg, msg_size);
     os::free(msg);
 
     uint8_t resp[64]; size_t resp_len = 0;
-    rdma_recv_msg(resp, sizeof(resp), &resp_len);
+    rdma_wait_recv(resp, sizeof(resp), &resp_len);
 
     offset += chunk;
     remaining -= chunk;
@@ -930,12 +969,13 @@ void RDMAExecutorBackend::directory_upsert(const uintptr_t* handle_ids,
     ptr += 20;
   }
 
+  if (!rdma_post_recv()) { os::free(msg); io_unlock(); return; }
   rdma_send_msg(msg, msg_size);
   os::free(msg);
 
   uint8_t resp[64];
   size_t resp_len = 0;
-  rdma_recv_msg(resp, sizeof(resp), &resp_len);
+  rdma_wait_recv(resp, sizeof(resp), &resp_len);
 
   io_unlock();
 }
