@@ -192,43 +192,65 @@ class EdgeTableBuildClosure : public BasicOopIterateClosure {
   RemoteHandleAllocBuffer* _hab;
   oop                    _base_obj;
 
-  static const int MAX_EDGES = 8192;
-  G1RemoteMemoryManager::EdgeEntry _edges[MAX_EDGES];
-  int _count;
+  // Heap-allocated, growable. Replaces the old fixed MAX_EDGES=8192 stack
+  // array, which pinned whole regions whenever a single large array
+  // (e.g. scala.Tuple3[N>8192]) was hit during eviction.
+  G1RemoteMemoryManager::EdgeEntry* _edges;
+  uint32_t _count;
+  uint32_t _capacity;
+
+  void grow() {
+    uint32_t new_cap = (_capacity == 0) ? 16u : _capacity * 2u;
+    G1RemoteMemoryManager::EdgeEntry* new_edges =
+      NEW_C_HEAP_ARRAY(G1RemoteMemoryManager::EdgeEntry, new_cap, mtGC);
+    if (_edges != nullptr) {
+      memcpy(new_edges, _edges,
+             (size_t)_count * sizeof(G1RemoteMemoryManager::EdgeEntry));
+      FREE_C_HEAP_ARRAY(G1RemoteMemoryManager::EdgeEntry, _edges);
+    }
+    _edges = new_edges;
+    _capacity = new_cap;
+  }
+
+  void append(uint32_t offset, RemoteHandle* h) {
+    if (_count >= _capacity) grow();
+    _edges[_count]._field_offset = offset;
+    _edges[_count]._target_handle = h;
+    _count++;
+  }
 
 public:
   EdgeTableBuildClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
                         RemoteHandleAllocBuffer* hab, oop base)
-    : _rmm(rmm), _g1h(g1h), _hab(hab), _base_obj(base), _count(0) {}
+    : _rmm(rmm), _g1h(g1h), _hab(hab), _base_obj(base),
+      _edges(nullptr), _count(0), _capacity(0) {}
+
+  ~EdgeTableBuildClosure() {
+    if (_edges != nullptr) {
+      FREE_C_HEAP_ARRAY(G1RemoteMemoryManager::EdgeEntry, _edges);
+    }
+  }
 
   virtual void do_oop(oop* p) {
-    if (_count >= MAX_EDGES) return;  // safety cap
-
     // Read field as raw uintptr_t to avoid debug oop constructor checks on tagged values
     uintptr_t raw = *(uintptr_t*)p;
     if (raw == 0) return;  // null
 
     // If already tagged (bit 63 set), the field already has a Handle reference.
-    // Extract the Handle directly.
     if ((raw >> 63) != 0) {
       if (raw & G1_OOP_INDIRECT_BIT) {
         // Shared OOP → already points to a Handle
         RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
         uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
-        _edges[_count]._field_offset = offset;
-        _edges[_count]._target_handle = h;
-        _count++;
+        append(offset, h);
         h->increment_remote_refcount();
-      }
-      // Unique OOP → strip tags, get target, create dormant anchor
-      else {
+      } else {
+        // Unique OOP → strip tags, get target, create dormant anchor
         oop target = (oop)(raw & G1_OOP_ADDR_MASK);
         if (_g1h->is_in(target)) {
           RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, _hab);
           uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
-          _edges[_count]._field_offset = offset;
-          _edges[_count]._target_handle = h;
-          _count++;
+          append(offset, h);
           h->increment_remote_refcount();
         }
       }
@@ -240,9 +262,7 @@ public:
     if (_g1h->is_in(target)) {
       RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, _hab);
       uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
-      _edges[_count]._field_offset = offset;
-      _edges[_count]._target_handle = h;
-      _count++;
+      append(offset, h);
       h->increment_remote_refcount();
     }
   }
@@ -251,8 +271,7 @@ public:
     // Narrow oops: not used (UseCompressedOops=false in our config)
   }
 
-  int count() const { return _count; }
-  bool overflowed() const { return _count >= MAX_EDGES; }
+  uint32_t count() const { return _count; }
   const G1RemoteMemoryManager::EdgeEntry* edges() const { return _edges; }
 };
 
@@ -262,21 +281,16 @@ G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
   EdgeTableBuildClosure cl(this, _g1h, hab, obj);
   obj->oop_iterate(&cl);
 
-  if (cl.overflowed()) {
-    log_info(gc)("Edge table overflow: obj=" PTR_FORMAT " klass=%s has >8192 oop fields — skipping eviction",
-                 p2i((void*)obj), obj->klass()->external_name());
-    return nullptr;
-  }
-
-  // Allocate and populate the edge table
+  // Allocate exact-sized ObjectEdgeTable and copy from the (now-sized) build
+  // buffer. The build buffer is freed by the closure destructor below.
   ObjectEdgeTable* et = ObjectEdgeTable::allocate(cl.count());
   et->_source_handle = obj_handle;
   et->_eviction_word_size = obj->size();
-  for (int i = 0; i < cl.count(); i++) {
+  for (uint32_t i = 0; i < cl.count(); i++) {
     et->add(cl.edges()[i]._field_offset, cl.edges()[i]._target_handle);
   }
 
-  log_debug(gc)("Edge table built: obj=" PTR_FORMAT " edges=%d",
+  log_debug(gc)("Edge table built: obj=" PTR_FORMAT " edges=%u",
                 p2i((void*)obj), cl.count());
   return et;
 }

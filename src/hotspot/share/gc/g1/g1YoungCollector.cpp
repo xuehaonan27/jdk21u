@@ -1779,6 +1779,117 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       double e1_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
       G1RemoteMemoryManager::log_prepare_eviction_stats();
 
+      // E1.5: Partial-region eviction salvage.
+      //
+      // For regions where some objects failed prepare_eviction (typically
+      // because their oop-edge count exceeded the build buffer, or a future
+      // failure mode like locked-mark or slot-allocation), the original
+      // policy was to keep the ENTIRE region pinned local. With dynamic
+      // edge tables this should now be rare, but we still salvage:
+      // we relocate the failed objects to a fresh FCR catch region (same
+      // mechanism as Phase D root-catch) and mark the region complete so
+      // E3 can free it. Without this, a single oversize array can pin a
+      // 16MB region full of evictable objects.
+      Ticks e1_5_start = Ticks::now();
+      HeapRegion* edge_catch = nullptr;
+      HeapWord*   catch_top  = nullptr;
+      int relocated_count = 0;
+      size_t relocated_bytes = 0;
+      int salvaged_regions = 0;
+      bool needs_catch = false;
+      for (uint i = 0; i < num_regions; i++) {
+        if (eviction_candidates[i] && !region_complete[i] && region_count_arr[i] > 0) {
+          needs_catch = true;
+          break;
+        }
+      }
+      if (needs_catch) {
+        edge_catch = _g1h->allocate_fcr_region();
+        if (edge_catch != nullptr) catch_top = edge_catch->bottom();
+      }
+      if (edge_catch != nullptr) {
+        for (uint i = 0; i < num_regions; i++) {
+          if (!eviction_candidates[i]) continue;
+          if (region_complete[i]) continue;
+          if (region_count_arr[i] == 0) continue;  // nothing to salvage
+          HeapRegion* hr = _g1h->region_at(i);
+          int rstart = region_start[i];
+          int rend   = rstart + region_count_arr[i];
+          int next_entry = rstart;
+          HeapWord* p = hr->bottom();
+          bool fully_relocated = true;
+          while (p < hr->top()) {
+            oop obj = cast_to_oop(p);
+            if (obj->is_forwarded()) {
+              p += obj->size_given_klass(obj->klass());
+              continue;
+            }
+            size_t sz = obj->size();
+            // entries[] within a region are address-ordered (E1 walks linearly).
+            bool is_prepared = (next_entry < rend && entries[next_entry].obj == obj);
+            if (is_prepared) {
+              next_entry++;
+              p += sz;
+              continue;
+            }
+            // Failed object — relocate to catch region. If full, try one more.
+            if (catch_top + sz > edge_catch->end()) {
+              edge_catch->set_top(catch_top);
+              HeapRegion* next_catch = _g1h->allocate_fcr_region();
+              if (next_catch == nullptr) {
+                fully_relocated = false;
+                break;
+              }
+              edge_catch = next_catch;
+              catch_top = edge_catch->bottom();
+              if (catch_top + sz > edge_catch->end()) {
+                // Object larger than a region (humongous) — give up on this region.
+                fully_relocated = false;
+                break;
+              }
+            }
+            Copy::aligned_disjoint_words(p, catch_top, sz);
+            oop new_obj = cast_to_oop(catch_top);
+            edge_catch->update_bot_for_obj(catch_top, sz);
+            obj->forward_to(new_obj);
+            rmm->update_handle_for_evacuation(obj, new_obj);
+            catch_top      += sz;
+            relocated_count++;
+            relocated_bytes += sz * HeapWordSize;
+            p              += sz;
+          }
+          if (fully_relocated && p >= hr->top()) {
+            region_complete[i] = true;
+            salvaged_regions++;
+          }
+        }
+        if (catch_top != edge_catch->bottom()) {
+          edge_catch->set_top(catch_top);
+          // Dirty cards over the relocated range so next GC's Merge Heap
+          // Roots scans them — same pattern as Phase D root-catch.
+          G1CardTable* ct = _g1h->card_table();
+          CardTable::CardValue* start_card = ct->byte_for(edge_catch->bottom());
+          CardTable::CardValue* end_card   = ct->byte_for(catch_top - 1) + 1;
+          memset(start_card, CardTable::dirty_card_val(), end_card - start_card);
+          G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
+          G1DirtyCardQueue tmp_queue(&dcqs);
+          for (CardTable::CardValue* card = start_card; card < end_card; card++) {
+            dcqs.enqueue(tmp_queue, card);
+          }
+          dcqs.flush_queue(tmp_queue);
+        } else {
+          // Allocated but unused (e.g., all incomplete regions had zero successes).
+          FreeRegionList tmp("tmp");
+          _g1h->free_region(edge_catch, &tmp);
+        }
+      }
+      double e1_5_ms = (Ticks::now() - e1_5_start).seconds() * 1000.0;
+      if (relocated_count > 0 || salvaged_regions > 0) {
+        log_info(gc)("E1.5 partial-eviction salvage: %d regions, %d objects (%zuKB) "
+                     "relocated to catch region",
+                     salvaged_regions, relocated_count, relocated_bytes / K);
+      }
+
       // E2: Batch-send to remote backend.
       Ticks e2_start = Ticks::now();
       G1RemoteBackend* backend = rmm->backend();
@@ -1914,9 +2025,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       if (total_candidates > 0) {
         double phase_e_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
-        log_info(gc)("Phase E eviction: %.1fms (E1=%.1fms E2=%.1fms/%d batches E3=%.1fms) "
+        log_info(gc)("Phase E eviction: %.1fms (E1=%.1fms E1.5=%.1fms E2=%.1fms/%d batches E3=%.1fms) "
                      "(%d objects, %d regions)",
-                     phase_e_ms, e1_ms, e2_ms, batches_sent, e3_ms,
+                     phase_e_ms, e1_ms, e1_5_ms, e2_ms, batches_sent, e3_ms,
                      total_evicted, regions_evicted);
       }
       }
