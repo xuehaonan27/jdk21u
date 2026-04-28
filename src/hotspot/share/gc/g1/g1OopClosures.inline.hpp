@@ -27,12 +27,14 @@
 
 #include "gc/g1/g1OopClosures.hpp"
 
+#include "gc/g1/g1BarrierSet.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1RemoteHandle.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1ParScanThreadState.inline.hpp"
 #include "gc/g1/g1RemSet.hpp"
+#include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
 #include "gc/g1/heapRegionRemSet.inline.hpp"
 #include "logging/log.hpp"
@@ -277,15 +279,21 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
     }
 
     // After writing a clean forwardee to a field outside the collection set,
-    // enqueue the card so the forwardee's region RSet learns about this ref.
-    // Without this, the card stays clean after merge_heap_roots processed it,
-    // and the next GC that collects the forwardee's region won't scan this
-    // field — leaving a stale reference to a freed region.
+    // re-dirty the card and enqueue it in the DCQS. merge_heap_roots already
+    // drained the DCQS for this pause, so the enqueued card survives until
+    // the next GC processes it — ensuring the forwardee's region finds this
+    // incoming reference regardless of whether it tracks RSets.
     if (wrote_clean_oop && _g1h->is_in(p) &&
         !_g1h->region_attr(p).is_in_cset() &&
         !HeapRegion::is_in_same_region(p, forwardee)) {
-      _par_scan_state->enqueue_card_if_tracked(
-          _g1h->region_attr(forwardee), p, forwardee);
+      G1CardTable* ct = _g1h->card_table();
+      CardTable::CardValue* card = ct->byte_for((HeapWord*)p);
+      if (*card != G1CardTable::g1_young_card_val()) {
+        *card = G1CardTable::dirty_card_val();
+        G1DirtyCardQueueSet& qset = G1BarrierSet::dirty_card_queue_set();
+        G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(Thread::current());
+        qset.enqueue(queue, card);
+      }
     }
 
     if (barrier == G1BarrierCLD) {

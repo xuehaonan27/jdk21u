@@ -824,6 +824,10 @@ public:
   // Decrements remote_refcount on each target Handle.
   // Removes the edge table after patching.
   void patch_fetched_fields(RemoteHandle* source_handle, HeapWord* dest);
+
+  // Returns true if the Handle's local address points to a valid live heap region.
+  // If stale (freed/guarded/out-of-heap), logs a warning and marks the Handle DEAD.
+  bool validate_anchor_addr(RemoteHandle* h);
 };
 
 // Template implementation — must be in header for instantiation.
@@ -846,7 +850,11 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
       if (h != nullptr && h->is_local() && h->remote_refcount() > 0) {
         // Use Handle's live LOCAL target, not potentially stale table key.
         oop obj = cast_to_oop(h->local_addr());
-        if (obj == nullptr || obj->klass_or_null() == nullptr) {
+        if (obj == nullptr || !validate_anchor_addr(h)) {
+          e = e->_next;
+          continue;
+        }
+        if (obj->klass_or_null() == nullptr) {
           e = e->_next;
           continue;
         }

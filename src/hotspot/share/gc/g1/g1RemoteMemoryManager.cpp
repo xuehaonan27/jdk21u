@@ -1468,6 +1468,29 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
   return cl.stale();
 }
 
+bool G1RemoteMemoryManager::validate_anchor_addr(RemoteHandle* h) {
+  void* addr = h->local_addr();
+  if (addr == nullptr) return false;
+  if (!_g1h->is_in(addr)) {
+    log_warning(gc)("STALE-ANCHOR: handle=" PTR_FORMAT " addr=" PTR_FORMAT
+                    " NOT IN HEAP — marking DEAD (rc=%u)",
+                    p2i(h), p2i(addr), h->remote_refcount());
+    h->set_dead();
+    return false;
+  }
+  HeapRegion* hr = _g1h->heap_region_containing(addr);
+  if (hr->is_free() || hr->is_evict_guarded()) {
+    log_warning(gc)("STALE-ANCHOR: handle=" PTR_FORMAT " addr=" PTR_FORMAT
+                    " in %s region %u — marking DEAD (rc=%u)",
+                    p2i(h), p2i(addr),
+                    hr->is_evict_guarded() ? "GUARDED" : "FREE",
+                    hr->hrm_index(), h->remote_refcount());
+    h->set_dead();
+    return false;
+  }
+  return true;
+}
+
 Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
   assert(h != nullptr, "Handle must not be null");
 
