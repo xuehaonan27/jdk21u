@@ -92,7 +92,15 @@ bool TCPExecutorBackend::recv_msg(void* buf, size_t max_len, size_t* actual_len)
   uint32_t net_len = 0;
   if (!recv_all(&net_len, 4)) return false;
   if (net_len > max_len) {
-    log_warning(gc)("TCPExecutor: message too large: %u > %zu", net_len, max_len);
+    log_warning(gc)("TCPExecutor: message too large: %u > %zu — draining", net_len, max_len);
+    // Drain the oversized message to keep the TCP stream synchronized
+    uint8_t drain[4096];
+    size_t remaining = net_len;
+    while (remaining > 0) {
+      size_t chunk = (remaining < sizeof(drain)) ? remaining : sizeof(drain);
+      if (!recv_all(drain, chunk)) return false;
+      remaining -= chunk;
+    }
     return false;
   }
   if (!recv_all(buf, net_len)) return false;
@@ -228,9 +236,13 @@ Klass* TCPExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_si
 
   if (!send_msg(fetch_msg, 24)) { io_unlock(); return nullptr; }
 
-  uint8_t* resp = (uint8_t*)os::malloc(128 * 1024, mtGC);
-  size_t resp_len = 0;
-  if (!recv_msg(resp, 128 * 1024, &resp_len)) {
+  // Read length prefix first, then allocate appropriately
+  uint32_t net_len = 0;
+  if (!recv_all(&net_len, 4)) { io_unlock(); return nullptr; }
+
+  size_t alloc_len = (net_len < 4096) ? 4096 : net_len;
+  uint8_t* resp = (uint8_t*)os::malloc(alloc_len, mtGC);
+  if (!recv_all(resp, net_len)) {
     os::free(resp);
     io_unlock();
     return nullptr;
@@ -243,9 +255,23 @@ Klass* TCPExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_si
     return nullptr;
   }
 
+  if (net_len < 36) {
+    log_warning(gc)("TCPExecutor: fetch response too short: %u bytes", net_len);
+    os::free(resp);
+    return nullptr;
+  }
+
   uint64_t resp_klass_val = *(uint64_t*)(resp + 24);
   uint32_t resp_ws = *(uint32_t*)(resp + 32);
   size_t byte_size = resp_ws * HeapWordSize;
+
+  if (36 + byte_size > net_len) {
+    log_warning(gc)("TCPExecutor: fetch resp_ws=%u claims %zuB but response only %u bytes",
+                    resp_ws, byte_size, net_len);
+    os::free(resp);
+    return nullptr;
+  }
+
   memcpy(dest, resp + 36, byte_size);
 
   if (out_word_size) *out_word_size = resp_ws;
