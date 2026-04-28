@@ -305,10 +305,27 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
 
     if (state == REMOTE_HANDLE_FETCHING) {
       ThreadBlockInVM tbivm(current);
+      // Bounded wait — same rationale as the no_safepoint variant below.
+      // Yield-based loop, so use lower thresholds (~10K yields ≈ 1s).
+      const uint64_t YieldWarn = 10000;
+      const uint64_t YieldHard = 100000;
+      uint64_t yields = 0;
       while (true) {
         sa = h->load_state_and_addr_acquire();
         state = sa & REMOTE_HANDLE_STATE_MASK;
         if (state != REMOTE_HANDLE_FETCHING) break;
+        if (++yields == YieldWarn) {
+          log_warning(gc)("FETCHING wait (slow path) exceeded %llu yields for handle " PTR_FORMAT
+                          " (slot=%lu) — fetcher may be stuck",
+                          (unsigned long long)yields, p2i(h),
+                          (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
+        }
+        if (yields >= YieldHard) {
+          log_warning(gc)("FETCHING wait HARD LIMIT (%llu yields) for handle " PTR_FORMAT
+                          " — giving up, returning nullptr",
+                          (unsigned long long)yields, p2i(h));
+          return nullptr;
+        }
         os::naked_yield();
       }
       continue;
@@ -351,10 +368,32 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
     }
 
     if (state == REMOTE_HANDLE_FETCHING) {
+      // Bounded wait with diagnostic logging. Without the bound, threads can
+      // livelock here if the fetcher itself is stuck (RDMA never completes,
+      // GC takes the global lock, etc.). After SpinThreshold iterations, log
+      // the suspect handle so we can investigate. After a much larger limit,
+      // give up — return nullptr so Java code can throw NPE rather than hang
+      // the whole JVM. The fetcher's eventual set_local_release would then
+      // race against our state, but the handle's CAS protects integrity.
+      const uint64_t SpinThreshold = 1ULL << 24;       // ~16M spins
+      const uint64_t HardLimit     = 1ULL << 30;       // ~1B spins (~10s)
+      uint64_t spins = 0;
       while (true) {
         sa = h->load_state_and_addr_acquire();
         state = sa & REMOTE_HANDLE_STATE_MASK;
         if (state != REMOTE_HANDLE_FETCHING) break;
+        if (++spins == SpinThreshold) {
+          log_warning(gc)("FETCHING wait exceeded %llu spins for handle " PTR_FORMAT
+                          " (slot=%lu) — fetcher may be stuck",
+                          (unsigned long long)spins, p2i(h),
+                          (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
+        }
+        if (spins >= HardLimit) {
+          log_warning(gc)("FETCHING wait HARD LIMIT (%llu spins) for handle " PTR_FORMAT
+                          " — giving up, returning nullptr",
+                          (unsigned long long)spins, p2i(h));
+          return nullptr;
+        }
         SpinPause();
       }
       continue;
