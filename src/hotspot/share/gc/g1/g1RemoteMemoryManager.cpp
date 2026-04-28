@@ -1882,10 +1882,10 @@ int G1RemoteMemoryManager::fixup_all_local_handles() {
 class CSetRefFixupClosure : public BasicOopIterateClosure {
   G1CollectedHeap* _g1h;
   int _fixed;
-  int _nulled;
+  int _skipped;
 public:
   CSetRefFixupClosure(G1CollectedHeap* g1h)
-    : _g1h(g1h), _fixed(0), _nulled(0) {}
+    : _g1h(g1h), _fixed(0), _skipped(0) {}
 
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
@@ -1901,13 +1901,13 @@ public:
       RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
       _fixed++;
     } else {
-      *(uintptr_t*)p = 0;
-      _nulled++;
+      // Evac-failed: object still at original address, region not freed — leave ref as-is
+      _skipped++;
     }
   }
   virtual void do_oop(narrowOop* p) {}
   int fixed() const { return _fixed; }
-  int nulled() const { return _nulled; }
+  int skipped() const { return _skipped; }
 };
 
 int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
@@ -1950,11 +1950,11 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
     }
   }
 
-  if (cl.fixed() > 0 || cl.nulled() > 0) {
-    log_warning(gc)("Old-region stale-ref fixup: %d refs fixed (forwardee), %d nulled (evac-failed)",
-                    cl.fixed(), cl.nulled());
+  if (cl.fixed() > 0 || cl.skipped() > 0) {
+    log_warning(gc)("Old-region stale-ref fixup: %d fixed (forwardee), %d skipped (evac-failed, in-place)",
+                    cl.fixed(), cl.skipped());
   }
-  return cl.fixed() + cl.nulled();
+  return cl.fixed() + cl.skipped();
 }
 
 HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
