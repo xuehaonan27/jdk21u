@@ -24,7 +24,10 @@
 
 #include "precompiled.hpp"
 #include "gc/g1/g1Allocator.inline.hpp"
+#include "gc/g1/g1BarrierSet.hpp"
+#include "gc/g1/g1CardTable.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1CollectionSet.hpp"
@@ -239,6 +242,7 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   }
   // Tag-aware write-back: if the field contains a shared_oop(Handle),
   // update the Handle's address instead of overwriting the tagged field.
+  bool wrote_clean_oop = false;
   if (sizeof(T) == sizeof(uintptr_t)) {
     uintptr_t raw = *(uintptr_t*)p;
     if (raw & G1_OOP_INDIRECT_BIT) {
@@ -246,9 +250,11 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
       h->set_local_release((void*)cast_from_oop<uintptr_t>(obj));
     } else {
       RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+      wrote_clean_oop = true;
     }
   } else {
     RawAccess<IS_NOT_NULL>::oop_store(p, obj);
+    wrote_clean_oop = true;
   }
 
   // Phase 2: Record reference site for RC counting if target was promoted to Old.
@@ -258,6 +264,27 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
     HeapRegion* dest = _g1h->heap_region_containing(obj);
     if (dest != nullptr && dest->is_old() && _g1h->is_in((void*)p)) {
       record_rc_ref_site(obj, (void*)p, sizeof(T) == sizeof(narrowOop));
+    }
+  }
+
+  // Force-dirty source card and enqueue DCQS for clean cross-region forwardee
+  // writes. write_ref_field_post → enqueue_card_if_tracked silently SKIPS when
+  // the destination's remset_is_tracked is false (which is the case for
+  // new-survivor destinations: set_new_survivor_region() leaves
+  // _remset_is_tracked at the default 0). Without redirty, the source card
+  // becomes "scanned" (0x01) and the next GC cannot find this cross-region ref
+  // — FCR-fetched objects' fields then go stale across GCs and crash mutators
+  // (SizeEstimator/identityHashCode) or GC workers (trim_queue_to_threshold).
+  if (wrote_clean_oop && _g1h->is_in((void*)p) &&
+      !_g1h->region_attr((void*)p).is_in_cset() &&
+      !HeapRegion::is_in_same_region(p, obj)) {
+    G1CardTable* ct = _g1h->card_table();
+    CardTable::CardValue* card = ct->byte_for((HeapWord*)p);
+    if (*card != G1CardTable::g1_young_card_val()) {
+      *card = G1CardTable::dirty_card_val();
+      G1DirtyCardQueueSet& qset = G1BarrierSet::dirty_card_queue_set();
+      G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(Thread::current());
+      qset.enqueue(queue, card);
     }
   }
 
