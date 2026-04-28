@@ -261,6 +261,7 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
     // Tag-aware write-back: if the field contains a shared_oop(Handle),
     // update the Handle's address instead of overwriting the tagged field.
     // The field (in the copied object) retains the tagged encoding.
+    bool wrote_clean_oop = false;
     if (sizeof(T) == sizeof(uintptr_t)) {
       uintptr_t raw = *(uintptr_t*)p;
       if (raw & G1_OOP_INDIRECT_BIT) {
@@ -268,9 +269,23 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
         h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
       } else {
         RawAccess<IS_NOT_NULL>::oop_store(p, forwardee);
+        wrote_clean_oop = true;
       }
     } else {
       RawAccess<IS_NOT_NULL>::oop_store(p, forwardee);
+      wrote_clean_oop = true;
+    }
+
+    // After writing a clean forwardee to a field outside the collection set,
+    // enqueue the card so the forwardee's region RSet learns about this ref.
+    // Without this, the card stays clean after merge_heap_roots processed it,
+    // and the next GC that collects the forwardee's region won't scan this
+    // field — leaving a stale reference to a freed region.
+    if (wrote_clean_oop && _g1h->is_in(p) &&
+        !_g1h->region_attr(p).is_in_cset() &&
+        !HeapRegion::is_in_same_region(p, forwardee)) {
+      _par_scan_state->enqueue_card_if_tracked(
+          _g1h->region_attr(forwardee), p, forwardee);
     }
 
     if (barrier == G1BarrierCLD) {

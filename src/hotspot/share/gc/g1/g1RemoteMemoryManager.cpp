@@ -1283,6 +1283,16 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
                           " (src_obj=" PTR_FORMAT " klass=%s region=%u offset=%u)",
                           src_kind, p2i(p), (unsigned long)raw,
                           p2i((void*)_cur_obj), src_klass, src_region, off);
+          // Decode as markWord to detect header-scribble (Codex H6 hypothesis)
+          uintptr_t mw_lock = raw & 0x3;
+          uintptr_t mw_age = (raw >> 3) & 0xF;
+          uintptr_t mw_hash = (raw >> 8) & 0x7FFFFFF;
+          if (mw_lock == 0x1 && raw > 0xFF) {
+            log_warning(gc)("  ^^ LOOKS LIKE MARK WORD: lock=unlocked age=%u hash=0x%07x"
+                            " upper=0x%lx — possible header copied into oop slot",
+                            (unsigned)mw_age, (unsigned)mw_hash,
+                            (unsigned long)(raw >> 35));
+          }
         }
         return;
       }

@@ -130,9 +130,15 @@ public:
     if ((raw >> 63) != 0) return;
     if (!_g1h->is_in((void*)raw)) {
       uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
+      uintptr_t mw_lock = raw & 0x3;
+      uintptr_t mw_age = (raw >> 3) & 0xF;
+      const char* mw_hint = (mw_lock == 0x1 && raw > 0xFF)
+                            ? " LOOKS-LIKE-MARKWORD" : "";
       log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
-                      "field_val=" PTR_FORMAT " not in heap",
-                      p2i((void*)_obj), _obj->klass()->external_name(), off, raw);
+                      "field_val=0x%lx not in heap (lock=%lu age=%u)%s",
+                      p2i((void*)_obj), _obj->klass()->external_name(), off,
+                      (unsigned long)raw, (unsigned long)mw_lock,
+                      (unsigned)mw_age, mw_hint);
       *(uintptr_t*)p = 0;
       _bad++;
       return;
@@ -166,6 +172,9 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
   HeapWord* dest = rmm->allocate_in_fcr(word_size);
   guarantee(dest != nullptr, "FCR allocation failed for fetch");
 
+  // Zero-fill before fetch so any partial/wrong copy is detectable
+  memset(dest, 0, word_size * HeapWordSize);
+
   Klass* fetched_klass = rmm->fetch_remote_object(h, dest);
 
   if (fetched_klass == nullptr) {
@@ -183,6 +192,10 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
     *out_retry = true;
     return nullptr;
   }
+
+  // Capture raw fetched header for diagnostics
+  uintptr_t raw_mark_after_fetch = *(uintptr_t*)dest;
+  uintptr_t raw_klass_after_fetch = *((uintptr_t*)dest + 1);
 
   {
     markWord fetched_mw = cast_to_oop(dest)->mark();
@@ -203,7 +216,27 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
     fetched->oop_iterate(&vcl);
     if (vcl.bad() > 0) {
       log_warning(gc)("POST-FETCH: %d corrupt fields nulled in obj=" PTR_FORMAT
-                      " klass=%s", vcl.bad(), p2i(dest), fetched->klass()->external_name());
+                      " klass=%s (fetched_mark=0x%lx fetched_klass=0x%lx ws=%zu)",
+                      vcl.bad(), p2i(dest), fetched->klass()->external_name(),
+                      (unsigned long)raw_mark_after_fetch,
+                      (unsigned long)raw_klass_after_fetch, word_size);
+    }
+  }
+
+  // Post-patch integrity: verify header wasn't scribbled during patch
+  {
+    Klass* final_klass = cast_to_oop(dest)->klass_or_null();
+    uintptr_t final_mark = *(uintptr_t*)dest;
+    if (final_klass != fetched_klass) {
+      log_warning(gc)("FETCH-SCRIBBLE: klass changed from %s (0x%lx) to 0x%lx during"
+                      " patch of handle " PTR_FORMAT " dest=" PTR_FORMAT " ws=%zu",
+                      fetched_klass->external_name(), (unsigned long)(uintptr_t)fetched_klass,
+                      (unsigned long)(uintptr_t)final_klass, p2i(h), p2i(dest), word_size);
+    }
+    if ((final_mark & 0x3) != (raw_mark_after_fetch & 0x3)) {
+      log_warning(gc)("FETCH-SCRIBBLE: mark word lock bits changed from 0x%lx to 0x%lx"
+                      " during patch of handle " PTR_FORMAT,
+                      (unsigned long)raw_mark_after_fetch, (unsigned long)final_mark, p2i(h));
     }
   }
 
