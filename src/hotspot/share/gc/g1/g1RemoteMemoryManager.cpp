@@ -1265,7 +1265,27 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
       } else {
         target = cast_to_oop(raw);
       }
-      if (!_g1h->is_in(target)) return;
+      if (!_g1h->is_in(target)) {
+        // Non-heap, non-tagged value in an oop slot — heap corruption
+        _stale++;
+        if (_stale <= 50) {
+          const char* src_kind = _is_root ? "ROOT" : "HEAP";
+          const char* src_klass = "?";
+          uint src_region = 9999;
+          if (_cur_obj != nullptr && _g1h->is_in(_cur_obj)) {
+            Klass* sk = _cur_obj->klass_or_null();
+            if (sk != nullptr) src_klass = sk->external_name();
+            src_region = _g1h->heap_region_containing(_cur_obj)->hrm_index();
+          }
+          uint32_t off = (_cur_obj != nullptr) ?
+            (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_cur_obj)) : 0;
+          log_warning(gc)("CORRUPT-OOP [%s]: field=" PTR_FORMAT " raw=0x%lx NOT IN HEAP"
+                          " (src_obj=" PTR_FORMAT " klass=%s region=%u offset=%u)",
+                          src_kind, p2i(p), (unsigned long)raw,
+                          p2i((void*)_cur_obj), src_klass, src_region, off);
+        }
+        return;
+      }
 
       HeapRegion* hr = _g1h->heap_region_containing(target);
       if (hr == nullptr) return;
@@ -1388,6 +1408,13 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
       oop obj = cast_to_oop(p);
       Klass* k = obj->klass_or_null();
       if (k == nullptr) break;
+      uintptr_t klass_raw = (uintptr_t)k;
+      if (klass_raw < 0x10000 || (klass_raw >> 47) != 0) {
+        log_warning(gc)("CORRUPT-KLASS: obj=" PTR_FORMAT " region=%u klass_raw=0x%lx"
+                        " — stopping region scan",
+                        p2i(p), hr->hrm_index(), (unsigned long)klass_raw);
+        break;
+      }
       size_t sz = obj->size();
       if (sz == 0) break;
       cl.set_cur_obj(obj);
