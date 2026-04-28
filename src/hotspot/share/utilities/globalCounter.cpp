@@ -40,15 +40,16 @@ class GlobalCounter::CounterThreadCheck : public ThreadClosure {
   CounterThreadCheck(uintx gbl_cnt) : _gbl_cnt(gbl_cnt) {}
   void do_thread(Thread* thread) {
     SpinYield yield;
-    // Loops on this thread until it has exited the critical read section.
+    int spins = 0;
     while(true) {
       uintx cnt = Atomic::load_acquire(thread->get_rcu_counter());
-      // This checks if the thread's counter is active. And if so is the counter
-      // for a pre-existing reader (belongs to this grace period). A pre-existing
-      // reader will have a lower counter than the global counter version for this
-      // generation. If the counter is larger than the global counter version this
-      //  is a new reader and we can continue.
       if (((cnt & COUNTER_ACTIVE) != 0) && (cnt - _gbl_cnt) > (max_uintx / 2)) {
+        if (++spins == 1000000) {
+          tty->print_cr("GlobalCounter::write_synchronize STUCK on thread %p "
+                        "(name='%s', rcu=" UINTX_FORMAT ", gbl=" UINTX_FORMAT ")",
+                        thread, thread->name(), cnt, _gbl_cnt);
+          spins = 0;
+        }
         yield.wait();
       } else {
         break;
