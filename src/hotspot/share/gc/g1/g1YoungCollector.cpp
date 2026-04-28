@@ -1145,12 +1145,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   post_evacuate_cleanup_1(per_thread_states);
   log_trace(gc)(">>>   post_evacuate_cleanup_1 DONE");
 
-  // FCR stale-ref fixup: scan FCR regions for untagged refs to cset regions.
-  // Must run BEFORE cleanup_2 frees cset regions (forwarding ptrs still valid).
   {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
-      rmm->fixup_stale_refs_in_fcr_regions();
+      rmm->fixup_stale_refs_in_old_regions();
     }
   }
 

@@ -1910,14 +1910,14 @@ public:
   int nulled() const { return _nulled; }
 };
 
-int G1RemoteMemoryManager::fixup_stale_refs_in_fcr_regions() {
+int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
   CSetRefFixupClosure cl(_g1h);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
-    if (!hr->is_fetch_cache()) continue;
+    if (!hr->is_old()) continue;
     if (hr->is_continues_humongous()) continue;
 
     HeapWord* const pb = hr->parsable_bottom_acquire();
@@ -1951,7 +1951,7 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_fcr_regions() {
   }
 
   if (cl.fixed() > 0 || cl.nulled() > 0) {
-    log_warning(gc)("FCR stale-ref fixup: %d refs fixed (forwardee), %d nulled (evac-failed)",
+    log_warning(gc)("Old-region stale-ref fixup: %d refs fixed (forwardee), %d nulled (evac-failed)",
                     cl.fixed(), cl.nulled());
   }
   return cl.fixed() + cl.nulled();

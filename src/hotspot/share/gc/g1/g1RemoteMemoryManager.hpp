@@ -597,10 +597,9 @@ public:
   int fixup_tagged_field_handles();
   int fixup_all_local_handles();
 
-  // Post-evacuation fixup: scan FCR regions for untagged clean refs to
-  // collection-set regions. Writes forwardee address for forwarded targets,
-  // or tags via Handle. Must be called BEFORE free_collection_set.
-  int fixup_stale_refs_in_fcr_regions();
+  // Post-evacuation fixup: scan ALL old regions for untagged refs to
+  // collection-set regions. Must be called BEFORE free_collection_set.
+  int fixup_stale_refs_in_old_regions();
 
   // Post-eviction diagnostic: full heap + root sweep for stale pointers
   // into freed/guarded regions. O(heap) — gated by G1VerifyAfterEviction.
