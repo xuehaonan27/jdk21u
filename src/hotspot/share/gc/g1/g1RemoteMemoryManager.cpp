@@ -1961,8 +1961,13 @@ public:
       RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
       _fixed++;
     } else {
-      // Evac-failed: object still at original address, region not freed — leave ref as-is
-      _skipped++;
+      // Target in CSet but not forwarded → DEAD. Evac-failed objects
+      // forward-to-self (handle_evacuation_failure_par at g1ParScanThreadState.cpp:973),
+      // which sets is_marked()==true. So an unmarked CSet target was unreachable
+      // and its region will be freed by FreeCollectionSetTask in post_evacuate_cleanup_2.
+      // Null the dangling ref before that happens to prevent stale pointers.
+      *(uintptr_t*)p = 0;
+      _fixed++;
     }
   }
   virtual void do_oop(narrowOop* p) {}
@@ -2011,7 +2016,7 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
   }
 
   if (cl.fixed() > 0 || cl.skipped() > 0) {
-    log_warning(gc)("Old-region stale-ref fixup: %d fixed (forwardee), %d skipped (evac-failed, in-place)",
+    log_warning(gc)("Old-region stale-ref fixup: %d fixed (forwardee or null), %d skipped",
                     cl.fixed(), cl.skipped());
   }
   return cl.fixed() + cl.skipped();
