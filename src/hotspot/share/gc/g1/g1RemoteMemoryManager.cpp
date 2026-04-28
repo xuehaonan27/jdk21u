@@ -52,7 +52,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _remote_roots(nullptr), _remote_roots_count(0), _remote_roots_capacity(0),
     _cross_roots_count(0), _deferred_decrement_count(0),
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
-    _current_fcr(nullptr), _fcr_lock(0) {
+    _current_fcr(nullptr), _fcr_lock(0),
+    _fcr_evac_writes(0), _fcr_fixup_nulls(0) {
   _table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
   memset(_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
   memset((void*)_stripe_locks, 0, sizeof(_stripe_locks));
@@ -1943,9 +1944,13 @@ class CSetRefFixupClosure : public BasicOopIterateClosure {
   G1CollectedHeap* _g1h;
   int _fixed;
   int _skipped;
+  int _fcr_nulls;       // Subset of NULL fixes whose source is in FCR
+  bool _src_is_fcr;     // Set per object via set_src_is_fcr()
 public:
   CSetRefFixupClosure(G1CollectedHeap* g1h)
-    : _g1h(g1h), _fixed(0), _skipped(0) {}
+    : _g1h(g1h), _fixed(0), _skipped(0), _fcr_nulls(0), _src_is_fcr(false) {}
+
+  void set_src_is_fcr(bool v) { _src_is_fcr = v; }
 
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
@@ -1968,11 +1973,16 @@ public:
       // Null the dangling ref before that happens to prevent stale pointers.
       *(uintptr_t*)p = 0;
       _fixed++;
+      if (_src_is_fcr) {
+        _fcr_nulls++;
+        _g1h->remote_memory_manager()->record_fcr_fixup_null();
+      }
     }
   }
   virtual void do_oop(narrowOop* p) {}
   int fixed() const { return _fixed; }
   int skipped() const { return _skipped; }
+  int fcr_nulls() const { return _fcr_nulls; }
 };
 
 int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
@@ -1984,6 +1994,8 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
     if (hr->is_empty() || hr->is_free()) continue;
     if (!hr->is_old()) continue;
     if (hr->is_continues_humongous()) continue;
+
+    cl.set_src_is_fcr(hr->is_fetch_cache());
 
     HeapWord* const pb = hr->parsable_bottom_acquire();
     HeapWord* const region_top = hr->top();
@@ -2016,8 +2028,11 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
   }
 
   if (cl.fixed() > 0 || cl.skipped() > 0) {
-    log_warning(gc)("Old-region stale-ref fixup: %d fixed (forwardee or null), %d skipped",
-                    cl.fixed(), cl.skipped());
+    log_warning(gc)("Old-region stale-ref fixup: %d fixed (forwardee or null), %d skipped"
+                    " (FCR-source NULLs: %d / total-evac FCR writes: %llu vs total-fixup FCR NULLs: %llu)",
+                    cl.fixed(), cl.skipped(), cl.fcr_nulls(),
+                    (unsigned long long)fcr_evac_writes(),
+                    (unsigned long long)fcr_fixup_nulls());
   }
   return cl.fixed() + cl.skipped();
 }

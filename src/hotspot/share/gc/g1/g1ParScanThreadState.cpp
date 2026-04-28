@@ -286,6 +286,13 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
       G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(Thread::current());
       qset.enqueue(queue, card);
     }
+    // Diagnostic for Task #11: count FCR-source writes for cross-region forwardees.
+    // Compare against CSetRefFixupClosure NULL count: if fixup > evac, some writes
+    // bypass do_oop_evac entirely (likely C2 putfield or Unsafe path).
+    HeapRegion* src_hr = _g1h->heap_region_containing((void*)p);
+    if (src_hr != nullptr && src_hr->is_fetch_cache()) {
+      _g1h->remote_memory_manager()->record_fcr_evac_write();
+    }
   }
 
   write_ref_field_post(p, obj);

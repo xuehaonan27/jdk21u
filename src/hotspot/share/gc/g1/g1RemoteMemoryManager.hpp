@@ -601,6 +601,16 @@ public:
   // collection-set regions. Must be called BEFORE free_collection_set.
   int fixup_stale_refs_in_old_regions();
 
+  // Diagnostic counters for Task #11 — comparing do_oop_evac processing
+  // of FCR-source fields vs fixup NULLing of stale refs from FCR sources.
+  // If fixup > evac, mutator writes are bypassing do_oop_evac.
+  volatile uint64_t _fcr_evac_writes;
+  volatile uint64_t _fcr_fixup_nulls;
+  void record_fcr_evac_write()  { Atomic::inc(&_fcr_evac_writes); }
+  void record_fcr_fixup_null()  { Atomic::inc(&_fcr_fixup_nulls); }
+  uint64_t fcr_evac_writes() const  { return Atomic::load(&_fcr_evac_writes); }
+  uint64_t fcr_fixup_nulls() const  { return Atomic::load(&_fcr_fixup_nulls); }
+
   // Post-eviction diagnostic: full heap + root sweep for stale pointers
   // into freed/guarded regions. O(heap) — gated by G1VerifyAfterEviction.
   int verify_no_stale_refs_to_freed_regions();
