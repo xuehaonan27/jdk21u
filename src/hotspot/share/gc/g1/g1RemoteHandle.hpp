@@ -3,7 +3,7 @@
  *
  * Handle table for G1 disaggregated memory support.
  *
- * Each RemoteHandle is 16 bytes, tracking the location (local or remote)
+ * Each RemoteHandle tracks the location (local or remote)
  * of a managed object. Handles serve three roles:
  *
  * 1. Evicted objects: Handle tracks LOCAL/REMOTE/FETCHING state for load barrier.
@@ -53,6 +53,7 @@ struct RemoteHandle {
   uint32_t           _remote_refcount; // Count of remote oop fields pointing to this Handle
   uint32_t           _flags;           // REMOTE_HANDLE_FLAG_* bits
   uintptr_t          _eviction_addr;   // Local address at eviction time (for O(1) table rekey)
+  size_t             _eviction_word_size; // Full object size for fetch-time FCR allocation
 
   // State queries (non-atomic, for use under lock or single-threaded)
   uintptr_t state() const { return _state_and_addr & REMOTE_HANDLE_STATE_MASK; }
@@ -143,15 +144,15 @@ struct RemoteHandle {
   void set_dormant()   { _flags |= REMOTE_HANDLE_FLAG_DORMANT; }
   void clear_dormant() { _flags &= ~REMOTE_HANDLE_FLAG_DORMANT; }
 
-  // Store/retrieve eviction metadata.
-  // word_size is needed at fetch time for FCR allocation (without querying backend).
-  // Packed into _flags upper 16 bits (max 64K words = 512KB object, sufficient).
+  // Store/retrieve eviction metadata. word_size is needed at fetch time for
+  // FCR allocation without querying the backend. This must not be packed into
+  // a 16-bit field: ordinary object arrays can exceed 64K HeapWords.
   void set_eviction_word_size(size_t ws) {
-    assert(ws <= 0xFFFF, "object too large for packed word_size");
-    _flags = (_flags & 0xFFFF) | ((uint32_t)ws << 16);
+    assert(ws > 0, "object word size must be non-zero");
+    _eviction_word_size = ws;
   }
   size_t eviction_word_size() const {
-    return (size_t)(_flags >> 16);
+    return _eviction_word_size;
   }
 
   // Initialize a fresh Handle
@@ -160,6 +161,7 @@ struct RemoteHandle {
     _remote_refcount = 0;
     _flags = 0;
     _eviction_addr = 0;
+    _eviction_word_size = 0;
   }
 
   // Initialize as dormant anchor (local object referenced by remote)
@@ -168,6 +170,7 @@ struct RemoteHandle {
     _remote_refcount = 0;
     _flags = REMOTE_HANDLE_FLAG_DORMANT;
     _eviction_addr = 0;
+    _eviction_word_size = 0;
   }
 };
 
