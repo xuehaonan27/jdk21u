@@ -24,6 +24,7 @@
 #include "oops/oop.inline.hpp"
 #include "runtime/os.hpp"
 #include "runtime/safepoint.hpp"
+#include "runtime/timer.hpp"
 #include "runtime/mutexLocker.hpp"
 #include "runtime/jniHandles.hpp"
 #include "runtime/threads.hpp"
@@ -53,6 +54,11 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _cross_roots_count(0), _deferred_decrement_count(0),
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
     _fcr_evac_writes(0), _fcr_fixup_nulls(0),
+    _resolve_fast_local(0), _resolve_fast_remote(0), _resolve_fast_fetching(0),
+    _resolve_fast_dead(0), _resolve_slow_entries(0), _resolve_no_safepoint_entries(0),
+    _fetch_success(0), _fetch_failures(0), _fetch_words(0), _fetch_elapsed_counter(0),
+    _fetch_retries(0), _fetch_wait_slow(0), _fetch_wait_no_safepoint(0),
+    _fetch_wait_hard(0), _fetch_wait_loops(0),
     _current_fcr(nullptr), _fcr_lock(0) {
   _table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
   memset(_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
@@ -117,6 +123,39 @@ void G1RemoteMemoryManager::initialize_backend() {
   _backend = new SimLocalBackend();
   _backend->initialize();
   log_info(gc)("Remote memory backend: %s", _backend->name());
+}
+
+void G1RemoteMemoryManager::log_remote_access_stats() const {
+  uint64_t fetch_success = Atomic::load(&_fetch_success);
+  uint64_t fetch_words = Atomic::load(&_fetch_words);
+  uint64_t fetch_counter = Atomic::load(&_fetch_elapsed_counter);
+  double fetch_ms = TimeHelper::counter_to_millis((jlong)fetch_counter);
+  double avg_us = fetch_success == 0 ? 0.0 : (fetch_ms * 1000.0) / (double)fetch_success;
+
+  log_info(gc)("Remote access stats: resolve_fast(local=" UINT64_FORMAT
+               " remote=" UINT64_FORMAT " fetching=" UINT64_FORMAT
+               " dead=" UINT64_FORMAT ") slow=" UINT64_FORMAT
+               " no_safepoint=" UINT64_FORMAT " fetch(ok=" UINT64_FORMAT
+               " fail=" UINT64_FORMAT " retry=" UINT64_FORMAT
+               " bytes=" UINT64_FORMAT " avg_us=%.1f total_ms=%.1f)"
+               " waits(slow=" UINT64_FORMAT " no_safepoint=" UINT64_FORMAT
+               " hard=" UINT64_FORMAT " loops=" UINT64_FORMAT ")",
+               Atomic::load(&_resolve_fast_local),
+               Atomic::load(&_resolve_fast_remote),
+               Atomic::load(&_resolve_fast_fetching),
+               Atomic::load(&_resolve_fast_dead),
+               Atomic::load(&_resolve_slow_entries),
+               Atomic::load(&_resolve_no_safepoint_entries),
+               fetch_success,
+               Atomic::load(&_fetch_failures),
+               Atomic::load(&_fetch_retries),
+               fetch_words * HeapWordSize,
+               avg_us,
+               fetch_ms,
+               Atomic::load(&_fetch_wait_slow),
+               Atomic::load(&_fetch_wait_no_safepoint),
+               Atomic::load(&_fetch_wait_hard),
+               Atomic::load(&_fetch_wait_loops));
 }
 
 G1RemoteMemoryManager::~G1RemoteMemoryManager() {

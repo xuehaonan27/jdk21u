@@ -615,6 +615,60 @@ public:
   uint64_t fcr_evac_writes() const  { return Atomic::load(&_fcr_evac_writes); }
   uint64_t fcr_fixup_nulls() const  { return Atomic::load(&_fcr_fixup_nulls); }
 
+  // Mutator-side remote access diagnostics. These are intentionally coarse
+  // atomic counters so Spark runs can be diagnosed without JVM attach.
+  volatile uint64_t _resolve_fast_local;
+  volatile uint64_t _resolve_fast_remote;
+  volatile uint64_t _resolve_fast_fetching;
+  volatile uint64_t _resolve_fast_dead;
+  volatile uint64_t _resolve_slow_entries;
+  volatile uint64_t _resolve_no_safepoint_entries;
+  volatile uint64_t _fetch_success;
+  volatile uint64_t _fetch_failures;
+  volatile uint64_t _fetch_words;
+  volatile uint64_t _fetch_elapsed_counter;
+  volatile uint64_t _fetch_retries;
+  volatile uint64_t _fetch_wait_slow;
+  volatile uint64_t _fetch_wait_no_safepoint;
+  volatile uint64_t _fetch_wait_hard;
+  volatile uint64_t _fetch_wait_loops;
+
+  void record_resolve_fast_state(uintptr_t state) {
+    if (state == REMOTE_HANDLE_LOCAL) {
+      Atomic::inc(&_resolve_fast_local);
+    } else if (state == REMOTE_HANDLE_REMOTE) {
+      Atomic::inc(&_resolve_fast_remote);
+    } else if (state == REMOTE_HANDLE_FETCHING) {
+      Atomic::inc(&_resolve_fast_fetching);
+    } else if (state == REMOTE_HANDLE_DEAD) {
+      Atomic::inc(&_resolve_fast_dead);
+    }
+  }
+  void record_resolve_slow_entry() { Atomic::inc(&_resolve_slow_entries); }
+  void record_resolve_no_safepoint_entry() { Atomic::inc(&_resolve_no_safepoint_entries); }
+  void record_fetch_result(size_t word_size, jlong elapsed_counter, bool success) {
+    if (success) {
+      Atomic::inc(&_fetch_success);
+      Atomic::add(&_fetch_words, (uint64_t)word_size);
+      Atomic::add(&_fetch_elapsed_counter, (uint64_t)elapsed_counter);
+    } else {
+      Atomic::inc(&_fetch_failures);
+    }
+  }
+  void record_fetch_retry() { Atomic::inc(&_fetch_retries); }
+  void record_fetch_wait(bool no_safepoint, bool hard, uint64_t loops) {
+    Atomic::add(&_fetch_wait_loops, loops);
+    if (no_safepoint) {
+      Atomic::inc(&_fetch_wait_no_safepoint);
+    } else {
+      Atomic::inc(&_fetch_wait_slow);
+    }
+    if (hard) {
+      Atomic::inc(&_fetch_wait_hard);
+    }
+  }
+  void log_remote_access_stats() const;
+
   // Post-eviction diagnostic: full heap + root sweep for stale pointers
   // into freed/guarded regions. O(heap) — gated by G1VerifyAfterEviction.
   int verify_no_stale_refs_to_freed_regions();

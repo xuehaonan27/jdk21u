@@ -1038,6 +1038,27 @@ static int rpe_cmp(const void* a, const void* b) {
   return (aa < bb) ? -1 : (aa > bb) ? 1 : 0;
 }
 
+static void dirty_root_catch_region(G1CollectedHeap* g1h, HeapRegion* root_catch, HeapWord* top) {
+  if (root_catch == nullptr || top == root_catch->bottom()) {
+    return;
+  }
+
+  root_catch->set_top(top);
+
+  G1CardTable* ct = g1h->card_table();
+  CardTable::CardValue* start_card = ct->byte_for(root_catch->bottom());
+  CardTable::CardValue* end_card   = ct->byte_for(top - 1) + 1;
+  memset(start_card, CardTable::dirty_card_val(), end_card - start_card);
+
+  // Raw card table dirtying alone is invisible to G1's remset processing.
+  G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
+  G1DirtyCardQueue tmp_queue(&dcqs);
+  for (CardTable::CardValue* card = start_card; card < end_card; card++) {
+    dcqs.enqueue(tmp_queue, card);
+  }
+  dcqs.flush_queue(tmp_queue);
+}
+
 // Closure that checks if a root oop targets a cold-destination region.
 // Used by both Path 1 (root-pinning) and Path 2 (existing region pinning).
 class ColdRegionPinClosure : public OopClosure {
@@ -1337,25 +1358,41 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // objects to a dedicated "root-catch" region. This allows eviction of
     // regions that previously had 1-2 root refs blocking them.
     if (total_candidates > 0) {
-      const int max_pins = 131072;
-      RootPinEntry* pins = NEW_C_HEAP_ARRAY(RootPinEntry, max_pins, mtGC);
+      int pin_capacity = 131072;
+      int pin_grows = 0;
+      RootPinEntry* pins = NEW_C_HEAP_ARRAY(RootPinEntry, pin_capacity, mtGC);
       int num_pins = 0;
 
       class EvictionRootCollectClosure : public OopClosure {
         G1CollectedHeap* _g1h;
         const bool*      _eviction_candidates;
         uint             _num_regions;
-        RootPinEntry*    _pins;
+        RootPinEntry**   _pins;
         int&             _num_pins;
-        int              _max_pins;
-        bool&            _overflow;
+        int&             _pin_capacity;
+        int&             _pin_grows;
+
+        void append(oop* root, uintptr_t obj_addr, bool update_root) {
+          if (_num_pins >= _pin_capacity) {
+            int new_capacity = _pin_capacity + MAX2(_pin_capacity / 2, 4096);
+            RootPinEntry* new_pins = NEW_C_HEAP_ARRAY(RootPinEntry, new_capacity, mtGC);
+            memcpy(new_pins, *_pins, _num_pins * sizeof(RootPinEntry));
+            FREE_C_HEAP_ARRAY(RootPinEntry, *_pins);
+            *_pins = new_pins;
+            _pin_capacity = new_capacity;
+            _pin_grows++;
+          }
+          (*_pins)[_num_pins] = {root, obj_addr, update_root};
+          _num_pins++;
+        }
+
       public:
         EvictionRootCollectClosure(G1CollectedHeap* g1h, const bool* candidates,
-                                   uint num_regions, RootPinEntry* pins,
-                                   int& num_pins, int max_pins, bool& overflow)
+                                   uint num_regions, RootPinEntry** pins,
+                                   int& num_pins, int& pin_capacity, int& pin_grows)
           : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
-            _pins(pins), _num_pins(num_pins), _max_pins(max_pins),
-            _overflow(overflow) {}
+            _pins(pins), _num_pins(num_pins), _pin_capacity(pin_capacity),
+            _pin_grows(pin_grows) {}
         void do_oop(oop* p) {
           oop obj = *p;
           if (obj == nullptr) return;
@@ -1370,20 +1407,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           if (hr == nullptr) return;
           uint idx = hr->hrm_index();
           if (idx < _num_regions && _eviction_candidates[idx]) {
-            if (_num_pins < _max_pins) {
-              _pins[_num_pins] = {p, cast_from_oop<uintptr_t>(obj), true};
-              _num_pins++;
-            } else {
-              _overflow = true;
-            }
+            append(p, cast_from_oop<uintptr_t>(obj), true);
           }
         }
         void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
       };
 
-      bool root_pin_overflow = false;
       EvictionRootCollectClosure collect_cl(_g1h, eviction_candidates, num_regions,
-                                             pins, num_pins, max_pins, root_pin_overflow);
+                                             &pins, num_pins, pin_capacity, pin_grows);
       Threads::oops_do(&collect_cl, nullptr);
       JNIHandles::oops_do(&collect_cl);
       OopStorageSet::strong_oops_do(&collect_cl);
@@ -1402,16 +1433,29 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       bool remote_anchor_overflow = false;
       int remote_anchor_seen = 0;
-      int remaining_pin_slots = max_pins - num_pins;
       uintptr_t* remote_anchor_addrs = nullptr;
-      if (remaining_pin_slots > 0) {
-        remote_anchor_addrs = NEW_C_HEAP_ARRAY(uintptr_t, remaining_pin_slots, mtGC);
+      remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
+          eviction_candidates, num_regions, nullptr, 0, &remote_anchor_overflow);
+
+      int remote_anchor_capacity = remote_anchor_seen;
+      if (remote_anchor_capacity > 0) {
+        remote_anchor_addrs = NEW_C_HEAP_ARRAY(uintptr_t, remote_anchor_capacity, mtGC);
       }
+      remote_anchor_overflow = false;
       remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
           eviction_candidates, num_regions, remote_anchor_addrs,
-          remaining_pin_slots, &remote_anchor_overflow);
-      int remote_anchor_stored = MIN2(remote_anchor_seen, remaining_pin_slots);
+          remote_anchor_capacity, &remote_anchor_overflow);
+      int remote_anchor_stored = MIN2(remote_anchor_seen, remote_anchor_capacity);
       for (int i = 0; i < remote_anchor_stored; i++) {
+        if (num_pins >= pin_capacity) {
+          int new_capacity = pin_capacity + MAX2(pin_capacity / 2, 4096);
+          RootPinEntry* new_pins = NEW_C_HEAP_ARRAY(RootPinEntry, new_capacity, mtGC);
+          memcpy(new_pins, pins, num_pins * sizeof(RootPinEntry));
+          FREE_C_HEAP_ARRAY(RootPinEntry, pins);
+          pins = new_pins;
+          pin_capacity = new_capacity;
+          pin_grows++;
+        }
         pins[num_pins] = {nullptr, remote_anchor_addrs[i], false};
         num_pins++;
       }
@@ -1423,7 +1467,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
 
       // Relocate collected root-pinned objects to a catch region
-      if (root_pin_overflow || remote_anchor_overflow) {
+      if (remote_anchor_overflow) {
         int overflow_pinned = 0;
         for (uint i = 0; i < num_regions; i++) {
           if (eviction_candidates[i]) {
@@ -1436,143 +1480,147 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
         total_candidates -= overflow_pinned;
         log_warning(gc)("Root-catch overflow: pinned %d candidate regions "
-                        "(pins=%d max=%d remote-anchor=%d stored=%d)",
-                        overflow_pinned, num_pins, max_pins,
+                        "(pins=%d capacity=%d grows=%d remote-anchor=%d stored=%d)",
+                        overflow_pinned, num_pins, pin_capacity, pin_grows,
                         remote_anchor_seen, remote_anchor_stored);
       } else if (num_pins > 0) {
         qsort(pins, num_pins, sizeof(RootPinEntry), rpe_cmp);
 
-        HeapRegion* root_catch = _g1h->allocate_fcr_region();
-        if (root_catch == nullptr) {
-          // Fallback: pin regions the old way
-          for (int i = 0; i < num_pins; i++) {
-            oop obj = cast_to_oop(pins[i].obj_addr);
-            if (!_g1h->is_in(obj)) continue;
+        HeapRegion* root_catch = nullptr;
+        HeapWord* catch_top = nullptr;
+        uint first_root_catch_idx = (uint)-1;
+        int catch_regions = 0;
+        int relocated = 0;
+        int roots_updated = 0;
+        int fallback_pinned = 0;
+        size_t root_catch_words = 0;
+        bool catch_alloc_failed = false;
+
+        uintptr_t prev_addr = 0;
+        HeapWord* prev_new = nullptr;
+
+        for (int i = 0; i < num_pins; i++) {
+          uintptr_t obj_addr = pins[i].obj_addr;
+          oop* root_p = pins[i].root;
+          bool update_root = pins[i].update_root && root_p != nullptr;
+
+          if (obj_addr == prev_addr && prev_new != nullptr) {
+            // Duplicate root to same object. Remote-anchor pins have no root
+            // slot; their Handle was updated by the first relocation and any
+            // duplicates are handled by the forwarding fixup below.
+            if (update_root) {
+              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+              uintptr_t tags = raw & G1_OOP_TAG_MASK;
+              *root_p = cast_to_oop(tags | ((uintptr_t)prev_new & G1_OOP_ADDR_MASK));
+              roots_updated++;
+            }
+            continue;
+          }
+
+          oop obj = cast_to_oop(obj_addr);
+          if (obj->is_forwarded()) {
+            // Already relocated by an earlier entry; update root to forwardee.
+            oop fwd = obj->forwardee();
+            if (update_root) {
+              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+              uintptr_t tags = raw & G1_OOP_TAG_MASK;
+              *root_p = cast_to_oop(tags | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK));
+              roots_updated++;
+            }
+            prev_addr = obj_addr;
+            prev_new = cast_from_oop<HeapWord*>(fwd);
+            continue;
+          }
+
+          size_t word_sz = obj->size();
+          if (root_catch == nullptr) {
+            root_catch = _g1h->allocate_fcr_region();
+            if (root_catch != nullptr) {
+              catch_top = root_catch->bottom();
+              if (first_root_catch_idx == (uint)-1) {
+                first_root_catch_idx = root_catch->hrm_index();
+              }
+              catch_regions++;
+            }
+          } else if (catch_top + word_sz > root_catch->end() &&
+                     catch_top != root_catch->bottom()) {
+            dirty_root_catch_region(_g1h, root_catch, catch_top);
+            root_catch = _g1h->allocate_fcr_region();
+            if (root_catch != nullptr) {
+              catch_top = root_catch->bottom();
+              catch_regions++;
+            }
+          }
+
+          if (root_catch == nullptr || catch_top + word_sz > root_catch->end()) {
+            catch_alloc_failed = true;
             HeapRegion* hr = _g1h->heap_region_containing(obj);
             uint idx = hr->hrm_index();
             if (idx < num_regions && eviction_candidates[idx]) {
               eviction_candidates[idx] = false;
               regions_pinned++;
               total_candidates--;
+              fallback_pinned++;
             }
-          }
-          log_warning(gc)("Root-catch: cannot allocate catch region, pinned %d regions", regions_pinned);
-        } else {
-          HeapWord* catch_top = root_catch->bottom();
-          int relocated = 0;
-          int roots_updated = 0;
-          int fallback_pinned = 0;
-
-          uintptr_t prev_addr = 0;
-          HeapWord* prev_new = nullptr;
-
-          for (int i = 0; i < num_pins; i++) {
-            uintptr_t obj_addr = pins[i].obj_addr;
-            oop* root_p = pins[i].root;
-            bool update_root = pins[i].update_root && root_p != nullptr;
-
-            if (obj_addr == prev_addr && prev_new != nullptr) {
-              // Duplicate root to same object — update this real root too.
-              // Remote-anchor pins have no root slot; their Handle was updated
-              // by the first relocation and any duplicates are handled by the
-              // forwarding fixup below.
-              if (update_root) {
-                uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-                uintptr_t tags = raw & G1_OOP_TAG_MASK;
-                *root_p = cast_to_oop(tags | ((uintptr_t)prev_new & G1_OOP_ADDR_MASK));
-                roots_updated++;
-              }
-              continue;
-            }
-
-            oop obj = cast_to_oop(obj_addr);
-            if (obj->is_forwarded()) {
-              // Already relocated by an earlier entry — update root to forwardee
-              oop fwd = obj->forwardee();
-              if (update_root) {
-                uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-                uintptr_t tags = raw & G1_OOP_TAG_MASK;
-                *root_p = cast_to_oop(tags | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK));
-                roots_updated++;
-              }
-              prev_addr = obj_addr;
-              prev_new = cast_from_oop<HeapWord*>(fwd);
-              continue;
-            }
-
-            size_t word_sz = obj->size();
-            if (catch_top + word_sz > root_catch->end()) {
-              // Catch region full — fallback pin for this region
-              HeapRegion* hr = _g1h->heap_region_containing(obj);
-              uint idx = hr->hrm_index();
-              if (idx < num_regions && eviction_candidates[idx]) {
-                eviction_candidates[idx] = false;
-                regions_pinned++;
-                total_candidates--;
-                fallback_pinned++;
-              }
-              prev_addr = obj_addr;
-              prev_new = nullptr;
-              continue;
-            }
-
-            // Copy object to catch region
-            Copy::aligned_disjoint_words((HeapWord*)obj_addr, catch_top, word_sz);
-            oop new_obj = cast_to_oop(catch_top);
-            root_catch->update_bot_for_obj(catch_top, word_sz);
-
-            // Install forwarding pointer in old location (Phase B/C/E check this)
-            obj->forward_to(new_obj);
-
-            // Update root (preserve tag bits)
-            if (update_root) {
-              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-              uintptr_t tags = raw & G1_OOP_TAG_MASK;
-              *root_p = cast_to_oop(tags | ((uintptr_t)catch_top & G1_OOP_ADDR_MASK));
-              roots_updated++;
-            }
-
-            // Rekey handle table (old_addr → new_addr)
-            rmm->update_handle_for_evacuation(obj, new_obj);
-
             prev_addr = obj_addr;
-            prev_new = catch_top;
-            catch_top += word_sz;
-            relocated++;
+            prev_new = nullptr;
+            continue;
           }
 
-          root_catch->set_top(catch_top);
-          if (relocated > 0) {
-            G1CardTable* ct = _g1h->card_table();
-            CardTable::CardValue* start_card = ct->byte_for(root_catch->bottom());
-            CardTable::CardValue* end_card   = ct->byte_for(catch_top - 1) + 1;
-            memset(start_card, CardTable::dirty_card_val(), end_card - start_card);
-            // Enqueue to dirty card queue so next GC's Merge Heap Roots scans them.
-            // Raw card table dirtying alone is invisible to G1's remset processing.
-            G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
-            G1DirtyCardQueue tmp_queue(&dcqs);
-            for (CardTable::CardValue* card = start_card; card < end_card; card++) {
-              dcqs.enqueue(tmp_queue, card);
-            }
-            dcqs.flush_queue(tmp_queue);
+          // Copy object to catch region.
+          Copy::aligned_disjoint_words((HeapWord*)obj_addr, catch_top, word_sz);
+          oop new_obj = cast_to_oop(catch_top);
+          root_catch->update_bot_for_obj(catch_top, word_sz);
+
+          // Install forwarding pointer in old location (Phase B/C/E check this).
+          obj->forward_to(new_obj);
+
+          // Update root (preserve tag bits).
+          if (update_root) {
+            uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+            uintptr_t tags = raw & G1_OOP_TAG_MASK;
+            *root_p = cast_to_oop(tags | ((uintptr_t)catch_top & G1_OOP_ADDR_MASK));
+            roots_updated++;
           }
-          if (relocated > 0 || fallback_pinned > 0) {
-            log_info(gc)("Root-catch relocation: %d objects (%zuKB) relocated to region %u, "
-                         "%d roots updated, %d regions fallback-pinned",
-                         relocated,
-                         (size_t)(catch_top - root_catch->bottom()) * HeapWordSize / K,
-                         root_catch->hrm_index(), roots_updated, fallback_pinned);
-          }
+
+          // Rekey handle table (old_addr -> new_addr).
+          rmm->update_handle_for_evacuation(obj, new_obj);
+
+          prev_addr = obj_addr;
+          prev_new = catch_top;
+          catch_top += word_sz;
+          root_catch_words += word_sz;
+          relocated++;
+        }
+
+        if (root_catch != nullptr) {
           if (catch_top == root_catch->bottom()) {
             FreeRegionList tmp("tmp");
             _g1h->free_region(root_catch, &tmp);
+          } else {
+            dirty_root_catch_region(_g1h, root_catch, catch_top);
           }
-
-          // Root-catch installs forwarding pointers in the old candidate
-          // regions. Update every LOCAL Handle that still points at one of
-          // those forwarding stubs, including duplicate dormant anchors.
-          rmm->fixup_all_local_handles();
         }
+
+        if (relocated > 0 || fallback_pinned > 0 || catch_alloc_failed) {
+          uint log_first_idx = (first_root_catch_idx == (uint)-1) ? 0 : first_root_catch_idx;
+          log_info(gc)("Root-catch relocation: %d objects (%zuKB) relocated to %d catch regions "
+                       "(first=%u), %d roots updated, %d regions fallback-pinned, pins=%d "
+                       "capacity=%d grows=%d remote-anchor=%d",
+                       relocated, root_catch_words * HeapWordSize / K,
+                       catch_regions, log_first_idx, roots_updated,
+                       fallback_pinned, num_pins, pin_capacity, pin_grows,
+                       remote_anchor_seen);
+        }
+        if (catch_alloc_failed) {
+          log_warning(gc)("Root-catch: catch region allocation failed or object too large; "
+                          "fallback-pinned %d regions", fallback_pinned);
+        }
+
+        // Root-catch installs forwarding pointers in the old candidate
+        // regions. Update every LOCAL Handle that still points at one of
+        // those forwarding stubs, including duplicate dormant anchors.
+        rmm->fixup_all_local_handles();
       }
 
       // Clean up cold_destination/root_pinned flags from earlier scan
@@ -2188,6 +2236,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                    regions_pinned,
                    rmm->backend()->total_evicted(), rmm->backend()->total_fetched());
     }
+    rmm->log_remote_access_stats();
     } // end else (not concurrent start)
   }
 

@@ -81,6 +81,10 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
     RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    G1RemoteMemoryManager* rmm = G1CollectedHeap::heap()->remote_memory_manager();
+    if (rmm != nullptr && state != REMOTE_HANDLE_LOCAL) {
+      rmm->record_resolve_fast_state(state);
+    }
     if (state == REMOTE_HANDLE_LOCAL) {
       oopDesc* resolved = (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
 
@@ -89,9 +93,8 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
       // Best-effort: skip if locked, skip on CAS failure.
       if (((uintptr_t)resolved & 0x78) == 0) {  // ~1/16 sampling
         markWord mw = resolved->mark_acquire();
-        if (mw.is_unlocked()) {
-          G1CollectedHeap* g1h = G1CollectedHeap::heap();
-          uint32_t epoch = g1h->remote_memory_manager()->gc_epoch() & 0xF;
+        if (mw.is_unlocked() && rmm != nullptr) {
+          uint32_t epoch = rmm->gc_epoch() & 0xF;
           if (mw.remote_epoch() != epoch) {
             markWord new_mw = mw.set_remote_epoch(epoch);
             // Best-effort CAS — skip on failure (another thread may have
@@ -175,10 +178,14 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
   // Zero-fill before fetch so any partial/wrong copy is detectable
   memset(dest, 0, word_size * HeapWordSize);
 
+  jlong fetch_start = os::elapsed_counter();
   Klass* fetched_klass = rmm->fetch_remote_object(h, dest);
+  jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
+  rmm->record_fetch_result(word_size, fetch_elapsed, fetched_klass != nullptr);
 
   if (fetched_klass == nullptr) {
     fetch_attempts++;
+    rmm->record_fetch_retry();
     if (fetch_attempts >= 3) {
       h->set_dead();
       log_warning(gc)("Fetch failed %d times for handle " PTR_FORMAT " — marking DEAD",
@@ -282,6 +289,10 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   RemoteHandle* h = nullptr;
   oopDesc* fast = resolve_fast_checks(tagged, &h);
   if (h == nullptr) return fast;
+  G1RemoteMemoryManager* rmm = G1CollectedHeap::heap()->remote_memory_manager();
+  if (rmm != nullptr) {
+    rmm->record_resolve_slow_entry();
+  }
 
   // VM diagnostic code can reach this through ordinary heap field loads
   // (for example VM_PrintThreads -> JavaThread::print_on). Those callers
@@ -334,6 +345,7 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
       const uint64_t YieldWarn = 10000;
       const uint64_t YieldHard = 100000;
       uint64_t yields = 0;
+      bool hard_wait = false;
       while (true) {
         sa = h->load_state_and_addr_acquire();
         state = sa & REMOTE_HANDLE_STATE_MASK;
@@ -356,9 +368,13 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
                             " — reverted to REMOTE, will retry",
                             (unsigned long long)yields, p2i(h));
           }
+          hard_wait = true;
           break;  // re-enter outer loop, will see REMOTE or whatever current state is
         }
         os::naked_yield();
+      }
+      if (rmm != nullptr && yields > 0) {
+        rmm->record_fetch_wait(false, hard_wait, yields);
       }
       continue;
     }
@@ -380,6 +396,10 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
   RemoteHandle* h = nullptr;
   oopDesc* fast = resolve_fast_checks(tagged, &h);
   if (h == nullptr) return fast;
+  G1RemoteMemoryManager* rmm = G1CollectedHeap::heap()->remote_memory_manager();
+  if (rmm != nullptr) {
+    rmm->record_resolve_no_safepoint_entry();
+  }
 
   int fetch_attempts = 0;
   while (true) {
@@ -411,6 +431,7 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
       const uint64_t SpinThreshold = 1ULL << 24;       // ~16M spins
       const uint64_t HardLimit     = 1ULL << 30;       // ~1B spins (~10s)
       uint64_t spins = 0;
+      bool hard_wait = false;
       while (true) {
         sa = h->load_state_and_addr_acquire();
         state = sa & REMOTE_HANDLE_STATE_MASK;
@@ -427,9 +448,13 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
                             " — reverted to REMOTE, will retry",
                             (unsigned long long)spins, p2i(h));
           }
+          hard_wait = true;
           break;  // re-enter outer loop, retry with current state
         }
         SpinPause();
+      }
+      if (rmm != nullptr && spins > 0) {
+        rmm->record_fetch_wait(true, hard_wait, spins);
       }
       continue;
     }
