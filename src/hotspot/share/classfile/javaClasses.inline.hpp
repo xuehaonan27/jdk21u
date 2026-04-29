@@ -27,6 +27,7 @@
 
 #include "classfile/javaClasses.hpp"
 
+#include "gc/g1/g1RemoteOop.hpp"
 #include "memory/referenceType.hpp"
 #include "oops/access.inline.hpp"
 #include "oops/instanceKlass.inline.hpp"
@@ -34,6 +35,14 @@
 #include "oops/oop.inline.hpp"
 #include "oops/oopsHierarchy.hpp"
 #include "oops/typeArrayOop.inline.hpp"
+
+static inline oop java_lang_String_resolve_remote_oop(oop obj) {
+  if (obj == nullptr) {
+    return nullptr;
+  }
+  uintptr_t raw = cast_from_oop<uintptr_t>(obj);
+  return (raw >> 63) == 0 ? obj : resolve_oop_full(obj);
+}
 
 void java_lang_String::set_coder(oop string, jbyte coder) {
   string->byte_field_put(_coder_offset, coder);
@@ -48,11 +57,14 @@ void java_lang_String::set_value(oop string, typeArrayOop buffer) {
 }
 
 bool java_lang_String::hash_is_set(oop java_string) {
+  java_string = java_lang_String_resolve_remote_oop(java_string);
   return java_string->int_field(_hash_offset) != 0 || java_string->bool_field(_hashIsZero_offset) != 0;
 }
 
 // Accessors
 bool java_lang_String::value_equals(typeArrayOop str_value1, typeArrayOop str_value2) {
+  str_value1 = (typeArrayOop)java_lang_String_resolve_remote_oop(str_value1);
+  str_value2 = (typeArrayOop)java_lang_String_resolve_remote_oop(str_value2);
   return ((str_value1 == str_value2) ||
           (str_value1->length() == str_value2->length() &&
            (!memcmp(str_value1->base(T_BYTE),
@@ -61,16 +73,19 @@ bool java_lang_String::value_equals(typeArrayOop str_value1, typeArrayOop str_va
 }
 
 typeArrayOop java_lang_String::value(oop java_string) {
+  java_string = java_lang_String_resolve_remote_oop(java_string);
   assert(is_instance(java_string), "must be java_string");
-  return (typeArrayOop) java_string->obj_field(_value_offset);
+  return (typeArrayOop)java_lang_String_resolve_remote_oop((typeArrayOop) java_string->obj_field(_value_offset));
 }
 
 typeArrayOop java_lang_String::value_no_keepalive(oop java_string) {
+  java_string = java_lang_String_resolve_remote_oop(java_string);
   assert(is_instance(java_string), "must be java_string");
-  return (typeArrayOop) java_string->obj_field_access<AS_NO_KEEPALIVE>(_value_offset);
+  return (typeArrayOop)java_lang_String_resolve_remote_oop((typeArrayOop) java_string->obj_field_access<AS_NO_KEEPALIVE>(_value_offset));
 }
 
 bool java_lang_String::is_latin1(oop java_string) {
+  java_string = java_lang_String_resolve_remote_oop(java_string);
   assert(is_instance(java_string), "must be java_string");
   jbyte coder = java_string->byte_field(_coder_offset);
   assert(CompactStrings || coder == CODER_UTF16, "Must be UTF16 without CompactStrings");
@@ -78,6 +93,7 @@ bool java_lang_String::is_latin1(oop java_string) {
 }
 
 uint8_t* java_lang_String::flags_addr(oop java_string) {
+  java_string = java_lang_String_resolve_remote_oop(java_string);
   assert(_initialized, "Must be initialized");
   assert(is_instance(java_string), "Must be java string");
   return java_string->field_addr<uint8_t>(_flags_offset);
@@ -104,6 +120,8 @@ bool java_lang_String::test_and_set_deduplication_requested(oop java_string) {
 }
 
 int java_lang_String::length(oop java_string, typeArrayOop value) {
+  java_string = java_lang_String_resolve_remote_oop(java_string);
+  value = (typeArrayOop)java_lang_String_resolve_remote_oop(value);
   assert(_initialized, "Must be initialized");
   assert(is_instance(java_string), "must be java_string");
   assert(value_equals(value, java_lang_String::value(java_string)),
@@ -120,6 +138,7 @@ int java_lang_String::length(oop java_string, typeArrayOop value) {
 }
 
 int java_lang_String::length(oop java_string) {
+  java_string = java_lang_String_resolve_remote_oop(java_string);
   assert(_initialized, "Must be initialized");
   assert(is_instance(java_string), "must be java_string");
   typeArrayOop value = java_lang_String::value_no_keepalive(java_string);
@@ -127,6 +146,7 @@ int java_lang_String::length(oop java_string) {
 }
 
 bool java_lang_String::is_instance(oop obj) {
+  obj = java_lang_String_resolve_remote_oop(obj);
   return obj != nullptr && obj->klass() == vmClasses::String_klass();
 }
 
