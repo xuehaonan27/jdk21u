@@ -25,6 +25,9 @@
 #include "precompiled.hpp"
 #include "asm/macroAssembler.hpp"
 #include "compiler/disassembler.hpp"
+#if INCLUDE_G1GC
+#include "gc/g1/g1BarrierSetRuntime.hpp"
+#endif
 #include "gc/shared/collectedHeap.hpp"
 #include "gc/shared/gc_globals.hpp"
 #include "gc/shared/tlab_globals.hpp"
@@ -164,6 +167,24 @@ static void do_oop_load(InterpreterMacroAssembler* _masm,
                         Register dst,
                         DecoratorSet decorators = 0) {
   __ load_heap_oop(dst, src, rdx, rbx, decorators);
+}
+
+static void resolve_rax_if_tagged(InterpreterMacroAssembler* _masm) {
+#if INCLUDE_G1GC
+  if (!UseG1GC) {
+    return;
+  }
+  Label done;
+  __ testptr(rax, rax);
+  __ jcc(Assembler::positive, done);
+
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), rax);
+  __ testptr(rax, rax);
+  __ jcc(Assembler::positive, done);
+
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+  __ bind(done);
+#endif
 }
 
 Address TemplateTable::at_bcp(int offset) {
@@ -741,6 +762,7 @@ void TemplateTable::wide_aload() {
   transition(vtos, atos);
   locals_index_wide(rbx);
   __ movptr(rax, aaddress(rbx));
+  resolve_rax_if_tagged(_masm);
 }
 
 void TemplateTable::index_check(Register array, Register index) {
@@ -901,6 +923,7 @@ void TemplateTable::dload(int n) {
 void TemplateTable::aload(int n) {
   transition(vtos, atos);
   __ movptr(rax, aaddress(n));
+  resolve_rax_if_tagged(_masm);
 }
 
 void TemplateTable::aload_0() {
@@ -4122,6 +4145,7 @@ void TemplateTable::anewarray() {
 
 void TemplateTable::arraylength() {
   transition(atos, itos);
+  resolve_rax_if_tagged(_masm);
   __ movl(rax, Address(rax, arrayOopDesc::length_offset_in_bytes()));
 }
 
@@ -4129,6 +4153,9 @@ void TemplateTable::checkcast() {
   transition(atos, atos);
   Label done, is_null, ok_is_subtype, quicked, resolved;
   __ testptr(rax, rax); // object is in rax
+  __ jcc(Assembler::zero, is_null);
+  resolve_rax_if_tagged(_masm);
+  __ testptr(rax, rax);
   __ jcc(Assembler::zero, is_null);
 
   // Get cpool & tags index
@@ -4191,6 +4218,9 @@ void TemplateTable::checkcast() {
 void TemplateTable::instanceof() {
   transition(atos, itos);
   Label done, is_null, ok_is_subtype, quicked, resolved;
+  __ testptr(rax, rax);
+  __ jcc(Assembler::zero, is_null);
+  resolve_rax_if_tagged(_masm);
   __ testptr(rax, rax);
   __ jcc(Assembler::zero, is_null);
 
