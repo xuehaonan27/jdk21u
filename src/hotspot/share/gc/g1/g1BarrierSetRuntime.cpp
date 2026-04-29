@@ -283,7 +283,19 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   oopDesc* fast = resolve_fast_checks(tagged, &h);
   if (h == nullptr) return fast;
 
-  JavaThread* current = JavaThread::current();
+  // VM diagnostic code can reach this through ordinary heap field loads
+  // (for example VM_PrintThreads -> JavaThread::print_on). Those callers
+  // cannot use JavaThread state transitions.
+  Thread* thread = Thread::current();
+  if (!thread->is_Java_thread()) {
+    return resolve_tagged_oop_no_safepoint(tagged);
+  }
+
+  JavaThread* current = JavaThread::cast(thread);
+  if (current->thread_state() != _thread_in_Java) {
+    return resolve_tagged_oop_no_safepoint(tagged);
+  }
+
   ThreadInVMfromJava tiv(current);
 
   int fetch_attempts = 0;
@@ -425,4 +437,3 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
     SpinPause();
   }
 }
-
