@@ -21,6 +21,7 @@
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/shared/collectedHeap.hpp"
 #include "logging/log.hpp"
+#include "oops/arrayOop.hpp"
 #include "oops/oop.inline.hpp"
 #include "runtime/os.hpp"
 #include "runtime/safepoint.hpp"
@@ -1366,14 +1367,37 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
   class StaleRefSweepClosure : public BasicOopIterateClosure {
     G1CollectedHeap* _g1h;
     int              _stale;
+    int              _raw_guarded;
     oop              _cur_obj;
     bool             _is_root;
+    const char*      _root_kind;
   public:
     StaleRefSweepClosure(G1CollectedHeap* g1h)
-      : _g1h(g1h), _stale(0), _cur_obj(nullptr), _is_root(false) {}
+      : _g1h(g1h), _stale(0), _raw_guarded(0), _cur_obj(nullptr),
+        _is_root(false), _root_kind("ROOT") {}
 
-    void set_cur_obj(oop obj) { _cur_obj = obj; _is_root = false; }
-    void set_root_mode() { _cur_obj = nullptr; _is_root = true; }
+    void set_cur_obj(oop obj) {
+      _cur_obj = obj;
+      _is_root = false;
+      _root_kind = "ROOT";
+    }
+
+    void set_root_mode(const char* root_kind) {
+      _cur_obj = nullptr;
+      _is_root = true;
+      _root_kind = root_kind;
+    }
+
+    bool decode_raw_value(uintptr_t raw, uintptr_t* addr) {
+      if (raw == 0) return false;
+      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+        return false;
+      }
+      *addr = ((raw & G1_OOP_TAG_MASK) != 0) ? (raw & G1_OOP_ADDR_MASK) : raw;
+      if ((*addr & (HeapWordSize - 1)) != 0) return false;
+      return true;
+    }
 
     virtual void do_oop(oop* p) {
       uintptr_t raw = *(uintptr_t*)p;
@@ -1387,11 +1411,11 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
       } else {
         target = cast_to_oop(raw);
       }
-      if (!_g1h->is_in(target)) {
+      if (!_g1h->is_in_reserved(target)) {
         // Non-heap, non-tagged value in an oop slot — heap corruption
         _stale++;
         if (_stale <= 50) {
-          const char* src_kind = _is_root ? "ROOT" : "HEAP";
+          const char* src_kind = _is_root ? _root_kind : "HEAP";
           const char* src_klass = "?";
           uint src_region = 9999;
           if (_cur_obj != nullptr && _g1h->is_in(_cur_obj)) {
@@ -1419,19 +1443,23 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
         return;
       }
 
-      HeapRegion* hr = _g1h->heap_region_containing(target);
-      if (hr == nullptr) return;
+      HeapRegion* hr = _g1h->heap_region_containing_or_null(target);
+      bool is_stale = (hr == nullptr);
 
-      bool is_stale = hr->is_free() || hr->is_evict_guarded();
       if (!is_stale) {
-        Klass* k = cast_to_oop(target)->klass_or_null();
-        if (k == nullptr) is_stale = true;
+        is_stale = hr->is_free() || hr->is_evict_guarded();
+      }
+      if (!is_stale) {
+        Klass* k = target->klass_or_null();
+        if (k == nullptr) {
+          is_stale = true;
+        }
       }
 
       if (is_stale) {
         _stale++;
         if (_stale <= 50) {
-          const char* src_kind = _is_root ? "ROOT" : "HEAP";
+          const char* src_kind = _is_root ? _root_kind : "HEAP";
           HeapRegion* src_hr = nullptr;
           const char* src_klass = "?";
           uint src_region = 9999;
@@ -1450,14 +1478,17 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
             }
           }
           G1CardTable* ct = _g1h->card_table();
-          G1CardTable::CardValue card_val = *ct->byte_for((HeapWord*)p);
+          G1CardTable::CardValue card_val = 0xff;
+          if (!_is_root) {
+            card_val = *ct->byte_for((HeapWord*)p);
+          }
           log_warning(gc)("STALE-REF-SWEEP [%s]: field=" PTR_FORMAT " raw=0x%lx -> target="
                           PTR_FORMAT " in %s region %u (src_obj=" PTR_FORMAT " klass=%s region=%u"
                           " card=0x%02x fcr_tagged=%s src_type=%s)",
                           src_kind, p2i(p), (unsigned long)raw,
                           p2i((void*)target),
-                          hr->is_evict_guarded() ? "GUARDED" : "FREE",
-                          hr->hrm_index(),
+                          hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                          hr == nullptr ? 9999 : hr->hrm_index(),
                           p2i((void*)_cur_obj), src_klass, src_region,
                           (unsigned)card_val,
                           has_tagged_fields ? "yes" : "no",
@@ -1502,8 +1533,57 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
         }
       }
     }
+
+    void scan_raw_payload(oop obj) {
+      if (obj == nullptr || obj->is_typeArray()) return;
+
+      size_t obj_words = obj->size();
+      size_t header_words = obj->is_objArray() ?
+        (size_t)arrayOopDesc::header_size(T_OBJECT) :
+        (size_t)oopDesc::header_size();
+      if (obj_words <= header_words) return;
+
+      HeapWord* obj_start = cast_from_oop<HeapWord*>(obj);
+      HeapWord* obj_end = obj_start + obj_words;
+      for (HeapWord* slot = obj_start + header_words; slot < obj_end; slot++) {
+        uintptr_t raw = *(uintptr_t*)slot;
+        uintptr_t addr = 0;
+        if (!decode_raw_value(raw, &addr)) continue;
+        void* target_addr = (void*)addr;
+        if (!_g1h->is_in_reserved(target_addr)) continue;
+
+        HeapRegion* target_hr = _g1h->heap_region_containing_or_null(target_addr);
+        if (target_hr == nullptr) continue;
+        if (!target_hr->is_free() && !target_hr->is_evict_guarded()) continue;
+
+        _raw_guarded++;
+        if (_raw_guarded <= 80) {
+          HeapRegion* src_hr = _g1h->heap_region_containing_or_null(obj);
+          const char* src_klass = "?";
+          Klass* sk = obj->klass_or_null();
+          if (sk != nullptr) src_klass = sk->external_name();
+
+          G1CardTable* ct = _g1h->card_table();
+          G1CardTable::CardValue card_val = *ct->byte_for(slot);
+          uint32_t off = (uint32_t)((uintptr_t)slot - cast_from_oop<uintptr_t>(obj));
+          log_warning(gc)("PROTECTED-RAW-REF [HEAP-PAYLOAD]: slot=" PTR_FORMAT
+                          " raw=0x%lx decoded=" PTR_FORMAT
+                          " -> %s region %u (src_obj=" PTR_FORMAT
+                          " klass=%s region=%u src_type=%s offset=%u card=0x%02x)",
+                          p2i(slot), (unsigned long)raw, p2i(target_addr),
+                          target_hr->is_evict_guarded() ? "GUARDED" : "FREE",
+                          target_hr->hrm_index(),
+                          p2i((void*)obj), src_klass,
+                          src_hr != nullptr ? src_hr->hrm_index() : 9999,
+                          src_hr != nullptr ? src_hr->get_short_type_str() : "?",
+                          off, (unsigned)card_val);
+        }
+      }
+    }
+
     virtual void do_oop(narrowOop* p) {}
     int stale() const { return _stale; }
+    int raw_guarded() const { return _raw_guarded; }
   };
 
   Ticks start = Ticks::now();
@@ -1528,6 +1608,7 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
         size_t sz = obj->size();
         cl.set_cur_obj(obj);
         obj->oop_iterate(&cl);
+        cl.scan_raw_payload(obj);
         p += sz;
       } else {
         p = bitmap->get_next_marked_addr(p, pb);
@@ -1552,42 +1633,54 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
       cl.set_cur_obj(obj);
       if (sz > (size_t)(region_end - p)) {
         obj->oop_iterate(&cl);
+        cl.scan_raw_payload(obj);
         break;
       }
       obj->oop_iterate(&cl);
+      cl.scan_raw_payload(obj);
       p += sz;
     }
     regions_scanned++;
   }
 
   int heap_stale = cl.stale();
+  int heap_raw_guarded = cl.raw_guarded();
 
-  cl.set_root_mode();
+  cl.set_root_mode("ROOT-Threads");
   Threads::oops_do(&cl, nullptr);
+  cl.set_root_mode("ROOT-JNI");
   JNIHandles::oops_do(&cl);
+  cl.set_root_mode("ROOT-OopStorageStrong");
   OopStorageSet::strong_oops_do(&cl);
   {
+    cl.set_root_mode("ROOT-CLDG");
     CLDToOopClosure cld_cl(&cl, ClassLoaderData::_claim_none);
     ClassLoaderDataGraph::cld_do(&cld_cl);
   }
   {
+    cl.set_root_mode("ROOT-CodeCache");
     CodeBlobToOopClosure code_cl(&cl, false);
     CodeCache::blobs_do(&code_cl);
   }
+  cl.set_root_mode("ROOT-Weak");
   _g1h->ref_processor_cm()->weak_oops_do(&cl);
 
   int root_stale = cl.stale() - heap_stale;
+  int raw_guarded = cl.raw_guarded();
   double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
 
-  if (cl.stale() > 0) {
-    log_warning(gc)("STALE-REF-SWEEP: %d stale refs found (%d heap, %d root) in %.1fms "
+  if (cl.stale() > 0 || raw_guarded > 0) {
+    log_warning(gc)("STALE-REF-SWEEP: %d stale oop refs found (%d heap, %d root), "
+                    "%d protected raw payload words (%d heap) in %.1fms "
                     "(%d regions scanned)",
-                    cl.stale(), heap_stale, root_stale, elapsed_ms, regions_scanned);
+                    cl.stale(), heap_stale, root_stale,
+                    raw_guarded, heap_raw_guarded, elapsed_ms, regions_scanned);
   } else {
-    log_info(gc)("STALE-REF-SWEEP: clean (0 stale refs) in %.1fms (%d regions scanned)",
+    log_info(gc)("STALE-REF-SWEEP: clean (0 stale refs, 0 protected raw payload words) "
+                 "in %.1fms (%d regions scanned)",
                  elapsed_ms, regions_scanned);
   }
-  return cl.stale();
+  return cl.stale() + raw_guarded;
 }
 
 bool G1RemoteMemoryManager::validate_anchor_addr(RemoteHandle* h) {
