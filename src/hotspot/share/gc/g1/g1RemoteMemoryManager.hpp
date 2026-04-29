@@ -728,6 +728,8 @@ public:
     return handle_for(obj) != nullptr;
   }
 
+  int count_local_handles_in_region(HeapRegion* hr, int log_limit = 0);
+
 public:
   size_t sim_remote_evicted_count() const { return _sim_remote_evicted_count; }
   size_t sim_remote_fetched_count() const { return _sim_remote_fetched_count; }

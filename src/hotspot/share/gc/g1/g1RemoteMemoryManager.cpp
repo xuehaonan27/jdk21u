@@ -1506,6 +1506,41 @@ bool G1RemoteMemoryManager::validate_anchor_addr(RemoteHandle* h) {
   return true;
 }
 
+int G1RemoteMemoryManager::count_local_handles_in_region(HeapRegion* hr, int log_limit) {
+  if (hr == nullptr) return 0;
+
+  uintptr_t bottom = (uintptr_t)hr->bottom();
+  uintptr_t end = (uintptr_t)hr->end();
+  int count = 0;
+
+  table_lock();
+  for (size_t i = 0; i < TABLE_SIZE; i++) {
+    HandleEntry* e = _table[i];
+    while (e != nullptr) {
+      RemoteHandle* h = e->_handle;
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) {
+        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+        if (addr >= bottom && addr < end) {
+          count++;
+          if (count <= log_limit) {
+            log_warning(gc)("LOCAL handle blocks eviction free: region=%u handle=" PTR_FORMAT
+                            " local=" PTR_FORMAT " table_addr=" PTR_FORMAT
+                            " dormant=%d rc=%u",
+                            hr->hrm_index(), p2i(h), addr, e->_obj_addr,
+                            h->is_dormant() ? 1 : 0, h->remote_refcount());
+          }
+        }
+      }
+      e = e->_next;
+    }
+  }
+  table_unlock();
+
+  return count;
+}
+
 Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
   assert(h != nullptr, "Handle must not be null");
 

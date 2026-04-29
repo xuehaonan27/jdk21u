@@ -1991,6 +1991,18 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           for (int e = start; e < start + rcount; e++) {
             rmm->finalize_eviction(&entries[e]);
           }
+
+          int remaining_local_handles = rmm->count_local_handles_in_region(hr, 4);
+          if (remaining_local_handles > 0) {
+            log_warning(gc)("Region %u NOT freed after eviction: %d LOCAL handles "
+                            "still point into [" PTR_FORMAT ", " PTR_FORMAT ")",
+                            hr->hrm_index(), remaining_local_handles,
+                            p2i(hr->bottom()), p2i(hr->end()));
+            regions_kept_alive++;
+            hr->clear_cold_destination();
+            continue;
+          }
+
           total_evicted += rcount;
           regions_evicted++;
           size_t region_used = hr->used();
