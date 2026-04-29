@@ -24,6 +24,9 @@
 
 #include "precompiled.hpp"
 #include "classfile/vmSymbols.hpp"
+#include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
+#include "gc/g1/heapRegion.inline.hpp"
 #include "gc/shared/collectedHeap.hpp"
 #include "jfr/jfrEvents.hpp"
 #include "logging/log.hpp"
@@ -913,6 +916,29 @@ static inline intptr_t get_next_hash(Thread* current, oop obj) {
 }
 
 intptr_t ObjectSynchronizer::FastHashCode(Thread* current, oop obj) {
+  if (UseG1GC && obj != nullptr && g1_oop_is_tagged(obj)) {
+    oop resolved = resolve_oop_full(obj);
+    if (resolved == nullptr) {
+      log_warning(gc)("FastHashCode: tagged obj=" PTR_FORMAT " resolved to null",
+                      p2i((void*)obj));
+      return 0;
+    }
+    obj = resolved;
+  }
+
+  if (UseG1GC && obj != nullptr) {
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    if (g1h != nullptr && g1h->is_in_reserved(obj)) {
+      HeapRegion* hr = g1h->heap_region_containing_or_null(obj);
+      if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+        log_warning(gc)("FastHashCode: obj=" PTR_FORMAT " in %s region %u; returning 0",
+                        p2i((void*)obj),
+                        hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                        hr == nullptr ? 9999 : hr->hrm_index());
+        return 0;
+      }
+    }
+  }
 
   while (true) {
     ObjectMonitor* monitor = nullptr;
@@ -932,11 +958,18 @@ intptr_t ObjectSynchronizer::FastHashCode(Thread* current, oop obj) {
         ((pointer >> 47) != 0 && (pointer >> 47) != 0x1FFFF);
       if (bogus) {
         Klass* k = obj->klass_or_null();
+        uintptr_t klass_raw = (uintptr_t)k;
+        bool klass_looks_safe = k != nullptr &&
+          (klass_raw & G1_OOP_TAG_MASK) == 0 &&
+          klass_raw >= 0x10000 &&
+          ((klass_raw >> 47) == 0);
         log_warning(gc)("FastHashCode CORRUPT MARK: obj=" PTR_FORMAT
-                        " mark=0x%lx (lock=%lu bogus_ptr=" PTR_FORMAT ") klass=%s",
+                        " mark=0x%lx (lock=%lu bogus_ptr=" PTR_FORMAT
+                        ") klass_raw=0x%lx klass=%s",
                         p2i((void*)obj), (unsigned long)mv,
                         (unsigned long)lock, p2i((void*)pointer),
-                        k != nullptr ? k->external_name() : "<null>");
+                        (unsigned long)klass_raw,
+                        klass_looks_safe ? k->external_name() : "<bad-or-tagged>");
         // Print 64 bytes around the object to see if it's a real header
         if (Universe::heap()->is_in((void*)obj)) {
           uintptr_t* p = (uintptr_t*)((uintptr_t)obj & ~uintptr_t(0x3F));
