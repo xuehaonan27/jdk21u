@@ -219,6 +219,15 @@ class EdgeTableBuildClosure : public BasicOopIterateClosure {
     _count++;
   }
 
+  oop canonical_target(oop target) {
+    if (!_g1h->is_in(target)) return nullptr;
+    if (target->is_forwarded()) {
+      target = target->forwardee();
+      if (target == nullptr || !_g1h->is_in(target)) return nullptr;
+    }
+    return target;
+  }
+
 public:
   EdgeTableBuildClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
                         RemoteHandleAllocBuffer* hab, oop base)
@@ -247,7 +256,8 @@ public:
       } else {
         // Unique OOP → strip tags, get target, create dormant anchor
         oop target = (oop)(raw & G1_OOP_ADDR_MASK);
-        if (_g1h->is_in(target)) {
+        target = canonical_target(target);
+        if (target != nullptr) {
           RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, _hab);
           uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
           append(offset, h);
@@ -259,7 +269,8 @@ public:
 
     // Clean oop — create dormant anchor for the target
     oop target = cast_to_oop(raw);
-    if (_g1h->is_in(target)) {
+    target = canonical_target(target);
+    if (target != nullptr) {
       RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, _hab);
       uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
       append(offset, h);
@@ -362,6 +373,63 @@ void G1RemoteMemoryManager::finalize_eviction(PreparedEviction* entry) {
   }
 
   CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(entry->obj), entry->word_size, false);
+}
+
+int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* region_set,
+                                                                  uint num_regions,
+                                                                  uintptr_t* addrs,
+                                                                  int max_addrs,
+                                                                  bool* overflow) {
+  if (overflow != nullptr) *overflow = false;
+  if (region_set == nullptr || num_regions == 0) return 0;
+
+  int count = 0;
+
+  table_lock();
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+      RemoteHandle* h = e->_handle;
+      if (h == nullptr || !h->is_local() || h->remote_refcount() == 0) continue;
+
+      uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+      if (addr == 0 || !_g1h->is_in((void*)addr)) continue;
+
+      HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
+      if (hr == nullptr) continue;
+      uint ridx = hr->hrm_index();
+      if (ridx >= num_regions || !region_set[ridx]) continue;
+
+      if (count < max_addrs && addrs != nullptr) {
+        addrs[count] = addr;
+      } else if (overflow != nullptr) {
+        *overflow = true;
+      }
+      count++;
+    }
+  }
+
+  for (int i = 0; i < _cross_roots_count; i++) {
+    RemoteHandle* h = _cross_roots[i];
+    if (h == nullptr || !h->is_local()) continue;
+
+    uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+    if (addr == 0 || !_g1h->is_in((void*)addr)) continue;
+
+    HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
+    if (hr == nullptr) continue;
+    uint ridx = hr->hrm_index();
+    if (ridx >= num_regions || !region_set[ridx]) continue;
+
+    if (count < max_addrs && addrs != nullptr) {
+      addrs[count] = addr;
+    } else if (overflow != nullptr) {
+      *overflow = true;
+    }
+    count++;
+  }
+  table_unlock();
+
+  return count;
 }
 
 // ============================================================

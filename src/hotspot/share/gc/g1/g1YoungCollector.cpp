@@ -1030,6 +1030,7 @@ void G1YoungCollector::post_evacuate_cleanup_2(G1ParScanThreadStateSet* per_thre
 struct RootPinEntry {
   oop*      root;
   uintptr_t obj_addr;
+  bool      update_root;
 };
 static int rpe_cmp(const void* a, const void* b) {
   uintptr_t aa = ((const RootPinEntry*)a)->obj_addr;
@@ -1347,12 +1348,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         RootPinEntry*    _pins;
         int&             _num_pins;
         int              _max_pins;
+        bool&            _overflow;
       public:
         EvictionRootCollectClosure(G1CollectedHeap* g1h, const bool* candidates,
                                    uint num_regions, RootPinEntry* pins,
-                                   int& num_pins, int max_pins)
+                                   int& num_pins, int max_pins, bool& overflow)
           : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
-            _pins(pins), _num_pins(num_pins), _max_pins(max_pins) {}
+            _pins(pins), _num_pins(num_pins), _max_pins(max_pins),
+            _overflow(overflow) {}
         void do_oop(oop* p) {
           oop obj = *p;
           if (obj == nullptr) return;
@@ -1366,16 +1369,21 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           HeapRegion* hr = _g1h->heap_region_containing(obj);
           if (hr == nullptr) return;
           uint idx = hr->hrm_index();
-          if (idx < _num_regions && _eviction_candidates[idx] && _num_pins < _max_pins) {
-            _pins[_num_pins] = {p, cast_from_oop<uintptr_t>(obj)};
-            _num_pins++;
+          if (idx < _num_regions && _eviction_candidates[idx]) {
+            if (_num_pins < _max_pins) {
+              _pins[_num_pins] = {p, cast_from_oop<uintptr_t>(obj), true};
+              _num_pins++;
+            } else {
+              _overflow = true;
+            }
           }
         }
         void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
       };
 
+      bool root_pin_overflow = false;
       EvictionRootCollectClosure collect_cl(_g1h, eviction_candidates, num_regions,
-                                             pins, num_pins, max_pins);
+                                             pins, num_pins, max_pins, root_pin_overflow);
       Threads::oops_do(&collect_cl, nullptr);
       JNIHandles::oops_do(&collect_cl);
       OopStorageSet::strong_oops_do(&collect_cl);
@@ -1391,11 +1399,47 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         CodeCache::blobs_do(&code_cl);
       }
       _g1h->ref_processor_cm()->weak_oops_do(&collect_cl);
-      rmm->oops_do_remote_anchors(&collect_cl);
-      rmm->oops_do_remote_cross_roots(&collect_cl);
+
+      bool remote_anchor_overflow = false;
+      int remote_anchor_seen = 0;
+      int remaining_pin_slots = max_pins - num_pins;
+      uintptr_t* remote_anchor_addrs = nullptr;
+      if (remaining_pin_slots > 0) {
+        remote_anchor_addrs = NEW_C_HEAP_ARRAY(uintptr_t, remaining_pin_slots, mtGC);
+      }
+      remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
+          eviction_candidates, num_regions, remote_anchor_addrs,
+          remaining_pin_slots, &remote_anchor_overflow);
+      int remote_anchor_stored = MIN2(remote_anchor_seen, remaining_pin_slots);
+      for (int i = 0; i < remote_anchor_stored; i++) {
+        pins[num_pins] = {nullptr, remote_anchor_addrs[i], false};
+        num_pins++;
+      }
+      if (remote_anchor_addrs != nullptr) {
+        FREE_C_HEAP_ARRAY(uintptr_t, remote_anchor_addrs);
+      }
+      if (remote_anchor_seen > remote_anchor_stored) {
+        remote_anchor_overflow = true;
+      }
 
       // Relocate collected root-pinned objects to a catch region
-      if (num_pins > 0) {
+      if (root_pin_overflow || remote_anchor_overflow) {
+        int overflow_pinned = 0;
+        for (uint i = 0; i < num_regions; i++) {
+          if (eviction_candidates[i]) {
+            HeapRegion* hr = _g1h->region_at(i);
+            eviction_candidates[i] = false;
+            hr->clear_cold_destination();
+            regions_pinned++;
+            overflow_pinned++;
+          }
+        }
+        total_candidates -= overflow_pinned;
+        log_warning(gc)("Root-catch overflow: pinned %d candidate regions "
+                        "(pins=%d max=%d remote-anchor=%d stored=%d)",
+                        overflow_pinned, num_pins, max_pins,
+                        remote_anchor_seen, remote_anchor_stored);
+      } else if (num_pins > 0) {
         qsort(pins, num_pins, sizeof(RootPinEntry), rpe_cmp);
 
         HeapRegion* root_catch = _g1h->allocate_fcr_region();
@@ -1425,13 +1469,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           for (int i = 0; i < num_pins; i++) {
             uintptr_t obj_addr = pins[i].obj_addr;
             oop* root_p = pins[i].root;
+            bool update_root = pins[i].update_root && root_p != nullptr;
 
             if (obj_addr == prev_addr && prev_new != nullptr) {
-              // Duplicate root to same object — update this root too
-              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-              uintptr_t tags = raw & G1_OOP_TAG_MASK;
-              *root_p = cast_to_oop(tags | ((uintptr_t)prev_new & G1_OOP_ADDR_MASK));
-              roots_updated++;
+              // Duplicate root to same object — update this real root too.
+              // Remote-anchor pins have no root slot; their Handle was updated
+              // by the first relocation and any duplicates are handled by the
+              // forwarding fixup below.
+              if (update_root) {
+                uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+                uintptr_t tags = raw & G1_OOP_TAG_MASK;
+                *root_p = cast_to_oop(tags | ((uintptr_t)prev_new & G1_OOP_ADDR_MASK));
+                roots_updated++;
+              }
               continue;
             }
 
@@ -1439,12 +1489,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (obj->is_forwarded()) {
               // Already relocated by an earlier entry — update root to forwardee
               oop fwd = obj->forwardee();
-              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-              uintptr_t tags = raw & G1_OOP_TAG_MASK;
-              *root_p = cast_to_oop(tags | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK));
+              if (update_root) {
+                uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+                uintptr_t tags = raw & G1_OOP_TAG_MASK;
+                *root_p = cast_to_oop(tags | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK));
+                roots_updated++;
+              }
               prev_addr = obj_addr;
               prev_new = cast_from_oop<HeapWord*>(fwd);
-              roots_updated++;
               continue;
             }
 
@@ -1473,9 +1525,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             obj->forward_to(new_obj);
 
             // Update root (preserve tag bits)
-            uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-            uintptr_t tags = raw & G1_OOP_TAG_MASK;
-            *root_p = cast_to_oop(tags | ((uintptr_t)catch_top & G1_OOP_ADDR_MASK));
+            if (update_root) {
+              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
+              uintptr_t tags = raw & G1_OOP_TAG_MASK;
+              *root_p = cast_to_oop(tags | ((uintptr_t)catch_top & G1_OOP_ADDR_MASK));
+              roots_updated++;
+            }
 
             // Rekey handle table (old_addr → new_addr)
             rmm->update_handle_for_evacuation(obj, new_obj);
@@ -1484,7 +1539,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             prev_new = catch_top;
             catch_top += word_sz;
             relocated++;
-            roots_updated++;
           }
 
           root_catch->set_top(catch_top);
@@ -1513,6 +1567,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             FreeRegionList tmp("tmp");
             _g1h->free_region(root_catch, &tmp);
           }
+
+          // Root-catch installs forwarding pointers in the old candidate
+          // regions. Update every LOCAL Handle that still points at one of
+          // those forwarding stubs, including duplicate dormant anchors.
+          rmm->fixup_all_local_handles();
         }
       }
 
