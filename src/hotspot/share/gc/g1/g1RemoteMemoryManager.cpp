@@ -2193,11 +2193,10 @@ class CSetRefFixupClosure : public BasicOopIterateClosure {
   G1CollectedHeap* _g1h;
   int _fixed;
   int _skipped;
-  int _fcr_nulls;       // Subset of NULL fixes whose source is in FCR
   bool _src_is_fcr;     // Set per object via set_src_is_fcr()
 public:
   CSetRefFixupClosure(G1CollectedHeap* g1h)
-    : _g1h(g1h), _fixed(0), _skipped(0), _fcr_nulls(0), _src_is_fcr(false) {}
+    : _g1h(g1h), _fixed(0), _skipped(0), _src_is_fcr(false) {}
 
   void set_src_is_fcr(bool v) { _src_is_fcr = v; }
 
@@ -2215,23 +2214,17 @@ public:
       RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
       _fixed++;
     } else {
-      // Target in CSet but not forwarded → DEAD. Evac-failed objects
-      // forward-to-self (handle_evacuation_failure_par at g1ParScanThreadState.cpp:973),
-      // which sets is_marked()==true. So an unmarked CSet target was unreachable
-      // and its region will be freed by FreeCollectionSetTask in post_evacuate_cleanup_2.
-      // Null the dangling ref before that happens to prevent stale pointers.
-      *(uintptr_t*)p = 0;
-      _fixed++;
-      if (_src_is_fcr) {
-        _fcr_nulls++;
-        _g1h->remote_memory_manager()->record_fcr_fixup_null();
-      }
+      // Do not null Java fields here. This runs after cleanup_1, which has
+      // restored preserved marks for evacuation-failed objects, so a live
+      // in-place object can be unmarked even though references to it are valid.
+      // Nulling such refs corrupts application objects (for example
+      // java.lang.Thread.holder) and leads to VM crashes shortly after GC.
+      _skipped++;
     }
   }
   virtual void do_oop(narrowOop* p) {}
   int fixed() const { return _fixed; }
   int skipped() const { return _skipped; }
-  int fcr_nulls() const { return _fcr_nulls; }
 };
 
 int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
@@ -2277,9 +2270,9 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
   }
 
   if (cl.fixed() > 0 || cl.skipped() > 0) {
-    log_warning(gc)("Old/humongous-region stale-ref fixup: %d fixed (forwardee or null), %d skipped"
-                    " (FCR-source NULLs: %d / total-evac FCR writes: %llu vs total-fixup FCR NULLs: %llu)",
-                    cl.fixed(), cl.skipped(), cl.fcr_nulls(),
+    log_warning(gc)("Old/humongous-region stale-ref fixup: %d fixed (forwardee), %d skipped"
+                    " (unforwarded/in-place; FCR evac writes: %llu, previous FCR nulls: %llu)",
+                    cl.fixed(), cl.skipped(),
                     (unsigned long long)fcr_evac_writes(),
                     (unsigned long long)fcr_fixup_nulls());
   }
