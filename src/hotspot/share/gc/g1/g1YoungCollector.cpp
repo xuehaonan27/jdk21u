@@ -69,6 +69,7 @@
 #include "gc/shared/oopStorageSet.inline.hpp"
 #include "runtime/jniHandles.hpp"
 #include "runtime/javaThread.hpp"
+#include "runtime/deoptimization.hpp"
 #include "runtime/os.hpp"
 #include "runtime/threads.hpp"
 #include "utilities/ticks.hpp"
@@ -1352,6 +1353,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     }
 
     int total_candidates = path1_candidates + path2_candidates;
+
+    if (G1DeoptimizeBeforeEviction && total_candidates > 0) {
+      Ticks deopt_start = Ticks::now();
+      DeoptimizationScope deopt_scope;
+      CodeCache::mark_all_nmethods_for_deoptimization(&deopt_scope);
+      deopt_scope.deoptimize_marked();
+      double deopt_ms = (Ticks::now() - deopt_start).seconds() * 1000.0;
+      log_info(gc)("Remote eviction: deoptimized compiled Java frames in %.1fms "
+                   "before processing %d candidate regions",
+                   deopt_ms, total_candidates);
+    }
 
     // ---- Phase D: Root-catch relocation ----
     // Instead of pinning entire 16MB regions for a few root-referenced

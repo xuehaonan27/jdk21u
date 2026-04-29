@@ -332,6 +332,11 @@
           "After eviction, scan entire heap + roots for stale pointers "     \
           "into freed regions. Expensive (O(heap)), debug only.")            \
                                                                             \
+  product(bool, G1DeoptimizeBeforeEviction, true, DIAGNOSTIC,                \
+          "Before remote eviction, deoptimize compiled Java frames so C2 "    \
+          "does not resume with raw oop temporaries into mprotected "         \
+          "evicted regions.")                                                \
+                                                                            \
   product(uintx, G1PeriodicGCInterval, 0, MANAGEABLE,                       \
           "Number of milliseconds after a previous GC to wait before "      \
           "triggering a periodic gc. A value of zero disables periodically "\
