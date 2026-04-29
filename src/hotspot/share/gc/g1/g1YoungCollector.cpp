@@ -68,6 +68,7 @@
 #include "gc/shared/oopStorage.inline.hpp"
 #include "gc/shared/oopStorageSet.inline.hpp"
 #include "runtime/jniHandles.hpp"
+#include "runtime/javaThread.hpp"
 #include "runtime/os.hpp"
 #include "runtime/threads.hpp"
 #include "utilities/ticks.hpp"
@@ -1832,6 +1833,102 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           total_candidates -= guard_cl.regions_guarded();
           log_info(gc)("Pre-E root guard: removed %d candidate regions with %d dangling roots",
                        guard_cl.regions_guarded(), guard_cl.roots_found());
+        }
+
+        class PreEvictionRawStackGuardClosure : public ThreadClosure {
+          G1CollectedHeap* _g1h;
+          bool*            _eviction_candidates;
+          uint             _num_regions;
+          int              _regions_guarded;
+          int              _stack_words_found;
+          int              _threads_scanned;
+          size_t           _words_scanned;
+          int              _reports_left;
+
+          bool maybe_guard_candidate(uintptr_t raw, Thread* thread, uintptr_t* slot) {
+            if (raw == 0) return false;
+
+            // Shared-handle references are already safe: they do not retain a
+            // raw local object address into the region being evicted.
+            if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+                (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+              return false;
+            }
+
+            uintptr_t addr = raw;
+            if ((raw & G1_OOP_TAG_MASK) != 0) {
+              addr = raw & G1_OOP_ADDR_MASK;
+            }
+            if (!is_aligned((address)addr, HeapWordSize)) return false;
+            if (!_g1h->is_in_reserved((void*)addr)) return false;
+
+            HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)addr);
+            if (hr == nullptr) return false;
+
+            uint idx = hr->hrm_index();
+            if (idx >= _num_regions) return false;
+
+            if (_eviction_candidates[idx]) {
+              _eviction_candidates[idx] = false;
+              hr->clear_cold_destination();
+              _regions_guarded++;
+              _stack_words_found++;
+              if (_reports_left > 0) {
+                log_warning(gc)("Pre-E raw stack guard: thread=" PTR_FORMAT
+                                " slot=" PTR_FORMAT " raw=" PTR_FORMAT
+                                " guards candidate region %u",
+                                p2i(thread), p2i(slot), raw, idx);
+                _reports_left--;
+              }
+              return true;
+            }
+
+            _stack_words_found++;
+            return false;
+          }
+
+        public:
+          PreEvictionRawStackGuardClosure(G1CollectedHeap* g1h, bool* candidates, uint num_regions)
+            : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
+              _regions_guarded(0), _stack_words_found(0), _threads_scanned(0),
+              _words_scanned(0), _reports_left(32) {}
+
+          void do_thread(Thread* thread) override {
+            JavaThread* jt = JavaThread::cast(thread);
+            if (!jt->has_last_Java_frame()) return;
+
+            address low = (address)jt->last_Java_sp();
+            address high = jt->stack_base();
+            if (low == nullptr || high == nullptr || low >= high) return;
+
+            uintptr_t* cur = (uintptr_t*)align_up(low, sizeof(uintptr_t));
+            uintptr_t* end = (uintptr_t*)align_down(high, sizeof(uintptr_t));
+            _threads_scanned++;
+            while (cur < end) {
+              maybe_guard_candidate(*cur, thread, cur);
+              cur++;
+              _words_scanned++;
+            }
+          }
+
+          int regions_guarded() const { return _regions_guarded; }
+          int stack_words_found() const { return _stack_words_found; }
+          int threads_scanned() const { return _threads_scanned; }
+          size_t words_scanned() const { return _words_scanned; }
+        };
+
+        PreEvictionRawStackGuardClosure raw_stack_cl(_g1h, eviction_candidates, num_regions);
+        Threads::java_threads_do(&raw_stack_cl);
+        if (raw_stack_cl.regions_guarded() > 0) {
+          total_candidates -= raw_stack_cl.regions_guarded();
+          log_info(gc)("Pre-E raw stack guard: removed %d candidate regions with %d stack words "
+                       "(scanned " SIZE_FORMAT " words in %d Java threads)",
+                       raw_stack_cl.regions_guarded(), raw_stack_cl.stack_words_found(),
+                       raw_stack_cl.words_scanned(), raw_stack_cl.threads_scanned());
+        } else {
+          log_info(gc)("Pre-E raw stack guard: scanned " SIZE_FORMAT
+                       " words in %d Java threads, 0 candidate stack words",
+                       raw_stack_cl.words_scanned(), raw_stack_cl.threads_scanned());
         }
       }
 
