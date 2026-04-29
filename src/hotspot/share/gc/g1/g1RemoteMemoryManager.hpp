@@ -298,6 +298,21 @@ public:
     return nullptr;
   }
 
+  // Look up a Handle by the table key without requiring it to still be LOCAL.
+  // Evicted handles keep their original local address as the secondary key, so
+  // this lets fetch-side validation repair clean stale oops that still contain
+  // that old eviction address.
+  RemoteHandle* handle_for_addr_any_state(uintptr_t addr) const {
+    size_t idx = hash_obj(addr);
+
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      if (e->_obj_addr == addr) return e->_handle;
+      e = e->_next;
+    }
+    return nullptr;
+  }
+
   // Check if an object has a Handle (fast negative via table lookup).
   bool has_handle(oop obj) const {
     return handle_for(obj) != nullptr;

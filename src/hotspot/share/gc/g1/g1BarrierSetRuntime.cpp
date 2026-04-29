@@ -25,10 +25,14 @@
 #include "precompiled.hpp"
 #include "gc/g1/g1BarrierSet.inline.hpp"
 #include "gc/g1/g1BarrierSetRuntime.hpp"
+#include "gc/g1/g1CardTable.hpp"
 #include "gc/g1/g1CollectedHeap.hpp"
+#include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1DirtyCardQueue.hpp"
 #include "gc/g1/g1RemoteBackend.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
+#include "gc/g1/heapRegion.hpp"
 #include "runtime/os.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
@@ -123,43 +127,126 @@ JRT_END
 
 class PostFetchValidateClosure : public BasicOopIterateClosure {
   G1CollectedHeap* _g1h;
+  G1RemoteMemoryManager* _rmm;
   oop _obj;
   int _bad;
+  int _stale_patched;
+  int _stale_nulled;
+
+  const char* obj_klass_name() const {
+    Klass* k = _obj->klass_or_null();
+    return k == nullptr ? "<null-klass>" : k->external_name();
+  }
+
+  void log_outside_heap(oop* p, uintptr_t raw) {
+    uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
+    uintptr_t mw_lock = raw & 0x3;
+    uintptr_t mw_age = (raw >> 3) & 0xF;
+    const char* mw_hint = (mw_lock == 0x1 && raw > 0xFF)
+                          ? " LOOKS-LIKE-MARKWORD" : "";
+    log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
+                    "field_val=0x%lx not in heap (lock=%lu age=%u)%s",
+                    p2i((void*)_obj), obj_klass_name(), off,
+                    (unsigned long)raw, (unsigned long)mw_lock,
+                    (unsigned)mw_age, mw_hint);
+  }
+
+  void repair_stale(oop* p, uintptr_t raw, HeapRegion* hr) {
+    uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
+    RemoteHandle* h = _rmm == nullptr ? nullptr : _rmm->handle_for_addr_any_state(raw);
+    if (h != nullptr) {
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state != REMOTE_HANDLE_DEAD) {
+        *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+        _stale_patched++;
+        if (_stale_patched <= 20) {
+          log_warning(gc)("POST-FETCH STALE-FIELD: obj=" PTR_FORMAT " klass=%s offset=%u "
+                          "raw=" PTR_FORMAT " -> shared handle=" PTR_FORMAT
+                          " state=0x%lx region=%u",
+                          p2i((void*)_obj), obj_klass_name(), off,
+                          p2i((void*)raw), p2i(h), (unsigned long)state,
+                          hr == nullptr ? 9999 : hr->hrm_index());
+        }
+        return;
+      }
+    }
+
+    *(uintptr_t*)p = 0;
+    _stale_nulled++;
+    _bad++;
+    if (_stale_nulled <= 20) {
+      log_warning(gc)("POST-FETCH STALE-FIELD: obj=" PTR_FORMAT " klass=%s offset=%u "
+                      "raw=" PTR_FORMAT " in %s region %u has no live handle; nulled",
+                      p2i((void*)_obj), obj_klass_name(), off,
+                      p2i((void*)raw),
+                      hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                      hr == nullptr ? 9999 : hr->hrm_index());
+    }
+  }
+
 public:
-  PostFetchValidateClosure(G1CollectedHeap* g1h, oop obj) : _g1h(g1h), _obj(obj), _bad(0) {}
+  PostFetchValidateClosure(G1CollectedHeap* g1h, oop obj)
+    : _g1h(g1h), _rmm(g1h->remote_memory_manager()), _obj(obj),
+      _bad(0), _stale_patched(0), _stale_nulled(0) {}
+
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
     if (raw == 0) return;
     if ((raw >> 63) != 0) return;
-    if (!_g1h->is_in((void*)raw)) {
-      uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
-      uintptr_t mw_lock = raw & 0x3;
-      uintptr_t mw_age = (raw >> 3) & 0xF;
-      const char* mw_hint = (mw_lock == 0x1 && raw > 0xFF)
-                            ? " LOOKS-LIKE-MARKWORD" : "";
-      log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
-                      "field_val=0x%lx not in heap (lock=%lu age=%u)%s",
-                      p2i((void*)_obj), _obj->klass()->external_name(), off,
-                      (unsigned long)raw, (unsigned long)mw_lock,
-                      (unsigned)mw_age, mw_hint);
+
+    if (!_g1h->is_in_reserved((void*)raw)) {
+      log_outside_heap(p, raw);
       *(uintptr_t*)p = 0;
       _bad++;
       return;
     }
+
+    HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)raw);
+    if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+      repair_stale(p, raw, hr);
+      return;
+    }
+
+    if (!_g1h->is_in((void*)raw)) {
+      log_outside_heap(p, raw);
+      *(uintptr_t*)p = 0;
+      _bad++;
+      return;
+    }
+
     oop target = cast_to_oop(raw);
     Klass* tk = target->klass_or_null();
     if (tk == nullptr) {
       uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
       log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
                       "target=" PTR_FORMAT " has null klass",
-                      p2i((void*)_obj), _obj->klass()->external_name(), off, raw);
+                      p2i((void*)_obj), obj_klass_name(), off, raw);
       *(uintptr_t*)p = 0;
       _bad++;
     }
   }
   virtual void do_oop(narrowOop* p) {}
   int bad() const { return _bad; }
+  int stale_patched() const { return _stale_patched; }
+  int stale_nulled() const { return _stale_nulled; }
 };
+
+static void dirty_fetched_object_cards(G1CollectedHeap* g1h, HeapWord* start, size_t word_size) {
+  if (word_size == 0) return;
+  G1CardTable* ct = g1h->card_table();
+  G1DirtyCardQueueSet& qset = G1BarrierSet::dirty_card_queue_set();
+  Thread* thr = Thread::current();
+  G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(thr);
+  CardTable::CardValue* first = ct->byte_for(start);
+  CardTable::CardValue* last = ct->byte_for(start + word_size - 1);
+  for (CardTable::CardValue* card = first; card <= last; card++) {
+    if (*card != G1CardTable::g1_young_card_val()) {
+      *card = G1CardTable::dirty_card_val();
+      qset.enqueue(queue, card);
+    }
+  }
+}
 
 // Fetch a REMOTE object, install it locally, and publish the Handle as LOCAL.
 // Caller must have already CAS'd the Handle to FETCHING.
@@ -221,10 +308,15 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
     oop fetched = cast_to_oop(dest);
     PostFetchValidateClosure vcl(g1h, fetched);
     fetched->oop_iterate(&vcl);
-    if (vcl.bad() > 0) {
-      log_warning(gc)("POST-FETCH: %d corrupt fields nulled in obj=" PTR_FORMAT
-                      " klass=%s (fetched_mark=0x%lx fetched_klass=0x%lx ws=%zu)",
-                      vcl.bad(), p2i(dest), fetched->klass()->external_name(),
+    if (vcl.stale_patched() > 0) {
+      dirty_fetched_object_cards(g1h, dest, word_size);
+    }
+    if (vcl.bad() > 0 || vcl.stale_patched() > 0) {
+      log_warning(gc)("POST-FETCH: %d corrupt/stale fields nulled, %d stale fields patched "
+                      "in obj=" PTR_FORMAT " klass=%s (fetched_mark=0x%lx "
+                      "fetched_klass=0x%lx ws=%zu)",
+                      vcl.bad(), vcl.stale_patched(), p2i(dest),
+                      fetched->klass()->external_name(),
                       (unsigned long)raw_mark_after_fetch,
                       (unsigned long)raw_klass_after_fetch, word_size);
     }
