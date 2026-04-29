@@ -1897,9 +1897,21 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             JavaThread* jt = JavaThread::cast(thread);
             if (!jt->has_last_Java_frame()) return;
 
-            address low = (address)jt->last_Java_sp();
+            address java_sp = (address)jt->last_Java_sp();
             address high = jt->stack_base();
-            if (low == nullptr || high == nullptr || low >= high) return;
+            if (java_sp == nullptr || high == nullptr || java_sp >= high) return;
+
+            // C2 can keep object temporaries in spill slots that are not
+            // described as oops at the safepoint.  Scan a bounded window below
+            // the walkable Java frame SP as a conservative guard, but stay well
+            // above the low stack guard pages.
+            const size_t scan_below_java_sp = 256 * K;
+            address low = java_sp;
+            address stack_low = jt->stack_end() + os::vm_page_size();
+            if (stack_low < java_sp &&
+                (size_t)(java_sp - stack_low) > scan_below_java_sp) {
+              low = java_sp - scan_below_java_sp;
+            }
 
             uintptr_t* cur = (uintptr_t*)align_up(low, sizeof(uintptr_t));
             uintptr_t* end = (uintptr_t*)align_down(high, sizeof(uintptr_t));
