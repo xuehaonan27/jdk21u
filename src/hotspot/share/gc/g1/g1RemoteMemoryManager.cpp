@@ -21,6 +21,7 @@
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/shared/collectedHeap.hpp"
 #include "logging/log.hpp"
+#include "memory/metaspace.hpp"
 #include "oops/arrayOop.hpp"
 #include "oops/oop.inline.hpp"
 #include "runtime/os.hpp"
@@ -712,63 +713,135 @@ public:
   int local_count() const { return _local_count; }
 };
 
-static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure* cl,
-                                          const G1CMBitMap* bitmap) {
+static bool remote_eviction_valid_klass(Klass* k) {
+  if (k == nullptr) return false;
+  if ((uintptr_t)k < os::min_page_size()) return false;
+  if (!is_aligned((address)k, sizeof(MetaWord))) return false;
+  if (!Metaspace::contains(k)) return false;
+  return k->is_klass();
+}
+
+static bool remote_eviction_parse_obj(HeapRegion* hr, HeapWord* p,
+                                      HeapWord* limit, size_t* obj_words) {
+  if (p < hr->bottom() || p >= limit || p >= hr->end()) return false;
+  if (!is_object_aligned((void*)p)) return false;
+
+  oop obj = cast_to_oop(p);
+  Klass* k = obj->klass_or_null();
+  if (!remote_eviction_valid_klass(k)) return false;
+
+  size_t sz = obj->size_given_klass(k);
+  if (sz < (size_t)MinObjAlignment) return false;
+  if (!is_object_aligned(sz)) return false;
+  if (sz > (size_t)(limit - p)) return false;
+  if (sz > (size_t)(hr->end() - p)) return false;
+
+  *obj_words = sz;
+  return true;
+}
+
+template <class ObjectClosure>
+static int remote_eviction_scan_region_objects(HeapRegion* hr,
+                                               const G1CMBitMap* bitmap,
+                                               const char* phase,
+                                               ObjectClosure* cl) {
   HeapWord* const pb = hr->parsable_bottom_acquire();
   HeapWord* const region_top = hr->top();
   HeapWord* const region_end = hr->end();
   int objects_scanned = 0;
+  int unmarked_scanned = 0;
+  size_t invalid_words = 0;
+  bool truncated = false;
+  bool marked_parse_failed = false;
 
-  // Below parsable_bottom: dead objects may have dangling klasses (class unloaded,
-  // concurrent rebuild hasn't filled them yet). Use the mark bitmap to find live
-  // objects, skipping dead ones — same approach as G1ConcurrentRebuildAndScrub.
+  // Below parsable_bottom: G1 normally uses the mark bitmap because dead
+  // objects may have unloaded klasses. Remote eviction is less forgiving:
+  // if a live object was allocated/copied outside the current bitmap's view
+  // and we miss it here, a raw reference can survive into a guarded region.
+  // Walk marked objects first, then conservatively parse unmarked gaps and
+  // scan only words that look like valid object starts.
   HeapWord* p = hr->bottom();
-  while (p < pb && p < region_top) {
+  HeapWord* const below_limit = MIN2(pb, region_top);
+  while (p < below_limit) {
     if (bitmap->is_marked(p)) {
-      oop obj = cast_to_oop(p);
-      size_t sz = obj->size();
-      obj->oop_iterate(cl);
-      objects_scanned++;
-      p += sz;
+      size_t sz = 0;
+      if (remote_eviction_parse_obj(hr, p, below_limit, &sz)) {
+        oop obj = cast_to_oop(p);
+        cl->do_object(obj);
+        objects_scanned++;
+        p += sz;
+      } else {
+        marked_parse_failed = true;
+        HeapWord* next = bitmap->get_next_marked_addr(p + MinObjAlignment, below_limit);
+        p = (next > p) ? next : below_limit;
+      }
     } else {
-      p = bitmap->get_next_marked_addr(p, pb);
+      HeapWord* next_mark = bitmap->get_next_marked_addr(p, below_limit);
+      HeapWord* q = p;
+      while (q < next_mark) {
+        size_t sz = 0;
+        if (remote_eviction_parse_obj(hr, q, next_mark, &sz)) {
+          oop obj = cast_to_oop(q);
+          cl->do_object(obj);
+          objects_scanned++;
+          unmarked_scanned++;
+          q += sz;
+        } else {
+          q += MinObjAlignment;
+          invalid_words += MinObjAlignment;
+        }
+      }
+      p = next_mark;
     }
   }
 
   // Above parsable_bottom: all objects are live, sequential scan is safe.
   if (p < pb) p = pb;
-  HeapWord* seq_start = p;
   while (p < region_top) {
     if (p >= region_end) break;
-    oop obj = cast_to_oop(p);
-    Klass* k = obj->klass_or_null();
-    if (k == nullptr) {
+    size_t sz = 0;
+    if (!remote_eviction_parse_obj(hr, p, region_top, &sz)) {
       size_t skipped_words = pointer_delta(region_top, p);
-      log_warning(gc)("Phase C scan TRUNCATED: region %u null klass at " PTR_FORMAT
-                      " (scanned %d objs, skipping " SIZE_FORMAT " words to top " PTR_FORMAT
-                      ", pb=" PTR_FORMAT ")",
-                      hr->hrm_index(), p2i(p), objects_scanned, skipped_words,
+      log_warning(gc)("%s scan TRUNCATED: region %u type=%s invalid object at " PTR_FORMAT
+                      " (scanned %d objs, unmarked=%d, skipping " SIZE_FORMAT
+                      " words to top " PTR_FORMAT ", pb=" PTR_FORMAT ")",
+                      phase, hr->hrm_index(), hr->get_short_type_str(),
+                      p2i(p), objects_scanned, unmarked_scanned, skipped_words,
                       p2i(region_top), p2i(pb));
+      truncated = true;
       break;
     }
-    size_t sz = obj->size();
-    if (sz == 0) {
-      size_t skipped_words = pointer_delta(region_top, p);
-      log_warning(gc)("Phase C scan TRUNCATED: region %u zero size at " PTR_FORMAT
-                      " klass=%s (scanned %d objs, skipping " SIZE_FORMAT " words)",
-                      hr->hrm_index(), p2i(p), k->external_name(),
-                      objects_scanned, skipped_words);
-      break;
-    }
-    if (sz > (size_t)(region_end - p)) {
-      obj->oop_iterate(cl);
-      objects_scanned++;
-      break;
-    }
-    obj->oop_iterate(cl);
+    oop obj = cast_to_oop(p);
+    cl->do_object(obj);
     objects_scanned++;
     p += sz;
   }
+
+  if (unmarked_scanned > 0 || marked_parse_failed || truncated) {
+    log_warning(gc)("%s conservative scan: region %u type=%s pb=" PTR_FORMAT
+                    " top=" PTR_FORMAT " scanned=%d unmarked_valid=%d"
+                    " invalid_gap_words=" SIZE_FORMAT " marked_parse_failed=%s",
+                    phase, hr->hrm_index(), hr->get_short_type_str(),
+                    p2i(pb), p2i(region_top), objects_scanned, unmarked_scanned,
+                    invalid_words, marked_parse_failed ? "yes" : "no");
+  }
+
+  return objects_scanned;
+}
+
+class EvictionTagObjectClosure {
+  EvictionSetTagClosure* _cl;
+public:
+  EvictionTagObjectClosure(EvictionSetTagClosure* cl) : _cl(cl) {}
+  void do_object(oop obj) {
+    obj->oop_iterate(_cl);
+  }
+};
+
+static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure* cl,
+                                          const G1CMBitMap* bitmap) {
+  EvictionTagObjectClosure obj_cl(cl);
+  remote_eviction_scan_region_objects(hr, bitmap, "Phase C", &obj_cl);
 }
 
 class TagAllHeapRefsTask : public WorkerTask {
@@ -1272,54 +1345,24 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
   VerifyTagClosure cl(_g1h, eviction_set, num_regions);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
-  // 1. Verify heap: use SAME walk as Phase C tagging to avoid blind spots
+  class VerifyObjectClosure {
+    VerifyTagClosure* _cl;
+  public:
+    VerifyObjectClosure(VerifyTagClosure* cl) : _cl(cl) {}
+    void do_object(oop obj) {
+      _cl->set_cur_obj(obj);
+      obj->oop_iterate(_cl);
+    }
+  };
+
+  // 1. Verify heap: use the same conservative walk as Phase C tagging so the
+  // verifier can catch bitmap/parser blind spots instead of repeating them.
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
     if (hr->is_continues_humongous()) continue;
-
-    HeapWord* const pb = hr->parsable_bottom_acquire();
-    HeapWord* const region_top = hr->top();
-    HeapWord* const region_end = hr->end();
-
-    HeapWord* p = hr->bottom();
-    while (p < pb && p < region_top) {
-      if (bitmap->is_marked(p)) {
-        oop obj = cast_to_oop(p);
-        size_t sz = obj->size();
-        cl.set_cur_obj(obj);
-        obj->oop_iterate(&cl);
-        p += sz;
-      } else {
-        p = bitmap->get_next_marked_addr(p, pb);
-      }
-    }
-
-    if (p < pb) p = pb;
-    while (p < region_top) {
-      if (p >= region_end) break;
-      oop obj = cast_to_oop(p);
-      Klass* k = obj->klass_or_null();
-      if (k == nullptr) {
-        log_warning(gc)("VERIFY scan TRUNCATED: region %u null klass at " PTR_FORMAT
-                        " (pb=" PTR_FORMAT " top=" PTR_FORMAT ")",
-                        hr->hrm_index(), p2i(p), p2i(pb), p2i(region_top));
-        break;
-      }
-      size_t sz = obj->size();
-      if (sz == 0) {
-        log_warning(gc)("VERIFY scan TRUNCATED: region %u zero size at " PTR_FORMAT
-                        " klass=%s", hr->hrm_index(), p2i(p), k->external_name());
-        break;
-      }
-      cl.set_cur_obj(obj);
-      if (sz > (size_t)(region_end - p)) {
-        obj->oop_iterate(&cl);
-        break;
-      }
-      obj->oop_iterate(&cl);
-      p += sz;
-    }
+    VerifyObjectClosure obj_cl(&cl);
+    remote_eviction_scan_region_objects(hr, bitmap, "VERIFY", &obj_cl);
   }
 
   int heap_missed = cl.missed();
@@ -1580,55 +1623,24 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
   int regions_scanned = 0;
 
+  class StaleObjectClosure {
+    StaleRefSweepClosure* _cl;
+  public:
+    StaleObjectClosure(StaleRefSweepClosure* cl) : _cl(cl) {}
+    void do_object(oop obj) {
+      _cl->set_cur_obj(obj);
+      obj->oop_iterate(_cl);
+      _cl->scan_raw_payload(obj);
+    }
+  };
+
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
     if (hr->is_continues_humongous()) continue;
     if (hr->is_evict_guarded()) continue;
-
-    HeapWord* const pb = hr->parsable_bottom_acquire();
-    HeapWord* const region_top = hr->top();
-    HeapWord* const region_end = hr->end();
-
-    HeapWord* p = hr->bottom();
-    while (p < pb && p < region_top) {
-      if (bitmap->is_marked(p)) {
-        oop obj = cast_to_oop(p);
-        size_t sz = obj->size();
-        cl.set_cur_obj(obj);
-        obj->oop_iterate(&cl);
-        cl.scan_raw_payload(obj);
-        p += sz;
-      } else {
-        p = bitmap->get_next_marked_addr(p, pb);
-      }
-    }
-
-    if (p < pb) p = pb;
-    while (p < region_top) {
-      if (p >= region_end) break;
-      oop obj = cast_to_oop(p);
-      Klass* k = obj->klass_or_null();
-      if (k == nullptr) break;
-      uintptr_t klass_raw = (uintptr_t)k;
-      if (klass_raw < 0x10000 || (klass_raw >> 47) != 0) {
-        log_warning(gc)("CORRUPT-KLASS: obj=" PTR_FORMAT " region=%u klass_raw=0x%lx"
-                        " — stopping region scan",
-                        p2i(p), hr->hrm_index(), (unsigned long)klass_raw);
-        break;
-      }
-      size_t sz = obj->size();
-      if (sz == 0) break;
-      cl.set_cur_obj(obj);
-      if (sz > (size_t)(region_end - p)) {
-        obj->oop_iterate(&cl);
-        cl.scan_raw_payload(obj);
-        break;
-      }
-      obj->oop_iterate(&cl);
-      cl.scan_raw_payload(obj);
-      p += sz;
-    }
+    StaleObjectClosure obj_cl(&cl);
+    remote_eviction_scan_region_objects(hr, bitmap, "STALE-REF-SWEEP", &obj_cl);
     regions_scanned++;
   }
 
@@ -2220,6 +2232,15 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
   CSetRefFixupClosure cl(_g1h);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
+  class CSetFixupObjectClosure {
+    CSetRefFixupClosure* _cl;
+  public:
+    CSetFixupObjectClosure(CSetRefFixupClosure* cl) : _cl(cl) {}
+    void do_object(oop obj) {
+      obj->oop_iterate(_cl);
+    }
+  };
+
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
@@ -2227,35 +2248,8 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
     if (!hr->is_old() && !hr->is_starts_humongous()) continue;
 
     cl.set_src_is_fcr(hr->is_fetch_cache());
-
-    HeapWord* const pb = hr->parsable_bottom_acquire();
-    HeapWord* const region_top = hr->top();
-    HeapWord* const region_end = hr->end();
-
-    // Below pb: use bitmap
-    HeapWord* p = hr->bottom();
-    while (p < pb && p < region_top) {
-      if (bitmap->is_marked(p)) {
-        oop obj = cast_to_oop(p);
-        obj->oop_iterate(&cl);
-        p += obj->size();
-      } else {
-        p = bitmap->get_next_marked_addr(p, pb);
-      }
-    }
-
-    // Above pb: sequential scan
-    if (p < pb) p = pb;
-    while (p < region_top) {
-      if (p >= region_end) break;
-      oop obj = cast_to_oop(p);
-      Klass* k = obj->klass_or_null();
-      if (k == nullptr) break;
-      size_t sz = obj->size();
-      if (sz == 0) break;
-      obj->oop_iterate(&cl);
-      p += sz;
-    }
+    CSetFixupObjectClosure obj_cl(&cl);
+    remote_eviction_scan_region_objects(hr, bitmap, "Old/cset fixup", &obj_cl);
   }
 
   if (cl.fixed() > 0 || cl.skipped() > 0) {
