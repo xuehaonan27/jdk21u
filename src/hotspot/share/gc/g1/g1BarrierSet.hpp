@@ -124,6 +124,14 @@ class G1BarrierSet: public CardTableBarrierSet {
     static void oop_store_in_heap(T* addr, oop new_value);
     static void oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value);
 
+    // Oop atomics must compare against the logical resolved oop.  Heap
+    // fields may still contain a tagged remote handle while a prior normal
+    // load returned the corresponding clean local oop to Java code.
+    template <typename T>
+    static oop oop_atomic_cmpxchg_in_heap(T* addr, oop compare_value, oop new_value);
+    static oop oop_atomic_cmpxchg_in_heap_at(oop base, ptrdiff_t offset,
+                                             oop compare_value, oop new_value);
+
     // Override arraycopy to resolve tagged oops in source elements.
     // The default ModRefBarrierSet::oop_arraycopy_in_heap does a raw copy
     // which propagates tagged oop bytes without resolution.

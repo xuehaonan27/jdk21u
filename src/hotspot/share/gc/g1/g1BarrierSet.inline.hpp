@@ -258,4 +258,49 @@ oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
   ModRef::oop_store_in_heap_at(base, offset, new_value);
 }
 
+template <DecoratorSet decorators, typename BarrierSetT>
+template <typename T>
+inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
+oop_atomic_cmpxchg_in_heap(T* addr, oop compare_value, oop new_value) {
+  BarrierSetT* bs = barrier_set_cast<BarrierSetT>(barrier_set());
+  bs->template write_ref_field_pre<decorators>(addr);
+
+  oop result = Raw::oop_atomic_cmpxchg(addr, compare_value, new_value);
+  if (result == compare_value) {
+    bs->template write_ref_field_post<decorators>(addr);
+    return result;
+  }
+
+  // A field may hold a tagged remote/shared handle even though Java code got
+  // the clean local oop from a previous load barrier.  In that case retry the
+  // CAS against the raw tagged bits, but return the clean logical witness.
+  if (!UseCompressedOops && result != nullptr &&
+      (cast_from_oop<uintptr_t>(result) & G1_OOP_TAG_MASK) != 0) {
+    oop resolved = resolve_oop_full(result);
+    if (resolved == compare_value) {
+      oop retry = Raw::oop_atomic_cmpxchg(addr, result, new_value);
+      if (retry == result) {
+        bs->template write_ref_field_post<decorators>(addr);
+        return compare_value;
+      }
+      result = retry;
+    } else {
+      result = resolved;
+    }
+  }
+
+  if (!UseCompressedOops && result != nullptr &&
+      (cast_from_oop<uintptr_t>(result) & G1_OOP_TAG_MASK) != 0) {
+    result = resolve_oop_full(result);
+  }
+  return result;
+}
+
+template <DecoratorSet decorators, typename BarrierSetT>
+inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
+oop_atomic_cmpxchg_in_heap_at(oop base, ptrdiff_t offset, oop compare_value, oop new_value) {
+  return oop_atomic_cmpxchg_in_heap(AccessInternal::oop_field_addr<decorators>(base, offset),
+                                   compare_value, new_value);
+}
+
 #endif // SHARE_GC_G1_G1BARRIERSET_INLINE_HPP

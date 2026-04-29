@@ -87,24 +87,43 @@ instruct g1LoadP(rRegP dst, memory mem, rFlagsReg cr)
 instruct g1CompareAndExchangeP(
                          memory mem_ptr,
                          rax_RegP oldval, rRegP newval,
+                         rRegP expected_tmp, rRegP tagged_tmp,
                          rFlagsReg cr)
 %{
   predicate(UseG1GC && VM_Version::supports_cx8() && n->as_LoadStore()->barrier_data() != 0);
   match(Set oldval (CompareAndExchangeP mem_ptr (Binary oldval newval)));
-  effect(KILL cr);
+  effect(TEMP expected_tmp, TEMP tagged_tmp, KILL cr);
 
   format %{ "lock\n\t"
-            "cmpxchgq $newval, $mem_ptr\t# (G1 tag-resolve barrier on old value)" %}
+            "cmpxchgq $newval, $mem_ptr\t# (G1 logical tagged compare-and-exchange)" %}
 
   ins_encode %{
+    Label done, not_tagged_or_mismatch, retry_failed;
+    __ movptr($expected_tmp$$Register, $oldval$$Register);
     __ lock();
     __ cmpxchgq($newval$$Register, $mem_ptr$$Address);
-    // oldval (rax) now holds the old value from memory -- resolve tags.
-    // Note: if the slot held a tagged oop (G1TagRefSites debug mode), the CAS
-    // may fail spuriously. Callers use retry loops and will succeed after the
-    // resolved value is used as the new expected value on retry. In production
-    // mode (invisible-handle design), heap slots are clean — no spurious failures.
+    __ jcc(Assembler::equal, done);
+
+    // If the raw memory value is tagged but resolves to the clean expected
+    // oop, the Java-level compare should succeed. Retry atomically using the
+    // raw tagged bits as the hardware compare value.
+    __ movptr($tagged_tmp$$Register, $oldval$$Register);
     g1_tag_resolve_barrier(_masm, this, $mem_ptr$$Address, $oldval$$Register);
+    __ cmpptr($oldval$$Register, $expected_tmp$$Register);
+    __ jcc(Assembler::notEqual, not_tagged_or_mismatch);
+    __ movptr($oldval$$Register, $tagged_tmp$$Register);
+    __ lock();
+    __ cmpxchgq($newval$$Register, $mem_ptr$$Address);
+    __ jcc(Assembler::notEqual, retry_failed);
+    __ movptr($oldval$$Register, $expected_tmp$$Register);
+    __ jmp(done);
+
+    __ bind(retry_failed);
+    g1_tag_resolve_barrier(_masm, this, $mem_ptr$$Address, $oldval$$Register);
+    __ jmp(done);
+
+    __ bind(not_tagged_or_mismatch);
+    __ bind(done);
   %}
 
   ins_pipe(pipe_cmpxchg);
@@ -119,25 +138,46 @@ instruct g1CompareAndExchangeP(
 // (barrier_data == 0) rule does not fire.
 instruct g1CompareAndSwapP(rRegI res,
                            memory mem_ptr,
-                           rax_RegP oldval, rRegP newval,
-                           rFlagsReg cr)
+                           rRegP expected_tmp, rRegP tagged_tmp,
+                           rRegP newval, rFlagsReg cr,
+                           rax_RegP oldval)
 %{
   predicate(UseG1GC && VM_Version::supports_cx8() && n->as_LoadStore()->barrier_data() != 0);
   match(Set res (CompareAndSwapP mem_ptr (Binary oldval newval)));
   match(Set res (WeakCompareAndSwapP mem_ptr (Binary oldval newval)));
-  effect(KILL cr, KILL oldval);
+  effect(TEMP expected_tmp, TEMP tagged_tmp, KILL cr, KILL oldval);
 
   format %{ "lock\n\t"
             "cmpxchgq $newval, $mem_ptr\n\t"
             "sete     $res\n\t"
-            "movzbl   $res, $res\t# (G1 barrier - bool result, no tag resolve)" %}
+            "movzbl   $res, $res\t# (G1 logical tagged compare-and-swap)" %}
 
   ins_encode %{
+    Label success, fail, done;
+    __ movptr($expected_tmp$$Register, $oldval$$Register);
     __ lock();
     __ cmpxchgq($newval$$Register, $mem_ptr$$Address);
-    // Note: CAS may fail spuriously with G1TagRefSites (tagged slot vs clean expected).
-    // Callers retry. In production (invisible-handle), slots are clean — no issue.
-    __ setb(Assembler::equal, $res$$Register);
+    __ jcc(Assembler::equal, success);
+
+    // Normal Java loads resolve tagged handles before exposing values to the
+    // program.  Unsafe CAS must therefore treat a tagged field value and its
+    // resolved clean oop as equal, then retry with the raw tagged compare bits.
+    __ movptr($tagged_tmp$$Register, $oldval$$Register);
+    g1_tag_resolve_barrier(_masm, this, $mem_ptr$$Address, $oldval$$Register);
+    __ cmpptr($oldval$$Register, $expected_tmp$$Register);
+    __ jcc(Assembler::notEqual, fail);
+    __ movptr($oldval$$Register, $tagged_tmp$$Register);
+    __ lock();
+    __ cmpxchgq($newval$$Register, $mem_ptr$$Address);
+    __ jcc(Assembler::equal, success);
+
+    __ bind(fail);
+    __ xorl($res$$Register, $res$$Register);
+    __ jmp(done);
+
+    __ bind(success);
+    __ movl($res$$Register, 1);
+    __ bind(done);
     __ movzbl($res$$Register, $res$$Register);
   %}
 
