@@ -537,6 +537,7 @@ public:
   // Dynamically allocated per collect_dead cycle.
   uintptr_t* _remote_roots;
   int        _remote_roots_count;
+  int        _cm_remote_roots_count;
   int        _remote_roots_capacity;
 
   // Cross-boundary roots: LOCAL handles referenced by live REMOTE objects.
@@ -691,7 +692,10 @@ public:
   // Check if concurrent marking is in progress
   bool concurrent_marking_active() const;
 
-  void clear_remote_roots() { _remote_roots_count = 0; }
+  void clear_remote_roots() {
+    _remote_roots_count = 0;
+    _cm_remote_roots_count = 0;
+  }
   void ensure_remote_roots_capacity(int needed) {
     if (needed <= _remote_roots_capacity) return;
     int new_cap = MAX2(needed, _remote_roots_capacity * 2);
@@ -711,6 +715,7 @@ public:
     _remote_roots[_remote_roots_count++] = handle_id;
   }
   int remote_roots_count() const { return _remote_roots_count; }
+  void remember_remote_roots_as_cm_roots() { _cm_remote_roots_count = _remote_roots_count; }
   const uintptr_t* remote_roots() const { return _remote_roots; }
 
   uint32_t gc_epoch() const { return _gc_epoch; }

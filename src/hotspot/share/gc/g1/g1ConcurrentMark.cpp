@@ -1347,6 +1347,7 @@ void G1ConcurrentMark::collect_remote_root_logs() {
     log_info(gc)("Remote root collection: %d logged across tasks, %d unique handle_ids",
                  total_logged, rmm->remote_roots_count());
   }
+  rmm->remember_remote_roots_as_cm_roots();
 
   // P13: Apply deferred remote_refcount decrements.
   // These were buffered during concurrent marking to prevent removing dormant

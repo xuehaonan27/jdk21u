@@ -53,7 +53,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _table_lock(0), _alloc_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
-    _remote_roots(nullptr), _remote_roots_count(0), _remote_roots_capacity(0),
+    _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
+    _remote_roots_capacity(0),
     _cross_roots_count(0), _deferred_decrement_count(0),
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
     _fcr_evac_writes(0), _fcr_fixup_nulls(0),
@@ -1975,8 +1976,8 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   size_t set_mask = set_capacity - 1;
 
   // Collect unique roots into _remote_roots (dynamically grown)
-  int cm_count = _remote_roots_count;  // CM roots already present
-  int old_count = _remote_roots_count;
+  int cm_count = MIN2(_cm_remote_roots_count, _remote_roots_count);
+  _remote_roots_count = cm_count;
 
   // Insert existing CM roots into dedup set
   for (int i = 0; i < cm_count; i++) {
@@ -2086,6 +2087,10 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   // Safe collection requires a full-heap scan to clear all shared_oops first.
   // TODO: implement full-heap dead-handle sweep before freeing handles.
   if (dead_ids) os::free(dead_ids);
+
+  // Keep only persistent CM roots. Phase C/refcount roots are recomputed for
+  // each collection; retaining them makes the root set grow every young GC.
+  _remote_roots_count = cm_count;
 
   size_t retained = total_remote;
   if (num_dead > 0 || retained > 0) {

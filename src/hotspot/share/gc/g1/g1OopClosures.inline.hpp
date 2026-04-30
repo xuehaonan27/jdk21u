@@ -143,6 +143,11 @@ inline void G1RootRegionScanClosure::do_oop_work(T* p) {
     if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
       return;
     }
+    HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
+    if (hr->is_continues_humongous() || hr->block_start(obj_addr) != obj_addr ||
+        G1CollectedHeap::is_obj_filler(obj)) {
+      return;
+    }
   }
   _cm->mark_in_bitmap(_worker_id, obj);
 }

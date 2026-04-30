@@ -38,6 +38,7 @@
 #include "gc/g1/g1_globals.hpp"
 #include "gc/g1/heapRegionRemSet.inline.hpp"
 #include "gc/g1/heapRegion.hpp"
+#include "gc/g1/heapRegion.inline.hpp"
 #include "gc/shared/suspendibleThreadSet.hpp"
 #include "gc/shared/taskqueue.inline.hpp"
 #include "utilities/bitMap.inline.hpp"
@@ -303,6 +304,11 @@ inline bool G1CMTask::deal_with_reference(T* p) {
     }
     HeapRegion* hr = _g1h->heap_region_containing(obj);
     if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+      return false;
+    }
+    HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
+    if (hr->is_continues_humongous() || hr->block_start(obj_addr) != obj_addr ||
+        G1CollectedHeap::is_obj_filler(obj)) {
       return false;
     }
   }
