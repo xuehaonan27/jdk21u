@@ -2200,7 +2200,6 @@ static bool is_valid_region_object(G1CollectedHeap* g1h, oop obj, HeapRegion** r
   if (obj_addr < hr->bottom() || obj_addr >= hr->top()) return false;
 
   HeapWord* pb = hr->parsable_bottom_acquire();
-  if (hr->block_start(obj_addr, pb) != obj_addr) return false;
   if (!hr->block_is_obj(obj_addr, pb)) return false;
 
   if (region_out != nullptr) {
