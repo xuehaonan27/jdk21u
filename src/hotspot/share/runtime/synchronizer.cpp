@@ -931,11 +931,15 @@ intptr_t ObjectSynchronizer::FastHashCode(Thread* current, oop obj) {
     if (g1h != nullptr && g1h->is_in_reserved(obj)) {
       HeapRegion* hr = g1h->heap_region_containing_or_null(obj);
       if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
-        log_warning(gc)("FastHashCode: obj=" PTR_FORMAT " in %s region %u; returning 0",
-                        p2i((void*)obj),
-                        hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
-                        hr == nullptr ? 9999 : hr->hrm_index());
-        return 0;
+        oop resolved = resolve_oop_full(obj);
+        if (resolved == nullptr) {
+          log_warning(gc)("FastHashCode: obj=" PTR_FORMAT " in %s region %u resolved to null",
+                          p2i((void*)obj),
+                          hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                          hr == nullptr ? 9999 : hr->hrm_index());
+          return 0;
+        }
+        obj = resolved;
       }
     }
   }

@@ -1152,6 +1152,21 @@ void TemplateTable::aastore() {
   __ testptr(rax, rax);
   __ jcc(Assembler::zero, is_null);
 
+#if INCLUDE_G1GC
+  if (UseRemoteExecutor || LocalMemoryRatio < 100 ||
+      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    // The interpreter aastore stub reads value->klass directly.  A clean raw
+    // oop can survive in interpreter state across remote eviction, so resolve
+    // it before the klass load and update the operand stack for the store.
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+    __ movptr(at_tos(), rax);
+    __ movl(rcx, at_tos_p1());
+    __ movptr(rdx, at_tos_p2());
+    __ testptr(rax, rax);
+    __ jcc(Assembler::zero, is_null);
+  }
+#endif
+
   // Move subklass into rbx
   __ load_klass(rbx, rax, rscratch1);
   // Move superklass into rax

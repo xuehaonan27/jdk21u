@@ -1902,6 +1902,9 @@ void LIR_Assembler::emit_opTypeCheck(LIR_OpTypeCheck* op) {
     }
 #endif
 
+    __ testptr(value, value);
+    __ jcc(Assembler::equal, done);
+
     add_debug_info_for_null_check_here(op->info_for_exception());
     __ load_klass(k_RInfo, array, tmp_load_klass);
     __ load_klass(klass_RInfo, value, tmp_load_klass);

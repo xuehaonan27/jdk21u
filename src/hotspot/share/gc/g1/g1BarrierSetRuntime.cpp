@@ -392,6 +392,7 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
                         p2i((void*)v),
                         hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
                         hr == nullptr ? 9999 : hr->hrm_index());
+        return nullptr;
       }
     }
     return tagged;

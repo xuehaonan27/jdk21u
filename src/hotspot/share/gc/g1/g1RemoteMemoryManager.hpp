@@ -100,6 +100,7 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   // 1M buckets: with ~800K handles, avg chain length < 1.
   static const size_t TABLE_SIZE = (1 << 20);
   HandleEntry** _table;
+  HandleEntry** _eviction_table;
   volatile int _table_lock;
 
   void table_lock()   { while (Atomic::cmpxchg(&_table_lock, 0, 1) != 0) { /* spin */ } }
@@ -162,6 +163,32 @@ private:
     h *= 0xbf58476d1ce4e5b9ULL;
     h ^= (h >> 31);
     return h & (TABLE_SIZE - 1);
+  }
+
+  RemoteHandle* handle_for_eviction_addr(uintptr_t addr) const {
+    size_t idx = hash_obj(addr);
+
+    HandleEntry* e = _eviction_table[idx];
+    while (e != nullptr) {
+      if (e->_obj_addr == addr) return e->_handle;
+      e = e->_next;
+    }
+    return nullptr;
+  }
+
+  void remember_eviction_alias_locked(uintptr_t addr, RemoteHandle* h) {
+    if (addr == 0 || h == nullptr) return;
+
+    size_t idx = hash_obj(addr);
+    HandleEntry* e = _eviction_table[idx];
+    while (e != nullptr) {
+      if (e->_obj_addr == addr && e->_handle == h) return;
+      e = e->_next;
+    }
+
+    HandleEntry* alias = alloc_entry();
+    alias->init(addr, h, _eviction_table[idx]);
+    _eviction_table[idx] = alias;
   }
 
 public:
@@ -310,7 +337,8 @@ public:
       if (e->_obj_addr == addr) return e->_handle;
       e = e->_next;
     }
-    return nullptr;
+
+    return handle_for_eviction_addr(addr);
   }
 
   // Check if an object has a Handle (fast negative via table lookup).
@@ -360,6 +388,7 @@ public:
     uintptr_t new_uaddr = (uintptr_t)new_addr;
     uintptr_t old_addr = h->_eviction_addr;
     table_lock();
+    remember_eviction_alias_locked(old_addr, h);
     if (old_addr != 0) {
       size_t old_idx = hash_obj(old_addr);
       HandleEntry** pp = &_table[old_idx];
