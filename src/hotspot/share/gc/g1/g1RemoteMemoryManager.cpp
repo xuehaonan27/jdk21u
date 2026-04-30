@@ -2190,31 +2190,162 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
 }
 
 int G1RemoteMemoryManager::fixup_all_local_handles() {
+  Ticks start = Ticks::now();
+  const size_t max_bucket_scan = 4 * 1024 * 1024;
   int updated = 0;
+  size_t scanned = 0;
+  size_t local_seen = 0;
+  size_t rekeyed = 0;
+  size_t stale_region = 0;
+  size_t null_handles = 0;
+  size_t non_empty_buckets = 0;
+  size_t longest_bucket = 0;
+  size_t corrupt_buckets = 0;
+
+  log_info(gc)("Handle table fixup START: buckets=%zu tagged_entries=%d",
+               TABLE_SIZE, _tagged_field_count);
+
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+    if (_table[idx] == nullptr) {
+      continue;
+    }
+    non_empty_buckets++;
+
+    // A corrupted chain would otherwise spin the VMThread inside a GC pause.
+    HandleEntry* slow = _table[idx];
+    HandleEntry* fast = _table[idx];
+    size_t cycle_probe = 0;
+    while (fast != nullptr && fast->_next != nullptr && cycle_probe < max_bucket_scan) {
+      slow = slow->_next;
+      fast = fast->_next->_next;
+      cycle_probe++;
+      if (slow == fast) {
+        HandleEntry* p1 = _table[idx];
+        HandleEntry* p2 = slow;
+        while (p1 != p2) {
+          p1 = p1->_next;
+          p2 = p2->_next;
+        }
+
+        HandleEntry* cycle_start = p1;
+        HandleEntry* tail = cycle_start;
+        size_t cycle_len = 1;
+        while (tail->_next != cycle_start && cycle_len < max_bucket_scan) {
+          tail = tail->_next;
+          cycle_len++;
+        }
+        if (tail->_next == cycle_start) {
+          tail->_next = nullptr;
+          log_warning(gc)("Handle table fixup repaired cycle in bucket %zu "
+                          "(cycle_start=" PTR_FORMAT ", cycle_len=%zu)",
+                          idx, p2i(cycle_start), cycle_len);
+        } else {
+          _table[idx] = nullptr;
+          log_warning(gc)("Handle table fixup dropped corrupt bucket %zu "
+                          "(cycle_start=" PTR_FORMAT ", probe_limit=%zu)",
+                          idx, p2i(cycle_start), max_bucket_scan);
+        }
+        corrupt_buckets++;
+        break;
+      }
+    }
+    if (cycle_probe >= max_bucket_scan) {
+      log_warning(gc)("Handle table fixup cycle probe exceeded limit in bucket %zu "
+                      "(limit=%zu, head=" PTR_FORMAT ")",
+                      idx, max_bucket_scan, p2i(_table[idx]));
+      corrupt_buckets++;
+    }
+
+    size_t bucket_entries = 0;
+    HandleEntry** pp = &_table[idx];
+    while (*pp != nullptr) {
+      HandleEntry* e = *pp;
+      bucket_entries++;
+      if (bucket_entries > max_bucket_scan) {
+        log_warning(gc)("Handle table fixup truncated bucket %zu after %zu entries "
+                        "(entry=" PTR_FORMAT ")",
+                        idx, max_bucket_scan, p2i(e));
+        *pp = nullptr;
+        corrupt_buckets++;
+        break;
+      }
+
+      scanned++;
       RemoteHandle* h = e->_handle;
+      if (h == nullptr) {
+        null_handles++;
+        pp = &e->_next;
+        continue;
+      }
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-      if (state != REMOTE_HANDLE_LOCAL) continue;
+      if (state != REMOTE_HANDLE_LOCAL) {
+        pp = &e->_next;
+        continue;
+      }
+      local_seen++;
 
       uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
-      if (addr == 0) continue;
+      if (addr == 0) {
+        pp = &e->_next;
+        continue;
+      }
       oop target = cast_to_oop(addr);
-      if (!_g1h->is_in(target)) continue;
+      if (!_g1h->is_in(target)) {
+        pp = &e->_next;
+        continue;
+      }
 
       HeapRegion* hr = _g1h->heap_region_containing(target);
-      if (hr != nullptr && (hr->is_free() || hr->is_evict_guarded())) continue;
+      if (hr != nullptr && (hr->is_free() || hr->is_evict_guarded())) {
+        stale_region++;
+        pp = &e->_next;
+        continue;
+      }
 
       markWord m = target->mark();
       if (m.is_marked()) {
         oop forwardee = cast_to_oop(m.decode_pointer());
-        h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
+        uintptr_t forward_addr = cast_from_oop<uintptr_t>(forwardee);
+        h->set_local_release((void*)forward_addr);
+
+        size_t new_idx = hash_obj(forward_addr);
+        e->_obj_addr = forward_addr;
+        if (new_idx != idx) {
+          *pp = e->_next;
+          e->_next = _table[new_idx];
+          _table[new_idx] = e;
+          rekeyed++;
+        } else {
+          pp = &e->_next;
+        }
         updated++;
+        continue;
       }
+
+      pp = &e->_next;
+    }
+    if (bucket_entries > longest_bucket) {
+      longest_bucket = bucket_entries;
     }
   }
-  if (updated > 0) {
+
+  double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
+  log_info(gc)("Handle table fixup DONE: %.1fms scanned=%zu local=%zu updated=%d "
+               "rekeyed=%zu non_empty_buckets=%zu longest_bucket=%zu "
+               "stale_region=%zu null_handles=%zu corrupt_buckets=%zu",
+               elapsed_ms, scanned, local_seen, updated, rekeyed,
+               non_empty_buckets, longest_bucket, stale_region,
+               null_handles, corrupt_buckets);
+  if (corrupt_buckets > 0) {
+    log_warning(gc)("Handle table fixup saw %zu corrupt buckets; table mutation "
+                    "paths need follow-up locking/cycle investigation",
+                    corrupt_buckets);
+  } else if (elapsed_ms > 1000.0) {
+    log_warning(gc)("Handle table fixup took %.1fms for %zu entries "
+                    "(longest_bucket=%zu)",
+                    elapsed_ms, scanned, longest_bucket);
+  } else if (updated > 0) {
     log_info(gc)("Handle table fixup: %d LOCAL handles updated for forwarded objects", updated);
   }
   return updated;

@@ -1112,10 +1112,20 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
+      Ticks fixup_start = Ticks::now();
+      int tagged_updated = 0;
+      int local_updated = 0;
+      log_info(gc)("Remote handle post-evac fixup START (tagged_entries=%d)",
+                   rmm->tagged_field_count());
       if (rmm->tagged_field_count() > 0) {
-        rmm->fixup_tagged_field_handles();
+        tagged_updated = rmm->fixup_tagged_field_handles();
       }
-      rmm->fixup_all_local_handles();
+      local_updated = rmm->fixup_all_local_handles();
+      double fixup_ms = (Ticks::now() - fixup_start).seconds() * 1000.0;
+      log_info(gc)("Remote handle post-evac fixup DONE: %.1fms "
+                   "(tagged_updated=%d local_updated=%d tagged_remaining=%d)",
+                   fixup_ms, tagged_updated, local_updated,
+                   rmm->tagged_field_count());
     }
   }
 
