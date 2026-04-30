@@ -468,6 +468,10 @@ public:
     EdgeTableEntry*  _next;
   };
   EdgeTableEntry* _edge_buckets[EDGE_TABLE_BUCKETS];
+  volatile int _edge_table_lock;
+
+  void edge_table_lock()   { while (Atomic::cmpxchg(&_edge_table_lock, 0, 1) != 0) { /* spin */ } }
+  void edge_table_unlock() { Atomic::release_store(&_edge_table_lock, 0); }
 
   static size_t hash_handle(RemoteHandle* h) {
     return ((uintptr_t)h >> 4) % EDGE_TABLE_BUCKETS;
@@ -478,22 +482,34 @@ public:
     size_t idx = hash_handle(et->_source_handle);
     EdgeTableEntry* entry = (EdgeTableEntry*)os::malloc(sizeof(EdgeTableEntry), mtGC);
     entry->_table = et;
+    edge_table_lock();
     entry->_next = _edge_buckets[idx];
     _edge_buckets[idx] = entry;
+    edge_table_unlock();
   }
 
-  ObjectEdgeTable* edge_table_for(RemoteHandle* h) const {
+  ObjectEdgeTable* take_edge_table(RemoteHandle* h) {
     size_t idx = hash_handle(h);
-    EdgeTableEntry* e = _edge_buckets[idx];
-    while (e != nullptr) {
-      if (e->_table->_source_handle == h) return e->_table;
-      e = e->_next;
+    edge_table_lock();
+    EdgeTableEntry** pp = &_edge_buckets[idx];
+    while (*pp != nullptr) {
+      if ((*pp)->_table->_source_handle == h) {
+        EdgeTableEntry* entry = *pp;
+        ObjectEdgeTable* table = entry->_table;
+        *pp = entry->_next;
+        os::free(entry);
+        edge_table_unlock();
+        return table;
+      }
+      pp = &(*pp)->_next;
     }
+    edge_table_unlock();
     return nullptr;
   }
 
   void remove_edge_table(RemoteHandle* h) {
     size_t idx = hash_handle(h);
+    edge_table_lock();
     EdgeTableEntry** pp = &_edge_buckets[idx];
     while (*pp != nullptr) {
       if ((*pp)->_table->_source_handle == h) {
@@ -501,10 +517,12 @@ public:
         *pp = entry->_next;
         ObjectEdgeTable::free(entry->_table);
         os::free(entry);
+        edge_table_unlock();
         return;
       }
       pp = &(*pp)->_next;
     }
+    edge_table_unlock();
   }
 
   // Build edge table for an object about to be evicted.

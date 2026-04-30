@@ -51,6 +51,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   : _g1h(g1h), _backend(nullptr), _handle_allocator(),
     _entry_chunks(nullptr), _entry_free_list(nullptr), _entry_chunk_top(ENTRY_CHUNK_CAPACITY),
     _table_lock(0), _alloc_lock(0),
+    _edge_table_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
     _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
@@ -1879,7 +1880,7 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
 // not be visible to other threads until all fields are patched.
 
 void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, HeapWord* dest) {
-  ObjectEdgeTable* et = edge_table_for(source_handle);
+  ObjectEdgeTable* et = take_edge_table(source_handle);
   if (et == nullptr) {
     // No edge table — object had no oop fields at eviction time.
     // Or edge table was already cleaned up. Nothing to patch.
@@ -1943,8 +1944,9 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
   log_debug(gc)("Fetch patch: handle=" PTR_FORMAT " dest=" PTR_FORMAT " patched=%d/%u fields",
                 p2i(source_handle), p2i(dest), patched, et->_entry_count);
 
-  // Remove edge table — no longer needed after fetch
-  remove_edge_table(source_handle);
+  // No longer needed after fetch.  The table was unlinked before patching so
+  // concurrent fetchers of other handles can safely traverse the bucket chain.
+  ObjectEdgeTable::free(et);
 }
 
 // ============================================================
