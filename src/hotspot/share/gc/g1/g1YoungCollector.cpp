@@ -2015,9 +2015,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       int* region_start = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
       int* region_count_arr = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
       bool* region_complete = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+      bool* entry_active = NEW_C_HEAP_ARRAY(bool, max_entries, mtGC);
       memset(region_start, 0, num_regions * sizeof(int));
       memset(region_count_arr, 0, num_regions * sizeof(int));
       memset(region_complete, 0, num_regions * sizeof(bool));
+      memset(entry_active, 0, max_entries * sizeof(bool));
       int num_entries = 0;
 
       for (uint i = 0; i < num_regions; i++) {
@@ -2035,6 +2037,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
           size_t sz = obj->size();
           if (rmm->prepare_eviction(obj, &hab, &entries[num_entries])) {
+            entry_active[num_entries] = true;
             num_entries++;
             rcount++;
           } else {
@@ -2160,6 +2163,54 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                      salvaged_regions, relocated_count, relocated_bytes / K);
       }
 
+      // E1.6: Guard regions that still have LOCAL handles not covered by the
+      // prepared object list. If such a region is sent/finalized anyway, the
+      // prepared objects are fillerized while the region remains mapped for
+      // the leftover LOCAL handles. Missed clean refs then observe
+      // FillerElement objects instead of trapping on a protected page.
+      int handle_guarded_regions = 0;
+      int handle_guarded_entries = 0;
+      int handle_blockers = 0;
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        if (!region_complete[i]) continue;
+
+        int rcount = region_count_arr[i];
+        if (rcount <= 0) continue;
+
+        HeapRegion* hr = _g1h->region_at(i);
+        int start = region_start[i];
+        int blockers = rmm->count_unprepared_local_handles_in_region(hr, entries,
+                                                                      start, rcount, 4);
+        if (blockers == 0) continue;
+
+        for (int e = start; e < start + rcount; e++) {
+          if (entry_active[e]) {
+            rmm->abort_prepared_eviction(&entries[e]);
+            entry_active[e] = false;
+            handle_guarded_entries++;
+          }
+        }
+
+        eviction_candidates[i] = false;
+        region_complete[i] = false;
+        region_count_arr[i] = 0;
+        hr->clear_cold_destination();
+        regions_kept_alive++;
+        total_candidates--;
+        handle_guarded_regions++;
+        handle_blockers += blockers;
+        log_warning(gc)("Pre-E local-handle guard: removed candidate region %u "
+                        "with %d unprepared LOCAL handles before backend send",
+                        hr->hrm_index(), blockers);
+      }
+      if (handle_guarded_regions > 0) {
+        log_info(gc)("Pre-E local-handle guard: removed %d regions, aborted %d "
+                     "prepared entries, found %d blocking LOCAL handles",
+                     handle_guarded_regions, handle_guarded_entries,
+                     handle_blockers);
+      }
+
       // E2: Batch-send to remote backend.
       Ticks e2_start = Ticks::now();
       G1RemoteBackend* backend = rmm->backend();
@@ -2177,11 +2228,16 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int batch_start_entry = 0;
 
         for (int e = 0; e < num_entries; e++) {
+          if (!entry_active[e]) continue;
           PreparedEviction* pe = &entries[e];
           size_t byte_size = pe->word_size * HeapWordSize;
           uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
           size_t edge_bytes = num_edges * 12;
           size_t entry_size = 32 + byte_size + edge_bytes;
+
+          if (batch_count == 0) {
+            batch_start_entry = e;
+          }
 
           if (batch_offset + entry_size > BATCH_BUF_SIZE && batch_count > 0) {
             *(uint32_t*)(batch_buf + 0) = 0x16; // CMD_BATCH_EVICT_WITH_EDGES
@@ -2191,6 +2247,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             int rc = backend->batch_evict(batch_buf, batch_offset);
             if (rc < 0) {
               for (int f = batch_start_entry; f < e; f++) {
+                if (!entry_active[f]) continue;
                 backend->evict(cast_from_oop<void*>(entries[f].obj), entries[f].word_size,
                                entries[f].klass, entries[f].slot_id);
               }
@@ -2233,8 +2290,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
           int rc = backend->batch_evict(batch_buf, batch_offset);
           if (rc < 0) {
-            int start = num_entries - batch_count;
-            for (int f = start; f < num_entries; f++) {
+            for (int f = batch_start_entry; f < num_entries; f++) {
+              if (!entry_active[f]) continue;
               backend->evict(cast_from_oop<void*>(entries[f].obj), entries[f].word_size,
                              entries[f].klass, entries[f].slot_id);
             }
@@ -2304,6 +2361,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       FREE_C_HEAP_ARRAY(int, region_start);
       FREE_C_HEAP_ARRAY(int, region_count_arr);
       FREE_C_HEAP_ARRAY(bool, region_complete);
+      FREE_C_HEAP_ARRAY(bool, entry_active);
 
       if (total_candidates > 0) {
         double phase_e_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;

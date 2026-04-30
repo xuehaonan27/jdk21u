@@ -869,6 +869,19 @@ public:
   bool prepare_eviction(oop obj, RemoteHandleAllocBuffer* hab, PreparedEviction* out);
   static void log_prepare_eviction_stats();
 
+  // Abort a prepared eviction before it is sent to the backend.
+  // Drops edge-table refcounts installed by prepare_eviction().
+  void abort_prepared_eviction(PreparedEviction* entry);
+
+  // Count LOCAL handles into hr that are not among the prepared objects for
+  // that region. These handles would remain LOCAL after publishing prepared
+  // handles as REMOTE, so the region must not be sent/fillerized.
+  int count_unprepared_local_handles_in_region(HeapRegion* hr,
+                                               const PreparedEviction* entries,
+                                               int start,
+                                               int count,
+                                               int log_limit = 0);
+
   // Finalize: set handle remote, mark word, fill with filler.
   // Called after backend confirms batch eviction.
   void finalize_eviction(PreparedEviction* entry);

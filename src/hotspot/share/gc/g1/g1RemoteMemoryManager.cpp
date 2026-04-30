@@ -411,6 +411,87 @@ void G1RemoteMemoryManager::finalize_eviction(PreparedEviction* entry) {
   CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(entry->obj), entry->word_size, false);
 }
 
+void G1RemoteMemoryManager::abort_prepared_eviction(PreparedEviction* entry) {
+  if (entry == nullptr || entry->edge_table == nullptr) {
+    return;
+  }
+
+  ObjectEdgeTable* et = entry->edge_table;
+  for (uint32_t i = 0; i < et->_entry_count; i++) {
+    RemoteHandle* target = et->_entries[i]._target_handle;
+    if (target != nullptr) {
+      target->decrement_remote_refcount();
+    }
+  }
+
+  remove_edge_table(entry->handle);
+  entry->edge_table = nullptr;
+}
+
+static bool prepared_entries_contain_addr(const G1RemoteMemoryManager::PreparedEviction* entries,
+                                          int start,
+                                          int count,
+                                          uintptr_t addr) {
+  int lo = start;
+  int hi = start + count - 1;
+  while (lo <= hi) {
+    int mid = lo + ((hi - lo) >> 1);
+    uintptr_t cur = cast_from_oop<uintptr_t>(entries[mid].obj);
+    if (cur == addr) {
+      return true;
+    }
+    if (cur < addr) {
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return false;
+}
+
+int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
+    HeapRegion* hr,
+    const PreparedEviction* entries,
+    int start,
+    int count,
+    int log_limit) {
+  if (hr == nullptr || entries == nullptr || count <= 0) {
+    return 0;
+  }
+
+  uintptr_t bottom = (uintptr_t)hr->bottom();
+  uintptr_t end = (uintptr_t)hr->end();
+  int blockers = 0;
+
+  table_lock();
+  for (size_t i = 0; i < TABLE_SIZE; i++) {
+    HandleEntry* e = _table[i];
+    while (e != nullptr) {
+      RemoteHandle* h = e->_handle;
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) {
+        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+        if (addr >= bottom && addr < end &&
+            !prepared_entries_contain_addr(entries, start, count, addr)) {
+          blockers++;
+          if (blockers <= log_limit) {
+            log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
+                            PTR_FORMAT " local=" PTR_FORMAT " table_addr="
+                            PTR_FORMAT " dormant=%d rc=%u",
+                            hr->hrm_index(), p2i(h), addr, e->_obj_addr,
+                            h->is_dormant() ? 1 : 0, h->remote_refcount());
+          }
+        }
+      }
+      e = e->_next;
+    }
+  }
+  table_unlock();
+
+  return blockers;
+}
+
 int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* region_set,
                                                                   uint num_regions,
                                                                   uintptr_t* addrs,
