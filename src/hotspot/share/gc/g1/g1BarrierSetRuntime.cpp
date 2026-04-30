@@ -373,9 +373,15 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
 }
 
 // ============================================================
-// Safepoint-safe slow path: REMOTE fetch with thread transitions.
-// Called from interpreter C++ barrier (oop_load_in_heap) where
-// the interpreter frame anchor is set and GC can walk the stack.
+// Runtime slow path for interpreter/shared callers.
+//
+// Remote fetch allocates into an FCR and publishes the Handle as LOCAL after
+// the RDMA copy and field patching complete.  This publication must not race
+// with STW remote eviction: otherwise eviction can inspect the Handle while it
+// is FETCHING/REMOTE, free the destination region, and then the fetcher can
+// publish a LOCAL address into a guarded region.  Use the no-safepoint state
+// machine here as well, so a safepoint waits for the short fetch window instead
+// of evicting concurrently with it.
 // ============================================================
 oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   RemoteHandle* h = nullptr;
@@ -385,96 +391,7 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
   if (rmm != nullptr) {
     rmm->record_resolve_slow_entry();
   }
-
-  // VM diagnostic code can reach this through ordinary heap field loads
-  // (for example VM_PrintThreads -> JavaThread::print_on). Those callers
-  // cannot use JavaThread state transitions.
-  Thread* thread = Thread::current();
-  if (!thread->is_Java_thread()) {
-    return resolve_tagged_oop_no_safepoint(tagged);
-  }
-
-  JavaThread* current = JavaThread::cast(thread);
-  if (current->thread_state() != _thread_in_Java) {
-    return resolve_tagged_oop_no_safepoint(tagged);
-  }
-
-  ThreadInVMfromJava tiv(current);
-
-  int fetch_attempts = 0;
-  while (true) {
-    uintptr_t sa = h->load_state_and_addr_acquire();
-    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-
-    if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
-    if (state == REMOTE_HANDLE_DEAD)  {
-      // Returning nullptr here propagates into JIT-compiled callers and crashes
-      // them deep in the data flow (RAX=0 deref) because C2 may have elided the
-      // implicit null check on the load result. Log loudly so we know if DEAD
-      // mutator-reachability is the source of the next SIGSEGV.
-      log_warning(gc)("resolve_tagged_oop_slow: DEAD handle " PTR_FORMAT
-                      " reached by mutator (slot=%lu) — returning nullptr",
-                      p2i(h), (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
-      return nullptr;
-    }
-
-    if (state == REMOTE_HANDLE_REMOTE) {
-      if (h->cas_remote_to_fetching()) {
-        bool retry = false;
-        oopDesc* result;
-        {
-          ThreadBlockInVM tbivm(current);
-          result = fetch_and_install(h, fetch_attempts, &retry);
-        }
-        if (retry) continue;
-        return result;
-      }
-      continue;
-    }
-
-    if (state == REMOTE_HANDLE_FETCHING) {
-      ThreadBlockInVM tbivm(current);
-      const uint64_t YieldWarn = 10000;
-      const uint64_t YieldHard = 100000;
-      uint64_t yields = 0;
-      bool hard_wait = false;
-      while (true) {
-        sa = h->load_state_and_addr_acquire();
-        state = sa & REMOTE_HANDLE_STATE_MASK;
-        if (state != REMOTE_HANDLE_FETCHING) break;
-        if (++yields == YieldWarn) {
-          log_warning(gc)("FETCHING wait (slow path) exceeded %llu yields for handle " PTR_FORMAT
-                          " (slot=%lu) — fetcher may be stuck",
-                          (unsigned long long)yields, p2i(h),
-                          (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
-        }
-        if (yields >= YieldHard) {
-          // Recovery: revert FETCHING → REMOTE so this or another thread
-          // can retry the fetch. Returning nullptr here corrupts caller
-          // (NPE deep in JIT/StringTable). If original fetcher is truly
-          // crashed, this revert lets us recover. If original fetcher
-          // resumes after revert, its set_local_release CAS will succeed
-          // (state is now REMOTE not FETCHING) and the work isn't lost.
-          if (h->cas_fetching_to_remote()) {
-            log_warning(gc)("FETCHING wait HARD LIMIT (%llu yields) for handle " PTR_FORMAT
-                            " — reverted to REMOTE, will retry",
-                            (unsigned long long)yields, p2i(h));
-          }
-          hard_wait = true;
-          break;  // re-enter outer loop, will see REMOTE or whatever current state is
-        }
-        os::naked_yield();
-      }
-      if (rmm != nullptr && yields > 0) {
-        rmm->record_fetch_wait(false, hard_wait, yields);
-      }
-      continue;
-    }
-
-    log_warning(gc)("resolve_tagged_oop_slow: unexpected state 0x%lx for handle " PTR_FORMAT,
-                    (unsigned long)state, p2i(h));
-    os::naked_yield();
-  }
+  return resolve_tagged_oop_no_safepoint(tagged);
 }
 
 // ============================================================
