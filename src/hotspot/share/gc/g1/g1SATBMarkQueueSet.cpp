@@ -84,6 +84,9 @@ SATBMarkQueue& G1SATBMarkQueueSet::satb_queue_for_thread(Thread* const t) const 
 static inline bool requires_marking(const void* entry, G1CollectedHeap* g1h) {
   // Includes rejection of null pointers.
   uintptr_t v = (uintptr_t)entry;
+  if (v == 0 || !g1_remote_oop_is_aligned(v & G1_OOP_ADDR_MASK)) {
+    return false;
+  }
 
   // Resolve tagged oops (shared_oop / unique_oop from disaggregated memory).
   // Tagged oops have bit 63 set and their raw value is NOT a valid heap address.
@@ -96,6 +99,9 @@ static inline bool requires_marking(const void* entry, G1CollectedHeap* g1h) {
     }
     entry = (const void*)cast_from_oop<uintptr_t>(resolved);
     v = (uintptr_t)entry;
+    if (!g1_remote_oop_is_aligned(v)) {
+      return false;
+    }
   }
 
   if (!g1h->is_in_reserved(entry)) {
@@ -117,6 +123,9 @@ static inline bool requires_marking(const void* entry, G1CollectedHeap* g1h) {
 static inline bool discard_entry(const void* entry, G1CollectedHeap* g1h) {
   // Resolve tagged oops before checking — tagged values are not valid heap oops
   uintptr_t v = (uintptr_t)entry;
+  if (v == 0 || !g1_remote_oop_is_aligned(v & G1_OOP_ADDR_MASK)) {
+    return true;
+  }
   if ((v >> 63) != 0) {
     oop resolved = resolve_oop_raw(cast_to_oop(v));
     if (resolved == nullptr) return true;  // Remote — discard
@@ -138,6 +147,9 @@ public:
     if (entry == nullptr) return true;
     // Tagged oops (bit 63 set) from disaggregated memory — resolve first
     uintptr_t v = (uintptr_t)entry;
+    if (!g1_remote_oop_is_aligned(v & G1_OOP_ADDR_MASK)) {
+      return true;
+    }
     if ((v >> 63) != 0) {
       oop resolved = resolve_oop_raw(cast_to_oop(v));
       if (resolved == nullptr) return true;  // Remote — discard

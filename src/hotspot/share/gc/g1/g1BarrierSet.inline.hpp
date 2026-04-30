@@ -42,13 +42,18 @@
 
 inline void G1BarrierSet::enqueue_preloaded(oop pre_val) {
   // Nulls should have been already filtered.
-  assert(oopDesc::is_oop(pre_val, true), "Error");
+  oop resolved = resolve_oop_raw(pre_val);
+  if (resolved == nullptr ||
+      !g1_remote_oop_is_aligned(cast_from_oop<uintptr_t>(resolved))) {
+    return;
+  }
+  assert(oopDesc::is_oop(resolved, true), "Error");
 
   G1SATBMarkQueueSet& queue_set = G1BarrierSet::satb_mark_queue_set();
   if (!queue_set.is_active()) return;
 
   SATBMarkQueue& queue = G1ThreadLocalData::satb_mark_queue(Thread::current());
-  queue_set.enqueue_known_active(queue, pre_val);
+  queue_set.enqueue_known_active(queue, resolved);
 }
 
 template <class T>
@@ -61,6 +66,10 @@ inline void G1BarrierSet::enqueue(T* dst) {
     // Resolve tag bits before SATB enqueue — SATB queue asserts valid heap pointers
     // (g1SATBMarkQueueSet.cpp:83). Tagged oops would fail this assertion.
     oop resolved = resolve_oop_raw(CompressedOops::decode_not_null(heap_oop));
+    if (resolved == nullptr ||
+        !g1_remote_oop_is_aligned(cast_from_oop<uintptr_t>(resolved))) {
+      return;
+    }
     SATBMarkQueue& queue = G1ThreadLocalData::satb_mark_queue(Thread::current());
     queue_set.enqueue_known_active(queue, resolved);
   }

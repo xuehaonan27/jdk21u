@@ -34,6 +34,7 @@
 #include "gc/g1/g1Policy.hpp"
 #include "gc/g1/g1RegionMarkStatsCache.inline.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1RemSetTrackingPolicy.hpp"
 #include "gc/g1/g1_globals.hpp"
 #include "gc/g1/heapRegionRemSet.inline.hpp"
@@ -221,6 +222,12 @@ inline void G1CMTask::abort_marking_if_regular_check_fail() {
 }
 
 inline bool G1CMTask::make_reference_grey(oop obj) {
+  if (obj == nullptr ||
+      !g1_remote_oop_is_aligned(cast_from_oop<uintptr_t>(obj)) ||
+      !_g1h->is_in(obj)) {
+    return false;
+  }
+
   if (!_cm->mark_in_bitmap(_worker_id, obj)) {
     return false;
   }
@@ -276,6 +283,9 @@ inline bool G1CMTask::deal_with_reference(T* p) {
     if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
         (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
       RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+      if (h == nullptr || (((uintptr_t)h & (sizeof(void*) - 1)) != 0)) {
+        return false;
+      }
       uintptr_t sa = h->load_state_and_addr_acquire();
       if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
         // REMOTE or FETCHING — log for remote GC root reporting

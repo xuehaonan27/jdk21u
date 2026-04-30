@@ -117,19 +117,34 @@ const uintptr_t G1_MW_CLASS_SHARED    = markWord::remote_class_shared;
 // We include it here so resolve_oop_raw can follow Handles.
 #include "gc/g1/g1RemoteHandle.hpp"
 
+inline bool g1_remote_oop_is_aligned(uintptr_t value) {
+  return (value & (uintptr_t)MinObjAlignmentInBytesMask) == 0;
+}
+
 inline oop resolve_oop_raw(oop tagged) {
   uintptr_t v = cast_from_oop<uintptr_t>(tagged);
   if ((v & G1_OOP_TAG_MASK) == 0) {
+    if (!g1_remote_oop_is_aligned(v)) {
+      return nullptr;
+    }
     return tagged;  // Ordinary (fast path -- no tags)
   }
 
   if (v & G1_OOP_INDIRECT_BIT) {
     // Shared OOP: bits 47:0 is Handle address. Follow the Handle.
-    RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+    uintptr_t handle_addr = v & G1_OOP_ADDR_MASK;
+    if (handle_addr == 0 || ((handle_addr & (sizeof(void*) - 1)) != 0)) {
+      return nullptr;
+    }
+    RemoteHandle* h = (RemoteHandle*)handle_addr;
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
     if (state == REMOTE_HANDLE_LOCAL) {
-      return cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+      uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      if (!g1_remote_oop_is_aligned(addr)) {
+        return nullptr;
+      }
+      return cast_to_oop(addr);
     }
     // Handle is REMOTE or FETCHING: object is not locally present.
     // Return nullptr — GC closures (mark_and_push, etc.) skip nullptr.
@@ -139,7 +154,11 @@ inline oop resolve_oop_raw(oop tagged) {
   }
 
   // Unique OOP (Managed, Direct): strip tag bits, return clean address.
-  return cast_to_oop(v & G1_OOP_ADDR_MASK);
+  uintptr_t addr = v & G1_OOP_ADDR_MASK;
+  if (!g1_remote_oop_is_aligned(addr)) {
+    return nullptr;
+  }
+  return cast_to_oop(addr);
 }
 
 
@@ -169,6 +188,9 @@ inline oop g1_resolved_load(T* p) {
   if (raw == 0) return nullptr;
   // Fast path: bit 63 clear → clean oop, return directly (no resolve)
   if ((raw >> 63) == 0) {
+    if (!g1_remote_oop_is_aligned(raw)) {
+      return nullptr;
+    }
     return cast_to_oop(raw);
   }
   // Slow path: tagged oop (bit 63 set) — resolve through Handle/strip tags

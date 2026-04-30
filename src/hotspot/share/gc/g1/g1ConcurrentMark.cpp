@@ -1750,7 +1750,66 @@ private:
   // circumspect about treating the argument as an object.
   void do_entry(void* entry) const {
     _task->increment_refs_reached();
-    oop const obj = cast_to_oop(entry);
+    uintptr_t raw = (uintptr_t)entry;
+    if (raw == 0 || !g1_remote_oop_is_aligned(raw & G1_OOP_ADDR_MASK)) {
+      return;
+    }
+
+    if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+        (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+      uintptr_t handle_addr = raw & G1_OOP_ADDR_MASK;
+      if (handle_addr == 0 || ((handle_addr & (sizeof(void*) - 1)) != 0)) {
+        return;
+      }
+      RemoteHandle* h = (RemoteHandle*)handle_addr;
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
+        _task->log_remote_handle((uintptr_t)h);
+        return;
+      }
+    }
+
+    oop const obj = resolve_oop_raw(cast_to_oop(raw));
+    if (obj == nullptr ||
+        !g1_remote_oop_is_aligned(cast_from_oop<uintptr_t>(obj)) ||
+        !_g1h->is_in(obj)) {
+      return;
+    }
+
+    if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+      G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+      if (rmm != nullptr) {
+        RemoteHandle* h = rmm->handle_for_addr_any_state(cast_from_oop<uintptr_t>(obj));
+        if (h != nullptr && !h->is_local()) {
+          if (h->is_remote()) {
+            _task->log_remote_handle((uintptr_t)h);
+          }
+          return;
+        }
+      }
+
+      HeapRegion* hr = _g1h->heap_region_containing(obj);
+      if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+        return;
+      }
+
+      HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
+      if (hr->is_continues_humongous()) {
+        return;
+      }
+      if (hr->is_starts_humongous()) {
+        if (obj_addr != hr->bottom()) {
+          return;
+        }
+      } else if (hr->is_old()) {
+        if (hr->block_start(obj_addr) != obj_addr ||
+            G1CollectedHeap::is_obj_filler(obj)) {
+          return;
+        }
+      }
+    }
+
     _task->make_reference_grey(obj);
   }
 

@@ -58,10 +58,30 @@ void G1BarrierSetRuntime::write_ref_array_post_entry(HeapWord* dst, size_t lengt
 JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_pre_entry(oopDesc* orig, JavaThread* thread))
   assert(thread == JavaThread::current(), "pre-condition");
   assert(orig != nullptr, "should be optimized out");
-  assert(oopDesc::is_oop(orig, true /* ignore mark word */), "Error");
+
+  oop obj = resolve_oop_raw(cast_to_oop(orig));
+  if (obj == nullptr ||
+      !g1_remote_oop_is_aligned(cast_from_oop<uintptr_t>(obj))) {
+    return;
+  }
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  if (!g1h->is_in(obj)) {
+    return;
+  }
+
+  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    HeapRegion* hr = g1h->heap_region_containing(obj);
+    if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+      return;
+    }
+  }
+
+  assert(oopDesc::is_oop(obj, true /* ignore mark word */), "Error");
   // store the original value that was in the field reference
   SATBMarkQueue& queue = G1ThreadLocalData::satb_mark_queue(thread);
-  G1BarrierSet::satb_mark_queue_set().enqueue_known_active(queue, orig);
+  G1BarrierSet::satb_mark_queue_set().enqueue_known_active(queue, obj);
 JRT_END
 
 // G1 post write barrier slowpath
