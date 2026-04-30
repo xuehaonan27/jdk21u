@@ -469,12 +469,12 @@ G1HeapRegionAttr G1ParScanThreadState::next_region_attr(G1HeapRegionAttr const r
     }
   }
 
-  // Cold object routing: if G1RemoteEvictionThreshold is active and the object
-  // has a stale hotness epoch (cold), route to ColdOld destination for eviction.
+  // Cold object routing: if remote eviction is active and the object has a
+  // stale hotness epoch (cold), route to ColdOld destination for eviction.
   // Only for objects being promoted to Old (not young survivors).
   // Objects with epoch=0 have never been stamped by the load barrier —
   // they're freshly promoted with unknown hotness, not cold.
-  if (G1RemoteEvictionThreshold > 0 && m.is_unlocked()) {
+  if ((G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) && m.is_unlocked()) {
     uint32_t obj_epoch = m.remote_epoch();
     if (obj_epoch != 0) {
       uint32_t gc_epoch = _g1h->remote_memory_manager()->gc_epoch();

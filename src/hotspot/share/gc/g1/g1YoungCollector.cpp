@@ -1406,9 +1406,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     //
     // When LocalMemoryRatio < 100, the real deadline is local_capacity, not Xmx.
     // Three tiers based on local pressure (with allocation rate lookahead):
-    //   Tier 1 (>60%): proactive — evict cold old regions to 50% target
-    //   Tier 2 (>85%): aggressive — evict all old regions to 50% target
-    //   Tier 3 (>95%): emergency — evict everything evictable
+    //   Tier 1 (>75%): proactive — evict cold old regions to 70% target
+    //   Tier 2 (>85%): aggressive — evict old regions to 70% target
+    //   Tier 3 (>95%): emergency — evict old regions to 60% target
     //
     // Falls back to G1RemoteEvictionThreshold if LocalMemoryRatio == 100.
     {
@@ -1427,30 +1427,37 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t effective_used = local_used + lookahead_alloc;
 
         double pressure = (double)effective_used / (double)local_capacity;
-        // Eviction target: 30% of local_capacity. Must evict before swap builds up —
-        // the eviction process itself reads all candidate objects, so heavy swap during
-        // Phase B/C/E makes the STW pause catastrophically long (observed: 7.5s at 61%).
-        size_t target_low = (local_capacity * 30) / 100;
+        // Do not evict at low pressure: object-granularity fetch is expensive,
+        // and early eviction refetches hot Spark partitions while plenty of the
+        // local budget is still unused. Keep headroom for the next young cycle,
+        // but avoid pushing the heap down to an artificially low watermark.
+        size_t target_low_percent = 0;
 
-        if (pressure > 0.85) {
+        if (pressure > 0.95) {
           eviction_tier = 3;
-          evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : local_used;
-        } else if (pressure > 0.60) {
+          target_low_percent = 60;
+        } else if (pressure > 0.85) {
           eviction_tier = 2;
-          evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
-        } else if (pressure > 0.40) {
+          target_low_percent = 70;
+        } else if (pressure > 0.75) {
           eviction_tier = 1;
+          target_low_percent = 70;
+        }
+
+        if (eviction_tier > 0) {
+          size_t target_low = (local_capacity * target_low_percent) / 100;
           evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
         }
 
         if (eviction_tier > 0) {
           log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB / local_cap=" SIZE_FORMAT "MB "
                        "(%.1f%%), alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, "
-                       "effective=%.1f%%, evict_target=" SIZE_FORMAT "MB",
+                       "effective=%.1f%%, target=%zu%%, evict_target=" SIZE_FORMAT "MB",
                        eviction_tier, local_used / M, local_capacity / M,
                        pressure * 100.0, alloc_rate_ms / 1024.0,
                        lookahead_alloc / M,
                        (double)effective_used / (double)local_capacity * 100.0,
+                       target_low_percent,
                        evict_target_bytes / M);
         }
       } else if (G1RemoteEvictionThreshold > 0) {

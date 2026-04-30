@@ -180,6 +180,24 @@ static oopDesc* resolve_local_handle_addr(RemoteHandle* h, uintptr_t addr,
   return nullptr;
 }
 
+static void sample_touch_hotness(oopDesc* obj, G1RemoteMemoryManager* rmm) {
+  if (obj == nullptr || rmm == nullptr) return;
+
+  // Sampled hotness epoch update: stamp the object's mark word with the
+  // current GC epoch. Sample 1 in 16 resolutions (cheap hash on addr).
+  // Best-effort: skip if locked, skip on CAS failure.
+  if (((uintptr_t)obj & 0x78) == 0) {
+    markWord mw = obj->mark_acquire();
+    if (mw.is_unlocked()) {
+      uint32_t epoch = rmm->gc_epoch() & 0xF;
+      if (mw.remote_epoch() != epoch) {
+        markWord new_mw = mw.set_remote_epoch(epoch);
+        obj->cas_set_mark(new_mw, mw);
+      }
+    }
+  }
+}
+
 JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   uintptr_t v = (uintptr_t)tagged;
   if ((v >> 63) == 0) {
@@ -233,21 +251,7 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
         return nullptr;
       }
 
-      // Sampled hotness epoch update: stamp the object's mark word with
-      // the current GC epoch. Sample 1 in 16 resolutions (cheap hash on addr).
-      // Best-effort: skip if locked, skip on CAS failure.
-      if (((uintptr_t)resolved & 0x78) == 0) {  // ~1/16 sampling
-        markWord mw = resolved->mark_acquire();
-        if (mw.is_unlocked() && rmm != nullptr) {
-          uint32_t epoch = rmm->gc_epoch() & 0xF;
-          if (mw.remote_epoch() != epoch) {
-            markWord new_mw = mw.set_remote_epoch(epoch);
-            // Best-effort CAS — skip on failure (another thread may have
-            // updated hash or lock bits concurrently).
-            resolved->cas_set_mark(new_mw, mw);
-          }
-        }
-      }
+      sample_touch_hotness(resolved, rmm);
 
       return resolved;
     }
@@ -258,7 +262,11 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   }
 
   // Unique/Direct: strip tags
-  return (oopDesc*)(v & G1_OOP_ADDR_MASK);
+  oopDesc* resolved = (oopDesc*)(v & G1_OOP_ADDR_MASK);
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  sample_touch_hotness(resolved, rmm);
+  return resolved;
 JRT_END
 
 // ============================================================
@@ -538,7 +546,13 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
     }
     return tagged;
   }
-  if (!(v & G1_OOP_INDIRECT_BIT)) return (oopDesc*)(v & G1_OOP_ADDR_MASK);
+  if (!(v & G1_OOP_INDIRECT_BIT)) {
+    oopDesc* resolved = (oopDesc*)(v & G1_OOP_ADDR_MASK);
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+    sample_touch_hotness(resolved, rmm);
+    return resolved;
+  }
 
   RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
   uintptr_t sa = h->load_state_and_addr_acquire();
@@ -551,6 +565,9 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
       *handle_out = redirect;
       return nullptr;
     }
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+    sample_touch_hotness(resolved, rmm);
     return resolved;
   }
   if (state == REMOTE_HANDLE_DEAD) {
