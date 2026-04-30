@@ -1948,27 +1948,48 @@ HeapRegion* G1RemoteMemoryManager::allocate_new_fcr_region() {
 //
 // Key principle: dead objects' bytes NEVER cross the network.
 
+static inline size_t remote_root_hash(uintptr_t id, size_t mask) {
+  uint64_t h = (uint64_t)id;
+  h ^= h >> 33;
+  h *= UINT64_C(0xff51afd7ed558ccd);
+  h ^= h >> 33;
+  h *= UINT64_C(0xc4ceb9fe1a85ec53);
+  h ^= h >> 33;
+  return (size_t)h & mask;
+}
+
+static inline bool insert_remote_root_id(uintptr_t* dedup_set, size_t set_mask,
+                                         uintptr_t id) {
+  size_t slot = remote_root_hash(id, set_mask);
+  while (dedup_set[slot] != 0 && dedup_set[slot] != id) {
+    slot = (slot + 1) & set_mask;
+  }
+  if (dedup_set[slot] == id) {
+    return false;
+  }
+  dedup_set[slot] = id;
+  return true;
+}
+
 size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
+  Ticks root_build_start = Ticks::now();
+
   // Build deduplicated root set from three sources:
   //   1. CM roots (from concurrent marking — already in _remote_roots)
   //   2. Phase C tagged field handles (shared_oops in heap)
   //   3. REMOTE handles with remote_refcount > 0 (edge-table references)
   //
-  // Use a power-of-2 hash set for O(1) dedup. Sized to 2x expected entries.
+  // Use a power-of-2 hash set for O(1) dedup. Size from allocated handle
+  // count instead of pre-scanning the handle table; the table scan below also
+  // computes total_remote.
   size_t total_remote = 0;
-  table_lock();
-  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
-      if (e->_handle != nullptr && e->_handle->is_remote()) {
-        total_remote++;
-      }
-    }
-  }
-  table_unlock();
 
   // Hash set for dedup: open addressing with linear probing
+  size_t expected_entries = (size_t)_remote_roots_count +
+                            (size_t)_tagged_field_count +
+                            _handle_allocator.total_handles_allocated();
   size_t set_capacity = 1;
-  while (set_capacity < (total_remote + _remote_roots_count) * 2 + 64) {
+  while (set_capacity < expected_entries * 2 + 64) {
     set_capacity <<= 1;
   }
   uintptr_t* dedup_set = NEW_C_HEAP_ARRAY(uintptr_t, set_capacity, mtGC);
@@ -1978,57 +1999,57 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   // Collect unique roots into _remote_roots (dynamically grown)
   int cm_count = MIN2(_cm_remote_roots_count, _remote_roots_count);
   _remote_roots_count = cm_count;
+  size_t max_root_capacity = MIN2(expected_entries, (size_t)max_jint);
+  ensure_remote_roots_capacity((int)max_root_capacity);
 
   // Insert existing CM roots into dedup set
   for (int i = 0; i < cm_count; i++) {
-    uintptr_t id = _remote_roots[i];
-    size_t slot = (id >> 4) & set_mask;
-    while (dedup_set[slot] != 0 && dedup_set[slot] != id) {
-      slot = (slot + 1) & set_mask;
-    }
-    dedup_set[slot] = id;
+    insert_remote_root_id(dedup_set, set_mask, _remote_roots[i]);
   }
 
   // Source 2: Phase C tagged field handles
+  Ticks tagged_start = Ticks::now();
   int phase_c_added = 0;
   for (int i = 0; i < _tagged_field_count; i++) {
     RemoteHandle* h = _tagged_fields[i]._handle;
     if (h != nullptr && h->is_remote()) {
       uintptr_t id = (uintptr_t)h;
-      size_t slot = (id >> 4) & set_mask;
-      while (dedup_set[slot] != 0 && dedup_set[slot] != id) {
-        slot = (slot + 1) & set_mask;
-      }
-      if (dedup_set[slot] == 0) {
-        dedup_set[slot] = id;
+      if (insert_remote_root_id(dedup_set, set_mask, id)) {
         add_remote_root(id);
         phase_c_added++;
       }
     }
   }
+  double tagged_ms = (Ticks::now() - tagged_start).seconds() * 1000.0;
 
   // Source 3: REMOTE handles with remote_refcount > 0
+  Ticks refcount_start = Ticks::now();
   int refcount_added = 0;
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
     for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
-      if (e->_handle != nullptr && e->_handle->is_remote() &&
-          e->_handle->remote_refcount() > 0) {
-        uintptr_t id = (uintptr_t)e->_handle;
-        size_t slot = (id >> 4) & set_mask;
-        while (dedup_set[slot] != 0 && dedup_set[slot] != id) {
-          slot = (slot + 1) & set_mask;
-        }
-        if (dedup_set[slot] == 0) {
-          dedup_set[slot] = id;
-          add_remote_root(id);
-          refcount_added++;
+      RemoteHandle* h = e->_handle;
+      if (h != nullptr && h->is_remote()) {
+        total_remote++;
+        if (h->remote_refcount() > 0) {
+          uintptr_t id = (uintptr_t)h;
+          if (insert_remote_root_id(dedup_set, set_mask, id)) {
+            add_remote_root(id);
+            refcount_added++;
+          }
         }
       }
     }
   }
   table_unlock();
+  double refcount_ms = (Ticks::now() - refcount_start).seconds() * 1000.0;
+  double root_build_ms = (Ticks::now() - root_build_start).seconds() * 1000.0;
   FREE_C_HEAP_ARRAY(uintptr_t, dedup_set);
+
+  log_info(gc)("collect_dead: root-build %.1fms (tagged %.1fms, refcount %.1fms, "
+               "dedup_cap=%zu, handles_allocated=%zu, tagged_entries=%d)",
+               root_build_ms, tagged_ms, refcount_ms, set_capacity,
+               _handle_allocator.total_handles_allocated(), _tagged_field_count);
 
   log_info(gc)("collect_dead: roots: %d CM + %d tagged-fields + %d refcount = %d unique "
                "(%zu remote handles)",
