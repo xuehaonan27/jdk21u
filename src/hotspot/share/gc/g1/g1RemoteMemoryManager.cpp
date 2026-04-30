@@ -500,6 +500,62 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
   return blockers;
 }
 
+int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
+    const bool* eviction_candidates,
+    const bool* region_complete,
+    const int* region_start,
+    const int* region_count,
+    uint num_regions,
+    const PreparedEviction* entries,
+    int* blockers_by_region,
+    int log_limit) {
+  if (eviction_candidates == nullptr || region_complete == nullptr ||
+      region_start == nullptr || region_count == nullptr ||
+      entries == nullptr || blockers_by_region == nullptr || num_regions == 0) {
+    return 0;
+  }
+
+  memset(blockers_by_region, 0, num_regions * sizeof(int));
+  int total_blockers = 0;
+
+  table_lock();
+  for (size_t i = 0; i < TABLE_SIZE; i++) {
+    HandleEntry* e = _table[i];
+    while (e != nullptr) {
+      RemoteHandle* h = e->_handle;
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) {
+        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+        if (addr != 0 && _g1h->is_in((void*)addr)) {
+          HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
+          if (hr != nullptr) {
+            uint ridx = hr->hrm_index();
+            if (ridx < num_regions && eviction_candidates[ridx] &&
+                region_complete[ridx] && region_count[ridx] > 0 &&
+                !prepared_entries_contain_handle(entries, region_start[ridx],
+                                                 region_count[ridx], addr, h)) {
+              int blockers = ++blockers_by_region[ridx];
+              total_blockers++;
+              if (blockers <= log_limit) {
+                log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
+                                PTR_FORMAT " local=" PTR_FORMAT " table_addr="
+                                PTR_FORMAT " dormant=%d rc=%u",
+                                ridx, p2i(h), addr, e->_obj_addr,
+                                h->is_dormant() ? 1 : 0, h->remote_refcount());
+              }
+            }
+          }
+        }
+      }
+      e = e->_next;
+    }
+  }
+  table_unlock();
+
+  return total_blockers;
+}
+
 int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* region_set,
                                                                   uint num_regions,
                                                                   uintptr_t* addrs,

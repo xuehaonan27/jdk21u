@@ -900,6 +900,17 @@ public:
                                                int count,
                                                int log_limit = 0);
 
+  // Batched form of count_unprepared_local_handles_in_region(). Scans the
+  // Handle table once for all candidate regions and fills blockers_by_region.
+  int count_unprepared_local_handles_in_regions(const bool* eviction_candidates,
+                                                const bool* region_complete,
+                                                const int* region_start,
+                                                const int* region_count,
+                                                uint num_regions,
+                                                const PreparedEviction* entries,
+                                                int* blockers_by_region,
+                                                int log_limit = 0);
+
   // Finalize: set handle remote, mark word, fill with filler.
   // Called after backend confirms batch eviction.
   void finalize_eviction(PreparedEviction* entry);

@@ -1483,7 +1483,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
         size_t local_capacity = (heap_capacity * LocalMemoryRatio) / 100;
-        size_t native_reserve = MAX2(local_capacity / 5, (size_t)1 * G);
+        // RDMA mode keeps large native side metadata (handles, edge tables,
+        // tagged-field lists, staging buffers, Spark/JVM native state). With a
+        // 5G cgroup, a 1G reserve still let the process hit memcg OOM while
+        // the heap was around 3.1G, so keep a larger native cushion.
+        size_t native_reserve = MAX2((local_capacity * 2) / 5, (size_t)1 * G);
         native_reserve = MIN2(native_reserve, local_capacity / 2);
         size_t heap_budget = local_capacity - native_reserve;
 
@@ -2454,6 +2458,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       int handle_guarded_regions = 0;
       int handle_guarded_entries = 0;
       int handle_blockers = 0;
+      int* handle_blockers_by_region = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
+      rmm->count_unprepared_local_handles_in_regions(eviction_candidates,
+                                                     region_complete,
+                                                     region_start,
+                                                     region_count_arr,
+                                                     num_regions,
+                                                     entries,
+                                                     handle_blockers_by_region,
+                                                     4);
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
         if (!region_complete[i]) continue;
@@ -2463,8 +2476,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
         HeapRegion* hr = _g1h->region_at(i);
         int start = region_start[i];
-        int blockers = rmm->count_unprepared_local_handles_in_region(hr, entries,
-                                                                      start, rcount, 4);
+        int blockers = handle_blockers_by_region[i];
         if (blockers == 0) continue;
 
         for (int e = start; e < start + rcount; e++) {
@@ -2487,6 +2499,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                         "with %d unprepared LOCAL handles before backend send",
                         hr->hrm_index(), blockers);
       }
+      FREE_C_HEAP_ARRAY(int, handle_blockers_by_region);
       if (handle_guarded_regions > 0) {
         log_info(gc)("Pre-E local-handle guard: removed %d regions, aborted %d "
                      "prepared entries, found %d blocking LOCAL handles",
