@@ -2204,15 +2204,26 @@ public:
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
     if (raw == 0) return;
-    if ((raw >> 63) != 0) return; // tagged — skip
-    if (!_g1h->is_in((void*)raw)) return;
-    oop target = cast_to_oop(raw);
+
+    // Shared tagged oops point at a RemoteHandle, not directly at an object.
+    // The handle table is fixed elsewhere. Direct/unique tagged oops still
+    // contain an object address and must be forwarded just like clean oops.
+    if ((raw & G1_OOP_INDIRECT_BIT) != 0) return;
+
+    uintptr_t tag_bits = raw & G1_OOP_TAG_MASK;
+    uintptr_t addr = (tag_bits != 0) ? (raw & G1_OOP_ADDR_MASK) : raw;
+    if (!_g1h->is_in((void*)addr)) return;
+    oop target = cast_to_oop(addr);
     const G1HeapRegionAttr attr = _g1h->region_attr(target);
     if (!attr.is_in_cset()) return;
     markWord mw = target->mark();
     if (mw.is_marked()) {
       oop fwd = cast_to_oop(mw.decode_pointer());
-      RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
+      if (tag_bits != 0) {
+        *(uintptr_t*)p = tag_bits | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK);
+      } else {
+        RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
+      }
       _fixed++;
     } else {
       // Do not null Java fields here. This runs after cleanup_1, which has
