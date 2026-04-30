@@ -2478,6 +2478,30 @@ class CSetRefFixupClosure : public BasicOopIterateClosure {
     return _rescued < 16 || ((_rescued & (_rescued - 1)) == 0);
   }
 
+  void dirty_cards_for_range(HeapWord* start, size_t word_size) {
+    if (start == nullptr || word_size == 0) return;
+    if (!_g1h->is_in_reserved(start)) return;
+
+    G1CardTable* ct = _g1h->card_table();
+    G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
+    G1DirtyCardQueue tmp_queue(&dcqs);
+
+    CardTable::CardValue* first = ct->byte_for(start);
+    CardTable::CardValue* last = ct->byte_for(start + word_size - 1);
+    for (CardTable::CardValue* card = first; card <= last; card++) {
+      if (*card != G1CardTable::g1_young_card_val()) {
+        *card = G1CardTable::dirty_card_val();
+        dcqs.enqueue(tmp_queue, card);
+      }
+    }
+    dcqs.flush_queue(tmp_queue);
+  }
+
+  void dirty_card_for_field(oop* p) {
+    if (p == nullptr) return;
+    dirty_cards_for_range((HeapWord*)p, 1);
+  }
+
 public:
   CSetRefFixupClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm, bool allow_rescue)
     : _g1h(g1h), _rmm(rmm), _allow_rescue(allow_rescue),
@@ -2492,6 +2516,7 @@ public:
     } else {
       RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
     }
+    dirty_card_for_field(p);
   }
 
   bool rescue_unforwarded(oop* p, uintptr_t tag_bits, oop target) {
@@ -2530,6 +2555,11 @@ public:
     // The rescued object was missed by normal evacuation, so scan its fields
     // immediately; otherwise its internal cset references would remain stale.
     rescued->oop_iterate(this);
+    // This path writes old/FCR heap fields outside normal G1 evacuation
+    // barriers. Enqueue the source and rescued object cards so later GCs see
+    // old-to-FCR/old refs through remembered-set processing.
+    dirty_card_for_field(p);
+    dirty_cards_for_range(dst, word_size);
     return true;
   }
 
