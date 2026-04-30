@@ -94,30 +94,56 @@ HeapRegion* HeapRegionManager::allocate_free_region(HeapRegionType type, uint re
   HeapRegion* hr = nullptr;
   bool from_head = !type.is_young();
   G1NUMA* numa = G1NUMA::numa();
+  uint skipped_guarded = 0;
 
   if (requested_node_index != G1NUMA::AnyNodeIndex && numa->is_enabled()) {
     // Try to allocate with requested node index.
-    hr = _free_list.remove_region_with_node_index(from_head, requested_node_index);
+    FreeRegionListIterator it(&_free_list);
+    while (it.more_available()) {
+      HeapRegion* cur = it.get_next();
+      if (cur->is_evict_guarded()) {
+        skipped_guarded++;
+        continue;
+      }
+      if (cur->node_index() == requested_node_index) {
+        hr = cur;
+        if (from_head) {
+          break;
+        }
+      }
+    }
   }
 
   if (hr == nullptr) {
     // If there's a single active node or we did not get a region from our requested node,
     // try without requested node index.
-    hr = _free_list.remove_region(from_head);
+    FreeRegionListIterator it(&_free_list);
+    while (it.more_available()) {
+      HeapRegion* cur = it.get_next();
+      if (cur->is_evict_guarded()) {
+        skipped_guarded++;
+        continue;
+      }
+      hr = cur;
+      if (from_head) {
+        break;
+      }
+    }
   }
 
   if (hr != nullptr) {
+    _free_list.remove_starting_at(hr, 1);
     assert(hr->next() == nullptr, "Single region should not have next");
+    assert(hr->prev() == nullptr, "Single region should not have prev");
     assert(is_available(hr->hrm_index()), "Must be committed");
-
-    if (hr->is_evict_guarded()) {
-      os::unguard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
-      hr->clear_evict_guarded();
-    }
+    assert(!hr->is_evict_guarded(), "must not reuse evicted guarded regions");
 
     if (numa->is_enabled() && hr->node_index() < numa->num_active_nodes()) {
       numa->update_statistics(G1NUMAStats::NewRegionAlloc, requested_node_index, hr->node_index());
     }
+  } else if (skipped_guarded > 0) {
+    log_debug(gc)("Region allocation skipped %u evict-guarded free regions and found no clean free region",
+                  skipped_guarded);
   }
 
   return hr;
@@ -513,7 +539,7 @@ uint HeapRegionManager::find_contiguous_in_range(uint start, uint end, uint num_
   while (num_regions <= (end - candidate)) {
     // Walk backward over the regions for the current candidate.
     for (uint i = candidate + num_regions - 1; true; --i) {
-      if (is_available(i) && !at(i)->is_free()) {
+      if (is_available(i) && (!at(i)->is_free() || at(i)->is_evict_guarded())) {
         // Region i can't be used, so restart with i+1 as the start
         // of a new candidate sequence, and with the region after the
         // old candidate sequence being the first unchecked region.

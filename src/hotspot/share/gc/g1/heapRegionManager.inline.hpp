@@ -80,14 +80,10 @@ inline void HeapRegionManager::insert_into_free_list(HeapRegion* hr) {
 
 inline HeapRegion* HeapRegionManager::allocate_free_regions_starting_at(uint first, uint num_regions) {
   HeapRegion* start = at(first);
-  _free_list.remove_starting_at(start, num_regions);
   for (uint i = first; i < first + num_regions; i++) {
-    HeapRegion* hr = at(i);
-    if (hr->is_evict_guarded()) {
-      os::unguard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
-      hr->clear_evict_guarded();
-    }
+    assert(!at(i)->is_evict_guarded(), "must not reuse evicted guarded regions");
   }
+  _free_list.remove_starting_at(start, num_regions);
   return start;
 }
 
