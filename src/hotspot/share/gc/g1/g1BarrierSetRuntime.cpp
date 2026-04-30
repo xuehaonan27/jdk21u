@@ -99,7 +99,36 @@ JRT_END
 // ============================================================
 JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   uintptr_t v = (uintptr_t)tagged;
-  if ((v >> 63) == 0) return tagged;  // Clean oop / null
+  if ((v >> 63) == 0) {
+    if (v == 0) return tagged;
+
+    // Remote eviction can leave a clean pre-eviction oop in Java/native state
+    // that is not itself tagged. If it points into a guarded/free region, turn
+    // it back into a shared handle so the caller's slow path can fetch it.
+    if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+      G1CollectedHeap* g1h = G1CollectedHeap::heap();
+      if (g1h != nullptr && g1h->is_in_reserved((void*)v)) {
+        HeapRegion* hr = g1h->heap_region_containing_or_null((void*)v);
+        if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+          G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+          RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(v);
+          if (h != nullptr) {
+            uintptr_t sa = h->load_state_and_addr_acquire();
+            uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+            if (rmm != nullptr) {
+              rmm->record_resolve_fast_state(state);
+            }
+            if (state != REMOTE_HANDLE_DEAD) {
+              return (oopDesc*)(G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h);
+            }
+          }
+          return nullptr;
+        }
+      }
+    }
+    return tagged;
+  }
 
   if (v & G1_OOP_INDIRECT_BIT) {
     RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);

@@ -135,9 +135,16 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
   // ================================================================
   if (on_oop) {
     Label done;
-    // Phase 1: test sign bit. Clean oops / null skip entirely.
+    // Phase 1: tagged oops always need resolution. In remote mode, clean
+    // non-null oops may also be stale pre-eviction addresses, so run the
+    // resolver on every non-null oop value.
     __ testptr(dst, dst);
-    __ jcc(Assembler::positive, done);
+    if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+      __ jcc(Assembler::zero, done);
+    } else {
+      __ jcc(Assembler::positive, done);
+    }
 
     // Phase 2: resolve tagged oop via JRT_LEAF call with register preservation.
     //

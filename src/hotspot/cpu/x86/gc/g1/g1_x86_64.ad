@@ -5,8 +5,9 @@
 //
 // Intercepts every oop load/atomic that carries barrier_data != 0
 // (set by G1BarrierSetC2::load_at_resolved / atomic overrides).
-// After the load, if the result has bit 63 set (tagged oop), we jump
-// to an out-of-line stub that calls G1BarrierSetRuntime::resolve_tagged_oop().
+// After the load, tagged oops jump to an out-of-line resolver stub. In
+// remote mode, clean non-null oops also jump there because they can be stale
+// pre-eviction addresses into guarded regions.
 //
 // The stub saves/restores all call-clobbered registers so the resolved
 // oop is transparent to the rest of the compiled code.
@@ -36,7 +37,6 @@ static void g1_tag_resolve_barrier(MacroAssembler& _masm,
                                    Register ref) {
   if (node->barrier_data() == 0) return;
 
-  // Fast path: test bit 63 (sign bit).  If clear, the oop is untagged.
   __ testptr(ref, ref);
 
   // Create out-of-line stub (registered with G1BarrierSetC2State)
@@ -48,8 +48,12 @@ static void g1_tag_resolve_barrier(MacroAssembler& _masm,
     bs_state->stubs()->append(stub);
   }
 
-  // Jump to stub if sign bit is set (JS = jump if sign flag)
-  __ jcc(Assembler::negative, *stub->entry());
+  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    __ jcc(Assembler::notZero, *stub->entry());
+  } else {
+    __ jcc(Assembler::negative, *stub->entry());
+  }
 
   // Continuation: oop is now resolved (either was untagged, or stub resolved it)
   __ bind(*stub->continuation());

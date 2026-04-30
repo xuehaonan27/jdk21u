@@ -176,13 +176,40 @@ static void resolve_rax_if_tagged(InterpreterMacroAssembler* _masm) {
   }
   Label done;
   __ testptr(rax, rax);
-  __ jcc(Assembler::positive, done);
+  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    __ jcc(Assembler::zero, done);
+  } else {
+    __ jcc(Assembler::positive, done);
+  }
 
   __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), rax);
   __ testptr(rax, rax);
   __ jcc(Assembler::positive, done);
 
   __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+  __ bind(done);
+#endif
+}
+
+static void resolve_reg_if_remote(InterpreterMacroAssembler* _masm, Register reg) {
+#if INCLUDE_G1GC
+  if (!UseG1GC ||
+      !(UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    return;
+  }
+
+  Label done;
+  __ testptr(reg, reg);
+  __ jcc(Assembler::zero, done);
+  if (reg != rax) {
+    __ movptr(rax, reg);
+  }
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+  if (reg != rax) {
+    __ movptr(reg, rax);
+  }
   __ bind(done);
 #endif
 }
@@ -772,6 +799,13 @@ void TemplateTable::index_check(Register array, Register index) {
 }
 
 void TemplateTable::index_check_without_pop(Register array, Register index) {
+  if (UseG1GC && (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+                  G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    __ push(index);
+    resolve_reg_if_remote(_masm, array);
+    __ pop(index);
+  }
+
   // destroys rbx
   // sign extend index for use by indexed load
   __ movl2ptr(index, index);
@@ -2896,6 +2930,7 @@ void TemplateTable::jvmti_post_field_access(Register cache,
 
 void TemplateTable::pop_and_check_object(Register r) {
   __ pop_ptr(r);
+  resolve_reg_if_remote(_masm, r);
   __ null_check(r);  // for field access must check obj.
   __ verify_oop(r);
 }
@@ -3550,6 +3585,7 @@ void TemplateTable::fast_accessfield(TosState state) {
                                   ConstantPoolCacheEntry::f2_offset())));
 
   // rax: object
+  resolve_rax_if_tagged(_masm);
   __ verify_oop(rax);
   __ null_check(rax);
   Address field(rax, rbx, Address::times_1);

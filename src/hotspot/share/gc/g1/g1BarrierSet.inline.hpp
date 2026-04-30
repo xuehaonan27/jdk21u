@@ -138,11 +138,13 @@ oop_load_in_heap(T* addr) {
   oop value = ModRef::oop_load_in_heap(addr);
 
   // === Disaggregated Memory Load Barrier ===
-  // Resolve tagged oops via the centralized runtime.
-  // resolve_tagged_oop_slow handles LOCAL (fast), Unique (strip tags),
-  // and REMOTE (blocking fetch with proper safepoint transitions).
+  // Resolve tagged oops, and in remote mode also clean stale oops whose
+  // old local region has since been evict-guarded.
   uintptr_t v = cast_from_oop<uintptr_t>(value);
-  if ((v & G1_OOP_TAG_MASK) != 0) {
+  if (value != nullptr &&
+      ((v & G1_OOP_TAG_MASK) != 0 ||
+       UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
     value = cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_slow((oopDesc*)v));
   }
 
@@ -157,15 +159,26 @@ oop_load_in_heap(T* addr) {
 template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_in_heap_at(oop base, ptrdiff_t offset) {
+  if (base != nullptr &&
+      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    base = resolve_oop_full(base);
+    if (base == nullptr) {
+      return nullptr;
+    }
+  }
   // Diagnostic: catch tagged base oops — means someone passed an unresolved
   // tagged oop as an object base for field access.
   guarantee((cast_from_oop<uintptr_t>(base) >> 47) == 0,
             "oop_load_in_heap_at: tagged base oop " PTR_FORMAT " at offset " INTX_FORMAT,
             cast_from_oop<uintptr_t>(base), (intx)offset);
   oop value = ModRef::oop_load_in_heap_at(base, offset);
-  // Resolve tagged oops via the centralized runtime (same as oop_load_in_heap).
+  // Resolve tagged oops and clean stale oops via the centralized runtime.
   uintptr_t v = cast_from_oop<uintptr_t>(value);
-  if ((v & G1_OOP_TAG_MASK) != 0) {
+  if (value != nullptr &&
+      ((v & G1_OOP_TAG_MASK) != 0 ||
+       UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
     value = cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_slow((oopDesc*)v));
   }
   assert(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
@@ -258,12 +271,30 @@ template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap(T* addr, oop new_value) {
+  if (new_value != nullptr &&
+      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    new_value = resolve_oop_full(new_value);
+  }
   ModRef::oop_store_in_heap(addr, new_value);
 }
 
 template <DecoratorSet decorators, typename BarrierSetT>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
+  if (new_value != nullptr &&
+      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    new_value = resolve_oop_full(new_value);
+  }
+  if (base != nullptr &&
+      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    base = resolve_oop_full(base);
+    if (base == nullptr) {
+      return;
+    }
+  }
   ModRef::oop_store_in_heap_at(base, offset, new_value);
 }
 
@@ -308,6 +339,14 @@ oop_atomic_cmpxchg_in_heap(T* addr, oop compare_value, oop new_value) {
 template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_atomic_cmpxchg_in_heap_at(oop base, ptrdiff_t offset, oop compare_value, oop new_value) {
+  if (base != nullptr &&
+      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    base = resolve_oop_full(base);
+    if (base == nullptr) {
+      return nullptr;
+    }
+  }
   return oop_atomic_cmpxchg_in_heap(AccessInternal::oop_field_addr<decorators>(base, offset),
                                    compare_value, new_value);
 }

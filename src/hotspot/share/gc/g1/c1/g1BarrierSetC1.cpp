@@ -60,7 +60,8 @@ void G1TagResolveStub::emit_code(LIR_Assembler* ce) {
 
 // Fused load+barrier LIR op for disaggregated memory.
 //
-// Performs movptr(result, [addr]) + testptr(result, result) + jcc(negative, stub)
+// Performs movptr(result, [addr]) + testptr(result, result) + conditional
+// branch to the resolver stub.
 // as a SINGLE LIR operation. This prevents C1's register allocator from
 // splitting the interval between the load and the barrier test — which caused
 // the testptr to check the wrong register in previous implementations.
@@ -95,7 +96,12 @@ public:
     // Fused: load + test + conditional branch (all in one op)
     masm->movptr(result_reg, ce->as_Address(_addr->as_address_ptr()));
     masm->testptr(result_reg, result_reg);
-    masm->jcc(Assembler::negative, *_stub->entry());
+    if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+      masm->jcc(Assembler::notZero, *_stub->entry());
+    } else {
+      masm->jcc(Assembler::negative, *_stub->entry());
+    }
     masm->bind(*_stub->continuation());
     ce->append_code_stub(_stub);
   }
