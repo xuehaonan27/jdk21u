@@ -2383,6 +2383,11 @@ class CSetRefFixupClosure : public BasicOopIterateClosure {
   int _invalid;
   int _rescue_failed;
   bool _src_is_fcr;     // Set per object via set_src_is_fcr()
+
+  bool should_log_rescue() const {
+    return _rescued < 16 || ((_rescued & (_rescued - 1)) == 0);
+  }
+
 public:
   CSetRefFixupClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm, bool allow_rescue)
     : _g1h(g1h), _rmm(rmm), _allow_rescue(allow_rescue),
@@ -2403,9 +2408,20 @@ public:
     if (!_allow_rescue) return false;
 
     const size_t word_size = target->size();
+    const bool log_rescue = should_log_rescue();
+    if (log_rescue) {
+      log_info(gc)("Old/cset rescue START: target=" PTR_FORMAT " size=" SIZE_FORMAT
+                   " src_fcr=%s field=" PTR_FORMAT,
+                   p2i(target), word_size, _src_is_fcr ? "true" : "false", p2i(p));
+    }
     HeapWord* dst = _rmm->allocate_in_fcr(word_size);
     if (dst == nullptr) {
       _rescue_failed++;
+      if (log_rescue) {
+        log_warning(gc)("Old/cset rescue FAILED: target=" PTR_FORMAT
+                        " size=" SIZE_FORMAT " failures=%d",
+                        p2i(target), word_size, _rescue_failed);
+      }
       return false;
     }
 
@@ -2415,6 +2431,11 @@ public:
     _rmm->update_handle_for_evacuation(target, rescued);
     store_forwardee(p, tag_bits, rescued);
     _rescued++;
+    if (log_rescue) {
+      log_info(gc)("Old/cset rescue DONE: target=" PTR_FORMAT " rescued=" PTR_FORMAT
+                   " size=" SIZE_FORMAT " count=%d",
+                   p2i(target), p2i(rescued), word_size, _rescued);
+    }
 
     // The rescued object was missed by normal evacuation, so scan its fields
     // immediately; otherwise its internal cset references would remain stale.
@@ -2486,6 +2507,7 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
   int regions_scanned = 0;
   int objects_scanned = 0;
+  log_info(gc)("Old/cset fixup heap scan START: heap_regions=%u", _g1h->num_regions());
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
@@ -2495,6 +2517,10 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
     cl.set_src_is_fcr(hr->is_fetch_cache());
     CSetFixupObjectClosure obj_cl(&cl);
     Ticks region_start = Ticks::now();
+    log_info(gc)("Old/cset fixup region START: index=%u type=%s bottom=" PTR_FORMAT
+                 " top=" PTR_FORMAT " src_fcr=%s",
+                 hr->hrm_index(), hr->get_short_type_str(), p2i(hr->bottom()),
+                 p2i(hr->top()), hr->is_fetch_cache() ? "true" : "false");
     int scanned = remote_eviction_scan_region_objects(hr, bitmap, "Old/cset fixup", &obj_cl);
     double region_ms = (Ticks::now() - region_start).seconds() * 1000.0;
     regions_scanned++;
@@ -2504,6 +2530,8 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
                    hr->hrm_index(), hr->get_short_type_str(), scanned, region_ms);
     }
   }
+  log_info(gc)("Old/cset fixup heap scan DONE: scanned %d regions, %d objects",
+               regions_scanned, objects_scanned);
 
   class CSetFixupCodeBlobClosure : public CodeBlobClosure {
     G1CollectedHeap* _g1h;
@@ -2531,8 +2559,11 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
   CSetFixupCodeBlobClosure code_cl(_g1h, &cl);
   Ticks code_start = Ticks::now();
+  log_info(gc)("Old/cset fixup code scan START");
   CodeCache::blobs_do(&code_cl);
   double code_ms = (Ticks::now() - code_start).seconds() * 1000.0;
+  log_info(gc)("Old/cset fixup code scan DONE: %.1fms, %d nmethods updated",
+               code_ms, code_cl.nmethods_updated());
 
   double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
   log_info(gc)("Old/cset fixup DONE: scanned %d regions, %d objects, code %.1fms, "
@@ -2570,8 +2601,8 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
   }
 
   // Current FCR full or doesn't exist. Allocate a new FCR region.
-  // Requires Heap_lock. The caller MUST be in _thread_in_vm state
-  // (JRT_ENTRY context from resolve_tagged_oop_slow, or GC STW).
+  // Outside a safepoint this requires Heap_lock. During STW GC, the VMThread
+  // must not wait for Heap_lock because the owner may be a stopped JavaThread.
   // No os::malloc fallback — all fetched objects go into proper G1 regions.
   fcr_lock();
   if (_current_fcr != fcr) {
@@ -2589,7 +2620,11 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
   }
 
   HeapRegion* new_fcr = nullptr;
-  {
+  if (SafepointSynchronize::is_at_safepoint()) {
+    log_info(gc)("FCR allocate new region at safepoint: word_size=" SIZE_FORMAT
+                 " old_fcr=" PTR_FORMAT, word_size, p2i(fcr));
+    new_fcr = allocate_new_fcr_region();
+  } else {
     MutexLocker ml(Heap_lock);
     new_fcr = allocate_new_fcr_region();
   }
