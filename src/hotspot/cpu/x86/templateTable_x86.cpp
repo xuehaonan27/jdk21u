@@ -176,6 +176,17 @@ static void resolve_rax_if_tagged(InterpreterMacroAssembler* _masm) {
   }
   Label done;
   __ testptr(rax, rax);
+
+  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    // Remote eviction can leave clean raw oops in interpreter state.  Resolve
+    // every non-null oop before direct header loads in interpreter templates.
+    __ jcc(Assembler::zero, done);
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+    __ bind(done);
+    return;
+  }
+
   __ jcc(Assembler::positive, done);
 
   __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), rax);
@@ -1153,7 +1164,7 @@ void TemplateTable::aastore() {
   __ jcc(Assembler::zero, is_null);
 
 #if INCLUDE_G1GC
-  if (UseRemoteExecutor || LocalMemoryRatio < 100 ||
+  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     // The interpreter aastore stub reads value->klass directly.  A clean raw
     // oop can survive in interpreter state across remote eviction, so resolve
