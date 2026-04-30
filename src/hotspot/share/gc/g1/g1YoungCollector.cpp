@@ -1061,6 +1061,119 @@ static void dirty_root_catch_region(G1CollectedHeap* g1h, HeapRegion* root_catch
   dcqs.flush_queue(tmp_queue);
 }
 
+static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
+                                                    bool* eviction_candidates,
+                                                    uint num_regions,
+                                                    const char* log_prefix) {
+  class RawStackGuardClosure : public ThreadClosure {
+    G1CollectedHeap* _g1h;
+    bool*            _eviction_candidates;
+    uint             _num_regions;
+    int              _regions_guarded;
+    int              _stack_words_found;
+    int              _threads_scanned;
+    size_t           _words_scanned;
+    int              _reports_left;
+    const char*      _log_prefix;
+
+    bool maybe_guard_candidate(uintptr_t raw, Thread* thread, uintptr_t* slot) {
+      if (raw == 0) return false;
+
+      // Shared-handle references are already safe: they do not retain a
+      // raw local object address into the region being evicted.
+      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+        return false;
+      }
+
+      uintptr_t addr = raw;
+      if ((raw & G1_OOP_TAG_MASK) != 0) {
+        addr = raw & G1_OOP_ADDR_MASK;
+      }
+      if (!is_aligned((address)addr, HeapWordSize)) return false;
+      if (!_g1h->is_in_reserved((void*)addr)) return false;
+
+      HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)addr);
+      if (hr == nullptr) return false;
+
+      uint idx = hr->hrm_index();
+      if (idx >= _num_regions) return false;
+
+      if (_eviction_candidates[idx]) {
+        _eviction_candidates[idx] = false;
+        hr->clear_cold_destination();
+        _regions_guarded++;
+        _stack_words_found++;
+        if (_reports_left > 0) {
+          log_warning(gc)("%s: thread=" PTR_FORMAT " slot=" PTR_FORMAT
+                          " raw=" PTR_FORMAT " guards candidate region %u",
+                          _log_prefix, p2i(thread), p2i(slot), raw, idx);
+          _reports_left--;
+        }
+        return true;
+      }
+
+      _stack_words_found++;
+      return false;
+    }
+
+  public:
+    RawStackGuardClosure(G1CollectedHeap* g1h, bool* candidates,
+                         uint num_regions, const char* log_prefix)
+      : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
+        _regions_guarded(0), _stack_words_found(0), _threads_scanned(0),
+        _words_scanned(0), _reports_left(32), _log_prefix(log_prefix) {}
+
+    void do_thread(Thread* thread) override {
+      JavaThread* jt = JavaThread::cast(thread);
+      if (!jt->has_last_Java_frame()) return;
+
+      address java_sp = (address)jt->last_Java_sp();
+      address high = jt->stack_base();
+      if (java_sp == nullptr || high == nullptr || java_sp >= high) return;
+
+      // Compiled/interpreter execution can leave raw clean oop values in
+      // stack slots that are not described as roots at the safepoint.  A
+      // bounded SP window missed long-lived task locals in Spark, so scan
+      // the full usable Java stack conservatively.  Stay above the low
+      // stack guard pages.
+      address stack_low = jt->stack_overflow_state()->stack_reserved_zone_base();
+      address low = MIN2(java_sp, stack_low);
+
+      uintptr_t* cur = (uintptr_t*)align_up(low, sizeof(uintptr_t));
+      uintptr_t* end = (uintptr_t*)align_down(high, sizeof(uintptr_t));
+      _threads_scanned++;
+      while (cur < end) {
+        maybe_guard_candidate(*cur, thread, cur);
+        cur++;
+        _words_scanned++;
+      }
+    }
+
+    int regions_guarded() const { return _regions_guarded; }
+    int stack_words_found() const { return _stack_words_found; }
+    int threads_scanned() const { return _threads_scanned; }
+    size_t words_scanned() const { return _words_scanned; }
+  };
+
+  RawStackGuardClosure raw_stack_cl(g1h, eviction_candidates, num_regions, log_prefix);
+  Threads::java_threads_do(&raw_stack_cl);
+  if (raw_stack_cl.regions_guarded() > 0) {
+    log_info(gc)("%s: removed %d candidate regions with %d stack words "
+                 "(scanned " SIZE_FORMAT " words in %d Java threads)",
+                 log_prefix, raw_stack_cl.regions_guarded(),
+                 raw_stack_cl.stack_words_found(),
+                 raw_stack_cl.words_scanned(), raw_stack_cl.threads_scanned());
+  } else {
+    log_info(gc)("%s: scanned " SIZE_FORMAT
+                 " words in %d Java threads, 0 candidate stack words",
+                 log_prefix, raw_stack_cl.words_scanned(),
+                 raw_stack_cl.threads_scanned());
+  }
+
+  return raw_stack_cl.regions_guarded();
+}
+
 // Closure that checks if a root oop targets a cold-destination region.
 // Used by both Path 1 (root-pinning) and Path 2 (existing region pinning).
 class ColdRegionPinClosure : public OopClosure {
@@ -1390,6 +1503,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       log_info(gc)("Remote eviction: deoptimized compiled Java frames in %.1fms "
                    "before processing %d candidate regions",
                    deopt_ms, total_candidates);
+    }
+
+    // ---- Phase C.9: Raw stack guard before root-catch relocation ----
+    // Root-catch installs forwarding pointers in old candidate objects.
+    // If a later raw-stack guard keeps that region local, those forwarding
+    // stubs become mutator-visible. Guard stack-held regions before any
+    // relocation so kept-local regions remain untouched.
+    if (total_candidates > 0) {
+      int raw_guarded = guard_eviction_candidates_with_raw_stack(
+          _g1h, eviction_candidates, num_regions, "Pre-D raw stack guard");
+      if (raw_guarded > 0) {
+        total_candidates -= raw_guarded;
+      }
     }
 
     // ---- Phase D: Root-catch relocation ----
