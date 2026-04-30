@@ -36,6 +36,7 @@
 #include "gc/shared/workerThread.hpp"
 #include "gc/g1/heapRegionManager.inline.hpp"
 #include "code/codeCache.hpp"
+#include "code/nmethod.hpp"
 #include "gc/shared/referenceProcessor.hpp"
 
 // TCP client for remote executor communication
@@ -2302,6 +2303,7 @@ public:
   int skipped() const { return _skipped; }
   int invalid() const { return _invalid; }
   int rescue_failed() const { return _rescue_failed; }
+  int updated() const { return _fixed + _rescued; }
 };
 
 int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_failed) {
@@ -2328,12 +2330,42 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
     remote_eviction_scan_region_objects(hr, bitmap, "Old/cset fixup", &obj_cl);
   }
 
+  class CSetFixupCodeBlobClosure : public CodeBlobClosure {
+    G1CollectedHeap* _g1h;
+    CSetRefFixupClosure* _cl;
+    int _nmethods_updated;
+  public:
+    CSetFixupCodeBlobClosure(G1CollectedHeap* g1h, CSetRefFixupClosure* cl)
+      : _g1h(g1h), _cl(cl), _nmethods_updated(0) {}
+
+    void do_code_blob(CodeBlob* cb) override {
+      nmethod* nm = cb->as_nmethod_or_null();
+      if (nm == nullptr) return;
+
+      int before = _cl->updated();
+      nm->oops_do(_cl);
+      if (_cl->updated() != before) {
+        nm->fix_oop_relocations();
+        _g1h->register_nmethod(nm);
+        _nmethods_updated++;
+      }
+    }
+
+    int nmethods_updated() const { return _nmethods_updated; }
+  };
+
+  CSetFixupCodeBlobClosure code_cl(_g1h, &cl);
+  CodeCache::blobs_do(&code_cl);
+
   if (cl.fixed() > 0 || cl.rescued() > 0 || cl.skipped() > 0 ||
-      cl.invalid() > 0 || cl.rescue_failed() > 0) {
+      cl.invalid() > 0 || cl.rescue_failed() > 0 ||
+      code_cl.nmethods_updated() > 0) {
     log_warning(gc)("Old/humongous-region stale-ref fixup: %d fixed (forwardee), "
                     "%d rescued, %d skipped (unforwarded/in-place), %d invalid, "
-                    "%d rescue-failed; FCR evac writes: %llu, previous FCR nulls: %llu",
+                    "%d rescue-failed, %d nmethods updated; "
+                    "FCR evac writes: %llu, previous FCR nulls: %llu",
                     cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(), cl.rescue_failed(),
+                    code_cl.nmethods_updated(),
                     (unsigned long long)fcr_evac_writes(),
                     (unsigned long long)fcr_fixup_nulls());
   }
