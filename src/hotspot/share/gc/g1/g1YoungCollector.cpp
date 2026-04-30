@@ -1466,8 +1466,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     // Path 2: tiered eviction based on local memory pressure
     //
-    // When LocalMemoryRatio < 100, the real deadline is local_capacity, not Xmx.
-    // Three tiers based on local pressure (with allocation rate lookahead):
+    // When LocalMemoryRatio < 100, the real deadline is the process/cgroup
+    // local capacity, not Xmx. Reserve headroom for native/RDMA/Spark memory
+    // so heap growth does not reach the cgroup limit before eviction fires.
+    // Three tiers based on heap budget pressure (with allocation rate lookahead):
     //   Tier 1 (>75%): proactive — evict cold old regions to 70% target
     //   Tier 2 (>85%): aggressive — evict old regions to 70% target
     //   Tier 3 (>95%): emergency — evict old regions to 60% target
@@ -1481,6 +1483,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
         size_t local_capacity = (heap_capacity * LocalMemoryRatio) / 100;
+        size_t native_reserve = MAX2(local_capacity / 5, (size_t)1 * G);
+        native_reserve = MIN2(native_reserve, local_capacity / 2);
+        size_t heap_budget = local_capacity - native_reserve;
 
         // Allocation rate lookahead: predict bytes allocated before next GC.
         // predict_alloc_rate_ms() returns bytes/ms; multiply by 2000ms lookahead.
@@ -1488,7 +1493,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t lookahead_alloc = (size_t)(alloc_rate_ms * 2000.0);
         size_t effective_used = local_used + lookahead_alloc;
 
-        double pressure = (double)effective_used / (double)local_capacity;
+        double pressure = (double)effective_used / (double)heap_budget;
         // Do not evict at low pressure: object-granularity fetch is expensive,
         // and early eviction refetches hot Spark partitions while plenty of the
         // local budget is still unused. Keep headroom for the next young cycle,
@@ -1507,18 +1512,20 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
 
         if (eviction_tier > 0) {
-          size_t target_low = (local_capacity * target_low_percent) / 100;
+          size_t target_low = (heap_budget * target_low_percent) / 100;
           evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
         }
 
         if (eviction_tier > 0) {
-          log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB / local_cap=" SIZE_FORMAT "MB "
-                       "(%.1f%%), alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, "
+          log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB / heap_budget=" SIZE_FORMAT
+                       "MB (local_cap=" SIZE_FORMAT "MB reserve=" SIZE_FORMAT "MB, %.1f%%), "
+                       "alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, "
                        "effective=%.1f%%, target=%zu%%, evict_target=" SIZE_FORMAT "MB",
-                       eviction_tier, local_used / M, local_capacity / M,
-                       pressure * 100.0, alloc_rate_ms / 1024.0,
+                       eviction_tier, local_used / M, heap_budget / M,
+                       local_capacity / M, native_reserve / M, pressure * 100.0,
+                       alloc_rate_ms / 1024.0,
                        lookahead_alloc / M,
-                       (double)effective_used / (double)local_capacity * 100.0,
+                       (double)effective_used / (double)heap_budget * 100.0,
                        target_low_percent,
                        evict_target_bytes / M);
         }
