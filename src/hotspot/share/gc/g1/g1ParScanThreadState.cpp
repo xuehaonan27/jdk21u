@@ -960,12 +960,18 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
 void G1ParScanThreadStateSet::flush_stats() {
   assert(!_flushed, "thread local state from the per thread states should be flushed once");
 
+  const bool remote_mode =
+    G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100;
+
   // Phase 2: OOP Classification Fixup — classifies promoted Old objects.
   // Classification fixup: only run when eviction is possible.
   // When disabled, skip to avoid post-evacuate overhead (can be 2+ seconds
   // for large heaps due to RC hash map construction + mark word updates).
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     process_oop_classification_fixup();
+  }
+  if (remote_mode) {
+    log_info(gc)("MergePSS: classification complete, flushing %u worker states", _num_workers);
   }
 
   for (uint worker_id = 0; worker_id < _num_workers; ++worker_id) {
@@ -988,6 +994,9 @@ void G1ParScanThreadStateSet::flush_stats() {
     _states[worker_id] = nullptr;
   }
   _flushed = true;
+  if (remote_mode) {
+    log_info(gc)("MergePSS: worker-state flush complete");
+  }
 }
 
 void G1ParScanThreadStateSet::record_unused_optional_region(HeapRegion* hr) {

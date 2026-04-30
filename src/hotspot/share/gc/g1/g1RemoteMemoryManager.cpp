@@ -2333,6 +2333,10 @@ public:
 };
 
 int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_failed) {
+  Ticks start = Ticks::now();
+  log_info(gc)("Old/cset fixup START (allow_rescue=%s)",
+               evacuation_failed ? "false" : "true");
+
   CSetRefFixupClosure cl(_g1h, this, !evacuation_failed);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
@@ -2345,6 +2349,8 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
     }
   };
 
+  int regions_scanned = 0;
+  int objects_scanned = 0;
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
@@ -2353,7 +2359,15 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
     cl.set_src_is_fcr(hr->is_fetch_cache());
     CSetFixupObjectClosure obj_cl(&cl);
-    remote_eviction_scan_region_objects(hr, bitmap, "Old/cset fixup", &obj_cl);
+    Ticks region_start = Ticks::now();
+    int scanned = remote_eviction_scan_region_objects(hr, bitmap, "Old/cset fixup", &obj_cl);
+    double region_ms = (Ticks::now() - region_start).seconds() * 1000.0;
+    regions_scanned++;
+    objects_scanned += scanned;
+    if (region_ms > 100.0) {
+      log_info(gc)("Old/cset fixup region %u type=%s scanned=%d in %.1fms",
+                   hr->hrm_index(), hr->get_short_type_str(), scanned, region_ms);
+    }
   }
 
   class CSetFixupCodeBlobClosure : public CodeBlobClosure {
@@ -2381,7 +2395,17 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
   };
 
   CSetFixupCodeBlobClosure code_cl(_g1h, &cl);
+  Ticks code_start = Ticks::now();
   CodeCache::blobs_do(&code_cl);
+  double code_ms = (Ticks::now() - code_start).seconds() * 1000.0;
+
+  double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
+  log_info(gc)("Old/cset fixup DONE: scanned %d regions, %d objects, code %.1fms, "
+               "%d fixed, %d rescued, %d skipped, %d invalid, %d rescue-failed, "
+               "%d nmethods updated in %.1fms",
+               regions_scanned, objects_scanned, code_ms,
+               cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(), cl.rescue_failed(),
+               code_cl.nmethods_updated(), elapsed_ms);
 
   if (cl.fixed() > 0 || cl.rescued() > 0 || cl.skipped() > 0 ||
       cl.invalid() > 0 || cl.rescue_failed() > 0 ||

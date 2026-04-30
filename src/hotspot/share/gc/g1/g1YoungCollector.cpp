@@ -1166,7 +1166,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   }
 
   log_trace(gc)(">>>   post_evacuate_cleanup_1 START");
+  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
+    log_info(gc)("Remote post-evac cleanup1 START");
+  }
   post_evacuate_cleanup_1(per_thread_states);
+  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
+    log_info(gc)("Remote post-evac cleanup1 DONE");
+  }
   log_trace(gc)(">>>   post_evacuate_cleanup_1 DONE");
 
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
@@ -1177,7 +1183,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   }
 
   log_trace(gc)(">>>   post_evacuate_cleanup_2 START");
+  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
+    log_info(gc)("Remote post-evac cleanup2 START");
+  }
   post_evacuate_cleanup_2(per_thread_states, evacuation_info);
+  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
+    log_info(gc)("Remote post-evac cleanup2 DONE");
+  }
   log_trace(gc)(">>>   post_evacuate_cleanup_2 DONE");
 
   _evac_failure_regions.post_collection();
