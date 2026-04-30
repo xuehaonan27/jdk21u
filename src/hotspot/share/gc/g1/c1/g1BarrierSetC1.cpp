@@ -96,12 +96,7 @@ public:
     // Fused: load + test + conditional branch (all in one op)
     masm->movptr(result_reg, ce->as_Address(_addr->as_address_ptr()));
     masm->testptr(result_reg, result_reg);
-    if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
-      masm->jcc(Assembler::notZero, *_stub->entry());
-    } else {
-      masm->jcc(Assembler::negative, *_stub->entry());
-    }
+    masm->jcc(Assembler::negative, *_stub->entry());
     masm->bind(*_stub->continuation());
     ce->append_code_stub(_stub);
   }
