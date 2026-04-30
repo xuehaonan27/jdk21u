@@ -97,6 +97,89 @@ JRT_END
 // Returns the ORIGINAL tagged oop for REMOTE/FETCHING — the caller
 // detects bit 63 still set and calls resolve_tagged_oop_slow.
 // ============================================================
+
+static bool remote_resolve_enabled() {
+  return UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+         G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
+}
+
+static bool local_handle_addr_is_stale(G1CollectedHeap* g1h, uintptr_t addr,
+                                       HeapRegion** hr_out) {
+  if (hr_out != nullptr) {
+    *hr_out = nullptr;
+  }
+  if (addr == 0 || g1h == nullptr || !g1h->is_in_reserved((void*)addr)) {
+    return true;
+  }
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null((void*)addr);
+  if (hr_out != nullptr) {
+    *hr_out = hr;
+  }
+  if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+    return true;
+  }
+  return !g1h->is_in((void*)addr);
+}
+
+static oopDesc* resolve_local_handle_addr(RemoteHandle* h, uintptr_t addr,
+                                          RemoteHandle** redirect_out,
+                                          const char* caller) {
+  if (redirect_out != nullptr) {
+    *redirect_out = nullptr;
+  }
+  if (!remote_resolve_enabled()) {
+    return (oopDesc*)addr;
+  }
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  HeapRegion* hr = nullptr;
+  if (!local_handle_addr_is_stale(g1h, addr, &hr)) {
+    return (oopDesc*)addr;
+  }
+
+  G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  RemoteHandle* alt = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(addr);
+  if (alt != nullptr && alt != h) {
+    uintptr_t alt_sa = alt->load_state_and_addr_acquire();
+    uintptr_t alt_state = alt_sa & REMOTE_HANDLE_STATE_MASK;
+    if (rmm != nullptr) {
+      rmm->record_resolve_fast_state(alt_state);
+    }
+
+    if (alt_state == REMOTE_HANDLE_LOCAL) {
+      uintptr_t alt_addr = alt_sa & REMOTE_HANDLE_ADDR_MASK;
+      HeapRegion* alt_hr = nullptr;
+      if (!local_handle_addr_is_stale(g1h, alt_addr, &alt_hr)) {
+        log_warning(gc)("%s: redirected stale LOCAL handle " PTR_FORMAT
+                        " addr=" PTR_FORMAT " to duplicate LOCAL handle "
+                        PTR_FORMAT " addr=" PTR_FORMAT,
+                        caller, p2i(h), p2i((void*)addr),
+                        p2i(alt), p2i((void*)alt_addr));
+        return (oopDesc*)alt_addr;
+      }
+    } else if (alt_state == REMOTE_HANDLE_REMOTE ||
+               alt_state == REMOTE_HANDLE_FETCHING) {
+      if (redirect_out != nullptr) {
+        *redirect_out = alt;
+      }
+      log_warning(gc)("%s: redirected stale LOCAL handle " PTR_FORMAT
+                      " addr=" PTR_FORMAT " to duplicate remote handle "
+                      PTR_FORMAT " state=0x%lx",
+                      caller, p2i(h), p2i((void*)addr), p2i(alt),
+                      (unsigned long)alt_state);
+      return nullptr;
+    }
+  }
+
+  log_warning(gc)("%s: stale LOCAL handle " PTR_FORMAT " addr=" PTR_FORMAT
+                  " points into %s region %u; returning nullptr",
+                  caller, p2i(h), p2i((void*)addr),
+                  hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                  hr == nullptr ? 9999 : hr->hrm_index());
+  return nullptr;
+}
+
 JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   uintptr_t v = (uintptr_t)tagged;
   if ((v >> 63) == 0) {
@@ -139,7 +222,16 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
       rmm->record_resolve_fast_state(state);
     }
     if (state == REMOTE_HANDLE_LOCAL) {
-      oopDesc* resolved = (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+      uintptr_t resolved_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      RemoteHandle* redirect = nullptr;
+      oopDesc* resolved = resolve_local_handle_addr(h, resolved_addr, &redirect,
+                                                    "resolve_tagged_oop");
+      if (redirect != nullptr) {
+        return (oopDesc*)(G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)redirect);
+      }
+      if (resolved == nullptr) {
+        return nullptr;
+      }
 
       // Sampled hotness epoch update: stamp the object's mark word with
       // the current GC epoch. Sample 1 in 16 resolutions (cheap hash on addr).
@@ -451,7 +543,16 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
   RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-  if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+  if (state == REMOTE_HANDLE_LOCAL) {
+    RemoteHandle* redirect = nullptr;
+    oopDesc* resolved = resolve_local_handle_addr(h, sa & REMOTE_HANDLE_ADDR_MASK,
+                                                  &redirect, "resolve_fast_checks");
+    if (redirect != nullptr) {
+      *handle_out = redirect;
+      return nullptr;
+    }
+    return resolved;
+  }
   if (state == REMOTE_HANDLE_DEAD) {
     log_warning(gc)("resolve_fast_checks: DEAD handle " PTR_FORMAT
                     " reached by mutator (slot=%lu) — returning nullptr",
@@ -506,7 +607,17 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
 
-    if (state == REMOTE_HANDLE_LOCAL) return (oopDesc*)(sa & REMOTE_HANDLE_ADDR_MASK);
+    if (state == REMOTE_HANDLE_LOCAL) {
+      RemoteHandle* redirect = nullptr;
+      oopDesc* resolved = resolve_local_handle_addr(h, sa & REMOTE_HANDLE_ADDR_MASK,
+                                                    &redirect,
+                                                    "resolve_tagged_oop_no_safepoint");
+      if (redirect != nullptr) {
+        h = redirect;
+        continue;
+      }
+      return resolved;
+    }
     if (state == REMOTE_HANDLE_DEAD)  {
       // Same diagnostic as the safepointing variant. C2 callers have elided
       // implicit null checks on the result, so a nullptr return manifests as

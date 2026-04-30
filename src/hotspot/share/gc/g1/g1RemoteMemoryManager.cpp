@@ -428,17 +428,24 @@ void G1RemoteMemoryManager::abort_prepared_eviction(PreparedEviction* entry) {
   entry->edge_table = nullptr;
 }
 
-static bool prepared_entries_contain_addr(const G1RemoteMemoryManager::PreparedEviction* entries,
-                                          int start,
-                                          int count,
-                                          uintptr_t addr) {
+static bool prepared_entries_contain_handle(const G1RemoteMemoryManager::PreparedEviction* entries,
+                                            int start,
+                                            int count,
+                                            uintptr_t addr,
+                                            RemoteHandle* h) {
   int lo = start;
   int hi = start + count - 1;
   while (lo <= hi) {
     int mid = lo + ((hi - lo) >> 1);
     uintptr_t cur = cast_from_oop<uintptr_t>(entries[mid].obj);
     if (cur == addr) {
-      return true;
+      for (int i = mid; i >= start && cast_from_oop<uintptr_t>(entries[i].obj) == addr; i--) {
+        if (entries[i].handle == h) return true;
+      }
+      for (int i = mid + 1; i < start + count && cast_from_oop<uintptr_t>(entries[i].obj) == addr; i++) {
+        if (entries[i].handle == h) return true;
+      }
+      return false;
     }
     if (cur < addr) {
       lo = mid + 1;
@@ -473,7 +480,7 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
       if (state == REMOTE_HANDLE_LOCAL) {
         uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
         if (addr >= bottom && addr < end &&
-            !prepared_entries_contain_addr(entries, start, count, addr)) {
+            !prepared_entries_contain_handle(entries, start, count, addr, h)) {
           blockers++;
           if (blockers <= log_limit) {
             log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
@@ -2672,7 +2679,8 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
   // Fast path: try CAS bump pointer on existing FCR region (lock-free).
   HeapRegion* fcr = _current_fcr;
-  if (fcr != nullptr && !fcr->is_free()) {
+  if (fcr != nullptr && fcr->is_fetch_cache() && !fcr->is_free() &&
+      !fcr->is_evict_guarded()) {
     size_t actual = 0;
     HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
     if (result != nullptr) {
@@ -2689,7 +2697,8 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
   if (_current_fcr != fcr) {
     fcr = _current_fcr;
     fcr_unlock();
-    if (fcr != nullptr) {
+    if (fcr != nullptr && fcr->is_fetch_cache() && !fcr->is_free() &&
+        !fcr->is_evict_guarded()) {
       size_t actual = 0;
       HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
       if (result != nullptr) {
