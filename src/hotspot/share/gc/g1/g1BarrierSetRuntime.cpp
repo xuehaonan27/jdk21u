@@ -354,7 +354,48 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
 // Sets *handle_out to the RemoteHandle* if state machine is needed.
 static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) {
   uintptr_t v = (uintptr_t)tagged;
-  if ((v >> 63) == 0) return tagged;
+  if ((v >> 63) == 0) {
+    if (v == 0) return tagged;
+
+    // A clean oop can still be stale if it was live only in compiled state
+    // while its region was evicted.  Heap field scans tag clean refs before
+    // eviction, but compiled registers are not a heap slot and may retain the
+    // pre-eviction address.  If that address now belongs to a guarded/free
+    // region, recover the RemoteHandle by its old eviction address and let the
+    // normal REMOTE/FETCHING/LOCAL state machine produce a current oop.
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    if (g1h != nullptr && g1h->is_in_reserved((void*)v)) {
+      HeapRegion* hr = g1h->heap_region_containing_or_null((void*)v);
+      if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+        G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+        RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(v);
+        if (h != nullptr) {
+          uintptr_t sa = h->load_state_and_addr_acquire();
+          uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+          if (rmm != nullptr) {
+            rmm->record_resolve_fast_state(state);
+          }
+          if (state != REMOTE_HANDLE_DEAD) {
+            *handle_out = h;
+            log_info(gc)("Resolved clean stale oop " PTR_FORMAT
+                         " from %s region %u via handle " PTR_FORMAT
+                         " state=0x%lx",
+                         p2i((void*)v),
+                         hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                         hr == nullptr ? 9999 : hr->hrm_index(),
+                         p2i(h), (unsigned long)state);
+            return nullptr;
+          }
+        }
+        log_warning(gc)("Clean oop " PTR_FORMAT
+                        " points into %s region %u but has no live remote handle",
+                        p2i((void*)v),
+                        hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                        hr == nullptr ? 9999 : hr->hrm_index());
+      }
+    }
+    return tagged;
+  }
   if (!(v & G1_OOP_INDIRECT_BIT)) return (oopDesc*)(v & G1_OOP_ADDR_MASK);
 
   RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);

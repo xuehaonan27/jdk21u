@@ -34,6 +34,10 @@
 #include "ci/ciArrayKlass.hpp"
 #include "ci/ciInstance.hpp"
 #include "compiler/oopMap.hpp"
+#if INCLUDE_G1GC
+#include "gc/g1/g1BarrierSetRuntime.hpp"
+#include "gc/g1/g1_globals.hpp"
+#endif
 #include "gc/shared/collectedHeap.hpp"
 #include "gc/shared/gc_globals.hpp"
 #include "nativeInst_x86.hpp"
@@ -1874,6 +1878,29 @@ void LIR_Assembler::emit_opTypeCheck(LIR_OpTypeCheck* op) {
     } else {
       __ jcc(Assembler::equal, done);
     }
+
+#if INCLUDE_G1GC
+    if (UseRemoteExecutor || LocalMemoryRatio < 100 ||
+        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+      // C1 store checks read value->klass directly.  A value that survived in
+      // compiled state across remote eviction can be a clean pre-eviction oop
+      // into a guarded/free region, so resolve it before the klass load.
+      __ push(rbx);
+      __ push_call_clobbered_registers();
+      if (value != c_rarg0) {
+        __ mov(c_rarg0, value);
+      }
+      __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), c_rarg0);
+      __ movptr(rbx, rax);
+      __ pop_call_clobbered_registers();
+      if (value == rbx) {
+        __ addptr(rsp, wordSize);
+      } else {
+        __ movptr(value, rbx);
+        __ pop(rbx);
+      }
+    }
+#endif
 
     add_debug_info_for_null_check_here(op->info_for_exception());
     __ load_klass(k_RInfo, array, tmp_load_klass);
