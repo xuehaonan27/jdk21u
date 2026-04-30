@@ -34,6 +34,7 @@
 #include "code/nativeInst.hpp"
 #include "code/vtableStubs.hpp"
 #include "compiler/oopMap.hpp"
+#include "gc/g1/g1_globals.hpp"
 #include "gc/shared/collectedHeap.hpp"
 #include "gc/shared/gcLocker.hpp"
 #include "gc/shared/barrierSet.hpp"
@@ -1917,7 +1918,12 @@ nmethod* SharedRuntime::generate_native_wrapper(MacroAssembler* masm,
 
 #ifdef COMPILER1
   // For Object.hashCode, System.identityHashCode try to pull hashCode from object header if available.
-  if ((InlineObjectHash && method->intrinsic_id() == vmIntrinsics::_hashCode) || (method->intrinsic_id() == vmIntrinsics::_identityHashCode)) {
+  const bool g1_remote_oops_may_be_protected =
+      UseG1GC && (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 ||
+                  LocalMemoryRatio < 100 || UseRemoteExecutor);
+  if (!g1_remote_oops_may_be_protected &&
+      ((InlineObjectHash && method->intrinsic_id() == vmIntrinsics::_hashCode) ||
+       (method->intrinsic_id() == vmIntrinsics::_identityHashCode))) {
     inline_check_hashcode_from_object_header(masm, method, j_rarg0 /*obj_reg*/, rax /*result*/);
   }
 #endif // COMPILER1
@@ -3721,4 +3727,3 @@ void OptoRuntime::generate_exception_blob() {
   _exception_blob =  ExceptionBlob::create(&buffer, oop_maps, SimpleRuntimeFrame::framesize >> 1);
 }
 #endif // COMPILER2
-

@@ -30,11 +30,13 @@
 #include "gc/g1/g1BarrierSet.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1RemoteHandle.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1ParScanThreadState.inline.hpp"
 #include "gc/g1/g1RemSet.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
+#include "gc/g1/g1_globals.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
 #include "gc/g1/heapRegionRemSet.inline.hpp"
 #include "logging/log.hpp"
@@ -129,6 +131,18 @@ inline void G1RootRegionScanClosure::do_oop_work(T* p) {
   // Phase 6: skip remote objects (resolved to non-heap slot_id)
   if (!_g1h->is_in(obj)) {
     return;
+  }
+  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+    RemoteHandle* h = rmm->handle_for_addr_any_state(cast_from_oop<uintptr_t>(obj));
+    if (h != nullptr && !h->is_local()) {
+      return;
+    }
+    HeapRegion* hr = _g1h->heap_region_containing(obj);
+    if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+      return;
+    }
   }
   _cm->mark_in_bitmap(_worker_id, obj);
 }
