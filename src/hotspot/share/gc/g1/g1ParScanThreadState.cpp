@@ -258,9 +258,10 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   }
 
   // Phase 2: Record reference site for RC counting if target was promoted to Old.
-  // Only record when eviction is possible (G1TagRefSites or G1SimulateRemoteEviction
-  // or G1RemoteEvictionThreshold > 0). Otherwise, skip to avoid post-evacuate overhead.
-  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+  // Only record when eviction is possible. LocalMemoryRatio < 100 enables the
+  // same remote-eviction path even when the legacy percentage threshold is 0.
+  if (G1TagRefSites || G1SimulateRemoteEviction ||
+      G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
     HeapRegion* dest = _g1h->heap_region_containing(obj);
     if (dest != nullptr && dest->is_old() && _g1h->is_in((void*)p)) {
       record_rc_ref_site(obj, (void*)p, sizeof(T) == sizeof(narrowOop));
@@ -967,7 +968,7 @@ void G1ParScanThreadStateSet::flush_stats() {
   // Classification fixup: only run when eviction is possible.
   // When disabled, skip to avoid post-evacuate overhead (can be 2+ seconds
   // for large heaps due to RC hash map construction + mark word updates).
-  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+  if (remote_mode) {
     process_oop_classification_fixup();
   }
   if (remote_mode) {

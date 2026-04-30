@@ -1200,6 +1200,68 @@ public:
   void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
 };
 
+static bool region_is_cold_by_epoch(HeapRegion* hr,
+                                    G1RemoteMemoryManager* rmm,
+                                    size_t* sampled_words_out,
+                                    size_t* cold_words_out,
+                                    size_t* hot_words_out,
+                                    size_t* unknown_words_out) {
+  const uintptr_t cold_distance = 4;
+  const uintptr_t gc_epoch = rmm->gc_epoch();
+  size_t sampled_words = 0;
+  size_t cold_words = 0;
+  size_t hot_words = 0;
+  size_t unknown_words = 0;
+  size_t obj_index = 0;
+
+  HeapWord* p = hr->bottom();
+  HeapWord* top = hr->top();
+  while (p < top) {
+    oop obj = cast_to_oop(p);
+    size_t word_size = 0;
+    if (obj->is_forwarded()) {
+      word_size = obj->size_given_klass(obj->klass());
+    } else {
+      word_size = obj->size();
+    }
+    if (word_size == 0) {
+      break;
+    }
+
+    // Sample every 8th object to bound mark-word work while still scanning
+    // object sizes correctly across the region.
+    if ((obj_index++ & 0x7) == 0) {
+      markWord mw = obj->mark();
+      sampled_words += word_size;
+      if (!mw.is_unlocked() || mw.remote_epoch() == 0) {
+        unknown_words += word_size;
+      } else if (mw.hotness_distance(gc_epoch) >= cold_distance) {
+        cold_words += word_size;
+      } else {
+        hot_words += word_size;
+      }
+    }
+    p += word_size;
+  }
+
+  *sampled_words_out = sampled_words;
+  *cold_words_out = cold_words;
+  *hot_words_out = hot_words;
+  *unknown_words_out = unknown_words;
+
+  size_t known_words = cold_words + hot_words;
+  if (sampled_words == 0 || known_words == 0) {
+    return false;
+  }
+
+  // Require a minimum amount of stamped hotness signal, then accept regions
+  // where the known sample is mostly cold and the total sample is not hot.
+  bool enough_signal = known_words * 100 >= sampled_words * 10;
+  bool mostly_cold = cold_words * 100 >= known_words * 75;
+  bool not_hot = hot_words * 100 <= sampled_words * 25;
+  return enough_signal && mostly_cold && not_hot;
+}
+
 void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                                     G1ParScanThreadStateSet* per_thread_states) {
   G1GCPhaseTimes* p = phase_times();
@@ -1476,25 +1538,106 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       if (eviction_tier > 0 && evict_target_bytes > 0) {
         size_t path2_bytes = 0;
+        size_t path2_cold_bytes = 0;
+        size_t path2_fallback_bytes = 0;
+        size_t sampled_words = 0;
+        size_t cold_words = 0;
+        size_t hot_words = 0;
+        size_t unknown_words = 0;
+        int path2_cold_candidates = 0;
+        int path2_fallback_candidates = 0;
+        int path2_regions_scanned = 0;
+        int path2_regions_not_cold = 0;
         bool unlimited = (eviction_tier >= 3);
+        G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
 
-        for (uint i = 0; i < num_regions; i++) {
-          if (!unlimited && path2_bytes >= evict_target_bytes) break;
+        // Prefer old regions whose sampled objects have stale hotness epochs.
+        // This makes T1 truly cold-region eviction instead of heap-index-order
+        // old-region eviction.
+        if (rmm != nullptr) {
+          for (uint i = 0; i < num_regions; i++) {
+            if (!unlimited && path2_bytes >= evict_target_bytes) break;
 
-          HeapRegion* hr = _g1h->region_at(i);
-          if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
-          if (hr->is_cold_destination() || hr->is_fetch_cache()) continue;
-          if (eviction_candidates[i]) continue;
+            HeapRegion* hr = _g1h->region_at(i);
+            if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
+            if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
+            if (eviction_candidates[i]) continue;
 
-          hr->set_cold_destination();
-          eviction_candidates[i] = true;
-          path2_candidates++;
-          path2_bytes += hr->used();
+            size_t region_sampled_words = 0;
+            size_t region_cold_words = 0;
+            size_t region_hot_words = 0;
+            size_t region_unknown_words = 0;
+            path2_regions_scanned++;
+            if (!region_is_cold_by_epoch(hr, rmm, &region_sampled_words,
+                                         &region_cold_words, &region_hot_words,
+                                         &region_unknown_words)) {
+              path2_regions_not_cold++;
+              sampled_words += region_sampled_words;
+              cold_words += region_cold_words;
+              hot_words += region_hot_words;
+              unknown_words += region_unknown_words;
+              continue;
+            }
+
+            hr->set_cold_destination();
+            eviction_candidates[i] = true;
+            path2_candidates++;
+            path2_cold_candidates++;
+            path2_bytes += hr->used();
+            path2_cold_bytes += hr->used();
+            sampled_words += region_sampled_words;
+            cold_words += region_cold_words;
+            hot_words += region_hot_words;
+            unknown_words += region_unknown_words;
+          }
+        }
+
+        if (path2_cold_candidates > 0 || path2_regions_scanned > 0) {
+          size_t sampled_bytes = sampled_words * HeapWordSize;
+          size_t cold_bytes = cold_words * HeapWordSize;
+          size_t hot_bytes = hot_words * HeapWordSize;
+          size_t unknown_bytes = unknown_words * HeapWordSize;
+          log_info(gc)("Path 2 cold scan: selected=%d/%d regions (" SIZE_FORMAT "MB), "
+                       "not_cold=%d, sample cold=" SIZE_FORMAT "MB hot=" SIZE_FORMAT
+                       "MB unknown=" SIZE_FORMAT "MB sampled=" SIZE_FORMAT "MB",
+                       path2_cold_candidates, path2_regions_scanned,
+                       path2_cold_bytes / M, path2_regions_not_cold,
+                       cold_bytes / M, hot_bytes / M, unknown_bytes / M,
+                       sampled_bytes / M);
+        }
+
+        // T1 is proactive: do not evict hot/unknown regions. Under higher local
+        // pressure, fall back to old regions after exhausting cold candidates.
+        if (eviction_tier >= 2 && (unlimited || path2_bytes < evict_target_bytes)) {
+          for (uint i = 0; i < num_regions; i++) {
+            if (!unlimited && path2_bytes >= evict_target_bytes) break;
+
+            HeapRegion* hr = _g1h->region_at(i);
+            if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
+            if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
+            if (eviction_candidates[i]) continue;
+
+            hr->set_cold_destination();
+            eviction_candidates[i] = true;
+            path2_candidates++;
+            path2_fallback_candidates++;
+            path2_bytes += hr->used();
+            path2_fallback_bytes += hr->used();
+          }
+
+          if (path2_fallback_candidates > 0) {
+            log_info(gc)("Path 2 fallback selected %d old regions (" SIZE_FORMAT
+                         "MB) for T%d pressure",
+                         path2_fallback_candidates, path2_fallback_bytes / M,
+                         eviction_tier);
+          }
         }
 
         if (path2_candidates > 0) {
-          log_info(gc)("Path 2 selected %d regions (" SIZE_FORMAT "MB) for T%d eviction",
-                       path2_candidates, path2_bytes / M, eviction_tier);
+          log_info(gc)("Path 2 selected %d regions (" SIZE_FORMAT "MB, cold="
+                       SIZE_FORMAT "MB fallback=" SIZE_FORMAT "MB) for T%d eviction",
+                       path2_candidates, path2_bytes / M, path2_cold_bytes / M,
+                       path2_fallback_bytes / M, eviction_tier);
         }
       }
     }
