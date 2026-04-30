@@ -2189,17 +2189,77 @@ int G1RemoteMemoryManager::fixup_all_local_handles() {
   return updated;
 }
 
-// Closure that fixes untagged refs to cset regions by writing forwardees.
+static bool is_valid_region_object(G1CollectedHeap* g1h, oop obj, HeapRegion** region_out = nullptr) {
+  if (obj == nullptr || !g1h->is_in(obj)) return false;
+  HeapRegion* hr = g1h->heap_region_containing(obj);
+  if (hr == nullptr || hr->is_free() || hr->is_empty() || hr->is_continues_humongous()) {
+    return false;
+  }
+
+  HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
+  if (obj_addr < hr->bottom() || obj_addr >= hr->top()) return false;
+
+  HeapWord* pb = hr->parsable_bottom_acquire();
+  if (hr->block_start(obj_addr, pb) != obj_addr) return false;
+  if (!hr->block_is_obj(obj_addr, pb)) return false;
+
+  if (region_out != nullptr) {
+    *region_out = hr;
+  }
+  return true;
+}
+
+// Closure that fixes refs to cset regions by writing forwardees. If remset/card
+// coverage missed a direct tagged old-field reference, the target may not have
+// been forwarded; rescue it into an FCR region before the cset is freed.
 class CSetRefFixupClosure : public BasicOopIterateClosure {
   G1CollectedHeap* _g1h;
+  G1RemoteMemoryManager* _rmm;
+  bool _allow_rescue;
   int _fixed;
+  int _rescued;
   int _skipped;
+  int _invalid;
+  int _rescue_failed;
   bool _src_is_fcr;     // Set per object via set_src_is_fcr()
 public:
-  CSetRefFixupClosure(G1CollectedHeap* g1h)
-    : _g1h(g1h), _fixed(0), _skipped(0), _src_is_fcr(false) {}
+  CSetRefFixupClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm, bool allow_rescue)
+    : _g1h(g1h), _rmm(rmm), _allow_rescue(allow_rescue),
+      _fixed(0), _rescued(0), _skipped(0), _invalid(0), _rescue_failed(0),
+      _src_is_fcr(false) {}
 
   void set_src_is_fcr(bool v) { _src_is_fcr = v; }
+
+  void store_forwardee(oop* p, uintptr_t tag_bits, oop fwd) {
+    if (tag_bits != 0) {
+      *(uintptr_t*)p = tag_bits | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK);
+    } else {
+      RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
+    }
+  }
+
+  bool rescue_unforwarded(oop* p, uintptr_t tag_bits, oop target) {
+    if (!_allow_rescue) return false;
+
+    const size_t word_size = target->size();
+    HeapWord* dst = _rmm->allocate_in_fcr(word_size);
+    if (dst == nullptr) {
+      _rescue_failed++;
+      return false;
+    }
+
+    Copy::aligned_disjoint_words(cast_from_oop<HeapWord*>(target), dst, word_size);
+    oop rescued = cast_to_oop(dst);
+    target->forward_to(rescued);
+    _rmm->update_handle_for_evacuation(target, rescued);
+    store_forwardee(p, tag_bits, rescued);
+    _rescued++;
+
+    // The rescued object was missed by normal evacuation, so scan its fields
+    // immediately; otherwise its internal cset references would remain stale.
+    rescued->oop_iterate(this);
+    return true;
+  }
 
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
@@ -2214,16 +2274,16 @@ public:
     uintptr_t addr = (tag_bits != 0) ? (raw & G1_OOP_ADDR_MASK) : raw;
     if (!_g1h->is_in((void*)addr)) return;
     oop target = cast_to_oop(addr);
+    if (!is_valid_region_object(_g1h, target)) {
+      _invalid++;
+      return;
+    }
     const G1HeapRegionAttr attr = _g1h->region_attr(target);
     if (!attr.is_in_cset()) return;
     markWord mw = target->mark();
     if (mw.is_marked()) {
       oop fwd = cast_to_oop(mw.decode_pointer());
-      if (tag_bits != 0) {
-        *(uintptr_t*)p = tag_bits | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK);
-      } else {
-        RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
-      }
+      store_forwardee(p, tag_bits, fwd);
       _fixed++;
     } else {
       // Do not null Java fields here. This runs after cleanup_1, which has
@@ -2231,16 +2291,22 @@ public:
       // in-place object can be unmarked even though references to it are valid.
       // Nulling such refs corrupts application objects (for example
       // java.lang.Thread.holder) and leads to VM crashes shortly after GC.
+      if (rescue_unforwarded(p, tag_bits, target)) {
+        return;
+      }
       _skipped++;
     }
   }
   virtual void do_oop(narrowOop* p) {}
   int fixed() const { return _fixed; }
+  int rescued() const { return _rescued; }
   int skipped() const { return _skipped; }
+  int invalid() const { return _invalid; }
+  int rescue_failed() const { return _rescue_failed; }
 };
 
-int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
-  CSetRefFixupClosure cl(_g1h);
+int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_failed) {
+  CSetRefFixupClosure cl(_g1h, this, !evacuation_failed);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
   class CSetFixupObjectClosure {
@@ -2263,14 +2329,16 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions() {
     remote_eviction_scan_region_objects(hr, bitmap, "Old/cset fixup", &obj_cl);
   }
 
-  if (cl.fixed() > 0 || cl.skipped() > 0) {
-    log_warning(gc)("Old/humongous-region stale-ref fixup: %d fixed (forwardee), %d skipped"
-                    " (unforwarded/in-place; FCR evac writes: %llu, previous FCR nulls: %llu)",
-                    cl.fixed(), cl.skipped(),
+  if (cl.fixed() > 0 || cl.rescued() > 0 || cl.skipped() > 0 ||
+      cl.invalid() > 0 || cl.rescue_failed() > 0) {
+    log_warning(gc)("Old/humongous-region stale-ref fixup: %d fixed (forwardee), "
+                    "%d rescued, %d skipped (unforwarded/in-place), %d invalid, "
+                    "%d rescue-failed; FCR evac writes: %llu, previous FCR nulls: %llu",
+                    cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(), cl.rescue_failed(),
                     (unsigned long long)fcr_evac_writes(),
                     (unsigned long long)fcr_fixup_nulls());
   }
-  return cl.fixed() + cl.skipped();
+  return cl.fixed() + cl.rescued() + cl.skipped() + cl.invalid() + cl.rescue_failed();
 }
 
 HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {

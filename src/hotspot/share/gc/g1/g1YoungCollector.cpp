@@ -1172,7 +1172,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
-      rmm->fixup_stale_refs_in_old_regions();
+      rmm->fixup_stale_refs_in_old_regions(evacuation_failed());
     }
   }
 
@@ -1250,6 +1250,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     for (uint i = 0; i < num_regions; i++) {
       HeapRegion* hr = _g1h->region_at(i);
       if (!hr->is_cold_destination()) continue;
+      if (hr->is_free() || hr->is_empty()) {
+        hr->clear_cold_destination();
+        hr->clear_root_pinned();
+        continue;
+      }
       if (hr->is_fetch_cache()) continue;
       if (hr->is_root_pinned()) {
         hr->clear_cold_destination();
@@ -1399,6 +1404,27 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           _num_pins++;
         }
 
+        bool is_valid_root_object(oop obj, HeapRegion** region_out = nullptr) {
+          if (obj == nullptr || !_g1h->is_in(obj)) return false;
+          HeapRegion* hr = _g1h->heap_region_containing(obj);
+          if (hr == nullptr || hr->is_free() || hr->is_empty() ||
+              hr->is_continues_humongous()) {
+            return false;
+          }
+
+          HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
+          if (obj_addr < hr->bottom() || obj_addr >= hr->top()) return false;
+
+          HeapWord* pb = hr->parsable_bottom_acquire();
+          if (hr->block_start(obj_addr, pb) != obj_addr) return false;
+          if (!hr->block_is_obj(obj_addr, pb)) return false;
+
+          if (region_out != nullptr) {
+            *region_out = hr;
+          }
+          return true;
+        }
+
       public:
         EvictionRootCollectClosure(G1CollectedHeap* g1h, const bool* candidates,
                                    uint num_regions, RootPinEntry** pins,
@@ -1415,9 +1441,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           if ((raw & G1_OOP_TAG_MASK) != 0) {
             obj = cast_to_oop(raw & G1_OOP_ADDR_MASK);
           }
-          if (!_g1h->is_in(obj)) return;
-          HeapRegion* hr = _g1h->heap_region_containing(obj);
-          if (hr == nullptr) return;
+          HeapRegion* hr = nullptr;
+          if (!is_valid_root_object(obj, &hr)) return;
           uint idx = hr->hrm_index();
           if (idx < _num_regions && _eviction_candidates[idx]) {
             append(p, cast_from_oop<uintptr_t>(obj), true);

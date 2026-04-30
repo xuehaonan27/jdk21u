@@ -616,9 +616,9 @@ public:
   int fixup_tagged_field_handles();
   int fixup_all_local_handles();
 
-  // Post-evacuation fixup: scan ALL old regions for untagged refs to
+  // Post-evacuation fixup: scan ALL old regions for refs to
   // collection-set regions. Must be called BEFORE free_collection_set.
-  int fixup_stale_refs_in_old_regions();
+  int fixup_stale_refs_in_old_regions(bool evacuation_failed);
 
   // Diagnostic counters for Task #11 — comparing do_oop_evac processing
   // of FCR-source fields vs fixup NULLing of stale refs from FCR sources.
