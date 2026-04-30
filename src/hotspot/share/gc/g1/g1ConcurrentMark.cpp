@@ -1789,24 +1789,8 @@ private:
         }
       }
 
-      HeapRegion* hr = _g1h->heap_region_containing(obj);
-      if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+      if (!g1_cm_mark_safe_local_oop(_g1h, obj)) {
         return;
-      }
-
-      HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
-      if (hr->is_continues_humongous()) {
-        return;
-      }
-      if (hr->is_starts_humongous()) {
-        if (obj_addr != hr->bottom()) {
-          return;
-        }
-      } else if (hr->is_old()) {
-        if (hr->block_start(obj_addr) != obj_addr ||
-            G1CollectedHeap::is_obj_filler(obj)) {
-          return;
-        }
       }
     }
 

@@ -30,7 +30,6 @@
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1ConcurrentMarkBitMap.inline.hpp"
 #include "gc/g1/g1ConcurrentMarkObjArrayProcessor.inline.hpp"
-#include "gc/g1/g1OopClosures.inline.hpp"
 #include "gc/g1/g1Policy.hpp"
 #include "gc/g1/g1RegionMarkStatsCache.inline.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
@@ -42,7 +41,92 @@
 #include "gc/g1/heapRegion.inline.hpp"
 #include "gc/shared/suspendibleThreadSet.hpp"
 #include "gc/shared/taskqueue.inline.hpp"
+#include "memory/metaspace.hpp"
+#include "oops/klass.hpp"
+#include "oops/oop.inline.hpp"
 #include "utilities/bitMap.inline.hpp"
+
+static inline bool g1_cm_remote_marking_checks_enabled() {
+  return UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+         G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
+}
+
+static inline bool g1_cm_valid_klass_for_mark(Klass* k) {
+  if (k == nullptr) {
+    return false;
+  }
+  if (!is_aligned((address)k, sizeof(MetaWord))) {
+    return false;
+  }
+  if (!Metaspace::contains(k)) {
+    return false;
+  }
+  return k->is_klass();
+}
+
+static inline bool g1_cm_mark_safe_local_oop(G1CollectedHeap* g1h,
+                                             oop obj,
+                                             HeapRegion** out_hr = nullptr,
+                                             size_t* out_size = nullptr) {
+  if (obj == nullptr ||
+      !g1_remote_oop_is_aligned(cast_from_oop<uintptr_t>(obj)) ||
+      !g1h->is_in(obj)) {
+    return false;
+  }
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null(obj);
+  if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+    return false;
+  }
+
+  HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
+  if (obj_addr < hr->bottom() || obj_addr >= hr->top()) {
+    return false;
+  }
+  if (hr->obj_allocated_since_marking_start(obj)) {
+    return false;
+  }
+  if (hr->is_continues_humongous()) {
+    return false;
+  }
+  if (hr->is_starts_humongous()) {
+    if (obj_addr != hr->bottom()) {
+      return false;
+    }
+  } else if (hr->is_old()) {
+    if (hr->block_start(obj_addr) != obj_addr) {
+      return false;
+    }
+  }
+
+  Klass* k = obj->klass_or_null();
+  if (!g1_cm_valid_klass_for_mark(k)) {
+    return false;
+  }
+
+  size_t obj_size = obj->size_given_klass(k);
+  if (obj_size < (size_t)MinObjAlignment ||
+      !is_object_aligned(obj_size) ||
+      obj_size > (size_t)(hr->top() - obj_addr) ||
+      obj_size > (size_t)(hr->end() - obj_addr)) {
+    return false;
+  }
+
+  if (!hr->is_starts_humongous() && hr->is_old() &&
+      G1CollectedHeap::is_obj_filler(obj)) {
+    return false;
+  }
+
+  if (out_hr != nullptr) {
+    *out_hr = hr;
+  }
+  if (out_size != nullptr) {
+    *out_size = obj_size;
+  }
+  return true;
+}
+
+#include "gc/g1/g1OopClosures.inline.hpp"
 
 inline bool G1CMIsAliveClosure::do_object_b(oop obj) {
   // Check whether the passed in object is null. During discovery the referent
@@ -70,7 +154,17 @@ inline bool G1CMSubjectToDiscoveryClosure::do_object_b(oop obj) {
 }
 
 inline bool G1ConcurrentMark::mark_in_bitmap(uint const worker_id, oop const obj) {
-  HeapRegion* const hr = _g1h->heap_region_containing(obj);
+  HeapRegion* hr = nullptr;
+  size_t obj_size = 0;
+  bool const remote_checks = g1_cm_remote_marking_checks_enabled();
+
+  if (remote_checks) {
+    if (!g1_cm_mark_safe_local_oop(_g1h, obj, &hr, &obj_size)) {
+      return false;
+    }
+  } else {
+    hr = _g1h->heap_region_containing(obj);
+  }
 
   if (hr->obj_allocated_since_marking_start(obj)) {
     return false;
@@ -82,7 +176,7 @@ inline bool G1ConcurrentMark::mark_in_bitmap(uint const worker_id, oop const obj
 
   bool success = _mark_bitmap.par_mark(obj);
   if (success) {
-    add_to_liveness(worker_id, obj, obj->size());
+    add_to_liveness(worker_id, obj, remote_checks ? obj_size : obj->size());
   }
   return success;
 }
@@ -173,6 +267,10 @@ inline void G1CMTask::process_grey_task_entry(G1TaskQueueEntry task_entry) {
       _words_scanned += _objArray_processor.process_slice(task_entry.slice());
     } else {
       oop obj = task_entry.obj();
+      if (g1_cm_remote_marking_checks_enabled() &&
+          !g1_cm_mark_safe_local_oop(_g1h, obj)) {
+        return;
+      }
       if (G1CMObjArrayProcessor::should_be_sliced(obj)) {
         _words_scanned += _objArray_processor.process_obj(obj);
       } else {
@@ -305,30 +403,17 @@ inline bool G1CMTask::deal_with_reference(T* p) {
   if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
-    RemoteHandle* h = rmm->handle_for_addr_any_state(cast_from_oop<uintptr_t>(obj));
-    if (h != nullptr && !h->is_local()) {
-      if (h->is_remote()) {
-        log_remote_handle((uintptr_t)h);
-      }
-      return false;
-    }
-    HeapRegion* hr = _g1h->heap_region_containing(obj);
-    if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
-      return false;
-    }
-    HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
-    if (hr->is_continues_humongous()) {
-      return false;
-    }
-    if (hr->is_starts_humongous()) {
-      if (obj_addr != hr->bottom()) {
+    if (rmm != nullptr) {
+      RemoteHandle* h = rmm->handle_for_addr_any_state(cast_from_oop<uintptr_t>(obj));
+      if (h != nullptr && !h->is_local()) {
+        if (h->is_remote()) {
+          log_remote_handle((uintptr_t)h);
+        }
         return false;
       }
-    } else if (hr->is_old()) {
-      if (hr->block_start(obj_addr) != obj_addr ||
-          G1CollectedHeap::is_obj_filler(obj)) {
-        return false;
-      }
+    }
+    if (!g1_cm_mark_safe_local_oop(_g1h, obj)) {
+      return false;
     }
   }
   return make_reference_grey(obj);
