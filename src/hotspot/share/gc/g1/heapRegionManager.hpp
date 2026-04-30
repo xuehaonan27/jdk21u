@@ -203,6 +203,9 @@ public:
   // Allocate a free region with specific node index. If fails allocate with next node index.
   HeapRegion* allocate_free_region(HeapRegionType type, uint requested_node_index);
 
+  // Allocate a free region for FCR use without reusing evict-guarded regions.
+  HeapRegion* allocate_free_region_skip_evict_guarded(uint requested_node_index);
+
   // Allocate a humongous object from the free list
   HeapRegion* allocate_humongous(uint num_regions);
 

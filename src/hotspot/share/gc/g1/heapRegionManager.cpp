@@ -123,6 +123,65 @@ HeapRegion* HeapRegionManager::allocate_free_region(HeapRegionType type, uint re
   return hr;
 }
 
+HeapRegion* HeapRegionManager::allocate_free_region_skip_evict_guarded(uint requested_node_index) {
+  HeapRegion* hr = nullptr;
+  uint skipped_guarded = 0;
+  G1NUMA* numa = G1NUMA::numa();
+
+  FreeRegionListIterator it(&_free_list);
+  while (it.more_available()) {
+    HeapRegion* cur = it.get_next();
+    if (cur->is_evict_guarded()) {
+      skipped_guarded++;
+      continue;
+    }
+    if (requested_node_index != G1NUMA::AnyNodeIndex &&
+        numa->is_enabled() &&
+        cur->node_index() != requested_node_index) {
+      continue;
+    }
+    hr = cur;
+    break;
+  }
+
+  if (hr == nullptr && requested_node_index != G1NUMA::AnyNodeIndex && numa->is_enabled()) {
+    FreeRegionListIterator retry(&_free_list);
+    while (retry.more_available()) {
+      HeapRegion* cur = retry.get_next();
+      if (cur->is_evict_guarded()) {
+        continue;
+      }
+      hr = cur;
+      break;
+    }
+  }
+
+  if (hr == nullptr) {
+    if (skipped_guarded > 0) {
+      log_warning(gc)("FCR allocation found no clean free region after skipping %u evict-guarded regions",
+                      skipped_guarded);
+    }
+    return nullptr;
+  }
+
+  _free_list.remove_starting_at(hr, 1);
+  assert(hr->next() == nullptr, "Single region should not have next");
+  assert(hr->prev() == nullptr, "Single region should not have prev");
+  assert(is_available(hr->hrm_index()), "Must be committed");
+  assert(!hr->is_evict_guarded(), "FCR allocation must not reuse evict-guarded regions");
+
+  if (skipped_guarded > 0) {
+    log_info(gc)("FCR allocation skipped %u evict-guarded free regions before selecting region %u",
+                 skipped_guarded, hr->hrm_index());
+  }
+
+  if (numa->is_enabled() && hr->node_index() < numa->num_active_nodes()) {
+    numa->update_statistics(G1NUMAStats::NewRegionAlloc, requested_node_index, hr->node_index());
+  }
+
+  return hr;
+}
+
 HeapRegion* HeapRegionManager::allocate_humongous_from_free_list(uint num_regions) {
   uint candidate = find_contiguous_in_free_list(num_regions);
   if (candidate == G1_NO_HRM_INDEX) {

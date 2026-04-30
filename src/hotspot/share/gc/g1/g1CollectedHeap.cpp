@@ -1352,9 +1352,11 @@ jint G1CollectedHeap::initialize_service_thread() {
 }
 
 HeapRegion* G1CollectedHeap::allocate_fcr_region() {
-  // Allocate a free region for Fetch Cache without expansion (safe outside safepoint).
-  HeapRegion* fcr = new_region(HeapRegion::GrainWords, HeapRegionType::Old,
-                                false /* do_expand */, G1NUMA::AnyNodeIndex);
+  // Allocate a clean free region for Fetch Cache without expansion (safe outside
+  // safepoint). Reusing evict-guarded regions as FCR hides stale clean oop
+  // aliases: the stale address becomes readable again and can resolve to
+  // unrelated fetched object bytes instead of faulting or being repaired.
+  HeapRegion* fcr = _hrm.allocate_free_region_skip_evict_guarded(G1NUMA::AnyNodeIndex);
   if (fcr != nullptr) {
     fcr->set_fetch_cache();
     log_info(gc)("Allocated FCR region: " PTR_FORMAT " (idx=%u)",
