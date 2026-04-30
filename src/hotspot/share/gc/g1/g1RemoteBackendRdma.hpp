@@ -49,6 +49,9 @@ class RDMAExecutorBackend : public G1RemoteBackend {
   size_t   _next_slot;
   size_t   _total_evicted;
   size_t   _total_fetched;
+  uintptr_t* _pending_localize_ids;
+  size_t   _pending_localize_count;
+  size_t   _pending_localize_capacity;
   volatile int _io_lock;
 
   void io_lock()   { while (Atomic::cmpxchg(&_io_lock, 0, 1) != 0) { /* spin */ } }
@@ -69,6 +72,10 @@ class RDMAExecutorBackend : public G1RemoteBackend {
   // Split post/wait — post BEFORE the matching send to avoid RNR race.
   bool rdma_post_recv();
   bool rdma_wait_recv(void* buf, size_t max_len, size_t* actual_len);
+
+  bool ensure_localize_buffer_locked();
+  bool send_localize_batch_locked(const uintptr_t* handle_ids, size_t count);
+  bool flush_localize_batch_locked();
 
 public:
   RDMAExecutorBackend();

@@ -142,7 +142,9 @@ RDMAExecutorBackend::RDMAExecutorBackend()
     _qp(nullptr), _local_mr(nullptr),
     _remote_base_addr(0), _remote_rkey(0), _remote_arena_size(0),
     _tcp_fd(-1), _connected(false), _seq_id(0),
-    _next_slot(0), _total_evicted(0), _total_fetched(0), _io_lock(0) {
+    _next_slot(0), _total_evicted(0), _total_fetched(0),
+    _pending_localize_ids(nullptr), _pending_localize_count(0),
+    _pending_localize_capacity(0), _io_lock(0) {
 }
 
 RDMAExecutorBackend::~RDMAExecutorBackend() {
@@ -398,6 +400,65 @@ bool RDMAExecutorBackend::rdma_recv_msg(void* buf, size_t max_len, size_t* actua
   return rdma_wait_recv(buf, max_len, actual_len);
 }
 
+static size_t rdma_localize_batch_capacity() {
+  size_t max_per_msg = (RDMAMsgBufSize > 20) ? ((RDMAMsgBufSize - 20) / 8) : 1;
+  return MAX2((size_t)1, MIN2(max_per_msg, (size_t)4096));
+}
+
+bool RDMAExecutorBackend::ensure_localize_buffer_locked() {
+  if (_pending_localize_ids != nullptr) return true;
+
+  _pending_localize_capacity = rdma_localize_batch_capacity();
+  _pending_localize_ids =
+      (uintptr_t*)os::malloc(_pending_localize_capacity * sizeof(uintptr_t), mtGC);
+  if (_pending_localize_ids == nullptr) {
+    _pending_localize_capacity = 0;
+    return false;
+  }
+  return true;
+}
+
+bool RDMAExecutorBackend::send_localize_batch_locked(const uintptr_t* handle_ids, size_t count) {
+  if (!_connected || count == 0) return true;
+
+  size_t max_per_msg = rdma_localize_batch_capacity();
+  size_t offset = 0;
+  while (offset < count) {
+    size_t chunk = MIN2(count - offset, max_per_msg);
+    size_t msg_size = 20 + chunk * 8;
+    uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+    if (msg == nullptr) return false;
+
+    *(uint32_t*)(msg + 0)  = RE_CMD_LOCALIZE_BATCH;
+    *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
+    *(uint64_t*)(msg + 8)  = _seq_id++;
+    *(uint32_t*)(msg + 16) = (uint32_t)chunk;
+    memcpy(msg + 20, handle_ids + offset, chunk * sizeof(uintptr_t));
+
+    if (!rdma_post_recv()) { os::free(msg); return false; }
+    bool ok = rdma_send_msg(msg, msg_size);
+    os::free(msg);
+    if (!ok) return false;
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    if (!rdma_wait_recv(resp, sizeof(resp), &resp_len)) return false;
+    if (resp_len < 4 || *(uint32_t*)resp != RE_RESP_OK) return false;
+
+    offset += chunk;
+  }
+  return true;
+}
+
+bool RDMAExecutorBackend::flush_localize_batch_locked() {
+  if (_pending_localize_count == 0) return true;
+  bool ok = send_localize_batch_locked(_pending_localize_ids, _pending_localize_count);
+  if (ok) {
+    _pending_localize_count = 0;
+  }
+  return ok;
+}
+
 // ================================================================
 // RDMA one-sided data operations
 // ================================================================
@@ -542,12 +603,21 @@ bool RDMAExecutorBackend::initialize() {
 
 void RDMAExecutorBackend::shutdown() {
   if (_connected) {
+    io_lock();
+    flush_localize_batch_locked();
     uint8_t msg[16];
     memset(msg, 0, sizeof(msg));
     *(uint32_t*)msg = RE_CMD_SHUTDOWN;
     *(uint32_t*)(msg + 4) = 16;
     rdma_send_msg(msg, 16);
+    io_unlock();
     _connected = false;
+  }
+  if (_pending_localize_ids != nullptr) {
+    os::free(_pending_localize_ids);
+    _pending_localize_ids = nullptr;
+    _pending_localize_count = 0;
+    _pending_localize_capacity = 0;
   }
   if (_qp) { ibv_destroy_qp(_qp); _qp = nullptr; }
   if (_send_cq) { ibv_destroy_cq(_send_cq); _send_cq = nullptr; }
@@ -575,6 +645,7 @@ size_t RDMAExecutorBackend::evict(const void* obj_bytes, size_t word_size,
   if (!_connected) return (size_t)-1;
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return (size_t)-1; }
 
   // Pre-post recv to win the race vs. peer's response.
   if (!rdma_post_recv()) { io_unlock(); return (size_t)-1; }
@@ -667,6 +738,7 @@ void RDMAExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_r
   if (!_connected) return;
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return; }
 
   size_t msg_size = 20 + num_roots * 8;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
@@ -697,6 +769,11 @@ void RDMAExecutorBackend::collect_dead(size_t** out_dead_ids, size_t* out_num_de
   }
 
   io_lock();
+  if (!flush_localize_batch_locked()) {
+    io_unlock();
+    *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0;
+    return;
+  }
 
   if (!rdma_post_recv()) { io_unlock(); *out_dead_ids = nullptr; *out_num_dead = 0; *out_bytes_freed = 0; return; }
 
@@ -745,6 +822,7 @@ void RDMAExecutorBackend::trace_and_report(uintptr_t** out_dead_ids, size_t* out
   if (!_connected) return;
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return; }
 
   if (!rdma_post_recv()) { io_unlock(); return; }
 
@@ -806,6 +884,7 @@ void RDMAExecutorBackend::discard_slot(size_t slot_id) {
   if (!_connected) return;
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return; }
 
   if (!rdma_post_recv()) { io_unlock(); return; }
 
@@ -826,6 +905,7 @@ int RDMAExecutorBackend::batch_evict(const void* msg_buf, size_t msg_len) {
   if (!_connected) return -1;
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return -1; }
   if (!rdma_post_recv()) { io_unlock(); return -1; }
   bool ok = rdma_send_msg(msg_buf, msg_len);
   if (!ok) { io_unlock(); return -1; }
@@ -853,6 +933,7 @@ size_t RDMAExecutorBackend::evict_with_edges(const void* obj_bytes, size_t word_
   if (!_connected) return (size_t)-1;
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return (size_t)-1; }
 
   size_t slot_id = (hint_slot_id == (size_t)-1) ? _next_slot++ : hint_slot_id;
   size_t byte_size = word_size * HeapWordSize;
@@ -900,21 +981,31 @@ void RDMAExecutorBackend::localize_batch(const uintptr_t* handle_ids, size_t cou
 
   io_lock();
 
-  size_t msg_size = 20 + count * 8;
-  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
-  *(uint32_t*)(msg + 0)  = RE_CMD_LOCALIZE_BATCH;
-  *(uint32_t*)(msg + 4)  = (uint32_t)msg_size;
-  *(uint64_t*)(msg + 8)  = _seq_id++;
-  *(uint32_t*)(msg + 16) = (uint32_t)count;
-  memcpy(msg + 20, handle_ids, count * 8);
+  if (!ensure_localize_buffer_locked()) {
+    send_localize_batch_locked(handle_ids, count);
+    io_unlock();
+    return;
+  }
 
-  if (!rdma_post_recv()) { os::free(msg); io_unlock(); return; }
-  rdma_send_msg(msg, msg_size);
-  os::free(msg);
+  size_t offset = 0;
+  while (offset < count) {
+    if (_pending_localize_count == _pending_localize_capacity &&
+        !flush_localize_batch_locked()) {
+      break;
+    }
+    size_t space = _pending_localize_capacity - _pending_localize_count;
+    size_t chunk = MIN2(count - offset, space);
+    memcpy(_pending_localize_ids + _pending_localize_count,
+           handle_ids + offset,
+           chunk * sizeof(uintptr_t));
+    _pending_localize_count += chunk;
+    offset += chunk;
 
-  uint8_t resp[64];
-  size_t resp_len = 0;
-  rdma_wait_recv(resp, sizeof(resp), &resp_len);
+    if (_pending_localize_count == _pending_localize_capacity &&
+        !flush_localize_batch_locked()) {
+      break;
+    }
+  }
 
   io_unlock();
 }
@@ -923,6 +1014,7 @@ void RDMAExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, si
   if (!_connected) return;
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return; }
 
   // Max roots per message: (RDMAMsgBufSize - 20 header) / 8 bytes per root
   size_t max_per_msg = (RDMAMsgBufSize - 20) / 8;
@@ -973,6 +1065,7 @@ void RDMAExecutorBackend::directory_upsert(const uintptr_t* handle_ids,
   if (!_connected || count == 0) return;
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return; }
 
   size_t msg_size = 20 + count * 20;
   uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);

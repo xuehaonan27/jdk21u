@@ -397,13 +397,13 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
           }
           if (state != REMOTE_HANDLE_DEAD) {
             *handle_out = h;
-            log_info(gc)("Resolved clean stale oop " PTR_FORMAT
-                         " from %s region %u via handle " PTR_FORMAT
-                         " state=0x%lx",
-                         p2i((void*)v),
-                         hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
-                         hr == nullptr ? 9999 : hr->hrm_index(),
-                         p2i(h), (unsigned long)state);
+            log_debug(gc)("Resolved clean stale oop " PTR_FORMAT
+                          " from %s region %u via handle " PTR_FORMAT
+                          " state=0x%lx",
+                          p2i((void*)v),
+                          hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                          hr == nullptr ? 9999 : hr->hrm_index(),
+                          p2i(h), (unsigned long)state);
             return nullptr;
           }
         }
