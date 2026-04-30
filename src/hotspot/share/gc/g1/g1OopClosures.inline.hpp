@@ -144,9 +144,18 @@ inline void G1RootRegionScanClosure::do_oop_work(T* p) {
       return;
     }
     HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
-    if (hr->is_continues_humongous() || hr->block_start(obj_addr) != obj_addr ||
-        G1CollectedHeap::is_obj_filler(obj)) {
+    if (hr->is_continues_humongous()) {
       return;
+    }
+    if (hr->is_starts_humongous()) {
+      if (obj_addr != hr->bottom()) {
+        return;
+      }
+    } else if (hr->is_old()) {
+      if (hr->block_start(obj_addr) != obj_addr ||
+          G1CollectedHeap::is_obj_filler(obj)) {
+        return;
+      }
     }
   }
   _cm->mark_in_bitmap(_worker_id, obj);

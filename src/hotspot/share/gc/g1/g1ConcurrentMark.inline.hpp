@@ -307,9 +307,18 @@ inline bool G1CMTask::deal_with_reference(T* p) {
       return false;
     }
     HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
-    if (hr->is_continues_humongous() || hr->block_start(obj_addr) != obj_addr ||
-        G1CollectedHeap::is_obj_filler(obj)) {
+    if (hr->is_continues_humongous()) {
       return false;
+    }
+    if (hr->is_starts_humongous()) {
+      if (obj_addr != hr->bottom()) {
+        return false;
+      }
+    } else if (hr->is_old()) {
+      if (hr->block_start(obj_addr) != obj_addr ||
+          G1CollectedHeap::is_obj_filler(obj)) {
+        return false;
+      }
     }
   }
   return make_reference_grey(obj);
