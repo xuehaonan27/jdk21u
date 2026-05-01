@@ -1200,18 +1200,37 @@ public:
   void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
 };
 
+struct RegionColdnessSample {
+  size_t sampled_words;
+  size_t cold_words;
+  size_t hot_words;
+  size_t unknown_words;
+  size_t object_count;
+  size_t object_words;
+  bool dense_small_objects;
+
+  RegionColdnessSample() :
+    sampled_words(0),
+    cold_words(0),
+    hot_words(0),
+    unknown_words(0),
+    object_count(0),
+    object_words(0),
+    dense_small_objects(false) {}
+};
+
 static bool region_is_cold_by_epoch(HeapRegion* hr,
                                     G1RemoteMemoryManager* rmm,
-                                    size_t* sampled_words_out,
-                                    size_t* cold_words_out,
-                                    size_t* hot_words_out,
-                                    size_t* unknown_words_out) {
+                                    bool guard_dense_small_objects,
+                                    RegionColdnessSample* sample) {
   const uintptr_t cold_distance = 4;
   const uintptr_t gc_epoch = rmm->gc_epoch();
   size_t sampled_words = 0;
   size_t cold_words = 0;
   size_t hot_words = 0;
   size_t unknown_words = 0;
+  size_t object_count = 0;
+  size_t object_words = 0;
   size_t obj_index = 0;
 
   HeapWord* p = hr->bottom();
@@ -1227,6 +1246,8 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     if (word_size == 0) {
       break;
     }
+    object_count++;
+    object_words += word_size;
 
     // Sample every 8th object to bound mark-word work while still scanning
     // object sizes correctly across the region.
@@ -1244,10 +1265,25 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     p += word_size;
   }
 
-  *sampled_words_out = sampled_words;
-  *cold_words_out = cold_words;
-  *hot_words_out = hot_words;
-  *unknown_words_out = unknown_words;
+  sample->sampled_words = sampled_words;
+  sample->cold_words = cold_words;
+  sample->hot_words = hot_words;
+  sample->unknown_words = unknown_words;
+  sample->object_count = object_count;
+  sample->object_words = object_words;
+
+  if (guard_dense_small_objects && object_count > 0) {
+    // Object-granularity RDMA fetch makes densely packed tiny-object regions
+    // extremely expensive to fault back in. Keep them local during proactive
+    // T1 eviction; higher pressure tiers may still fall back to them.
+    const size_t min_avg_object_words = 512 / HeapWordSize;
+    const size_t min_dense_object_count = MAX2((size_t)4096, HeapRegion::GrainBytes / 1024);
+    if (object_count >= min_dense_object_count &&
+        object_words < object_count * min_avg_object_words) {
+      sample->dense_small_objects = true;
+      return false;
+    }
+  }
 
   size_t known_words = cold_words + hot_words;
   if (sampled_words == 0 || known_words == 0) {
@@ -1559,6 +1595,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_fallback_candidates = 0;
         int path2_regions_scanned = 0;
         int path2_regions_not_cold = 0;
+        int path2_regions_dense_small = 0;
+        size_t path2_dense_small_bytes = 0;
+        size_t path2_dense_small_objects = 0;
         bool unlimited = (eviction_tier >= 3);
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
 
@@ -1574,19 +1613,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
 
-            size_t region_sampled_words = 0;
-            size_t region_cold_words = 0;
-            size_t region_hot_words = 0;
-            size_t region_unknown_words = 0;
+            RegionColdnessSample region_sample;
             path2_regions_scanned++;
-            if (!region_is_cold_by_epoch(hr, rmm, &region_sampled_words,
-                                         &region_cold_words, &region_hot_words,
-                                         &region_unknown_words)) {
+            if (!region_is_cold_by_epoch(hr, rmm, eviction_tier == 1, &region_sample)) {
               path2_regions_not_cold++;
-              sampled_words += region_sampled_words;
-              cold_words += region_cold_words;
-              hot_words += region_hot_words;
-              unknown_words += region_unknown_words;
+              sampled_words += region_sample.sampled_words;
+              cold_words += region_sample.cold_words;
+              hot_words += region_sample.hot_words;
+              unknown_words += region_sample.unknown_words;
+              if (region_sample.dense_small_objects) {
+                path2_regions_dense_small++;
+                path2_dense_small_bytes += hr->used();
+                path2_dense_small_objects += region_sample.object_count;
+              }
               continue;
             }
 
@@ -1596,10 +1635,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             path2_cold_candidates++;
             path2_bytes += hr->used();
             path2_cold_bytes += hr->used();
-            sampled_words += region_sampled_words;
-            cold_words += region_cold_words;
-            hot_words += region_hot_words;
-            unknown_words += region_unknown_words;
+            sampled_words += region_sample.sampled_words;
+            cold_words += region_sample.cold_words;
+            hot_words += region_sample.hot_words;
+            unknown_words += region_sample.unknown_words;
           }
         }
 
@@ -1609,10 +1648,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           size_t hot_bytes = hot_words * HeapWordSize;
           size_t unknown_bytes = unknown_words * HeapWordSize;
           log_info(gc)("Path 2 cold scan: selected=%d/%d regions (" SIZE_FORMAT "MB), "
-                       "not_cold=%d, sample cold=" SIZE_FORMAT "MB hot=" SIZE_FORMAT
-                       "MB unknown=" SIZE_FORMAT "MB sampled=" SIZE_FORMAT "MB",
+                       "not_cold=%d, dense_small=%d (" SIZE_FORMAT "MB, "
+                       SIZE_FORMAT " objs), sample cold=" SIZE_FORMAT "MB hot="
+                       SIZE_FORMAT "MB unknown=" SIZE_FORMAT "MB sampled="
+                       SIZE_FORMAT "MB",
                        path2_cold_candidates, path2_regions_scanned,
                        path2_cold_bytes / M, path2_regions_not_cold,
+                       path2_regions_dense_small, path2_dense_small_bytes / M,
+                       path2_dense_small_objects,
                        cold_bytes / M, hot_bytes / M, unknown_bytes / M,
                        sampled_bytes / M);
         }
