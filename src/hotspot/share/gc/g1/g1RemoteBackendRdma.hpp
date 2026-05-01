@@ -99,6 +99,8 @@ public:
   void shutdown() override;
 
   int batch_evict(const void* msg_buf, size_t msg_len) override;
+  bool supports_batch_evict() const override;
+  size_t max_batch_evict_message_size() const override;
   void trace_and_report(uintptr_t** out_dead_ids, size_t* out_num_dead,
                         size_t* out_bytes_freed,
                         uintptr_t** out_cross_src, uintptr_t** out_cross_tgt,

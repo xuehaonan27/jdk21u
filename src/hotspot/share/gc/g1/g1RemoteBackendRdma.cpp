@@ -918,6 +918,14 @@ int RDMAExecutorBackend::batch_evict(const void* msg_buf, size_t msg_len) {
   return (*(uint32_t*)resp == RE_RESP_OK) ? 0 : -1;
 }
 
+bool RDMAExecutorBackend::supports_batch_evict() const {
+  return true;
+}
+
+size_t RDMAExecutorBackend::max_batch_evict_message_size() const {
+  return RDMAMsgBufSize;
+}
+
 size_t RDMAExecutorBackend::slot_word_size(size_t /*slot_id*/) const {
   return 0;  // Remote metadata — fetch response includes size
 }

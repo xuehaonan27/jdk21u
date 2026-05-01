@@ -91,6 +91,16 @@ public:
     return -1; // Not supported by default
   }
 
+  virtual bool supports_batch_evict() const {
+    return false;
+  }
+
+  // Maximum accepted batch-eviction message size. Backends without a fixed
+  // transport message buffer keep the caller's local batch-buffer limit.
+  virtual size_t max_batch_evict_message_size() const {
+    return (size_t)-1;
+  }
+
   // Notify executor that these handle_ids are now LOCAL (fetched back)
   virtual void localize_batch(const uintptr_t* handle_ids, size_t count) {
     // Default: no-op (SIM backend doesn't track handle state)

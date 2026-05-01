@@ -2643,90 +2643,259 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       G1RemoteBackend* backend = rmm->backend();
       int batches_sent = 0;
 
-      if (num_entries > 0) {
-        // CMD_BATCH_EVICT_WITH_EDGES format:
-        // header(24) + N × [slot_id(8) + handle_id(8) + klass(8) + word_size(4) +
-        //                    num_edges(4) + obj_bytes(ws*8) + edges(num_edges*12)]
-        static const size_t BATCH_HDR_SIZE = 24;
-        static const size_t BATCH_BUF_SIZE = 4 * 1024 * 1024;
-        uint8_t* batch_buf = (uint8_t*)os::malloc(BATCH_BUF_SIZE, mtGC);
+      // CMD_BATCH_EVICT_WITH_EDGES format:
+      // header(24) + N × [slot_id(8) + handle_id(8) + klass(8) + word_size(4) +
+      //                    num_edges(4) + obj_bytes(ws*8) + edges(num_edges*12)]
+      static const size_t BATCH_HDR_SIZE = 24;
+      static const size_t LOCAL_BATCH_BUF_SIZE = 4 * 1024 * 1024;
+      const bool use_batch_evict = backend->supports_batch_evict();
+      const size_t batch_buf_size =
+          MIN2(LOCAL_BATCH_BUF_SIZE, backend->max_batch_evict_message_size());
+      const size_t max_entry_payload =
+          use_batch_evict && batch_buf_size > BATCH_HDR_SIZE ?
+          (batch_buf_size - BATCH_HDR_SIZE) : (size_t)-1;
+
+      int* message_blockers_by_region = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
+      memset(message_blockers_by_region, 0, num_regions * sizeof(int));
+      int message_guarded_regions = 0;
+      int message_guarded_entries = 0;
+      int oversized_entries = 0;
+      size_t largest_oversized_entry = 0;
+      for (int e = 0; e < num_entries; e++) {
+        if (!entry_active[e]) continue;
+        PreparedEviction* pe = &entries[e];
+        size_t byte_size = pe->word_size * HeapWordSize;
+        uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
+        size_t edge_bytes = num_edges * 12;
+        size_t entry_size = 32 + byte_size + edge_bytes;
+        if (entry_size > max_entry_payload) {
+          HeapRegion* hr = _g1h->heap_region_containing(pe->obj);
+          uint idx = hr->hrm_index();
+          if (idx < num_regions) {
+            message_blockers_by_region[idx]++;
+          }
+          oversized_entries++;
+          largest_oversized_entry = MAX2(largest_oversized_entry, entry_size);
+        }
+      }
+      for (uint i = 0; i < num_regions; i++) {
+        if (message_blockers_by_region[i] == 0) continue;
+        if (!eviction_candidates[i]) continue;
+
+        int start = region_start[i];
+        int rcount = region_count_arr[i];
+        for (int e = start; e < start + rcount; e++) {
+          if (entry_active[e]) {
+            rmm->abort_prepared_eviction(&entries[e]);
+            entry_active[e] = false;
+            message_guarded_entries++;
+          }
+        }
+
+        HeapRegion* hr = _g1h->region_at(i);
+        eviction_candidates[i] = false;
+        region_complete[i] = false;
+        region_count_arr[i] = 0;
+        hr->clear_cold_destination();
+        regions_kept_alive++;
+        total_candidates--;
+        message_guarded_regions++;
+      }
+      FREE_C_HEAP_ARRAY(int, message_blockers_by_region);
+      if (message_guarded_regions > 0) {
+        log_warning(gc)("Pre-E message-size guard: removed %d regions, aborted %d "
+                        "prepared entries, found %d oversized entries "
+                        "(largest=" SIZE_FORMAT "KB, limit=" SIZE_FORMAT "KB)",
+                        message_guarded_regions, message_guarded_entries,
+                        oversized_entries, largest_oversized_entry / K,
+                        max_entry_payload / K);
+      }
+
+      bool* send_failed_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+      memset(send_failed_regions, 0, num_regions * sizeof(bool));
+      int send_failed_entries = 0;
+
+      if (num_entries > 0 && use_batch_evict && batch_buf_size > BATCH_HDR_SIZE) {
+        uint8_t* batch_buf = (uint8_t*)os::malloc(batch_buf_size, mtGC);
         size_t batch_offset = BATCH_HDR_SIZE;
         int batch_count = 0;
         int batch_start_entry = 0;
 
-        for (int e = 0; e < num_entries; e++) {
-          if (!entry_active[e]) continue;
-          PreparedEviction* pe = &entries[e];
-          size_t byte_size = pe->word_size * HeapWordSize;
-          uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
-          size_t edge_bytes = num_edges * 12;
-          size_t entry_size = 32 + byte_size + edge_bytes;
+        if (batch_buf == nullptr) {
+          log_warning(gc)("Pre-E batch send skipped: failed to allocate " SIZE_FORMAT
+                          "KB batch buffer; keeping prepared entries local",
+                          batch_buf_size / K);
+          for (uint i = 0; i < num_regions; i++) {
+            if (eviction_candidates[i] && region_count_arr[i] > 0) {
+              send_failed_regions[i] = true;
+            }
+          }
+        } else {
+          for (int e = 0; e < num_entries; e++) {
+            if (!entry_active[e]) continue;
+            PreparedEviction* pe = &entries[e];
+            size_t byte_size = pe->word_size * HeapWordSize;
+            uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
+            size_t edge_bytes = num_edges * 12;
+            size_t entry_size = 32 + byte_size + edge_bytes;
 
-          if (batch_count == 0) {
-            batch_start_entry = e;
+            if (entry_size > max_entry_payload) {
+              // Guard should have removed the containing region before E2.
+              rmm->abort_prepared_eviction(pe);
+              entry_active[e] = false;
+              continue;
+            }
+
+            if (batch_count == 0) {
+              batch_start_entry = e;
+            }
+
+            if (batch_offset + entry_size > batch_buf_size && batch_count > 0) {
+              *(uint32_t*)(batch_buf + 0) = 0x16; // CMD_BATCH_EVICT_WITH_EDGES
+              *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
+              *(uint64_t*)(batch_buf + 8) = 0;
+              *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
+              int rc = backend->batch_evict(batch_buf, batch_offset);
+              if (rc < 0) {
+                log_warning(gc)("Pre-E batch send failed for %d objects (" SIZE_FORMAT "KB); "
+                                "keeping affected regions local",
+                                batch_count, batch_offset / K);
+                for (int f = batch_start_entry; f < e; f++) {
+                  if (!entry_active[f]) continue;
+                  HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
+                  uint idx = hr->hrm_index();
+                  if (idx < num_regions) send_failed_regions[idx] = true;
+                  send_failed_entries++;
+                }
+              }
+              batches_sent++;
+              batch_offset = BATCH_HDR_SIZE;
+              batch_count = 0;
+              batch_start_entry = e;
+            }
+
+            *(uint64_t*)(batch_buf + batch_offset)      = (uint64_t)pe->slot_id;
+            *(uint64_t*)(batch_buf + batch_offset + 8)   = (uintptr_t)pe->handle;
+            *(uint64_t*)(batch_buf + batch_offset + 16)  = (uint64_t)(uintptr_t)pe->klass;
+            *(uint32_t*)(batch_buf + batch_offset + 24)  = (uint32_t)pe->word_size;
+            *(uint32_t*)(batch_buf + batch_offset + 28)  = num_edges;
+            memcpy(batch_buf + batch_offset + 32, cast_from_oop<void*>(pe->obj), byte_size);
+            {
+              uintptr_t* mw_in_buf = (uintptr_t*)(batch_buf + batch_offset + 32);
+              markWord mw(*mw_in_buf);
+              if (!mw.is_unlocked()) {
+                *mw_in_buf = markWord::prototype().value();
+              }
+            }
+            uint8_t* edge_ptr = batch_buf + batch_offset + 32 + byte_size;
+            if (pe->edge_table != nullptr) {
+              for (uint32_t j = 0; j < num_edges; j++) {
+                *(uint32_t*)(edge_ptr)     = pe->edge_table->_entries[j]._field_offset;
+                *(uint64_t*)(edge_ptr + 4) = (uintptr_t)pe->edge_table->_entries[j]._target_handle;
+                edge_ptr += 12;
+              }
+            }
+            batch_offset += entry_size;
+            batch_count++;
           }
 
-          if (batch_offset + entry_size > BATCH_BUF_SIZE && batch_count > 0) {
+          if (batch_count > 0) {
             *(uint32_t*)(batch_buf + 0) = 0x16; // CMD_BATCH_EVICT_WITH_EDGES
             *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
             *(uint64_t*)(batch_buf + 8) = 0;
             *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
             int rc = backend->batch_evict(batch_buf, batch_offset);
             if (rc < 0) {
-              for (int f = batch_start_entry; f < e; f++) {
+              log_warning(gc)("Pre-E batch send failed for %d objects (" SIZE_FORMAT "KB); "
+                              "keeping affected regions local",
+                              batch_count, batch_offset / K);
+              for (int f = batch_start_entry; f < num_entries; f++) {
                 if (!entry_active[f]) continue;
-                backend->evict(cast_from_oop<void*>(entries[f].obj), entries[f].word_size,
-                               entries[f].klass, entries[f].slot_id);
+                HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
+                uint idx = hr->hrm_index();
+                if (idx < num_regions) send_failed_regions[idx] = true;
+                send_failed_entries++;
               }
             }
             batches_sent++;
-            batch_offset = BATCH_HDR_SIZE;
-            batch_count = 0;
-            batch_start_entry = e;
           }
 
-          *(uint64_t*)(batch_buf + batch_offset)      = (uint64_t)pe->slot_id;
-          *(uint64_t*)(batch_buf + batch_offset + 8)   = (uintptr_t)pe->handle;
-          *(uint64_t*)(batch_buf + batch_offset + 16)  = (uint64_t)(uintptr_t)pe->klass;
-          *(uint32_t*)(batch_buf + batch_offset + 24)  = (uint32_t)pe->word_size;
-          *(uint32_t*)(batch_buf + batch_offset + 28)  = num_edges;
-          memcpy(batch_buf + batch_offset + 32, cast_from_oop<void*>(pe->obj), byte_size);
-          {
-            uintptr_t* mw_in_buf = (uintptr_t*)(batch_buf + batch_offset + 32);
-            markWord mw(*mw_in_buf);
-            if (!mw.is_unlocked()) {
-              *mw_in_buf = markWord::prototype().value();
-            }
+          os::free(batch_buf);
+        }
+      } else if (num_entries > 0 && use_batch_evict) {
+        log_warning(gc)("Pre-E batch send skipped: backend batch message limit "
+                        SIZE_FORMAT "B is too small; keeping prepared entries local",
+                        batch_buf_size);
+        for (uint i = 0; i < num_regions; i++) {
+          if (eviction_candidates[i] && region_count_arr[i] > 0) {
+            send_failed_regions[i] = true;
           }
-          uint8_t* edge_ptr = batch_buf + batch_offset + 32 + byte_size;
-          if (pe->edge_table != nullptr) {
+        }
+      } else if (num_entries > 0 && !use_batch_evict) {
+        for (int e = 0; e < num_entries; e++) {
+          if (!entry_active[e]) continue;
+          PreparedEviction* pe = &entries[e];
+          uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
+          G1RemoteBackend::EdgeInfo* edge_infos = nullptr;
+          if (num_edges > 0) {
+            edge_infos = NEW_C_HEAP_ARRAY(G1RemoteBackend::EdgeInfo, num_edges, mtGC);
             for (uint32_t j = 0; j < num_edges; j++) {
-              *(uint32_t*)(edge_ptr)     = pe->edge_table->_entries[j]._field_offset;
-              *(uint64_t*)(edge_ptr + 4) = (uintptr_t)pe->edge_table->_entries[j]._target_handle;
-              edge_ptr += 12;
+              edge_infos[j].field_offset = pe->edge_table->_entries[j]._field_offset;
+              edge_infos[j].target_handle_id =
+                  (uintptr_t)pe->edge_table->_entries[j]._target_handle;
             }
           }
-          batch_offset += entry_size;
-          batch_count++;
-        }
 
-        if (batch_count > 0) {
-          *(uint32_t*)(batch_buf + 0) = 0x16; // CMD_BATCH_EVICT_WITH_EDGES
-          *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
-          *(uint64_t*)(batch_buf + 8) = 0;
-          *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
-          int rc = backend->batch_evict(batch_buf, batch_offset);
-          if (rc < 0) {
-            for (int f = batch_start_entry; f < num_entries; f++) {
-              if (!entry_active[f]) continue;
-              backend->evict(cast_from_oop<void*>(entries[f].obj), entries[f].word_size,
-                             entries[f].klass, entries[f].slot_id);
-            }
+          size_t sid = backend->evict_with_edges(cast_from_oop<void*>(pe->obj),
+                                                 pe->word_size,
+                                                 pe->klass,
+                                                 (uintptr_t)pe->handle,
+                                                 edge_infos,
+                                                 num_edges,
+                                                 pe->slot_id);
+          if (edge_infos != nullptr) {
+            FREE_C_HEAP_ARRAY(G1RemoteBackend::EdgeInfo, edge_infos);
           }
-          batches_sent++;
+          if (sid == (size_t)-1) {
+            HeapRegion* hr = _g1h->heap_region_containing(pe->obj);
+            uint idx = hr->hrm_index();
+            if (idx < num_regions) send_failed_regions[idx] = true;
+            send_failed_entries++;
+          }
+        }
+      }
+
+      int send_failed_region_count = 0;
+      int send_failed_aborted = 0;
+      for (uint i = 0; i < num_regions; i++) {
+        if (!send_failed_regions[i]) continue;
+        if (!eviction_candidates[i]) continue;
+
+        int start = region_start[i];
+        int rcount = region_count_arr[i];
+        for (int e = start; e < start + rcount; e++) {
+          if (entry_active[e]) {
+            rmm->abort_prepared_eviction(&entries[e]);
+            entry_active[e] = false;
+            send_failed_aborted++;
+          }
         }
 
-        os::free(batch_buf);
+        HeapRegion* hr = _g1h->region_at(i);
+        eviction_candidates[i] = false;
+        region_complete[i] = false;
+        region_count_arr[i] = 0;
+        hr->clear_cold_destination();
+        regions_kept_alive++;
+        total_candidates--;
+        send_failed_region_count++;
+      }
+      FREE_C_HEAP_ARRAY(bool, send_failed_regions);
+      if (send_failed_region_count > 0) {
+        log_warning(gc)("Pre-E batch failure guard: removed %d regions, aborted %d "
+                        "prepared entries (%d send-failed entries observed)",
+                        send_failed_region_count, send_failed_aborted,
+                        send_failed_entries);
       }
       double e2_ms = (Ticks::now() - e2_start).seconds() * 1000.0;
 
