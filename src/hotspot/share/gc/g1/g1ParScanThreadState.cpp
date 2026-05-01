@@ -67,7 +67,11 @@ static bool should_record_remote_ref_sites(G1CollectedHeap* g1h) {
   if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
     const size_t local_capacity = (g1h->max_capacity() * LocalMemoryRatio) / 100;
     const size_t used = g1h->used();
-    return used >= (local_capacity * 60) / 100;
+    // Do not start object/ref-site tagging during the proactive tier. Spark NB
+    // creates dense tiny-object regions where object-granularity eviction is
+    // both expensive and currently unsafe. Delay recording until high pressure;
+    // page/region-oriented eviction should handle dense spatial-locality cases.
+    return used >= (local_capacity * 75) / 100;
   }
 
   return false;

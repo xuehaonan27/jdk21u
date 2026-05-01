@@ -1079,6 +1079,9 @@ static bool remote_eviction_parse_obj(HeapRegion* hr, HeapWord* p,
   if (p < hr->bottom() || p >= limit || p >= hr->end()) return false;
   if (!is_object_aligned((void*)p)) return false;
 
+  HeapWord* pb = hr->parsable_bottom_acquire();
+  if (!hr->block_is_obj(p, pb)) return false;
+
   oop obj = cast_to_oop(p);
   Klass* k = obj->klass_or_null();
   if (!remote_eviction_valid_klass(k)) return false;
@@ -2918,7 +2921,20 @@ public:
   bool rescue_unforwarded(oop* p, uintptr_t tag_bits, oop target) {
     if (!_allow_rescue) return false;
 
+    if (!is_valid_region_object(_g1h, target)) {
+      _invalid++;
+      return false;
+    }
+
     const size_t word_size = target->size();
+    if (word_size == 0 || word_size > HeapRegion::GrainWords) {
+      _rescue_failed++;
+      log_warning(gc)("Old/cset rescue SKIP: invalid target size target="
+                      PTR_FORMAT " size=" SIZE_FORMAT " failures=%d",
+                      p2i(target), word_size, _rescue_failed);
+      return false;
+    }
+
     const bool log_rescue = should_log_rescue();
     if (log_rescue) {
       log_debug(gc)("Old/cset rescue START: target=" PTR_FORMAT " size=" SIZE_FORMAT

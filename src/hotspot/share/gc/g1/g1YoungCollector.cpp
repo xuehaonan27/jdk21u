@@ -1651,8 +1651,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // When LocalMemoryRatio < 100, the real deadline is the process/cgroup
     // local capacity, not Xmx. Reserve headroom for native/RDMA/Spark memory
     // so heap growth does not reach the cgroup limit before eviction fires.
-    // Three tiers based on heap budget pressure (with allocation rate lookahead):
-    //   Tier 1 (>75%): proactive - evict cold old regions to 70% target
+    // Two active tiers based on heap budget pressure (with allocation rate
+    // lookahead). The old proactive T1 path did full object hotness/classify
+    // work for Spark NB but selected zero regions because all candidates were
+    // dense tiny-object regions. Keep object-granularity eviction dormant until
+    // pressure is high enough to justify its cost.
     //   Tier 2 (>85%): aggressive - evict old regions to 70% target
     //   Tier 3 (>95%): emergency - evict old regions to 60% target
     //
@@ -1695,18 +1698,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         } else if (pressure > 0.85) {
           eviction_tier = 2;
           target_low_percent = 70;
-        } else if (pressure > 0.75) {
-          eviction_tier = 1;
-          target_low_percent = 70;
         }
 
         if (eviction_tier > 0) {
           size_t target_low = (heap_budget * target_low_percent) / 100;
           evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
-          if (eviction_tier == 1) {
-            evict_batch_cap_bytes = HeapRegion::GrainBytes * 4;
-            evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
-          } else if (eviction_tier == 2) {
+          if (eviction_tier == 2) {
             evict_batch_cap_bytes = HeapRegion::GrainBytes * 8;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
           } else if (eviction_tier == 3) {
@@ -1762,6 +1759,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_dense_last_resort_candidates = 0;
         size_t path2_dense_last_resort_bytes = 0;
         size_t path2_dense_last_resort_objects = 0;
+        const bool allow_dense_object_granularity_eviction = false;
         bool unlimited = false;
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
         bool* dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
@@ -1841,12 +1839,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        sampled_bytes / M);
         }
 
-        // T1 is proactive: do not evict hot/unknown regions. Under higher local
-        // pressure, fall back to old regions after exhausting cold candidates.
-        // T2 still avoids dense tiny-object regions if any non-dense fallback
-        // exists. T3 is the memcg emergency path: allow a bounded dense batch,
-        // otherwise Spark's dense cached partitions can keep us at the cgroup
-        // edge while we evict only one 16M region per GC.
+        // Under higher local pressure, fall back to old regions after
+        // exhausting cold candidates. Dense tiny-object regions are deliberately
+        // excluded: object-granularity eviction of Spark's cached partitions
+        // has poor reclaim/fetch economics and currently leaves stale raw
+        // references. A region/page-granularity path should handle them.
         if (eviction_tier >= 2 && (unlimited || path2_bytes < evict_target_bytes)) {
           for (uint i = 0; i < num_regions; i++) {
             if (!unlimited && path2_bytes >= evict_target_bytes) break;
@@ -1886,7 +1883,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-        if (eviction_tier >= 2 && path2_bytes < evict_target_bytes) {
+        if (allow_dense_object_granularity_eviction &&
+            eviction_tier >= 2 && path2_bytes < evict_target_bytes) {
           size_t dense_last_resort_cap = HeapRegion::GrainBytes;
           if (eviction_tier >= 3) {
             size_t remaining_target = evict_target_bytes - path2_bytes;
