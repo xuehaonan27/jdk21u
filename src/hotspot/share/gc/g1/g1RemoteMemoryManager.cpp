@@ -56,7 +56,10 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _sim_remote_fetched_count(0), _gc_epoch(0),
     _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
     _remote_roots_capacity(0),
-    _cross_roots_count(0), _deferred_decrement_count(0),
+    _cross_roots_count(0),
+    _remote_collection_has_trace(false), _remote_collection_skipped(0),
+    _remote_collection_last_handles_allocated(0),
+    _deferred_decrement_count(0),
     _tagged_fields(nullptr), _tagged_field_count(0), _tagged_field_capacity(0),
     _fcr_evac_writes(0), _fcr_fixup_nulls(0),
     _resolve_fast_local(0), _resolve_fast_remote(0), _resolve_fast_fetching(0),
@@ -590,12 +593,17 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
   if (region_set == nullptr || num_regions == 0) return 0;
 
   int count = 0;
+  int stale_handles = 0;
 
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
     for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
       RemoteHandle* h = e->_handle;
       if (h == nullptr || !h->is_local() || h->remote_refcount() == 0) continue;
+      if (!validate_local_handle_addr(h, "ANCHOR-COLLECT",
+                                      &stale_handles, 8)) {
+        continue;
+      }
 
       uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
       if (addr == 0 || !_g1h->is_in((void*)addr)) continue;
@@ -617,6 +625,10 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
   for (int i = 0; i < _cross_roots_count; i++) {
     RemoteHandle* h = _cross_roots[i];
     if (h == nullptr || !h->is_local()) continue;
+    if (!validate_local_handle_addr(h, "CROSS-ROOT-COLLECT",
+                                    &stale_handles, 8)) {
+      continue;
+    }
 
     uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
     if (addr == 0 || !_g1h->is_in((void*)addr)) continue;
@@ -634,6 +646,11 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
     count++;
   }
   table_unlock();
+
+  if (stale_handles > 8) {
+    log_warning(gc)("Remote anchor collection marked %d stale LOCAL handles DEAD "
+                    "(logged first 8)", stale_handles);
+  }
 
   return count;
 }
@@ -1860,27 +1877,61 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
   return cl.stale() + raw_guarded;
 }
 
+bool G1RemoteMemoryManager::validate_local_handle_addr(RemoteHandle* h,
+                                                       const char* context,
+                                                       int* invalid_count,
+                                                       int log_limit) {
+  if (h == nullptr) return false;
+
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+  if (state != REMOTE_HANDLE_LOCAL) return false;
+
+  uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+  HeapRegion* hr = nullptr;
+  const char* reason = nullptr;
+
+  if (addr == 0) {
+    reason = "NULL";
+  } else if (!_g1h->is_in_reserved((void*)addr)) {
+    reason = "NOT IN HEAP";
+  } else {
+    hr = _g1h->heap_region_containing_or_null((void*)addr);
+    if (hr == nullptr) {
+      reason = "NO REGION";
+    } else if (hr->is_evict_guarded()) {
+      reason = "GUARDED";
+    } else if (hr->is_free()) {
+      reason = "FREE";
+    } else if ((HeapWord*)addr < hr->bottom() || (HeapWord*)addr >= hr->top()) {
+      reason = "OUTSIDE-TOP";
+    } else if (!_g1h->is_in((void*)addr)) {
+      reason = "NOT IN LIVE HEAP";
+    }
+  }
+
+  if (reason == nullptr) {
+    return true;
+  }
+
+  int ordinal = 1;
+  if (invalid_count != nullptr) {
+    ordinal = ++(*invalid_count);
+  }
+  if (log_limit < 0 || ordinal <= log_limit) {
+    log_warning(gc)("%s: stale LOCAL handle=" PTR_FORMAT " addr=" PTR_FORMAT
+                    " %s region=%u — marking DEAD (dormant=%d rc=%u)",
+                    context == nullptr ? "STALE-LOCAL-HANDLE" : context,
+                    p2i(h), p2i((void*)addr), reason,
+                    hr == nullptr ? 9999 : hr->hrm_index(),
+                    h->is_dormant() ? 1 : 0, h->remote_refcount());
+  }
+  h->set_dead();
+  return false;
+}
+
 bool G1RemoteMemoryManager::validate_anchor_addr(RemoteHandle* h) {
-  void* addr = h->local_addr();
-  if (addr == nullptr) return false;
-  if (!_g1h->is_in(addr)) {
-    log_warning(gc)("STALE-ANCHOR: handle=" PTR_FORMAT " addr=" PTR_FORMAT
-                    " NOT IN HEAP — marking DEAD (rc=%u)",
-                    p2i(h), p2i(addr), h->remote_refcount());
-    h->set_dead();
-    return false;
-  }
-  HeapRegion* hr = _g1h->heap_region_containing(addr);
-  if (hr->is_free() || hr->is_evict_guarded()) {
-    log_warning(gc)("STALE-ANCHOR: handle=" PTR_FORMAT " addr=" PTR_FORMAT
-                    " in %s region %u — marking DEAD (rc=%u)",
-                    p2i(h), p2i(addr),
-                    hr->is_evict_guarded() ? "GUARDED" : "FREE",
-                    hr->hrm_index(), h->remote_refcount());
-    h->set_dead();
-    return false;
-  }
-  return true;
+  return validate_local_handle_addr(h, "STALE-ANCHOR");
 }
 
 int G1RemoteMemoryManager::count_local_handles_in_region(HeapRegion* hr, int log_limit) {
@@ -1970,6 +2021,7 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
 
   uintptr_t base = (uintptr_t)dest;
   int patched = 0;
+  int stale_targets = 0;
   bool cm_active = concurrent_marking_active();
 
   size_t obj_byte_size = et->_eviction_word_size * HeapWordSize;
@@ -1983,11 +2035,22 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
               edge._field_offset, sizeof(uintptr_t), obj_byte_size);
     uintptr_t* field_addr = (uintptr_t*)(base + edge._field_offset);
     RemoteHandle* target = edge._target_handle;
+    if (target == nullptr) {
+      *field_addr = 0;
+      patched++;
+      continue;
+    }
 
     uintptr_t sa = target->load_state_and_addr_acquire();
     uintptr_t target_state = sa & REMOTE_HANDLE_STATE_MASK;
 
     if (target_state == REMOTE_HANDLE_DEAD) {
+      *field_addr = 0;
+      patched++;
+      if (cm_active) { defer_refcount_decrement(target); } else { target->decrement_remote_refcount(); }
+    } else if (target_state == REMOTE_HANDLE_LOCAL &&
+               !validate_local_handle_addr(target, "FETCH-PATCH",
+                                           &stale_targets, 16)) {
       *field_addr = 0;
       patched++;
       if (cm_active) { defer_refcount_decrement(target); } else { target->decrement_remote_refcount(); }
@@ -2000,6 +2063,11 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
       *field_addr = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)target;
       patched++;
     }
+  }
+
+  if (stale_targets > 16) {
+    log_warning(gc)("FETCH-PATCH: marked %d stale LOCAL target handles DEAD "
+                    "(logged first 16)", stale_targets);
   }
 
   // Enqueue dirty cards covering the fetched object into the G1 dirty card
@@ -2147,6 +2215,30 @@ static inline bool insert_remote_root_id(uintptr_t* dedup_set, size_t set_mask,
 }
 
 size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
+  size_t handles_allocated = _handle_allocator.total_handles_allocated();
+  if (_remote_collection_has_trace && G1RemoteCollectionInterval > 1) {
+    size_t handle_delta =
+        (handles_allocated >= _remote_collection_last_handles_allocated) ?
+        (handles_allocated - _remote_collection_last_handles_allocated) : 0;
+    bool interval_due =
+        (_remote_collection_skipped + 1) >= G1RemoteCollectionInterval;
+    bool growth_due =
+        G1RemoteCollectionHandleDelta > 0 &&
+        handle_delta >= G1RemoteCollectionHandleDelta;
+
+    if (!interval_due && !growth_due) {
+      _remote_collection_skipped++;
+      log_info(gc)("collect_dead: SKIP throttled (skipped=%u/%u, "
+                   "handles=%zu last=%zu delta=%zu threshold=%zu, "
+                   "tagged_entries=%d, retained_cross_roots=%d)",
+                   _remote_collection_skipped, G1RemoteCollectionInterval,
+                   handles_allocated, _remote_collection_last_handles_allocated,
+                   handle_delta, G1RemoteCollectionHandleDelta,
+                   _tagged_field_count, _cross_roots_count);
+      return 0;
+    }
+  }
+
   Ticks root_build_start = Ticks::now();
 
   // Build deduplicated root set from three sources:
@@ -2224,7 +2316,7 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   log_info(gc)("collect_dead: root-build %.1fms (tagged %.1fms, refcount %.1fms, "
                "dedup_cap=%zu, handles_allocated=%zu, tagged_entries=%d)",
                root_build_ms, tagged_ms, refcount_ms, set_capacity,
-               _handle_allocator.total_handles_allocated(), _tagged_field_count);
+               handles_allocated, _tagged_field_count);
 
   log_info(gc)("collect_dead: roots: %d CM + %d tagged-fields + %d refcount = %d unique "
                "(%zu remote handles)",
@@ -2253,6 +2345,9 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
                              &cross_src, &cross_tgt, &num_cross);
   log_info(gc)("collect_dead: trace_and_report DONE (dead=%zu freed=%zu cross=%zu)",
                num_dead, bytes_freed, num_cross);
+  _remote_collection_has_trace = true;
+  _remote_collection_skipped = 0;
+  _remote_collection_last_handles_allocated = handles_allocated;
 
   // Step 2c: Populate cross-boundary roots.
   // Cross-edges: live REMOTE handle → LOCAL handle.
@@ -2368,6 +2463,7 @@ int G1RemoteMemoryManager::fixup_all_local_handles() {
   size_t local_seen = 0;
   size_t rekeyed = 0;
   size_t stale_region = 0;
+  int stale_killed = 0;
   size_t null_handles = 0;
   size_t non_empty_buckets = 0;
   size_t longest_bucket = 0;
@@ -2457,23 +2553,14 @@ int G1RemoteMemoryManager::fixup_all_local_handles() {
       local_seen++;
 
       uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
-      if (addr == 0) {
-        pp = &e->_next;
-        continue;
-      }
-      oop target = cast_to_oop(addr);
-      if (!_g1h->is_in(target)) {
-        pp = &e->_next;
-        continue;
-      }
-
-      HeapRegion* hr = _g1h->heap_region_containing(target);
-      if (hr != nullptr && (hr->is_free() || hr->is_evict_guarded())) {
+      if (!validate_local_handle_addr(h, "HANDLE-FIXUP",
+                                      &stale_killed, 16)) {
         stale_region++;
         pp = &e->_next;
         continue;
       }
 
+      oop target = cast_to_oop(addr);
       markWord m = target->mark();
       if (m.is_marked()) {
         oop forwardee = cast_to_oop(m.decode_pointer());
@@ -2504,10 +2591,14 @@ int G1RemoteMemoryManager::fixup_all_local_handles() {
   double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
   log_info(gc)("Handle table fixup DONE: %.1fms scanned=%zu local=%zu updated=%d "
                "rekeyed=%zu non_empty_buckets=%zu longest_bucket=%zu "
-               "stale_region=%zu null_handles=%zu corrupt_buckets=%zu",
+               "stale_region=%zu stale_killed=%d null_handles=%zu corrupt_buckets=%zu",
                elapsed_ms, scanned, local_seen, updated, rekeyed,
                non_empty_buckets, longest_bucket, stale_region,
-               null_handles, corrupt_buckets);
+               stale_killed, null_handles, corrupt_buckets);
+  if (stale_killed > 16) {
+    log_warning(gc)("Handle table fixup marked %d stale LOCAL handles DEAD "
+                    "(logged first 16)", stale_killed);
+  }
   if (corrupt_buckets > 0) {
     log_warning(gc)("Handle table fixup saw %zu corrupt buckets; table mutation "
                     "paths need follow-up locking/cycle investigation",
@@ -2520,6 +2611,40 @@ int G1RemoteMemoryManager::fixup_all_local_handles() {
     log_info(gc)("Handle table fixup: %d LOCAL handles updated for forwarded objects", updated);
   }
   return updated;
+}
+
+int G1RemoteMemoryManager::purge_stale_local_handles(const char* phase, int log_limit) {
+  Ticks start = Ticks::now();
+  size_t scanned = 0;
+  size_t local_seen = 0;
+  int stale_killed = 0;
+
+  table_lock();
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      RemoteHandle* h = e->_handle;
+      scanned++;
+      if (h != nullptr && h->is_local()) {
+        local_seen++;
+        validate_local_handle_addr(h,
+                                   phase == nullptr ? "STALE-HANDLE-SWEEP" : phase,
+                                   &stale_killed,
+                                   log_limit);
+      }
+      e = e->_next;
+    }
+  }
+  table_unlock();
+
+  if (stale_killed > 0) {
+    double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
+    log_warning(gc)("%s: marked %d stale LOCAL handles DEAD in %.1fms "
+                    "(scanned=%zu local=%zu)",
+                    phase == nullptr ? "STALE-HANDLE-SWEEP" : phase,
+                    stale_killed, elapsed_ms, scanned, local_seen);
+  }
+  return stale_killed;
 }
 
 static bool is_valid_region_object(G1CollectedHeap* g1h, oop obj, HeapRegion** region_out = nullptr) {

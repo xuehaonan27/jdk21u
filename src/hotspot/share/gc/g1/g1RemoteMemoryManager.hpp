@@ -593,6 +593,13 @@ public:
   RemoteHandle* _cross_roots[MAX_CROSS_ROOTS];
   int           _cross_roots_count;
 
+  // Full remote trace-and-report is expensive after bulk eviction. Dead
+  // handles are currently reported but not reclaimed, so repeated traces are
+  // only needed to refresh cross-boundary roots and executor liveness state.
+  bool   _remote_collection_has_trace;
+  uint   _remote_collection_skipped;
+  size_t _remote_collection_last_handles_allocated;
+
 public:
   // Deferred remote_refcount decrements (P13: SATB safety).
   // During concurrent marking, refcount decrements are buffered here
@@ -663,6 +670,7 @@ public:
   // entries (fields no longer tagged). Returns number of handles updated.
   int fixup_tagged_field_handles();
   int fixup_all_local_handles();
+  int purge_stale_local_handles(const char* phase, int log_limit = 16);
 
   // Post-evacuation fixup: scan ALL old regions for refs to
   // collection-set regions. Must be called BEFORE free_collection_set.
@@ -972,8 +980,9 @@ public:
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
   // For each edge entry:
-  //   - target LOCAL  → patch field to clean oop(current_addr)
+  //   - target LOCAL  → patch field to shared_oop(target_handle)
   //   - target REMOTE → patch field to shared_oop(target_handle)
+  //   - target stale  → mark target DEAD and patch field to null
   //   - target DEAD   → patch field to null
   // Decrements remote_refcount on each target Handle.
   // Removes the edge table after patching.
@@ -981,6 +990,9 @@ public:
 
   // Returns true if the Handle's local address points to a valid live heap region.
   // If stale (freed/guarded/out-of-heap), logs a warning and marks the Handle DEAD.
+  bool validate_local_handle_addr(RemoteHandle* h, const char* context,
+                                  int* invalid_count = nullptr,
+                                  int log_limit = 32);
   bool validate_anchor_addr(RemoteHandle* h);
 };
 
@@ -996,6 +1008,7 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
   struct MovedEntry { HandleEntry* entry; uintptr_t old_addr; };
   MovedEntry moved[MAX_MOVED];
   int num_moved = 0;
+  int stale_anchors = 0;
 
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
     HandleEntry* e = _table[idx];
@@ -1004,7 +1017,8 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
       if (h != nullptr && h->is_local() && h->remote_refcount() > 0) {
         // Use Handle's live LOCAL target, not potentially stale table key.
         oop obj = cast_to_oop(h->local_addr());
-        if (obj == nullptr || !validate_anchor_addr(h)) {
+        if (obj == nullptr ||
+            !validate_local_handle_addr(h, "STALE-ANCHOR", &stale_anchors, 16)) {
           e = e->_next;
           continue;
         }
@@ -1024,6 +1038,11 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
       }
       e = e->_next;
     }
+  }
+
+  if (stale_anchors > 16) {
+    log_warning(gc)("STALE-ANCHOR: marked %d stale LOCAL anchor handles DEAD "
+                    "(logged first 16)", stale_anchors);
   }
 
   // Rehash moved entries: unlink from old bucket, insert into new
@@ -1054,10 +1073,15 @@ void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
   struct MovedEntry { HandleEntry* entry; uintptr_t old_addr; };
   MovedEntry moved[MAX_MOVED];
   int num_moved = 0;
+  int stale_cross_roots = 0;
 
   for (int i = 0; i < _cross_roots_count; i++) {
     RemoteHandle* h = _cross_roots[i];
     if (h == nullptr || !h->is_local()) continue;
+    if (!validate_local_handle_addr(h, "STALE-CROSS-ROOT",
+                                    &stale_cross_roots, 16)) {
+      continue;
+    }
     uintptr_t old_addr = (uintptr_t)h->local_addr();
     oop obj = cast_to_oop(h->local_addr());
     if (obj == nullptr || obj->klass_or_null() == nullptr) continue;
@@ -1077,6 +1101,11 @@ void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
         }
       }
     }
+  }
+
+  if (stale_cross_roots > 16) {
+    log_warning(gc)("STALE-CROSS-ROOT: marked %d stale LOCAL cross-root handles "
+                    "DEAD (logged first 16)", stale_cross_roots);
   }
 
   for (int i = 0; i < num_moved; i++) {

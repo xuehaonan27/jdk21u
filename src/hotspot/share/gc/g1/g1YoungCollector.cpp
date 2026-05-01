@@ -1415,6 +1415,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   }
   log_trace(gc)(">>>   post_evacuate_cleanup_2 DONE");
 
+  if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
+    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      rmm->purge_stale_local_handles("POST-FREE-HANDLE-SWEEP", 16);
+    }
+  }
+
   _evac_failure_regions.post_collection();
 
   assert_used_and_recalculate_used_equal(_g1h);
@@ -3025,6 +3032,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         log_warning(gc)("POST-EVICTION: %d root oops point into %d freed regions!",
                         vr.bad(), regions_evicted);
       }
+    }
+
+    if (regions_evicted > 0) {
+      rmm->purge_stale_local_handles("POST-REMOTE-EVICTION-HANDLE-SWEEP", 16);
     }
 
     if (G1VerifyAfterEviction && regions_evicted > 0) {

@@ -337,6 +337,15 @@
           "does not resume with raw oop temporaries into mprotected "         \
           "evicted regions.")                                                \
                                                                             \
+  product(uint, G1RemoteCollectionInterval, 8, DIAGNOSTIC,                   \
+          "Minimum number of young GC cycles between remote trace-and-report "\
+          "collections after one successful trace. 1 traces every GC.")       \
+                                                                            \
+  product(size_t, G1RemoteCollectionHandleDelta, 256*K, DIAGNOSTIC,          \
+          "Force remote trace-and-report before the interval expires when "   \
+          "the allocated remote handle count grows by this many handles. "    \
+          "0 disables the handle-growth trigger.")                           \
+                                                                            \
   product(uintx, G1PeriodicGCInterval, 0, MANAGEABLE,                       \
           "Number of milliseconds after a previous GC to wait before "      \
           "triggering a periodic gc. A value of zero disables periodically "\
