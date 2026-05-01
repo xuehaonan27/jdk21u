@@ -119,7 +119,30 @@ static bool local_handle_addr_is_stale(G1CollectedHeap* g1h, uintptr_t addr,
   if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
     return true;
   }
-  return !g1h->is_in((void*)addr);
+  if (!g1h->is_in((void*)addr)) {
+    return true;
+  }
+
+  oop obj = cast_to_oop((HeapWord*)addr);
+  Klass* k = obj->klass_or_null();
+  return k == nullptr || G1CollectedHeap::is_obj_filler(obj);
+}
+
+static const char* stale_local_addr_reason(G1CollectedHeap* g1h, uintptr_t addr,
+                                           HeapRegion* hr) {
+  if (addr == 0) return "NULL";
+  if (g1h == nullptr) return "NO-HEAP";
+  if (!g1h->is_in_reserved((void*)addr)) return "NOT-IN-HEAP";
+  if (hr == nullptr) return "NO-HR";
+  if (hr->is_evict_guarded()) return "GUARDED";
+  if (hr->is_free()) return "FREE";
+  if (!g1h->is_in((void*)addr)) return "OUTSIDE-LIVE";
+
+  oop obj = cast_to_oop((HeapWord*)addr);
+  Klass* k = obj->klass_or_null();
+  if (k == nullptr) return "NULL-KLASS";
+  if (G1CollectedHeap::is_obj_filler(obj)) return "FILLER";
+  return "STALE";
 }
 
 static oopDesc* resolve_local_handle_addr(RemoteHandle* h, uintptr_t addr,
@@ -175,7 +198,7 @@ static oopDesc* resolve_local_handle_addr(RemoteHandle* h, uintptr_t addr,
   log_warning(gc)("%s: stale LOCAL handle " PTR_FORMAT " addr=" PTR_FORMAT
                   " points into %s region %u; returning nullptr",
                   caller, p2i(h), p2i((void*)addr),
-                  hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                  stale_local_addr_reason(g1h, addr, hr),
                   hr == nullptr ? 9999 : hr->hrm_index());
   return nullptr;
 }
@@ -211,7 +234,14 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
       G1CollectedHeap* g1h = G1CollectedHeap::heap();
       if (g1h != nullptr && g1h->is_in_reserved((void*)v)) {
         HeapRegion* hr = g1h->heap_region_containing_or_null((void*)v);
-        if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+        bool stale_raw = hr == nullptr || hr->is_free() || hr->is_evict_guarded() ||
+                         !g1h->is_in((void*)v);
+        if (!stale_raw) {
+          oop obj = cast_to_oop((HeapWord*)v);
+          Klass* k = obj->klass_or_null();
+          stale_raw = k == nullptr || G1CollectedHeap::is_obj_filler(obj);
+        }
+        if (stale_raw) {
           G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
           RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(v);
           if (h != nullptr) {
@@ -300,8 +330,9 @@ class PostFetchValidateClosure : public BasicOopIterateClosure {
                     (unsigned)mw_age, mw_hint);
   }
 
-  void repair_stale(oop* p, uintptr_t raw, HeapRegion* hr) {
+  void repair_stale(oop* p, uintptr_t raw, HeapRegion* hr, const char* reason = nullptr) {
     uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
+    const char* target_state = reason != nullptr ? reason : stale_local_addr_reason(_g1h, raw, hr);
     RemoteHandle* h = _rmm == nullptr ? nullptr : _rmm->handle_for_addr_any_state(raw);
     if (h != nullptr) {
       uintptr_t sa = h->load_state_and_addr_acquire();
@@ -312,9 +343,10 @@ class PostFetchValidateClosure : public BasicOopIterateClosure {
         if (_stale_patched <= 20) {
           log_warning(gc)("POST-FETCH STALE-FIELD: obj=" PTR_FORMAT " klass=%s offset=%u "
                           "raw=" PTR_FORMAT " -> shared handle=" PTR_FORMAT
-                          " state=0x%lx region=%u",
+                          " state=0x%lx target=%s region=%u",
                           p2i((void*)_obj), obj_klass_name(), off,
                           p2i((void*)raw), p2i(h), (unsigned long)state,
+                          target_state,
                           hr == nullptr ? 9999 : hr->hrm_index());
         }
         return;
@@ -329,7 +361,7 @@ class PostFetchValidateClosure : public BasicOopIterateClosure {
                       "raw=" PTR_FORMAT " in %s region %u has no live handle; nulled",
                       p2i((void*)_obj), obj_klass_name(), off,
                       p2i((void*)raw),
-                      hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                      target_state,
                       hr == nullptr ? 9999 : hr->hrm_index());
     }
   }
@@ -367,12 +399,11 @@ public:
     oop target = cast_to_oop(raw);
     Klass* tk = target->klass_or_null();
     if (tk == nullptr) {
-      uint32_t off = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_obj));
-      log_warning(gc)("POST-FETCH CORRUPT: obj=" PTR_FORMAT " klass=%s offset=%u "
-                      "target=" PTR_FORMAT " has null klass",
-                      p2i((void*)_obj), obj_klass_name(), off, raw);
-      *(uintptr_t*)p = 0;
-      _bad++;
+      repair_stale(p, raw, hr, "NULL-KLASS");
+      return;
+    }
+    if (G1CollectedHeap::is_obj_filler(target)) {
+      repair_stale(p, raw, hr, "FILLER");
     }
   }
   virtual void do_oop(narrowOop* p) {}

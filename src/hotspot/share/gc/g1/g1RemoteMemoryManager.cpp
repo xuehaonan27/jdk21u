@@ -1669,19 +1669,24 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
       }
 
       HeapRegion* hr = _g1h->heap_region_containing_or_null(target);
-      bool is_stale = (hr == nullptr);
+      const char* stale_reason = nullptr;
 
-      if (!is_stale) {
-        is_stale = hr->is_free() || hr->is_evict_guarded();
-      }
-      if (!is_stale) {
+      if (hr == nullptr) {
+        stale_reason = "NO-HR";
+      } else if (hr->is_free()) {
+        stale_reason = "FREE";
+      } else if (hr->is_evict_guarded()) {
+        stale_reason = "GUARDED";
+      } else {
         Klass* k = target->klass_or_null();
         if (k == nullptr) {
-          is_stale = true;
+          stale_reason = "NULL-KLASS";
+        } else if (G1CollectedHeap::is_obj_filler(target)) {
+          stale_reason = "FILLER";
         }
       }
 
-      if (is_stale) {
+      if (stale_reason != nullptr) {
         _stale++;
         if (_stale <= 50) {
           const char* src_kind = _is_root ? _root_kind : "HEAP";
@@ -1712,7 +1717,7 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
                           " card=0x%02x fcr_tagged=%s src_type=%s)",
                           src_kind, p2i(p), (unsigned long)raw,
                           p2i((void*)target),
-                          hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                          stale_reason,
                           hr == nullptr ? 9999 : hr->hrm_index(),
                           p2i((void*)_cur_obj), src_klass, src_region,
                           (unsigned)card_val,
@@ -1739,7 +1744,14 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
               else { slot_target = cast_to_oop(v); }
               if (!_g1h->is_in(slot_target)) { continue; }
               HeapRegion* slot_hr = _g1h->heap_region_containing(slot_target);
-              if (slot_hr != nullptr && (slot_hr->is_free() || slot_hr->is_evict_guarded())) {
+              bool slot_stale = slot_hr == nullptr || slot_hr->is_free() ||
+                                slot_hr->is_evict_guarded();
+              if (!slot_stale) {
+                Klass* slot_k = slot_target->klass_or_null();
+                slot_stale = slot_k == nullptr ||
+                             G1CollectedHeap::is_obj_filler(slot_target);
+              }
+              if (slot_stale) {
                 n_stale_card++;
               } else {
                 n_live++;
@@ -1907,6 +1919,14 @@ bool G1RemoteMemoryManager::validate_local_handle_addr(RemoteHandle* h,
       reason = "OUTSIDE-TOP";
     } else if (!_g1h->is_in((void*)addr)) {
       reason = "NOT IN LIVE HEAP";
+    } else {
+      oop obj = cast_to_oop((HeapWord*)addr);
+      Klass* k = obj->klass_or_null();
+      if (k == nullptr) {
+        reason = "NULL-KLASS";
+      } else if (G1CollectedHeap::is_obj_filler(obj)) {
+        reason = "FILLER";
+      }
     }
   }
 
