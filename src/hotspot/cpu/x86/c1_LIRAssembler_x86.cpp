@@ -1882,9 +1882,11 @@ void LIR_Assembler::emit_opTypeCheck(LIR_OpTypeCheck* op) {
 #if INCLUDE_G1GC
     if (UseRemoteExecutor || LocalMemoryRatio < 100 ||
         G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
-      // C1 store checks read value->klass directly.  A value that survived in
-      // compiled state across remote eviction can be a clean pre-eviction oop
-      // into a guarded/free region, so resolve it before the klass load.
+      // C1 store checks read value->klass directly. Resolve tagged values
+      // before the klass load, but keep clean local oops on the fast path.
+      Label value_resolved;
+      __ testptr(value, value);
+      __ jcc(Assembler::positive, value_resolved);
       __ push(rbx);
       __ push_call_clobbered_registers();
       if (value != c_rarg0) {
@@ -1899,6 +1901,7 @@ void LIR_Assembler::emit_opTypeCheck(LIR_OpTypeCheck* op) {
         __ movptr(value, rbx);
         __ pop(rbx);
       }
+      __ bind(value_resolved);
     }
 #endif
 
