@@ -151,11 +151,11 @@ static oopDesc* resolve_local_handle_addr(RemoteHandle* h, uintptr_t addr,
       uintptr_t alt_addr = alt_sa & REMOTE_HANDLE_ADDR_MASK;
       HeapRegion* alt_hr = nullptr;
       if (!local_handle_addr_is_stale(g1h, alt_addr, &alt_hr)) {
-        log_warning(gc)("%s: redirected stale LOCAL handle " PTR_FORMAT
-                        " addr=" PTR_FORMAT " to duplicate LOCAL handle "
-                        PTR_FORMAT " addr=" PTR_FORMAT,
-                        caller, p2i(h), p2i((void*)addr),
-                        p2i(alt), p2i((void*)alt_addr));
+        log_debug(gc)("%s: redirected stale LOCAL handle " PTR_FORMAT
+                      " addr=" PTR_FORMAT " to duplicate LOCAL handle "
+                      PTR_FORMAT " addr=" PTR_FORMAT,
+                      caller, p2i(h), p2i((void*)addr),
+                      p2i(alt), p2i((void*)alt_addr));
         return (oopDesc*)alt_addr;
       }
     } else if (alt_state == REMOTE_HANDLE_REMOTE ||
@@ -163,11 +163,11 @@ static oopDesc* resolve_local_handle_addr(RemoteHandle* h, uintptr_t addr,
       if (redirect_out != nullptr) {
         *redirect_out = alt;
       }
-      log_warning(gc)("%s: redirected stale LOCAL handle " PTR_FORMAT
-                      " addr=" PTR_FORMAT " to duplicate remote handle "
-                      PTR_FORMAT " state=0x%lx",
-                      caller, p2i(h), p2i((void*)addr), p2i(alt),
-                      (unsigned long)alt_state);
+      log_debug(gc)("%s: redirected stale LOCAL handle " PTR_FORMAT
+                    " addr=" PTR_FORMAT " to duplicate remote handle "
+                    PTR_FORMAT " state=0x%lx",
+                    caller, p2i(h), p2i((void*)addr), p2i(alt),
+                    (unsigned long)alt_state);
       return nullptr;
     }
   }

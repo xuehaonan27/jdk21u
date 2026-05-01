@@ -29,16 +29,43 @@
 
 #include "gc/g1/g1BarrierSetRuntime.hpp"
 #include "gc/g1/g1CardTable.hpp"
-#include "gc/g1/g1CollectedHeap.hpp"
+#include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
+#include "gc/g1/heapRegion.hpp"
 #include "gc/shared/accessBarrierSupport.inline.hpp"
 #include "memory/universe.hpp"
 #include "oops/access.inline.hpp"
 #include "oops/compressedOops.inline.hpp"
 #include "oops/oop.hpp"
 #include "runtime/thread.hpp"
+
+static inline bool g1_remote_mode_active() {
+  return UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+         G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
+}
+
+static inline bool g1_needs_remote_resolve(oop value) {
+  if (value == nullptr) return false;
+
+  uintptr_t v = cast_from_oop<uintptr_t>(value);
+  if ((v & G1_OOP_TAG_MASK) != 0) return true;
+  if (!g1_remote_mode_active()) return false;
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  if (g1h == nullptr || !g1h->is_in_reserved((void*)v)) return false;
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null((void*)v);
+  return hr == nullptr || hr->is_free() || hr->is_evict_guarded();
+}
+
+static inline oop g1_resolve_remote_oop_if_needed(oop value) {
+  if (g1_needs_remote_resolve(value)) {
+    return cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_slow((oopDesc*)value));
+  }
+  return value;
+}
 
 inline void G1BarrierSet::enqueue_preloaded(oop pre_val) {
   // Nulls should have been already filtered.
@@ -140,13 +167,7 @@ oop_load_in_heap(T* addr) {
   // === Disaggregated Memory Load Barrier ===
   // Resolve tagged oops, and in remote mode also clean stale oops whose
   // old local region has since been evict-guarded.
-  uintptr_t v = cast_from_oop<uintptr_t>(value);
-  if (value != nullptr &&
-      ((v & G1_OOP_TAG_MASK) != 0 ||
-       UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
-    value = cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_slow((oopDesc*)v));
-  }
+  value = g1_resolve_remote_oop_if_needed(value);
 
   guarantee(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
             "oop_load_in_heap: barrier returned tagged value " PTR_FORMAT " from addr " PTR_FORMAT,
@@ -159,10 +180,8 @@ oop_load_in_heap(T* addr) {
 template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_in_heap_at(oop base, ptrdiff_t offset) {
-  if (base != nullptr &&
-      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
-    base = resolve_oop_full(base);
+  if (g1_needs_remote_resolve(base)) {
+    base = g1_resolve_remote_oop_if_needed(base);
     if (base == nullptr) {
       return nullptr;
     }
@@ -174,13 +193,7 @@ oop_load_in_heap_at(oop base, ptrdiff_t offset) {
             cast_from_oop<uintptr_t>(base), (intx)offset);
   oop value = ModRef::oop_load_in_heap_at(base, offset);
   // Resolve tagged oops and clean stale oops via the centralized runtime.
-  uintptr_t v = cast_from_oop<uintptr_t>(value);
-  if (value != nullptr &&
-      ((v & G1_OOP_TAG_MASK) != 0 ||
-       UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
-    value = cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_slow((oopDesc*)v));
-  }
+  value = g1_resolve_remote_oop_if_needed(value);
   assert(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
          "oop_load_in_heap_at: barrier returned tagged " PTR_FORMAT " base=" PTR_FORMAT " off=" INTX_FORMAT,
          cast_from_oop<uintptr_t>(value), cast_from_oop<uintptr_t>(base), (intx)offset);
@@ -271,26 +284,16 @@ template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap(T* addr, oop new_value) {
-  if (new_value != nullptr &&
-      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
-    new_value = resolve_oop_full(new_value);
-  }
+  new_value = g1_resolve_remote_oop_if_needed(new_value);
   ModRef::oop_store_in_heap(addr, new_value);
 }
 
 template <DecoratorSet decorators, typename BarrierSetT>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
-  if (new_value != nullptr &&
-      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
-    new_value = resolve_oop_full(new_value);
-  }
-  if (base != nullptr &&
-      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
-    base = resolve_oop_full(base);
+  new_value = g1_resolve_remote_oop_if_needed(new_value);
+  if (g1_needs_remote_resolve(base)) {
+    base = g1_resolve_remote_oop_if_needed(base);
     if (base == nullptr) {
       return;
     }
@@ -339,10 +342,8 @@ oop_atomic_cmpxchg_in_heap(T* addr, oop compare_value, oop new_value) {
 template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_atomic_cmpxchg_in_heap_at(oop base, ptrdiff_t offset, oop compare_value, oop new_value) {
-  if (base != nullptr &&
-      (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
-    base = resolve_oop_full(base);
+  if (g1_needs_remote_resolve(base)) {
+    base = g1_resolve_remote_oop_if_needed(base);
     if (base == nullptr) {
       return nullptr;
     }
