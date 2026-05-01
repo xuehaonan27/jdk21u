@@ -2437,7 +2437,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       {
       Ticks phase_e_start = Ticks::now();
 
-      // E1: Prepare all evictions (build edge tables, assign slot_ids).
+      // E1: Collect eviction metadata. Edge tables and backend slots are
+      // finished after late guards so rejected dense regions are cheap to drop.
       typedef G1RemoteMemoryManager::PreparedEviction PreparedEviction;
       int max_entries = 0;
       for (uint i = 0; i < num_regions; i++) {
@@ -2471,7 +2472,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             continue;
           }
           size_t sz = obj->size();
-          if (rmm->prepare_eviction(obj, &hab, &entries[num_entries])) {
+          if (rmm->prepare_eviction_metadata(obj, &hab, &entries[num_entries])) {
             entry_active[num_entries] = true;
             num_entries++;
             rcount++;
@@ -2485,7 +2486,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         region_complete[i] = all_prepared;
       }
       double e1_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;
-      G1RemoteMemoryManager::log_prepare_eviction_stats();
 
       // E1.5: Partial-region eviction salvage.
       //
@@ -2654,6 +2654,70 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                      handle_guarded_regions, handle_guarded_entries,
                      handle_blockers);
       }
+
+      // E1.7: Finish preparation only for entries that survived late guards.
+      // Building edge tables before the local-handle guard made each rejected
+      // dense region unwind tens of thousands of edge tables during STW.
+      Ticks e1_7_start = Ticks::now();
+      RemoteHandleAllocBuffer finish_hab;
+      bool* finish_failed_region_set = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+      memset(finish_failed_region_set, 0, num_regions * sizeof(bool));
+      int finish_success_entries = 0;
+      int finish_failed_entries = 0;
+      int finish_failed_regions = 0;
+      int finish_failed_aborted = 0;
+      for (int e = 0; e < num_entries; e++) {
+        if (!entry_active[e]) continue;
+        HeapRegion* hr = _g1h->heap_region_containing(entries[e].obj);
+        if (hr == nullptr) {
+          entry_active[e] = false;
+          finish_failed_entries++;
+          continue;
+        }
+        uint idx = hr->hrm_index();
+        if (idx >= num_regions || finish_failed_region_set[idx]) {
+          entry_active[e] = false;
+          continue;
+        }
+        if (rmm->finish_prepared_eviction(&entries[e], &finish_hab)) {
+          finish_success_entries++;
+        } else {
+          finish_failed_region_set[idx] = true;
+          entry_active[e] = false;
+          finish_failed_entries++;
+        }
+      }
+      for (uint i = 0; i < num_regions; i++) {
+        if (!finish_failed_region_set[i]) continue;
+        if (!eviction_candidates[i]) continue;
+
+        int start = region_start[i];
+        int rcount = region_count_arr[i];
+        for (int e = start; e < start + rcount; e++) {
+          if (entry_active[e]) {
+            rmm->abort_prepared_eviction(&entries[e]);
+            entry_active[e] = false;
+            finish_failed_aborted++;
+          }
+        }
+
+        HeapRegion* hr = _g1h->region_at(i);
+        eviction_candidates[i] = false;
+        region_complete[i] = false;
+        region_count_arr[i] = 0;
+        hr->clear_cold_destination();
+        regions_kept_alive++;
+        total_candidates--;
+        finish_failed_regions++;
+      }
+      FREE_C_HEAP_ARRAY(bool, finish_failed_region_set);
+      double e1_7_ms = (Ticks::now() - e1_7_start).seconds() * 1000.0;
+      e1_ms += e1_7_ms;
+      G1RemoteMemoryManager::log_prepare_eviction_stats();
+      log_info(gc)("Phase E finish prepare: %.1fms (%d entries finished, %d failed, "
+                   "%d regions removed, %d finished entries aborted)",
+                   e1_7_ms, finish_success_entries, finish_failed_entries,
+                   finish_failed_regions, finish_failed_aborted);
 
       // E2: Batch-send to remote backend.
       Ticks e2_start = Ticks::now();

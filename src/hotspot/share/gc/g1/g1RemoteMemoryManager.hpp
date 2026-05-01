@@ -884,8 +884,15 @@ public:
     ObjectEdgeTable* edge_table;
   };
 
-  // Prepare: safety checks, handle lookup, edge table build.
-  // Does NOT send to backend. Returns false if object is unevictable.
+  // Prepare metadata: safety checks and handle lookup only. This is used before
+  // late region guards, so rejected regions do not need to unwind edge tables.
+  bool prepare_eviction_metadata(oop obj, RemoteHandleAllocBuffer* hab, PreparedEviction* out);
+
+  // Finish preparation for entries that survived late guards: build edge table
+  // and assign backend slot. Does NOT send to backend.
+  bool finish_prepared_eviction(PreparedEviction* entry, RemoteHandleAllocBuffer* hab);
+
+  // Prepare: metadata + finish. Does NOT send to backend.
   bool prepare_eviction(oop obj, RemoteHandleAllocBuffer* hab, PreparedEviction* out);
   static void log_prepare_eviction_stats();
 
