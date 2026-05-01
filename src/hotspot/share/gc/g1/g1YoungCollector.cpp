@@ -1435,20 +1435,26 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
+      const bool remote_activity = has_remote_heap_activity(rmm);
+      const int tagged_count = rmm->tagged_field_count();
       Ticks fixup_start = Ticks::now();
       int tagged_updated = 0;
       int local_updated = 0;
-      log_info(gc)("Remote handle post-evac fixup START (tagged_entries=%d)",
-                   rmm->tagged_field_count());
-      if (rmm->tagged_field_count() > 0) {
-        tagged_updated = rmm->fixup_tagged_field_handles();
+      if (remote_activity || tagged_count > 0) {
+        log_info(gc)("Remote handle post-evac fixup START (tagged_entries=%d)",
+                     tagged_count);
+        if (tagged_count > 0) {
+          tagged_updated = rmm->fixup_tagged_field_handles();
+        }
+        local_updated = rmm->fixup_all_local_handles();
+        double fixup_ms = (Ticks::now() - fixup_start).seconds() * 1000.0;
+        log_info(gc)("Remote handle post-evac fixup DONE: %.1fms "
+                     "(tagged_updated=%d local_updated=%d tagged_remaining=%d)",
+                     fixup_ms, tagged_updated, local_updated,
+                     rmm->tagged_field_count());
+      } else {
+        log_debug(gc)("Remote handle post-evac fixup SKIP: no remote heap activity");
       }
-      local_updated = rmm->fixup_all_local_handles();
-      double fixup_ms = (Ticks::now() - fixup_start).seconds() * 1000.0;
-      log_info(gc)("Remote handle post-evac fixup DONE: %.1fms "
-                   "(tagged_updated=%d local_updated=%d tagged_remaining=%d)",
-                   fixup_ms, tagged_updated, local_updated,
-                   rmm->tagged_field_count());
     }
   }
 
@@ -1522,7 +1528,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       bool periodic = (old_cset_fixup_gc % 8) == 0;
       bool clean_probe = old_cset_clean_streak < 2;
 
-      if (remote_activity || warmup || old_growth || periodic || clean_probe) {
+      if (remote_activity && (warmup || old_growth || periodic || clean_probe)) {
         int repaired = rmm->fixup_stale_refs_in_old_regions(evacuation_failed());
         old_cset_clean_streak = (repaired == 0) ? old_cset_clean_streak + 1 : 0;
         old_cset_last_old_regions = old_regions;
@@ -1547,7 +1553,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
-    if (rmm != nullptr) {
+    if (rmm != nullptr && has_remote_heap_activity(rmm)) {
       rmm->purge_stale_local_handles("POST-FREE-HANDLE-SWEEP", 16);
     }
   }
@@ -1577,7 +1583,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   // (sim, TCP executor, or RDMA executor) via G1RemoteMemoryManager.
   {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
-    if (rmm != nullptr) {
+    if (rmm != nullptr && has_remote_heap_activity(rmm)) {
       log_trace(gc)(">>>   collect_dead_remote_objects START");
       rmm->collect_dead_remote_objects();
       log_trace(gc)(">>>   collect_dead_remote_objects DONE");

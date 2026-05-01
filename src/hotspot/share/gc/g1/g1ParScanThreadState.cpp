@@ -59,6 +59,20 @@
 // Explicit NOINLINE to block ATTRIBUTE_FLATTENing.
 #define MAYBE_INLINE_EVACUATION NOT_DEBUG(inline) DEBUG_ONLY(NOINLINE)
 
+static bool should_record_remote_ref_sites(G1CollectedHeap* g1h) {
+  if (G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    return true;
+  }
+
+  if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
+    const size_t local_capacity = (g1h->max_capacity() * LocalMemoryRatio) / 100;
+    const size_t used = g1h->used();
+    return used >= (local_capacity * 60) / 100;
+  }
+
+  return false;
+}
+
 G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
                                            G1RedirtyCardsQueueSet* rdcqs,
                                            PreservedMarks* preserved_marks,
@@ -96,7 +110,8 @@ G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
     _evac_failure_regions(evac_failure_regions),
     _rc_buffer(nullptr),
     _rc_buffer_size(0),
-    _rc_buffer_capacity(0)
+    _rc_buffer_capacity(0),
+    _record_remote_ref_sites(should_record_remote_ref_sites(g1h))
 {
   // We allocate number of young gen regions in the collection set plus one
   // entries, since entry 0 keeps track of surviving bytes for non-young regions.
@@ -263,8 +278,7 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   // Phase 2: Record reference site for RC counting if target was promoted to Old.
   // Only record when eviction is possible. LocalMemoryRatio < 100 enables the
   // same remote-eviction path even when the legacy percentage threshold is 0.
-  if (G1TagRefSites || G1SimulateRemoteEviction ||
-      G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
+  if (_record_remote_ref_sites) {
     HeapRegion* dest = _g1h->heap_region_containing(obj);
     if (dest != nullptr && dest->is_old() && _g1h->is_in((void*)p)) {
       record_rc_ref_site(obj, (void*)p, sizeof(T) == sizeof(narrowOop));
@@ -964,17 +978,23 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
 void G1ParScanThreadStateSet::flush_stats() {
   assert(!_flushed, "thread local state from the per thread states should be flushed once");
 
-  const bool remote_mode =
-    G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100;
+  bool has_rc_records = false;
+  for (uint worker_id = 0; worker_id < _num_workers; ++worker_id) {
+    G1ParScanThreadState* pss = _states[worker_id];
+    if (pss != nullptr && pss->rc_buffer_size() > 0) {
+      has_rc_records = true;
+      break;
+    }
+  }
 
   // Phase 2: OOP Classification Fixup — classifies promoted Old objects.
-  // Classification fixup: only run when eviction is possible.
-  // When disabled, skip to avoid post-evacuate overhead (can be 2+ seconds
-  // for large heaps due to RC hash map construction + mark word updates).
-  if (remote_mode) {
+  // Classification fixup is useful only after this GC actually recorded
+  // ref-sites. Keeping it dormant at low local-memory pressure avoids building
+  // large local-only Handle tables that never participate in remote eviction.
+  if (has_rc_records) {
     process_oop_classification_fixup();
   }
-  if (remote_mode) {
+  if (has_rc_records) {
     log_info(gc)("MergePSS: classification complete, flushing %u worker states", _num_workers);
   }
 
@@ -998,7 +1018,7 @@ void G1ParScanThreadStateSet::flush_stats() {
     _states[worker_id] = nullptr;
   }
   _flushed = true;
-  if (remote_mode) {
+  if (has_rc_records) {
     log_info(gc)("MergePSS: worker-state flush complete");
   }
 }

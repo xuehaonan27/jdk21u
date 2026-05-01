@@ -129,12 +129,14 @@ private:
   RCRefSite*  _rc_buffer;         // Growable buffer of ref-site records
   size_t      _rc_buffer_size;    // Current number of entries
   size_t      _rc_buffer_capacity; // Allocated capacity
+  bool        _record_remote_ref_sites;
 
   void rc_buffer_ensure_capacity();
 
 public:
   // Record a reference site for RC counting.
   inline void record_rc_ref_site(oop new_copy, void* ref_site, bool is_narrow);
+  bool record_remote_ref_sites() const { return _record_remote_ref_sites; }
 
   bool inject_evacuation_failure(uint region_idx) EVAC_FAILURE_INJECTOR_RETURN_( return false; );
 
