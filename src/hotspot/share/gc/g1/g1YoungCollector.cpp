@@ -1300,6 +1300,41 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   return enough_signal && mostly_cold && not_hot;
 }
 
+static void trim_free_region_rss(G1CollectedHeap* g1h) {
+  Ticks trim_start = Ticks::now();
+  uint trimmed_regions = 0;
+  uint failed_regions = 0;
+  size_t trimmed_bytes = 0;
+  uint num_regions = g1h->num_regions();
+
+  for (uint i = 0; i < num_regions; i++) {
+    HeapRegion* hr = g1h->region_at(i);
+    if (hr == nullptr || !hr->is_free() || hr->is_evict_guarded()) {
+      continue;
+    }
+
+    if (::madvise((char*)hr->bottom(), HeapRegion::GrainBytes, MADV_DONTNEED) == 0) {
+      trimmed_regions++;
+      trimmed_bytes += HeapRegion::GrainBytes;
+    } else {
+      failed_regions++;
+    }
+  }
+
+  if (trimmed_regions > 0 || failed_regions > 0) {
+    double trim_ms = (Ticks::now() - trim_start).seconds() * 1000.0;
+    if (failed_regions > 0) {
+      log_info(gc)("Remote RSS trim: madvised %u free regions (" SIZE_FORMAT
+                   "MB) in %.1fms, failures=%u",
+                   trimmed_regions, trimmed_bytes / M, trim_ms, failed_regions);
+    } else {
+      log_info(gc)("Remote RSS trim: madvised %u free regions (" SIZE_FORMAT
+                   "MB) in %.1fms",
+                   trimmed_regions, trimmed_bytes / M, trim_ms);
+    }
+  }
+}
+
 void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                                     G1ParScanThreadStateSet* per_thread_states) {
   G1GCPhaseTimes* p = phase_times();
@@ -3143,6 +3178,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   }
 
   _g1h->rebuild_free_region_list();
+
+  if (LocalMemoryRatio < 100) {
+    trim_free_region_rss(_g1h);
+  }
 
   _g1h->record_obj_copy_mem_stats();
 
