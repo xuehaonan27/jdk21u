@@ -1516,6 +1516,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       size_t local_used = pre_cleanup_heap_used;
       int eviction_tier = 0;
       size_t evict_target_bytes = 0;
+      size_t evict_batch_cap_bytes = 0;
 
       if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
         size_t local_capacity = (heap_capacity * LocalMemoryRatio) / 100;
@@ -1554,19 +1555,25 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (eviction_tier > 0) {
           size_t target_low = (heap_budget * target_low_percent) / 100;
           evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
+          if (eviction_tier < 3) {
+            evict_batch_cap_bytes = HeapRegion::GrainBytes * 6;
+            evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
+          }
         }
 
         if (eviction_tier > 0) {
           log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB / heap_budget=" SIZE_FORMAT
                        "MB (local_cap=" SIZE_FORMAT "MB reserve=" SIZE_FORMAT "MB, %.1f%%), "
                        "alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, "
-                       "effective=%.1f%%, target=%zu%%, evict_target=" SIZE_FORMAT "MB",
+                       "effective=%.1f%%, target=%zu%%, batch_cap=" SIZE_FORMAT
+                       "MB, evict_target=" SIZE_FORMAT "MB",
                        eviction_tier, local_used / M, heap_budget / M,
                        local_capacity / M, native_reserve / M, pressure * 100.0,
                        alloc_rate_ms / 1024.0,
                        lookahead_alloc / M,
                        (double)effective_used / (double)heap_budget * 100.0,
                        target_low_percent,
+                       evict_batch_cap_bytes / M,
                        evict_target_bytes / M);
         }
       } else if (G1RemoteEvictionThreshold > 0) {
