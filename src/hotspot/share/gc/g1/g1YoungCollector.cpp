@@ -1515,9 +1515,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // local capacity, not Xmx. Reserve headroom for native/RDMA/Spark memory
     // so heap growth does not reach the cgroup limit before eviction fires.
     // Three tiers based on heap budget pressure (with allocation rate lookahead):
-    //   Tier 1 (>75%): proactive — evict cold old regions to 70% target
-    //   Tier 2 (>85%): aggressive — evict old regions to 70% target
-    //   Tier 3 (>95%): emergency — evict old regions to 60% target
+    //   Tier 1 (>75%): proactive - evict cold old regions to 70% target
+    //   Tier 2 (>85%): aggressive - evict old regions to 70% target
+    //   Tier 3 (>95%): emergency - evict old regions to 60% target
     //
     // Falls back to G1RemoteEvictionThreshold if LocalMemoryRatio == 100.
     {
@@ -1530,11 +1530,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
         size_t local_capacity = (heap_capacity * LocalMemoryRatio) / 100;
         // RDMA mode keeps large native side metadata (handles, edge tables,
-        // tagged-field lists, staging buffers, Spark/JVM native state). With a
-        // 5G cgroup, a 1G reserve still let the process hit memcg OOM while
-        // the heap was around 3.1G, so keep a larger native cushion.
-        size_t native_reserve = MAX2((local_capacity * 2) / 5, (size_t)1 * G);
-        native_reserve = MIN2(native_reserve, local_capacity / 2);
+        // tagged-field lists, staging buffers, Spark/JVM native state). In the
+        // Spark lr=25 run, a 2G reserve still let the process reach the 5G
+        // memcg limit while the local heap was just under 4G, so keep half of
+        // the local capacity as non-Java-heap headroom.
+        size_t native_reserve = MAX2(local_capacity / 2, (size_t)2 * G);
+        native_reserve = MIN2(native_reserve, (local_capacity * 3) / 5);
         size_t heap_budget = local_capacity - native_reserve;
 
         // Allocation rate lookahead: predict bytes allocated before next GC.
@@ -1565,13 +1566,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           size_t target_low = (heap_budget * target_low_percent) / 100;
           evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
           if (eviction_tier == 1) {
-            evict_batch_cap_bytes = HeapRegion::GrainBytes * 6;
+            evict_batch_cap_bytes = HeapRegion::GrainBytes * 4;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
           } else if (eviction_tier == 2) {
-            evict_batch_cap_bytes = HeapRegion::GrainBytes * 3;
+            evict_batch_cap_bytes = HeapRegion::GrainBytes * 8;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
           } else if (eviction_tier == 3) {
-            evict_batch_cap_bytes = HeapRegion::GrainBytes * 8;
+            evict_batch_cap_bytes = HeapRegion::GrainBytes * 16;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
           }
         }
@@ -1705,9 +1706,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         // T1 is proactive: do not evict hot/unknown regions. Under higher local
         // pressure, fall back to old regions after exhausting cold candidates.
         // T2 still avoids dense tiny-object regions if any non-dense fallback
-        // exists; otherwise a very small dense last-resort batch is allowed to
-        // keep the process below the cgroup limit without returning to the
-        // multi-region fetch storm.
+        // exists. T3 is the memcg emergency path: allow a bounded dense batch,
+        // otherwise Spark's dense cached partitions can keep us at the cgroup
+        // edge while we evict only one 16M region per GC.
         if (eviction_tier >= 2 && (unlimited || path2_bytes < evict_target_bytes)) {
           for (uint i = 0; i < num_regions; i++) {
             if (!unlimited && path2_bytes >= evict_target_bytes) break;
@@ -1747,8 +1748,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-        if (eviction_tier >= 2 && path2_bytes == 0) {
-          const size_t dense_last_resort_cap = HeapRegion::GrainBytes;
+        if (eviction_tier >= 2 && path2_bytes < evict_target_bytes) {
+          size_t dense_last_resort_cap = HeapRegion::GrainBytes;
+          if (eviction_tier >= 3) {
+            size_t remaining_target = evict_target_bytes - path2_bytes;
+            dense_last_resort_cap = MAX2(HeapRegion::GrainBytes,
+                                         MIN2(remaining_target, evict_batch_cap_bytes));
+          }
           for (uint i = 0; i < num_regions; i++) {
             if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
             if (!dense_deferred_candidates[i]) continue;
