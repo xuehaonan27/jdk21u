@@ -1272,7 +1272,7 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   sample->object_count = object_count;
   sample->object_words = object_words;
 
-  if (guard_dense_small_objects && object_count > 0) {
+  if (object_count > 0) {
     // Object-granularity RDMA fetch makes densely packed tiny-object regions
     // extremely expensive to fault back in. Keep them local during proactive
     // T1 eviction; higher pressure tiers may still fall back to them.
@@ -1281,7 +1281,9 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     if (object_count >= min_dense_object_count &&
         object_words < object_count * min_avg_object_words) {
       sample->dense_small_objects = true;
-      return false;
+      if (guard_dense_small_objects) {
+        return false;
+      }
     }
   }
 
@@ -1555,8 +1557,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (eviction_tier > 0) {
           size_t target_low = (heap_budget * target_low_percent) / 100;
           evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
-          if (eviction_tier < 3) {
+          if (eviction_tier == 1) {
             evict_batch_cap_bytes = HeapRegion::GrainBytes * 6;
+            evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
+          } else if (eviction_tier == 2) {
+            evict_batch_cap_bytes = HeapRegion::GrainBytes * 3;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
           }
         }
@@ -1605,12 +1610,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_regions_dense_small = 0;
         size_t path2_dense_small_bytes = 0;
         size_t path2_dense_small_objects = 0;
+        int path2_dense_last_resort_candidates = 0;
+        size_t path2_dense_last_resort_bytes = 0;
+        size_t path2_dense_last_resort_objects = 0;
         bool unlimited = (eviction_tier >= 3);
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+        bool* dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+        memset(dense_deferred_candidates, 0, num_regions * sizeof(bool));
 
         // Prefer old regions whose sampled objects have stale hotness epochs.
         // This makes T1 truly cold-region eviction instead of heap-index-order
-        // old-region eviction.
+        // old-region eviction. For non-emergency tiers, defer dense tiny-object
+        // regions: they are cheap to classify as cold but very expensive to
+        // evict and fault back object-by-object under Spark's scan pattern.
         if (rmm != nullptr) {
           for (uint i = 0; i < num_regions; i++) {
             if (!unlimited && path2_bytes >= evict_target_bytes) break;
@@ -1622,17 +1634,30 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
             RegionColdnessSample region_sample;
             path2_regions_scanned++;
-            if (!region_is_cold_by_epoch(hr, rmm, eviction_tier == 1, &region_sample)) {
+            if (!region_is_cold_by_epoch(hr, rmm, false, &region_sample)) {
               path2_regions_not_cold++;
               sampled_words += region_sample.sampled_words;
               cold_words += region_sample.cold_words;
               hot_words += region_sample.hot_words;
               unknown_words += region_sample.unknown_words;
               if (region_sample.dense_small_objects) {
+                dense_deferred_candidates[i] = true;
                 path2_regions_dense_small++;
                 path2_dense_small_bytes += hr->used();
                 path2_dense_small_objects += region_sample.object_count;
               }
+              continue;
+            }
+
+            if (eviction_tier < 3 && region_sample.dense_small_objects) {
+              dense_deferred_candidates[i] = true;
+              path2_regions_dense_small++;
+              path2_dense_small_bytes += hr->used();
+              path2_dense_small_objects += region_sample.object_count;
+              sampled_words += region_sample.sampled_words;
+              cold_words += region_sample.cold_words;
+              hot_words += region_sample.hot_words;
+              unknown_words += region_sample.unknown_words;
               continue;
             }
 
@@ -1669,6 +1694,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
         // T1 is proactive: do not evict hot/unknown regions. Under higher local
         // pressure, fall back to old regions after exhausting cold candidates.
+        // T2 still avoids dense tiny-object regions if any non-dense fallback
+        // exists; otherwise a very small dense last-resort batch is allowed to
+        // keep the process below the cgroup limit without returning to the
+        // multi-region fetch storm.
         if (eviction_tier >= 2 && (unlimited || path2_bytes < evict_target_bytes)) {
           for (uint i = 0; i < num_regions; i++) {
             if (!unlimited && path2_bytes >= evict_target_bytes) break;
@@ -1677,6 +1706,20 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
+
+            if (eviction_tier == 2 && rmm != nullptr) {
+              RegionColdnessSample region_sample;
+              (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
+              if (region_sample.dense_small_objects) {
+                if (!dense_deferred_candidates[i]) {
+                  dense_deferred_candidates[i] = true;
+                  path2_regions_dense_small++;
+                  path2_dense_small_bytes += hr->used();
+                  path2_dense_small_objects += region_sample.object_count;
+                }
+                continue;
+              }
+            }
 
             hr->set_cold_destination();
             eviction_candidates[i] = true;
@@ -1694,12 +1737,50 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
+        if (eviction_tier == 2 && path2_bytes == 0) {
+          const size_t dense_last_resort_cap = HeapRegion::GrainBytes * 2;
+          for (uint i = 0; i < num_regions; i++) {
+            if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
+            if (!dense_deferred_candidates[i]) continue;
+
+            HeapRegion* hr = _g1h->region_at(i);
+            if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
+            if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
+            if (eviction_candidates[i]) continue;
+
+            RegionColdnessSample region_sample;
+            if (rmm != nullptr) {
+              (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
+            }
+
+            hr->set_cold_destination();
+            eviction_candidates[i] = true;
+            path2_candidates++;
+            path2_fallback_candidates++;
+            path2_bytes += hr->used();
+            path2_fallback_bytes += hr->used();
+            path2_dense_last_resort_candidates++;
+            path2_dense_last_resort_bytes += hr->used();
+            path2_dense_last_resort_objects += region_sample.object_count;
+          }
+
+          if (path2_dense_last_resort_candidates > 0) {
+            log_info(gc)("Path 2 dense last-resort selected %d regions ("
+                         SIZE_FORMAT "MB, " SIZE_FORMAT " objs) for T2 pressure",
+                         path2_dense_last_resort_candidates,
+                         path2_dense_last_resort_bytes / M,
+                         path2_dense_last_resort_objects);
+          }
+        }
+
         if (path2_candidates > 0) {
           log_info(gc)("Path 2 selected %d regions (" SIZE_FORMAT "MB, cold="
                        SIZE_FORMAT "MB fallback=" SIZE_FORMAT "MB) for T%d eviction",
                        path2_candidates, path2_bytes / M, path2_cold_bytes / M,
                        path2_fallback_bytes / M, eviction_tier);
         }
+
+        FREE_C_HEAP_ARRAY(bool, dense_deferred_candidates);
       }
     }
 
