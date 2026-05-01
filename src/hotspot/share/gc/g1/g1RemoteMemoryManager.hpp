@@ -1004,17 +1004,18 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
   // edge-table references may still hold a valid RemoteHandle even if the
   // address index is stale or missing.
   //
-  // For each anchor (LOCAL + remote_refcount > 0),
-  // call cl->do_oop. If GC moves the object, update Handle and rekey table entry.
+  // For each anchor (LOCAL + remote_refcount > 0), call cl->do_oop. If GC
+  // moves the object, update the primary Handle immediately. Do not rebuild the
+  // secondary address table here: this method is called from evacuation workers,
+  // and a full table rebuild serializes the whole worker gang.
   class AnchorHandleClosure {
     G1RemoteMemoryManager* _rmm;
     OopClosureType* _cl;
     int _stale_anchors;
-    int _moved;
 
   public:
     AnchorHandleClosure(G1RemoteMemoryManager* rmm, OopClosureType* cl)
-      : _rmm(rmm), _cl(cl), _stale_anchors(0), _moved(0) {}
+      : _rmm(rmm), _cl(cl), _stale_anchors(0) {}
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr || h->remote_refcount() == 0) return;
@@ -1034,12 +1035,10 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
       uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
       if (new_addr != (sa & REMOTE_HANDLE_ADDR_MASK)) {
         h->set_local(cast_from_oop<void*>(obj));
-        _moved++;
       }
     }
 
     int stale_anchors() const { return _stale_anchors; }
-    int moved() const { return _moved; }
   };
 
   AnchorHandleClosure hcl(this, cl);
@@ -1050,14 +1049,10 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
                     "(logged first 16)", hcl.stale_anchors());
   }
 
-  if (hcl.moved() > 0) {
-    rebuild_handle_table_from_handles();
-  }
 }
 
 template <typename OopClosureType>
 void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
-  int num_moved = 0;
   int stale_cross_roots = 0;
 
   for (int i = 0; i < _cross_roots_count; i++) {
@@ -1074,7 +1069,6 @@ void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
     uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
     if (new_addr != old_addr) {
       h->set_local(cast_from_oop<void*>(obj));
-      num_moved++;
     }
   }
 
@@ -1083,9 +1077,6 @@ void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
                     "DEAD (logged first 16)", stale_cross_roots);
   }
 
-  if (num_moved > 0) {
-    rebuild_handle_table_from_handles();
-  }
 }
 
 #endif // SHARE_GC_G1_G1REMOTEMEMORYMANAGER_HPP
