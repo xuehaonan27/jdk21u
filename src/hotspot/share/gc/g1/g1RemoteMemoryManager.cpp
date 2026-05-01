@@ -150,7 +150,29 @@ void G1RemoteMemoryManager::record_fetch_result(size_t word_size,
 }
 
 void G1RemoteMemoryManager::log_remote_access_stats() const {
+  uint64_t resolve_fast_local = Atomic::load(&_resolve_fast_local);
+  uint64_t resolve_fast_remote = Atomic::load(&_resolve_fast_remote);
+  uint64_t resolve_fast_fetching = Atomic::load(&_resolve_fast_fetching);
+  uint64_t resolve_fast_dead = Atomic::load(&_resolve_fast_dead);
+  uint64_t resolve_slow_entries = Atomic::load(&_resolve_slow_entries);
+  uint64_t resolve_no_safepoint_entries = Atomic::load(&_resolve_no_safepoint_entries);
   uint64_t fetch_success = Atomic::load(&_fetch_success);
+  uint64_t fetch_failures = Atomic::load(&_fetch_failures);
+  uint64_t fetch_retries = Atomic::load(&_fetch_retries);
+  uint64_t fetch_wait_slow = Atomic::load(&_fetch_wait_slow);
+  uint64_t fetch_wait_no_safepoint = Atomic::load(&_fetch_wait_no_safepoint);
+  uint64_t fetch_wait_hard = Atomic::load(&_fetch_wait_hard);
+  uint64_t fetch_wait_loops = Atomic::load(&_fetch_wait_loops);
+
+  if (resolve_fast_local == 0 && resolve_fast_remote == 0 &&
+      resolve_fast_fetching == 0 && resolve_fast_dead == 0 &&
+      resolve_slow_entries == 0 && resolve_no_safepoint_entries == 0 &&
+      fetch_success == 0 && fetch_failures == 0 && fetch_retries == 0 &&
+      fetch_wait_slow == 0 && fetch_wait_no_safepoint == 0 &&
+      fetch_wait_hard == 0 && fetch_wait_loops == 0) {
+    return;
+  }
+
   uint64_t fetch_words = Atomic::load(&_fetch_words);
   uint64_t fetch_counter = Atomic::load(&_fetch_elapsed_counter);
   double fetch_ms = TimeHelper::counter_to_millis((jlong)fetch_counter);
@@ -164,22 +186,22 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                " bytes=" UINT64_FORMAT " avg_us=%.1f total_ms=%.1f)"
                " waits(slow=" UINT64_FORMAT " no_safepoint=" UINT64_FORMAT
                " hard=" UINT64_FORMAT " loops=" UINT64_FORMAT ")",
-               Atomic::load(&_resolve_fast_local),
-               Atomic::load(&_resolve_fast_remote),
-               Atomic::load(&_resolve_fast_fetching),
-               Atomic::load(&_resolve_fast_dead),
-               Atomic::load(&_resolve_slow_entries),
-               Atomic::load(&_resolve_no_safepoint_entries),
+               resolve_fast_local,
+               resolve_fast_remote,
+               resolve_fast_fetching,
+               resolve_fast_dead,
+               resolve_slow_entries,
+               resolve_no_safepoint_entries,
                fetch_success,
-               Atomic::load(&_fetch_failures),
-               Atomic::load(&_fetch_retries),
+               fetch_failures,
+               fetch_retries,
                fetch_words * HeapWordSize,
                avg_us,
                fetch_ms,
-               Atomic::load(&_fetch_wait_slow),
-               Atomic::load(&_fetch_wait_no_safepoint),
-               Atomic::load(&_fetch_wait_hard),
-               Atomic::load(&_fetch_wait_loops));
+               fetch_wait_slow,
+               fetch_wait_no_safepoint,
+               fetch_wait_hard,
+               fetch_wait_loops);
 }
 
 size_t G1RemoteMemoryManager::rebuild_handle_table_from_handles() {
@@ -2899,9 +2921,9 @@ public:
     const size_t word_size = target->size();
     const bool log_rescue = should_log_rescue();
     if (log_rescue) {
-      log_info(gc)("Old/cset rescue START: target=" PTR_FORMAT " size=" SIZE_FORMAT
-                   " src_fcr=%s field=" PTR_FORMAT,
-                   p2i(target), word_size, _src_is_fcr ? "true" : "false", p2i(p));
+      log_debug(gc)("Old/cset rescue START: target=" PTR_FORMAT " size=" SIZE_FORMAT
+                    " src_fcr=%s field=" PTR_FORMAT,
+                    p2i(target), word_size, _src_is_fcr ? "true" : "false", p2i(p));
     }
     HeapWord* dst = _rmm->allocate_in_fcr(word_size);
     if (dst == nullptr) {
@@ -2921,9 +2943,9 @@ public:
     store_forwardee(p, tag_bits, rescued);
     _rescued++;
     if (log_rescue) {
-      log_info(gc)("Old/cset rescue DONE: target=" PTR_FORMAT " rescued=" PTR_FORMAT
-                   " size=" SIZE_FORMAT " count=%d",
-                   p2i(target), p2i(rescued), word_size, _rescued);
+      log_debug(gc)("Old/cset rescue DONE: target=" PTR_FORMAT " rescued=" PTR_FORMAT
+                    " size=" SIZE_FORMAT " count=%d",
+                    p2i(target), p2i(rescued), word_size, _rescued);
     }
 
     // The rescued object was missed by normal evacuation, so scan its fields
@@ -2984,8 +3006,8 @@ public:
 
 int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_failed) {
   Ticks start = Ticks::now();
-  log_info(gc)("Old/cset fixup START (allow_rescue=%s)",
-               evacuation_failed ? "false" : "true");
+  log_debug(gc)("Old/cset fixup START (allow_rescue=%s)",
+                evacuation_failed ? "false" : "true");
 
   CSetRefFixupClosure cl(_g1h, this, !evacuation_failed);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
@@ -3001,7 +3023,7 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
   int regions_scanned = 0;
   int objects_scanned = 0;
-  log_info(gc)("Old/cset fixup heap scan START: heap_regions=%u", _g1h->num_regions());
+  log_debug(gc)("Old/cset fixup heap scan START: heap_regions=%u", _g1h->num_regions());
   for (uint i = 0; i < _g1h->num_regions(); i++) {
     HeapRegion* hr = _g1h->region_at(i);
     if (hr->is_empty() || hr->is_free()) continue;
@@ -3011,21 +3033,21 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
     cl.set_src_is_fcr(hr->is_fetch_cache());
     CSetFixupObjectClosure obj_cl(&cl);
     Ticks region_start = Ticks::now();
-    log_info(gc)("Old/cset fixup region START: index=%u type=%s bottom=" PTR_FORMAT
-                 " top=" PTR_FORMAT " src_fcr=%s",
-                 hr->hrm_index(), hr->get_short_type_str(), p2i(hr->bottom()),
-                 p2i(hr->top()), hr->is_fetch_cache() ? "true" : "false");
+    log_trace(gc)("Old/cset fixup region START: index=%u type=%s bottom=" PTR_FORMAT
+                  " top=" PTR_FORMAT " src_fcr=%s",
+                  hr->hrm_index(), hr->get_short_type_str(), p2i(hr->bottom()),
+                  p2i(hr->top()), hr->is_fetch_cache() ? "true" : "false");
     int scanned = remote_eviction_scan_region_objects(hr, bitmap, "Old/cset fixup", &obj_cl);
     double region_ms = (Ticks::now() - region_start).seconds() * 1000.0;
     regions_scanned++;
     objects_scanned += scanned;
     if (region_ms > 100.0) {
-      log_info(gc)("Old/cset fixup region %u type=%s scanned=%d in %.1fms",
-                   hr->hrm_index(), hr->get_short_type_str(), scanned, region_ms);
+      log_debug(gc)("Old/cset fixup region %u type=%s scanned=%d in %.1fms",
+                    hr->hrm_index(), hr->get_short_type_str(), scanned, region_ms);
     }
   }
-  log_info(gc)("Old/cset fixup heap scan DONE: scanned %d regions, %d objects",
-               regions_scanned, objects_scanned);
+  log_debug(gc)("Old/cset fixup heap scan DONE: scanned %d regions, %d objects",
+                regions_scanned, objects_scanned);
 
   class CSetFixupCodeBlobClosure : public CodeBlobClosure {
     G1CollectedHeap* _g1h;
@@ -3053,19 +3075,19 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
   CSetFixupCodeBlobClosure code_cl(_g1h, &cl);
   Ticks code_start = Ticks::now();
-  log_info(gc)("Old/cset fixup code scan START");
+  log_debug(gc)("Old/cset fixup code scan START");
   CodeCache::blobs_do(&code_cl);
   double code_ms = (Ticks::now() - code_start).seconds() * 1000.0;
-  log_info(gc)("Old/cset fixup code scan DONE: %.1fms, %d nmethods updated",
-               code_ms, code_cl.nmethods_updated());
+  log_debug(gc)("Old/cset fixup code scan DONE: %.1fms, %d nmethods updated",
+                code_ms, code_cl.nmethods_updated());
 
   double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
-  log_info(gc)("Old/cset fixup DONE: scanned %d regions, %d objects, code %.1fms, "
-               "%d fixed, %d rescued, %d skipped, %d invalid, %d rescue-failed, "
-               "%d nmethods updated in %.1fms",
-               regions_scanned, objects_scanned, code_ms,
-               cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(), cl.rescue_failed(),
-               code_cl.nmethods_updated(), elapsed_ms);
+  log_debug(gc)("Old/cset fixup DONE: scanned %d regions, %d objects, code %.1fms, "
+                "%d fixed, %d rescued, %d skipped, %d invalid, %d rescue-failed, "
+                "%d nmethods updated in %.1fms",
+                regions_scanned, objects_scanned, code_ms,
+                cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(), cl.rescue_failed(),
+                code_cl.nmethods_updated(), elapsed_ms);
 
   if (cl.fixed() > 0 || cl.rescued() > 0 || cl.skipped() > 0 ||
       cl.invalid() > 0 || cl.rescue_failed() > 0 ||

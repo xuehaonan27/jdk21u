@@ -141,6 +141,7 @@ void HeapRegion::hr_clear(bool clear_space) {
   _has_classified_objects = false;
   _is_cold_destination = false;
   _is_root_pinned = false;
+  _rss_trimmed_free = false;
 
   init_top_at_mark_start();
   if (clear_space) clear(SpaceDecorator::Mangle);
@@ -263,7 +264,8 @@ HeapRegion::HeapRegion(uint hrm_index,
   _has_classified_objects(false),
   _is_cold_destination(false),
   _is_root_pinned(false),
-  _evict_guarded(false)
+  _evict_guarded(false),
+  _rss_trimmed_free(false)
 {
   assert(Universe::on_page_boundary(mr.start()) && Universe::on_page_boundary(mr.end()),
          "invalid space boundaries");

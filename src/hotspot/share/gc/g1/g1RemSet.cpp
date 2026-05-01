@@ -1292,7 +1292,7 @@ class G1MergeHeapRootsTask : public WorkerTask {
       buffers_processed++;
     }
     if (buffers_processed > 100) {
-      log_info(gc)("DIAG: worker %u processed " SIZE_FORMAT " DCQ buffers", worker_id, buffers_processed);
+      log_debug(gc)("DIAG: worker %u processed " SIZE_FORMAT " DCQ buffers", worker_id, buffers_processed);
     }
   }
 
@@ -1357,25 +1357,25 @@ public:
           p->record_or_add_thread_work_item(merge_remset_phase, worker_id, stats.merged(i), i);
         }
       }
-      log_info(gc)("DIAG: worker %u remset merge done", worker_id);
+      log_trace(gc)("DIAG: worker %u remset merge done", worker_id);
     }
-    log_info(gc)("DIAG: worker %u remset scope closed", worker_id);
+    log_trace(gc)("DIAG: worker %u remset scope closed", worker_id);
 
     // Now apply the closure to all remaining log entries.
     if (_initial_evacuation) {
       assert(merge_remset_phase == G1GCPhaseTimes::MergeRS, "Wrong merge phase");
-      log_info(gc)("DIAG: worker %u MergeLB START", worker_id);
+      log_trace(gc)("DIAG: worker %u MergeLB START", worker_id);
       G1GCParPhaseTimesTracker x(p, G1GCPhaseTimes::MergeLB, worker_id);
 
       G1MergeLogBufferCardsClosure cl(g1h, _scan_state);
       apply_closure_to_dirty_card_buffers(&cl, worker_id);
-      log_info(gc)("DIAG: worker %u MergeLB DONE (dirty=" SIZE_FORMAT " skipped=" SIZE_FORMAT ")",
+      log_trace(gc)("DIAG: worker %u MergeLB DONE (dirty=" SIZE_FORMAT " skipped=" SIZE_FORMAT ")",
                     worker_id, cl.cards_dirty(), cl.cards_skipped());
 
       p->record_thread_work_item(G1GCPhaseTimes::MergeLB, worker_id, cl.cards_dirty(), G1GCPhaseTimes::MergeLBDirtyCards);
       p->record_thread_work_item(G1GCPhaseTimes::MergeLB, worker_id, cl.cards_skipped(), G1GCPhaseTimes::MergeLBSkippedCards);
     }
-    log_info(gc)("DIAG: worker %u merge_heap_roots work() done", worker_id);
+    log_trace(gc)("DIAG: worker %u merge_heap_roots work() done", worker_id);
   }
 };
 
@@ -1405,7 +1405,7 @@ void G1RemSet::merge_heap_roots(bool initial_evacuation) {
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
 
   {
-    log_info(gc)("DIAG: merge_heap_roots prepare START");
+    log_trace(gc)("DIAG: merge_heap_roots prepare START");
     Ticks start = Ticks::now();
 
     _scan_state->prepare_for_merge_heap_roots();
@@ -1416,7 +1416,7 @@ void G1RemSet::merge_heap_roots(bool initial_evacuation) {
     } else {
       g1h->phase_times()->record_or_add_optional_prepare_merge_heap_roots_time(total.seconds() * 1000.0);
     }
-    log_info(gc)("DIAG: merge_heap_roots prepare DONE (%.1fms)", total.seconds() * 1000.0);
+    log_trace(gc)("DIAG: merge_heap_roots prepare DONE (%.1fms)", total.seconds() * 1000.0);
   }
 
   WorkerThreads* workers = g1h->workers();
@@ -1427,9 +1427,9 @@ void G1RemSet::merge_heap_roots(bool initial_evacuation) {
 
   {
     G1MergeHeapRootsTask cl(_scan_state, num_workers, initial_evacuation);
-    log_info(gc)("DIAG: merge_heap_roots parallel task START (%u workers, " SIZE_FORMAT " regions)", num_workers, increment_length);
+    log_trace(gc)("DIAG: merge_heap_roots parallel task START (%u workers, " SIZE_FORMAT " regions)", num_workers, increment_length);
     workers->run_task(&cl, num_workers);
-    log_info(gc)("DIAG: merge_heap_roots parallel task DONE");
+    log_trace(gc)("DIAG: merge_heap_roots parallel task DONE");
   }
 
   print_merge_heap_roots_stats();

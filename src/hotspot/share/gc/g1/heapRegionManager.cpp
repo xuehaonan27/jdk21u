@@ -137,6 +137,7 @@ HeapRegion* HeapRegionManager::allocate_free_region(HeapRegionType type, uint re
     assert(hr->prev() == nullptr, "Single region should not have prev");
     assert(is_available(hr->hrm_index()), "Must be committed");
     assert(!hr->is_evict_guarded(), "must not reuse evicted guarded regions");
+    hr->clear_rss_trimmed_free();
 
     if (numa->is_enabled() && hr->node_index() < numa->num_active_nodes()) {
       numa->update_statistics(G1NUMAStats::NewRegionAlloc, requested_node_index, hr->node_index());
@@ -195,6 +196,7 @@ HeapRegion* HeapRegionManager::allocate_free_region_skip_evict_guarded(uint requ
   assert(hr->prev() == nullptr, "Single region should not have prev");
   assert(is_available(hr->hrm_index()), "Must be committed");
   assert(!hr->is_evict_guarded(), "FCR allocation must not reuse evict-guarded regions");
+  hr->clear_rss_trimmed_free();
 
   if (skipped_guarded > 0) {
     log_info(gc)("FCR allocation skipped %u evict-guarded free regions before selecting region %u",

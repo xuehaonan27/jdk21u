@@ -754,12 +754,12 @@ void G1YoungCollector::evacuate_initial_collection_set(G1ParScanThreadStateSet* 
   G1GCPhaseTimes* p = phase_times();
 
   {
-    log_info(gc)("DIAG: merge_heap_roots START");
+    log_trace(gc)("DIAG: merge_heap_roots START");
     Ticks start = Ticks::now();
     rem_set()->merge_heap_roots(true /* initial_evacuation */);
     double merge_ms = (Ticks::now() - start).seconds() * 1000.0;
     p->record_merge_heap_roots_time(merge_ms);
-    log_info(gc)("DIAG: merge_heap_roots DONE (%.1fms)", merge_ms);
+    log_trace(gc)("DIAG: merge_heap_roots DONE (%.1fms)", merge_ms);
   }
 
   Tickspan task_time;
@@ -774,9 +774,9 @@ void G1YoungCollector::evacuate_initial_collection_set(G1ParScanThreadStateSet* 
                                       &root_processor,
                                       num_workers,
                                       has_optional_evacuation_work);
-    log_info(gc)("DIAG: G1EvacuateRegionsTask START (%u workers)", num_workers);
+    log_trace(gc)("DIAG: G1EvacuateRegionsTask START (%u workers)", num_workers);
     task_time = run_task_timed(&g1_par_task);
-    log_info(gc)("DIAG: G1EvacuateRegionsTask DONE (%.1fms)", task_time.seconds() * 1000.0);
+    log_trace(gc)("DIAG: G1EvacuateRegionsTask DONE (%.1fms)", task_time.seconds() * 1000.0);
     // Closing the inner scope will execute the destructor for the
     // G1RootProcessor object. By subtracting the WorkerThreads task from the total
     // time of this scope, we get the "NMethod List Cleanup" time. This list is
@@ -1300,7 +1300,9 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   return enough_signal && mostly_cold && not_hot;
 }
 
-static void flush_free_region_trim(char*& run_start,
+static void flush_free_region_trim(G1CollectedHeap* g1h,
+                                   uint& run_start_idx,
+                                   char*& run_start,
                                    char*& run_end,
                                    uint& run_region_count,
                                    uint& trimmed_regions,
@@ -1314,6 +1316,9 @@ static void flush_free_region_trim(char*& run_start,
 
   size_t run_bytes = (size_t)(run_end - run_start);
   if (::madvise(run_start, run_bytes, MADV_DONTNEED) == 0) {
+    for (uint i = 0; i < run_region_count; i++) {
+      g1h->region_at(run_start_idx + i)->set_rss_trimmed_free();
+    }
     trimmed_regions += run_region_count;
     trimmed_ranges++;
     trimmed_bytes += run_bytes;
@@ -1322,6 +1327,7 @@ static void flush_free_region_trim(char*& run_start,
     failed_ranges++;
   }
 
+  run_start_idx = 0;
   run_start = nullptr;
   run_end = nullptr;
   run_region_count = 0;
@@ -1335,14 +1341,16 @@ static void trim_free_region_rss(G1CollectedHeap* g1h) {
   uint failed_ranges = 0;
   size_t trimmed_bytes = 0;
   uint num_regions = g1h->num_regions();
+  uint run_start_idx = 0;
   char* run_start = nullptr;
   char* run_end = nullptr;
   uint run_region_count = 0;
 
   for (uint i = 0; i < num_regions; i++) {
     HeapRegion* hr = g1h->region_at(i);
-    if (hr == nullptr || !hr->is_free() || hr->is_evict_guarded()) {
-      flush_free_region_trim(run_start, run_end, run_region_count,
+    if (hr == nullptr || !hr->is_free() || hr->is_evict_guarded() ||
+        hr->is_rss_trimmed_free()) {
+      flush_free_region_trim(g1h, run_start_idx, run_start, run_end, run_region_count,
                              trimmed_regions, failed_regions,
                              trimmed_ranges, failed_ranges,
                              trimmed_bytes);
@@ -1352,6 +1360,7 @@ static void trim_free_region_rss(G1CollectedHeap* g1h) {
     char* bottom = (char*)hr->bottom();
     char* end = (char*)hr->end();
     if (run_start == nullptr) {
+      run_start_idx = i;
       run_start = bottom;
       run_end = end;
       run_region_count = 1;
@@ -1359,16 +1368,17 @@ static void trim_free_region_rss(G1CollectedHeap* g1h) {
       run_end = end;
       run_region_count++;
     } else {
-      flush_free_region_trim(run_start, run_end, run_region_count,
+      flush_free_region_trim(g1h, run_start_idx, run_start, run_end, run_region_count,
                              trimmed_regions, failed_regions,
                              trimmed_ranges, failed_ranges,
                              trimmed_bytes);
+      run_start_idx = i;
       run_start = bottom;
       run_end = end;
       run_region_count = 1;
     }
   }
-  flush_free_region_trim(run_start, run_end, run_region_count,
+  flush_free_region_trim(g1h, run_start_idx, run_start, run_end, run_region_count,
                          trimmed_regions, failed_regions,
                          trimmed_ranges, failed_ranges,
                          trimmed_bytes);
@@ -1386,6 +1396,17 @@ static void trim_free_region_rss(G1CollectedHeap* g1h) {
                    trimmed_regions, trimmed_bytes / M, trimmed_ranges, trim_ms);
     }
   }
+}
+
+static bool has_remote_heap_activity(G1RemoteMemoryManager* rmm) {
+  if (rmm == nullptr) {
+    return false;
+  }
+  G1RemoteBackend* backend = rmm->backend();
+  return rmm->tagged_field_count() > 0 ||
+         rmm->remote_roots_count() > 0 ||
+         (backend != nullptr &&
+          (backend->total_evicted() > 0 || backend->total_fetched() > 0));
 }
 
 void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
@@ -1479,28 +1500,48 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
   log_trace(gc)(">>>   post_evacuate_cleanup_1 START");
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
-    log_info(gc)("Remote post-evac cleanup1 START");
+    log_debug(gc)("Remote post-evac cleanup1 START");
   }
   post_evacuate_cleanup_1(per_thread_states);
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
-    log_info(gc)("Remote post-evac cleanup1 DONE");
+    log_debug(gc)("Remote post-evac cleanup1 DONE");
   }
   log_trace(gc)(">>>   post_evacuate_cleanup_1 DONE");
 
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
-      rmm->fixup_stale_refs_in_old_regions(evacuation_failed());
+      static uint old_cset_fixup_gc = 0;
+      static uint old_cset_clean_streak = 0;
+      static uint old_cset_last_old_regions = 0;
+
+      uint old_regions = _g1h->old_regions_count();
+      bool remote_activity = has_remote_heap_activity(rmm);
+      bool warmup = old_cset_fixup_gc < 30;
+      bool old_growth = old_regions >= old_cset_last_old_regions + 8;
+      bool periodic = (old_cset_fixup_gc % 8) == 0;
+      bool clean_probe = old_cset_clean_streak < 2;
+
+      if (remote_activity || warmup || old_growth || periodic || clean_probe) {
+        int repaired = rmm->fixup_stale_refs_in_old_regions(evacuation_failed());
+        old_cset_clean_streak = (repaired == 0) ? old_cset_clean_streak + 1 : 0;
+        old_cset_last_old_regions = old_regions;
+      } else {
+        log_debug(gc)("Old/cset fixup SKIP: no remote activity, clean_streak=%u, "
+                      "old_regions=%u last_scan_old_regions=%u",
+                      old_cset_clean_streak, old_regions, old_cset_last_old_regions);
+      }
+      old_cset_fixup_gc++;
     }
   }
 
   log_trace(gc)(">>>   post_evacuate_cleanup_2 START");
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
-    log_info(gc)("Remote post-evac cleanup2 START");
+    log_debug(gc)("Remote post-evac cleanup2 START");
   }
   post_evacuate_cleanup_2(per_thread_states, evacuation_info);
   if (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 || LocalMemoryRatio < 100) {
-    log_info(gc)("Remote post-evac cleanup2 DONE");
+    log_debug(gc)("Remote post-evac cleanup2 DONE");
   }
   log_trace(gc)(">>>   post_evacuate_cleanup_2 DONE");
 
@@ -1519,12 +1560,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
   {
     static int _gc_count_for_sweep = 0;
     G1RemoteMemoryManager* rmm_early = _g1h->remote_memory_manager();
-    if (rmm_early != nullptr && _gc_count_for_sweep < 20) {
+    if (G1VerifyAfterEviction && rmm_early != nullptr &&
+        has_remote_heap_activity(rmm_early) && _gc_count_for_sweep < 20) {
       int stale_early = rmm_early->verify_no_stale_refs_to_freed_regions();
       if (stale_early > 0) {
         log_warning(gc)("EARLY-SWEEP GC#%d: %d stale refs found!", _gc_count_for_sweep, stale_early);
       } else {
-        log_info(gc)("EARLY-SWEEP GC#%d: clean", _gc_count_for_sweep);
+        log_debug(gc)("EARLY-SWEEP GC#%d: clean", _gc_count_for_sweep);
       }
       _gc_count_for_sweep++;
     }
@@ -3289,9 +3331,9 @@ void G1YoungCollector::collect() {
   // Wait for root region scan here to make sure that it is done before any
   // use of the STW workers to maximize cpu use (i.e. all cores are available
   // just to do that).
-  log_info(gc)("DIAG: wait_for_root_region_scanning START");
+  log_trace(gc)("DIAG: wait_for_root_region_scanning START");
   wait_for_root_region_scanning();
-  log_info(gc)("DIAG: wait_for_root_region_scanning DONE");
+  log_trace(gc)("DIAG: wait_for_root_region_scanning DONE");
 
   G1YoungGCVerifierMark vm(this);
   {
@@ -3305,9 +3347,9 @@ void G1YoungCollector::collect() {
     // Increment hotness epoch for recency tracking.
     _g1h->remote_memory_manager()->increment_gc_epoch();
 
-    log_info(gc)("DIAG: pre_evacuate_collection_set START");
+    log_trace(gc)("DIAG: pre_evacuate_collection_set START");
     pre_evacuate_collection_set(jtm.evacuation_info());
-    log_info(gc)("DIAG: pre_evacuate_collection_set DONE");
+    log_trace(gc)("DIAG: pre_evacuate_collection_set DONE");
 
     // Save region tops before evacuation for fast Phase C destination scan.
     uint num_regions = _g1h->num_regions();
@@ -3324,9 +3366,9 @@ void G1YoungCollector::collect() {
 
     bool may_do_optional_evacuation = collection_set()->optional_region_length() != 0;
     // Actually do the work...
-    log_info(gc)("DIAG: evacuate_initial_collection_set START");
+    log_trace(gc)("DIAG: evacuate_initial_collection_set START");
     evacuate_initial_collection_set(&per_thread_states, may_do_optional_evacuation);
-    log_info(gc)("DIAG: evacuate_initial_collection_set DONE");
+    log_trace(gc)("DIAG: evacuate_initial_collection_set DONE");
 
     if (may_do_optional_evacuation) {
       log_trace(gc)(">>> evacuate_optional START");
