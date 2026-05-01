@@ -1225,6 +1225,9 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
                                     RegionColdnessSample* sample) {
   const uintptr_t cold_distance = 4;
   const uintptr_t gc_epoch = rmm->gc_epoch();
+  const size_t min_avg_object_words = 512 / HeapWordSize;
+  const size_t dense_probe_object_count = 4096;
+  const size_t min_dense_object_count = MAX2((size_t)4096, HeapRegion::GrainBytes / 1024);
   size_t sampled_words = 0;
   size_t cold_words = 0;
   size_t hot_words = 0;
@@ -1248,6 +1251,18 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     }
     object_count++;
     object_words += word_size;
+
+    if (object_count >= dense_probe_object_count &&
+        object_words < object_count * min_avg_object_words) {
+      sample->sampled_words = sampled_words;
+      sample->cold_words = cold_words;
+      sample->hot_words = hot_words;
+      sample->unknown_words = unknown_words;
+      sample->object_count = object_count;
+      sample->object_words = object_words;
+      sample->dense_small_objects = true;
+      return false;
+    }
 
     // Sample every 8th object to bound mark-word work while still scanning
     // object sizes correctly across the region.
@@ -1276,8 +1291,6 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     // Object-granularity RDMA fetch makes densely packed tiny-object regions
     // extremely expensive to fault back in. Keep them local during proactive
     // T1 eviction; higher pressure tiers may still fall back to them.
-    const size_t min_avg_object_words = 512 / HeapWordSize;
-    const size_t min_dense_object_count = MAX2((size_t)4096, HeapRegion::GrainBytes / 1024);
     if (object_count >= min_dense_object_count &&
         object_words < object_count * min_avg_object_words) {
       sample->dense_small_objects = true;
@@ -1852,6 +1865,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
+            if (dense_deferred_candidates[i]) continue;
 
             if (rmm != nullptr) {
               RegionColdnessSample region_sample;
