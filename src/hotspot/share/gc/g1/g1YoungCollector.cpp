@@ -1300,37 +1300,90 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   return enough_signal && mostly_cold && not_hot;
 }
 
+static void flush_free_region_trim(char*& run_start,
+                                   char*& run_end,
+                                   uint& run_region_count,
+                                   uint& trimmed_regions,
+                                   uint& failed_regions,
+                                   uint& trimmed_ranges,
+                                   uint& failed_ranges,
+                                   size_t& trimmed_bytes) {
+  if (run_start == nullptr) {
+    return;
+  }
+
+  size_t run_bytes = (size_t)(run_end - run_start);
+  if (::madvise(run_start, run_bytes, MADV_DONTNEED) == 0) {
+    trimmed_regions += run_region_count;
+    trimmed_ranges++;
+    trimmed_bytes += run_bytes;
+  } else {
+    failed_regions += run_region_count;
+    failed_ranges++;
+  }
+
+  run_start = nullptr;
+  run_end = nullptr;
+  run_region_count = 0;
+}
+
 static void trim_free_region_rss(G1CollectedHeap* g1h) {
   Ticks trim_start = Ticks::now();
   uint trimmed_regions = 0;
   uint failed_regions = 0;
+  uint trimmed_ranges = 0;
+  uint failed_ranges = 0;
   size_t trimmed_bytes = 0;
   uint num_regions = g1h->num_regions();
+  char* run_start = nullptr;
+  char* run_end = nullptr;
+  uint run_region_count = 0;
 
   for (uint i = 0; i < num_regions; i++) {
     HeapRegion* hr = g1h->region_at(i);
     if (hr == nullptr || !hr->is_free() || hr->is_evict_guarded()) {
+      flush_free_region_trim(run_start, run_end, run_region_count,
+                             trimmed_regions, failed_regions,
+                             trimmed_ranges, failed_ranges,
+                             trimmed_bytes);
       continue;
     }
 
-    if (::madvise((char*)hr->bottom(), HeapRegion::GrainBytes, MADV_DONTNEED) == 0) {
-      trimmed_regions++;
-      trimmed_bytes += HeapRegion::GrainBytes;
+    char* bottom = (char*)hr->bottom();
+    char* end = (char*)hr->end();
+    if (run_start == nullptr) {
+      run_start = bottom;
+      run_end = end;
+      run_region_count = 1;
+    } else if (bottom == run_end) {
+      run_end = end;
+      run_region_count++;
     } else {
-      failed_regions++;
+      flush_free_region_trim(run_start, run_end, run_region_count,
+                             trimmed_regions, failed_regions,
+                             trimmed_ranges, failed_ranges,
+                             trimmed_bytes);
+      run_start = bottom;
+      run_end = end;
+      run_region_count = 1;
     }
   }
+  flush_free_region_trim(run_start, run_end, run_region_count,
+                         trimmed_regions, failed_regions,
+                         trimmed_ranges, failed_ranges,
+                         trimmed_bytes);
 
   if (trimmed_regions > 0 || failed_regions > 0) {
     double trim_ms = (Ticks::now() - trim_start).seconds() * 1000.0;
     if (failed_regions > 0) {
       log_info(gc)("Remote RSS trim: madvised %u free regions (" SIZE_FORMAT
-                   "MB) in %.1fms, failures=%u",
-                   trimmed_regions, trimmed_bytes / M, trim_ms, failed_regions);
+                   "MB, %u ranges) in %.1fms, failures=%u regions/%u ranges",
+                   trimmed_regions, trimmed_bytes / M, trimmed_ranges, trim_ms,
+                   failed_regions, failed_ranges);
     } else {
       log_info(gc)("Remote RSS trim: madvised %u free regions (" SIZE_FORMAT
-                   "MB) in %.1fms",
-                   trimmed_regions, trimmed_bytes / M, trim_ms);
+                   "MB, %u ranges) in %.1fms",
+                   trimmed_regions, trimmed_bytes / M, trimmed_ranges, trim_ms);
     }
   }
 }
@@ -1339,9 +1392,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                                     G1ParScanThreadStateSet* per_thread_states) {
   G1GCPhaseTimes* p = phase_times();
 
-  // Capture heap usage before cleanup for eviction threshold check.
-  // After cleanup, used() drops (young regions reclaimed) and may fall
-  // below threshold even when Old gen pressure warrants eviction.
+  // Capture heap usage before cleanup for legacy eviction threshold mode.
+  // LocalMemoryRatio mode uses post-cleanup live usage below: reclaimed young
+  // pages are madvised before returning to the mutator and should not force
+  // dense old-region eviction.
   const size_t pre_cleanup_heap_used = _g1h->used();
 
   // Process any discovered reference objects - we have
@@ -1563,6 +1617,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       size_t evict_batch_cap_bytes = 0;
 
       if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
+        local_used = _g1h->used();
         size_t local_capacity = (heap_capacity * LocalMemoryRatio) / 100;
         // RDMA mode keeps large native side metadata (handles, edge tables,
         // tagged-field lists, staging buffers, Spark/JVM native state). In the
