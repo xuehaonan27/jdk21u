@@ -63,7 +63,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _resolve_fast_dead(0), _resolve_slow_entries(0), _resolve_no_safepoint_entries(0),
     _fetch_success(0), _fetch_failures(0), _fetch_words(0), _fetch_elapsed_counter(0),
     _fetch_retries(0), _fetch_wait_slow(0), _fetch_wait_no_safepoint(0),
-    _fetch_wait_hard(0), _fetch_wait_loops(0),
+    _fetch_wait_hard(0), _fetch_wait_loops(0), _fetch_progress_next(1024),
     _current_fcr(nullptr), _fcr_lock(0) {
   _table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
   _eviction_table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
@@ -119,6 +119,31 @@ void G1RemoteMemoryManager::initialize_backend() {
   _backend = new SimLocalBackend();
   _backend->initialize();
   log_info(gc)("Remote memory backend: %s", _backend->name());
+}
+
+void G1RemoteMemoryManager::record_fetch_result(size_t word_size,
+                                                jlong elapsed_counter,
+                                                bool success) {
+  if (!success) {
+    Atomic::inc(&_fetch_failures);
+    return;
+  }
+
+  Atomic::inc(&_fetch_success);
+  Atomic::add(&_fetch_words, (uint64_t)word_size);
+  Atomic::add(&_fetch_elapsed_counter, (uint64_t)elapsed_counter);
+
+  const uint64_t progress_interval = 1024;
+  uint64_t fetch_success = Atomic::load(&_fetch_success);
+  uint64_t next = Atomic::load(&_fetch_progress_next);
+  while (fetch_success >= next) {
+    uint64_t new_next = next + progress_interval;
+    if (Atomic::cmpxchg(&_fetch_progress_next, next, new_next) == next) {
+      log_remote_access_stats();
+      break;
+    }
+    next = Atomic::load(&_fetch_progress_next);
+  }
 }
 
 void G1RemoteMemoryManager::log_remote_access_stats() const {

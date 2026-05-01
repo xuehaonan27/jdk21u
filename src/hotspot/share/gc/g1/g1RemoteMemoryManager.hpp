@@ -695,6 +695,7 @@ public:
   volatile uint64_t _fetch_wait_no_safepoint;
   volatile uint64_t _fetch_wait_hard;
   volatile uint64_t _fetch_wait_loops;
+  volatile uint64_t _fetch_progress_next;
 
   void record_resolve_fast_state(uintptr_t state) {
     if (state == REMOTE_HANDLE_LOCAL) {
@@ -709,15 +710,7 @@ public:
   }
   void record_resolve_slow_entry() { Atomic::inc(&_resolve_slow_entries); }
   void record_resolve_no_safepoint_entry() { Atomic::inc(&_resolve_no_safepoint_entries); }
-  void record_fetch_result(size_t word_size, jlong elapsed_counter, bool success) {
-    if (success) {
-      Atomic::inc(&_fetch_success);
-      Atomic::add(&_fetch_words, (uint64_t)word_size);
-      Atomic::add(&_fetch_elapsed_counter, (uint64_t)elapsed_counter);
-    } else {
-      Atomic::inc(&_fetch_failures);
-    }
-  }
+  void record_fetch_result(size_t word_size, jlong elapsed_counter, bool success);
   void record_fetch_retry() { Atomic::inc(&_fetch_retries); }
   void record_fetch_wait(bool no_safepoint, bool hard, uint64_t loops) {
     Atomic::add(&_fetch_wait_loops, loops);
