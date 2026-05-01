@@ -216,6 +216,9 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   if (obj == nullptr || !_g1h->is_in(obj)) {
     return;
   }
+  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+    return;
+  }
 
   // Although we never intentionally push references outside of the collection
   // set, due to (benign) races in the claim mechanism during RSet scanning more

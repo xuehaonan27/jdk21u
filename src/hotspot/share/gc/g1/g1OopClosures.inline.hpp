@@ -59,6 +59,89 @@
 //
 // Ladder: shared_oop(handle) → unique_oop(addr) → clean oop(addr)
 // For prototype simplicity, go directly shared → clean when safe.
+static inline bool g1_remote_gc_scan_checks_enabled() {
+  return UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+         G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
+}
+
+static inline bool g1_gc_scan_region_contains_oop(G1CollectedHeap* g1h, oop obj) {
+  if (obj == nullptr) {
+    return false;
+  }
+
+  uintptr_t addr = cast_from_oop<uintptr_t>(obj);
+  if (!g1_remote_oop_is_aligned(addr) ||
+      !g1h->is_in_reserved((void*)addr)) {
+    return false;
+  }
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null((void*)addr);
+  if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+    return false;
+  }
+
+  HeapWord* obj_addr = (HeapWord*)addr;
+  return obj_addr >= hr->bottom() && obj_addr < hr->top();
+}
+
+template <class T>
+static inline bool g1_retag_stale_gc_slot_if_possible(G1CollectedHeap* g1h, T* p, oop obj) {
+  if (sizeof(T) != sizeof(uintptr_t) || p == nullptr) {
+    return false;
+  }
+  if (!g1h->is_in_reserved((void*)p)) {
+    return false;
+  }
+
+  HeapRegion* field_hr = g1h->heap_region_containing_or_null((void*)p);
+  if (field_hr == nullptr || field_hr->is_free() || field_hr->is_evict_guarded()) {
+    return false;
+  }
+
+  uintptr_t raw = *(uintptr_t*)p;
+  if (raw == 0 ||
+      (raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+      (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+    return false;
+  }
+
+  uintptr_t addr = (raw & G1_OOP_TAG_MASK) != 0 ? (raw & G1_OOP_ADDR_MASK) :
+                                                  cast_from_oop<uintptr_t>(obj);
+  if (addr == 0 || !g1_remote_oop_is_aligned(addr)) {
+    return false;
+  }
+
+  G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+  RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(addr);
+  if (h == nullptr) {
+    return false;
+  }
+
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_DEAD) {
+    return false;
+  }
+
+  *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+  return true;
+}
+
+template <class T>
+static inline bool g1_gc_resolved_oop_safe_for_scan(G1CollectedHeap* g1h, T* p, oop obj) {
+  if (!g1_remote_gc_scan_checks_enabled()) {
+    return true;
+  }
+  if (g1_gc_scan_region_contains_oop(g1h, obj)) {
+    return true;
+  }
+
+  // A clean pre-eviction oop can survive in a dirty card/root slot. If the
+  // field is a writable heap slot, repair it back to a shared handle before
+  // skipping; otherwise just avoid dereferencing the protected/free address.
+  g1_retag_stale_gc_slot_if_possible(g1h, p, obj);
+  return false;
+}
+
 template <class T>
 inline void G1ScanClosureBase::prefetch_and_push(T* p, const oop obj) {
   // We're not going to even bother checking whether the object is
@@ -104,6 +187,9 @@ inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
   if (!_g1h->is_in(obj)) {
     return;
   }
+  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+    return;
+  }
   const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
   if (region_attr.is_in_cset()) {
     prefetch_and_push(p, obj);
@@ -130,6 +216,9 @@ inline void G1RootRegionScanClosure::do_oop_work(T* p) {
   }
   // Phase 6: skip remote objects (resolved to non-heap slot_id)
   if (!_g1h->is_in(obj)) {
+    return;
+  }
+  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
     return;
   }
   if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
@@ -170,6 +259,9 @@ inline void G1ConcurrentRefineOopClosure::do_oop_work(T* p) {
   if (!_g1h->is_in(obj)) {
     return;
   }
+  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+    return;
+  }
 
   check_obj_during_refinement(p, obj);
 
@@ -200,6 +292,9 @@ inline void G1ScanCardClosure::do_oop_work(T* p) {
   }
   // Phase 6: skip remote objects (resolved to non-heap slot_id)
   if (!_g1h->is_in(obj)) {
+    return;
+  }
+  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
     return;
   }
 
@@ -241,6 +336,9 @@ void G1ParCopyHelper::do_cld_barrier(oop new_obj) {
 }
 
 void G1ParCopyHelper::mark_object(oop obj) {
+  if (!g1_gc_resolved_oop_safe_for_scan<oop>(_g1h, nullptr, obj)) {
+    return;
+  }
   assert(!_g1h->heap_region_containing(obj)->in_collection_set(), "should not mark objects in the CSet");
 
   // We know that the object is not moving so it's safe to read its size.
@@ -260,6 +358,9 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
   }
   // Phase 6: skip remote objects (resolved to non-heap slot_id)
   if (!_g1h->is_in(obj)) {
+    return;
+  }
+  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
     return;
   }
   assert(_worker_id == _par_scan_state->worker_id(), "sanity");
@@ -338,6 +439,9 @@ template <class T> void G1RebuildRemSetClosure::do_oop_work(T* p) {
   }
   // Phase 6: skip remote objects (resolved to non-heap slot_id)
   if (!_g1h->is_in(obj)) {
+    return;
+  }
+  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
     return;
   }
 
