@@ -185,7 +185,15 @@ struct RemoteHandleChunk : public CHeapObj<mtGC> {
   RemoteHandle    _handles[REMOTE_HANDLE_CHUNK_CAPACITY];
   RemoteHandleChunk* _next;  // Linked list for global pool
 
-  RemoteHandleChunk() : _next(nullptr) {}
+  RemoteHandleChunk() : _next(nullptr) {
+    for (size_t i = 0; i < REMOTE_HANDLE_CHUNK_CAPACITY; i++) {
+      _handles[i]._state_and_addr = REMOTE_HANDLE_DEAD;
+      _handles[i]._remote_refcount = 0;
+      _handles[i]._flags = 0;
+      _handles[i]._eviction_addr = 0;
+      _handles[i]._eviction_word_size = 0;
+    }
+  }
 };
 
 
@@ -292,6 +300,15 @@ public:
 
   size_t total_chunks() const { return _total_chunks; }
   size_t total_handles_allocated() const { return _total_handles_allocated; }
+
+  template <typename Closure>
+  void handles_do(Closure* cl) const {
+    for (RemoteHandleChunk* chunk = _all_chunks; chunk != nullptr; chunk = chunk->_next) {
+      for (size_t i = 0; i < REMOTE_HANDLE_CHUNK_CAPACITY; i++) {
+        cl->do_handle(const_cast<RemoteHandle*>(&chunk->_handles[i]));
+      }
+    }
+  }
 };
 
 

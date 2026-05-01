@@ -1570,6 +1570,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           } else if (eviction_tier == 2) {
             evict_batch_cap_bytes = HeapRegion::GrainBytes * 3;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
+          } else if (eviction_tier == 3) {
+            evict_batch_cap_bytes = HeapRegion::GrainBytes * 8;
+            evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
           }
         }
 
@@ -1620,7 +1623,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_dense_last_resort_candidates = 0;
         size_t path2_dense_last_resort_bytes = 0;
         size_t path2_dense_last_resort_objects = 0;
-        bool unlimited = (eviction_tier >= 3);
+        bool unlimited = false;
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
         bool* dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
         memset(dense_deferred_candidates, 0, num_regions * sizeof(bool));
@@ -1656,7 +1659,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               continue;
             }
 
-            if (eviction_tier < 3 && region_sample.dense_small_objects) {
+            if (region_sample.dense_small_objects) {
               dense_deferred_candidates[i] = true;
               path2_regions_dense_small++;
               path2_dense_small_bytes += hr->used();
@@ -1714,7 +1717,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
 
-            if (eviction_tier == 2 && rmm != nullptr) {
+            if (rmm != nullptr) {
               RegionColdnessSample region_sample;
               (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
               if (region_sample.dense_small_objects) {
@@ -1744,8 +1747,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-        if (eviction_tier == 2 && path2_bytes == 0) {
-          const size_t dense_last_resort_cap = HeapRegion::GrainBytes * 2;
+        if (eviction_tier >= 2 && path2_bytes == 0) {
+          const size_t dense_last_resort_cap = HeapRegion::GrainBytes;
           for (uint i = 0; i < num_regions; i++) {
             if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
             if (!dense_deferred_candidates[i]) continue;
@@ -1773,10 +1776,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
           if (path2_dense_last_resort_candidates > 0) {
             log_info(gc)("Path 2 dense last-resort selected %d regions ("
-                         SIZE_FORMAT "MB, " SIZE_FORMAT " objs) for T2 pressure",
+                         SIZE_FORMAT "MB, " SIZE_FORMAT " objs) for T%d pressure",
                          path2_dense_last_resort_candidates,
                          path2_dense_last_resort_bytes / M,
-                         path2_dense_last_resort_objects);
+                         path2_dense_last_resort_objects,
+                         eviction_tier);
           }
         }
 

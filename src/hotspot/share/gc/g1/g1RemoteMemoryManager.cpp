@@ -182,6 +182,87 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                Atomic::load(&_fetch_wait_loops));
 }
 
+size_t G1RemoteMemoryManager::rebuild_handle_table_from_handles() {
+  size_t inserted = 0;
+  size_t local = 0;
+  size_t remote = 0;
+  size_t fetching = 0;
+  size_t skipped = 0;
+
+  table_lock();
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      HandleEntry* next = e->_next;
+      e->_next = _entry_free_list;
+      _entry_free_list = e;
+      e = next;
+    }
+    _table[idx] = nullptr;
+  }
+
+  class RebuildClosure {
+    G1RemoteMemoryManager* _rmm;
+    size_t* _inserted;
+    size_t* _local;
+    size_t* _remote;
+    size_t* _fetching;
+    size_t* _skipped;
+
+  public:
+    RebuildClosure(G1RemoteMemoryManager* rmm,
+                   size_t* inserted,
+                   size_t* local,
+                   size_t* remote,
+                   size_t* fetching,
+                   size_t* skipped)
+      : _rmm(rmm), _inserted(inserted), _local(local),
+        _remote(remote), _fetching(fetching), _skipped(skipped) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      uintptr_t key = 0;
+
+      if (state == REMOTE_HANDLE_LOCAL) {
+        key = sa & REMOTE_HANDLE_ADDR_MASK;
+        (*_local)++;
+      } else if (state == REMOTE_HANDLE_REMOTE) {
+        key = h->_eviction_addr;
+        (*_remote)++;
+      } else if (state == REMOTE_HANDLE_FETCHING) {
+        key = h->_eviction_addr;
+        (*_fetching)++;
+      } else {
+        return;
+      }
+
+      if (key == 0) {
+        (*_skipped)++;
+        return;
+      }
+
+      size_t idx = hash_obj(key);
+      HandleEntry* entry = _rmm->alloc_entry();
+      entry->init(key, h, _rmm->_table[idx]);
+      _rmm->_table[idx] = entry;
+      (*_inserted)++;
+    }
+  };
+
+  RebuildClosure cl(this, &inserted, &local, &remote, &fetching, &skipped);
+  _handle_allocator.handles_do(&cl);
+  table_unlock();
+
+  log_info(gc)("Handle table rebuild: inserted=%zu local=%zu remote=%zu "
+               "fetching=%zu skipped=%zu allocated=%zu",
+               inserted, local, remote, fetching, skipped,
+               _handle_allocator.total_handles_allocated());
+  return inserted;
+}
+
 G1RemoteMemoryManager::~G1RemoteMemoryManager() {
   // Free HandleEntry chunks (entries are pool-managed, not individually freed)
   HandleEntryChunk* ec = _entry_chunks;
@@ -544,44 +625,72 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
   }
 
   memset(blockers_by_region, 0, num_regions * sizeof(int));
-  int total_blockers = 0;
+  class UnpreparedLocalHandleClosure {
+    G1RemoteMemoryManager* _rmm;
+    const bool* _eviction_candidates;
+    const bool* _region_complete;
+    const int* _region_start;
+    const int* _region_count;
+    uint _num_regions;
+    const PreparedEviction* _entries;
+    int* _blockers_by_region;
+    int _log_limit;
+    int _total_blockers;
 
-  table_lock();
-  for (size_t i = 0; i < TABLE_SIZE; i++) {
-    HandleEntry* e = _table[i];
-    while (e != nullptr) {
-      RemoteHandle* h = e->_handle;
+  public:
+    UnpreparedLocalHandleClosure(G1RemoteMemoryManager* rmm,
+                                 const bool* eviction_candidates,
+                                 const bool* region_complete,
+                                 const int* region_start,
+                                 const int* region_count,
+                                 uint num_regions,
+                                 const PreparedEviction* entries,
+                                 int* blockers_by_region,
+                                 int log_limit)
+      : _rmm(rmm), _eviction_candidates(eviction_candidates),
+        _region_complete(region_complete), _region_start(region_start),
+        _region_count(region_count), _num_regions(num_regions),
+        _entries(entries), _blockers_by_region(blockers_by_region),
+        _log_limit(log_limit), _total_blockers(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
       if (state == REMOTE_HANDLE_LOCAL) {
         uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
-        if (addr != 0 && _g1h->is_in((void*)addr)) {
-          HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
+        if (addr != 0 && _rmm->_g1h->is_in((void*)addr)) {
+          HeapRegion* hr = _rmm->_g1h->heap_region_containing((void*)addr);
           if (hr != nullptr) {
             uint ridx = hr->hrm_index();
-            if (ridx < num_regions && eviction_candidates[ridx] &&
-                region_complete[ridx] && region_count[ridx] > 0 &&
-                !prepared_entries_contain_handle(entries, region_start[ridx],
-                                                 region_count[ridx], addr, h)) {
-              int blockers = ++blockers_by_region[ridx];
-              total_blockers++;
-              if (blockers <= log_limit) {
+            if (ridx < _num_regions && _eviction_candidates[ridx] &&
+                _region_complete[ridx] && _region_count[ridx] > 0 &&
+                !prepared_entries_contain_handle(_entries, _region_start[ridx],
+                                                 _region_count[ridx], addr, h)) {
+              int blockers = ++_blockers_by_region[ridx];
+              _total_blockers++;
+              if (blockers <= _log_limit) {
                 log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
-                                PTR_FORMAT " local=" PTR_FORMAT " table_addr="
-                                PTR_FORMAT " dormant=%d rc=%u",
-                                ridx, p2i(h), addr, e->_obj_addr,
+                                PTR_FORMAT " local=" PTR_FORMAT
+                                " dormant=%d rc=%u",
+                                ridx, p2i(h), addr,
                                 h->is_dormant() ? 1 : 0, h->remote_refcount());
               }
             }
           }
         }
       }
-      e = e->_next;
     }
-  }
-  table_unlock();
 
-  return total_blockers;
+    int total_blockers() const { return _total_blockers; }
+  };
+
+  UnpreparedLocalHandleClosure cl(this, eviction_candidates, region_complete,
+                                  region_start, region_count, num_regions,
+                                  entries, blockers_by_region, log_limit);
+  _handle_allocator.handles_do(&cl);
+  return cl.total_blockers();
 }
 
 int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* region_set,
@@ -1959,34 +2068,44 @@ int G1RemoteMemoryManager::count_local_handles_in_region(HeapRegion* hr, int log
 
   uintptr_t bottom = (uintptr_t)hr->bottom();
   uintptr_t end = (uintptr_t)hr->end();
-  int count = 0;
+  class CountLocalHandleClosure {
+    uintptr_t _bottom;
+    uintptr_t _end;
+    uint _region_idx;
+    int _log_limit;
+    int _count;
 
-  table_lock();
-  for (size_t i = 0; i < TABLE_SIZE; i++) {
-    HandleEntry* e = _table[i];
-    while (e != nullptr) {
-      RemoteHandle* h = e->_handle;
+  public:
+    CountLocalHandleClosure(uintptr_t bottom, uintptr_t end, uint region_idx, int log_limit)
+      : _bottom(bottom), _end(end), _region_idx(region_idx),
+        _log_limit(log_limit), _count(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
       if (state == REMOTE_HANDLE_LOCAL) {
         uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
-        if (addr >= bottom && addr < end) {
-          count++;
-          if (count <= log_limit) {
+        if (addr >= _bottom && addr < _end) {
+          _count++;
+          if (_count <= _log_limit) {
             log_warning(gc)("LOCAL handle blocks eviction free: region=%u handle=" PTR_FORMAT
-                            " local=" PTR_FORMAT " table_addr=" PTR_FORMAT
+                            " local=" PTR_FORMAT
                             " dormant=%d rc=%u",
-                            hr->hrm_index(), p2i(h), addr, e->_obj_addr,
+                            _region_idx, p2i(h), addr,
                             h->is_dormant() ? 1 : 0, h->remote_refcount());
           }
         }
       }
-      e = e->_next;
     }
-  }
-  table_unlock();
 
-  return count;
+    int count() const { return _count; }
+  };
+
+  CountLocalHandleClosure cl(bottom, end, hr->hrm_index(), log_limit);
+  _handle_allocator.handles_do(&cl);
+  return cl.count();
 }
 
 Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {

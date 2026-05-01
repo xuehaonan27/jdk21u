@@ -671,6 +671,7 @@ public:
   int fixup_tagged_field_handles();
   int fixup_all_local_handles();
   int purge_stale_local_handles(const char* phase, int log_limit = 16);
+  size_t rebuild_handle_table_from_handles();
 
   // Post-evacuation fixup: scan ALL old regions for refs to
   // collection-set regions. Must be called BEFORE free_collection_set.
@@ -999,79 +1000,63 @@ public:
 // Template implementation — must be in header for instantiation.
 template <typename OopClosureType>
 void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
-  // Walk the Handle table. For each dormant anchor (LOCAL + remote_refcount > 0),
-  // call cl->do_oop. If GC moves the object, update Handle and rekey table entry.
+  // Walk the primary Handle storage. The hash table is only a secondary index;
+  // edge-table references may still hold a valid RemoteHandle even if the
+  // address index is stale or missing.
   //
-  // Collect moved entries for rehashing after the walk (can't modify hash
-  // structure during iteration).
-  static const int MAX_MOVED = 256;
-  struct MovedEntry { HandleEntry* entry; uintptr_t old_addr; };
-  MovedEntry moved[MAX_MOVED];
-  int num_moved = 0;
-  int stale_anchors = 0;
+  // For each anchor (LOCAL + remote_refcount > 0),
+  // call cl->do_oop. If GC moves the object, update Handle and rekey table entry.
+  class AnchorHandleClosure {
+    G1RemoteMemoryManager* _rmm;
+    OopClosureType* _cl;
+    int _stale_anchors;
+    int _moved;
 
-  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    HandleEntry* e = _table[idx];
-    while (e != nullptr) {
-      RemoteHandle* h = e->_handle;
-      if (h != nullptr && h->is_local() && h->remote_refcount() > 0) {
-        // Use Handle's live LOCAL target, not potentially stale table key.
-        oop obj = cast_to_oop(h->local_addr());
-        if (obj == nullptr ||
-            !validate_local_handle_addr(h, "STALE-ANCHOR", &stale_anchors, 16)) {
-          e = e->_next;
-          continue;
-        }
-        if (obj->klass_or_null() == nullptr) {
-          e = e->_next;
-          continue;
-        }
-        cl->do_oop(&obj);
-        uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
-        if (new_addr != e->_obj_addr) {
-          h->set_local(cast_from_oop<void*>(obj));
-          if (num_moved < MAX_MOVED) {
-            moved[num_moved++] = {e, e->_obj_addr};
-          }
-          e->_obj_addr = new_addr;
-        }
+  public:
+    AnchorHandleClosure(G1RemoteMemoryManager* rmm, OopClosureType* cl)
+      : _rmm(rmm), _cl(cl), _stale_anchors(0), _moved(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr || h->remote_refcount() == 0) return;
+
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) return;
+
+      if (!_rmm->validate_local_handle_addr(h, "STALE-ANCHOR", &_stale_anchors, 16)) {
+        return;
       }
-      e = e->_next;
-    }
-  }
 
-  if (stale_anchors > 16) {
+      oop obj = cast_to_oop((HeapWord*)(sa & REMOTE_HANDLE_ADDR_MASK));
+      if (obj == nullptr || obj->klass_or_null() == nullptr) return;
+
+      _cl->do_oop(&obj);
+
+      uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
+      if (new_addr != (sa & REMOTE_HANDLE_ADDR_MASK)) {
+        h->set_local(cast_from_oop<void*>(obj));
+        _moved++;
+      }
+    }
+
+    int stale_anchors() const { return _stale_anchors; }
+    int moved() const { return _moved; }
+  };
+
+  AnchorHandleClosure hcl(this, cl);
+  _handle_allocator.handles_do(&hcl);
+
+  if (hcl.stale_anchors() > 16) {
     log_warning(gc)("STALE-ANCHOR: marked %d stale LOCAL anchor handles DEAD "
-                    "(logged first 16)", stale_anchors);
+                    "(logged first 16)", hcl.stale_anchors());
   }
 
-  // Rehash moved entries: unlink from old bucket, insert into new
-  for (int i = 0; i < num_moved; i++) {
-    HandleEntry* entry = moved[i].entry;
-    size_t old_idx = hash_obj(moved[i].old_addr);
-    size_t new_idx = hash_obj(entry->_obj_addr);
-    if (old_idx != new_idx) {
-      // Unlink from old bucket
-      HandleEntry** pp = &_table[old_idx];
-      while (*pp != nullptr) {
-        if (*pp == entry) {
-          *pp = entry->_next;
-          break;
-        }
-        pp = &(*pp)->_next;
-      }
-      // Insert into new bucket
-      entry->_next = _table[new_idx];
-      _table[new_idx] = entry;
-    }
+  if (hcl.moved() > 0) {
+    rebuild_handle_table_from_handles();
   }
 }
 
 template <typename OopClosureType>
 void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
-  static const int MAX_MOVED = 256;
-  struct MovedEntry { HandleEntry* entry; uintptr_t old_addr; };
-  MovedEntry moved[MAX_MOVED];
   int num_moved = 0;
   int stale_cross_roots = 0;
 
@@ -1089,17 +1074,7 @@ void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
     uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
     if (new_addr != old_addr) {
       h->set_local(cast_from_oop<void*>(obj));
-      // Find table entry by old address for rehashing
-      size_t idx = hash_obj(old_addr);
-      for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
-        if (e->_handle == h) {
-          if (num_moved < MAX_MOVED) {
-            moved[num_moved++] = {e, old_addr};
-            e->_obj_addr = new_addr;
-          }
-          break;
-        }
-      }
+      num_moved++;
     }
   }
 
@@ -1108,19 +1083,8 @@ void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
                     "DEAD (logged first 16)", stale_cross_roots);
   }
 
-  for (int i = 0; i < num_moved; i++) {
-    HandleEntry* entry = moved[i].entry;
-    size_t old_idx = hash_obj(moved[i].old_addr);
-    size_t new_idx = hash_obj(entry->_obj_addr);
-    if (old_idx != new_idx) {
-      HandleEntry** pp = &_table[old_idx];
-      while (*pp != nullptr) {
-        if (*pp == entry) { *pp = entry->_next; break; }
-        pp = &(*pp)->_next;
-      }
-      entry->_next = _table[new_idx];
-      _table[new_idx] = entry;
-    }
+  if (num_moved > 0) {
+    rebuild_handle_table_from_handles();
   }
 }
 
