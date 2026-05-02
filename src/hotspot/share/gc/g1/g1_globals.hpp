@@ -300,6 +300,12 @@
           "enables tiered eviction: Tier1 (>60% local), Tier2 (>85%), "    \
           "Tier3 (>95%). Overrides G1RemoteEvictionThreshold.")                                     \
                                                                             \
+  product(bool, G1RemoteAllowDenseObjectEviction, false, DIAGNOSTIC,        \
+          "Allow tiered remote eviction to use dense small-object Old "     \
+          "regions as an emergency last resort. Disabled by default because "\
+          "object-granularity fetch has poor economics for dense Spark "    \
+          "regions and this path is only for controlled experiments.")      \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \

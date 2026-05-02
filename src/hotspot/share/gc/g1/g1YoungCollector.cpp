@@ -1730,7 +1730,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        "MB (local_cap=" SIZE_FORMAT "MB reserve=" SIZE_FORMAT "MB, %.1f%%), "
                        "alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, "
                        "effective=%.1f%%, target=%zu%%, batch_cap=" SIZE_FORMAT
-                       "MB, evict_target=" SIZE_FORMAT "MB",
+                       "MB, evict_target=" SIZE_FORMAT "MB, dense_last_resort=%s",
                        eviction_tier, local_used / M, heap_budget / M,
                        local_capacity / M, native_reserve / M, pressure * 100.0,
                        alloc_rate_ms / 1024.0,
@@ -1738,7 +1738,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        (double)effective_used / (double)heap_budget * 100.0,
                        target_low_percent,
                        evict_batch_cap_bytes / M,
-                       evict_target_bytes / M);
+                       evict_target_bytes / M,
+                       G1RemoteAllowDenseObjectEviction ? "on" : "off");
         }
       } else if (G1RemoteEvictionThreshold > 0) {
         // Legacy threshold mode: evict when total heap > threshold% of Xmx
@@ -1772,7 +1773,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_dense_last_resort_candidates = 0;
         size_t path2_dense_last_resort_bytes = 0;
         size_t path2_dense_last_resort_objects = 0;
-        const bool allow_dense_object_granularity_eviction = false;
+        const bool allow_dense_object_granularity_eviction =
+          G1RemoteAllowDenseObjectEviction;
         bool unlimited = false;
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
         bool* dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
