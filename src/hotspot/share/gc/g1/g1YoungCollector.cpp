@@ -2292,6 +2292,64 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       RootPinEntry* pins = NEW_C_HEAP_ARRAY(RootPinEntry, pin_capacity, mtGC);
       int num_pins = 0;
 
+      class EvictionThreadRootPinClosure : public OopClosure {
+        G1CollectedHeap* _g1h;
+        bool*            _eviction_candidates;
+        uint             _num_regions;
+        int              _regions_guarded;
+        int              _roots_found;
+
+      public:
+        EvictionThreadRootPinClosure(G1CollectedHeap* g1h, bool* candidates,
+                                     uint num_regions)
+          : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
+            _regions_guarded(0), _roots_found(0) {}
+
+        void do_oop(oop* p) {
+          uintptr_t raw = *(uintptr_t*)p;
+          if (raw == 0) return;
+          if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+              (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+
+          uintptr_t addr = raw;
+          if ((raw & G1_OOP_TAG_MASK) != 0) {
+            addr = raw & G1_OOP_ADDR_MASK;
+          }
+          if (!is_aligned((address)addr, HeapWordSize)) return;
+          if (!_g1h->is_in_reserved((void*)addr)) return;
+
+          HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)addr);
+          if (hr == nullptr) return;
+
+          uint idx = hr->hrm_index();
+          if (idx >= _num_regions) return;
+
+          if (_eviction_candidates[idx]) {
+            _eviction_candidates[idx] = false;
+            hr->clear_cold_destination();
+            _regions_guarded++;
+            _roots_found++;
+          } else {
+            _roots_found++;
+          }
+        }
+        void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+
+        int regions_guarded() const { return _regions_guarded; }
+        int roots_found() const { return _roots_found; }
+      };
+
+      // Thread oop-map slots can still contain stale or interior heap-looking
+      // words in this late post-evacuation eviction pass. Do not parse object
+      // headers or relocate them here; conservatively keep their regions local.
+      EvictionThreadRootPinClosure thread_pin_cl(_g1h, eviction_candidates, num_regions);
+      Threads::oops_do(&thread_pin_cl, nullptr);
+      if (thread_pin_cl.regions_guarded() > 0) {
+        total_candidates -= thread_pin_cl.regions_guarded();
+        log_info(gc)("Root-catch: pinned %d candidate regions for %d thread roots",
+                     thread_pin_cl.regions_guarded(), thread_pin_cl.roots_found());
+      }
+
       class EvictionRootCollectClosure : public OopClosure {
         G1CollectedHeap* _g1h;
         const bool*      _eviction_candidates;
@@ -2349,8 +2407,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       };
 
       EvictionRootCollectClosure collect_cl(_g1h, eviction_candidates, num_regions,
-                                             &pins, num_pins, pin_capacity, pin_grows);
-      Threads::oops_do(&collect_cl, nullptr);
+                                            &pins, num_pins, pin_capacity, pin_grows);
       JNIHandles::oops_do(&collect_cl);
       OopStorageSet::strong_oops_do(&collect_cl);
       for (auto id : EnumRange<OopStorageSet::WeakId>()) {
