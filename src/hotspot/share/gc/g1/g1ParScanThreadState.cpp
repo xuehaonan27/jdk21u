@@ -857,7 +857,8 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         // Determine if tagging is safe: skip arrays and JVM-internal types
         // that are accessed by non-barrier paths (arraycopy, MH dispatch).
         bool in_cold_region = dest->is_cold_destination() && !dest->is_root_pinned();
-        bool safe_to_tag = G1TagRefSites || in_cold_region;
+        bool safe_to_tag = G1RemoteAllowPromotionRefSiteTags &&
+                            (G1TagRefSites || in_cold_region);
         if (safe_to_tag) {
           Klass* k = obj->klass();
           if (k->is_array_klass()) {
@@ -873,7 +874,7 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
 
         // Cold region objects MUST use shared-handle path (for eviction).
         // Force RC > 1 path so they get Handles + shared_oop tagging.
-        if (in_cold_region && info.count == 1) {
+        if (safe_to_tag && in_cold_region && info.count == 1) {
           // Treat as shared (RC > 1) for eviction purposes
           info.count = 2;  // Force shared path
         }

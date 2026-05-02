@@ -607,6 +607,11 @@ public:
   HotnessLevelStats _hotness_stats[HOTNESS_LEVELS];     // current GC's data
   HotnessLevelStats _prev_hotness_stats[HOTNESS_LEVELS]; // previous GC's data (for eviction decisions)
 
+private:
+  uint32_t* _eviction_backoff_until_epoch;
+  uint      _eviction_backoff_capacity;
+  void ensure_eviction_backoff_capacity(uint num_regions);
+
 public:
   // Remote root set: handle_ids for CMD_REPORT_REMOTE_ROOTS_V2.
   // Sources: concurrent marking logs + Phase C tagged fields + refcount>0.
@@ -825,6 +830,12 @@ public:
 
   // Get previous GC's stats for eviction decisions.
   const HotnessLevelStats* prev_hotness_stats() const { return _prev_hotness_stats; }
+
+  bool is_region_in_eviction_backoff(uint region_idx) const {
+    return region_idx < _eviction_backoff_capacity &&
+           _eviction_backoff_until_epoch[region_idx] > _gc_epoch;
+  }
+  void backoff_eviction_region(uint region_idx, uint gc_cycles);
 
   // Determine eviction threshold: objects at or above this distance are cold.
   // Returns the distance threshold, or HOTNESS_LEVELS if nothing to evict.

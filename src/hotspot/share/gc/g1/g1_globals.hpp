@@ -333,6 +333,26 @@
           "is enabled.")                                                    \
           range(0, 1024)                                                    \
                                                                             \
+  product(uint, G1RemoteEvictionAbortBackoffGCCycles, 16, DIAGNOSTIC,       \
+          "Number of GC cycles to skip a region after remote eviction "      \
+          "verification aborts with untagged heap refs. 0 disables the "     \
+          "backoff.")                                                        \
+          range(0, 10000)                                                    \
+                                                                            \
+  product(bool, G1RemoteAllowPromotionRefSiteTags, false, DIAGNOSTIC,        \
+          "Allow ordinary promotion-time OOP classification to write "        \
+          "persistent tagged refs into heap fields. Disabled by default "     \
+          "because Spark-like array-heavy cached data can expose load paths " \
+          "that do not safely tolerate long-lived tagged refs. Remote "       \
+          "eviction Phase C may still tag refs during a bounded STW "         \
+          "eviction attempt.")                                                \
+                                                                            \
+  product(bool, G1RemoteTagObjArraySources, true, DIAGNOSTIC,                \
+          "Allow remote eviction Phase C to tag references stored in object " \
+          "array elements. This is needed for Spark cached partitions such "  \
+          "as Object[]/Tuple3[]; unknown sources and non-oop arrays remain "  \
+          "untaggable.")                                                      \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \

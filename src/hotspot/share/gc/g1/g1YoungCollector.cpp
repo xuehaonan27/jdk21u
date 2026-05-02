@@ -2081,6 +2081,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_regions_scanned = 0;
         int path2_regions_not_cold = 0;
         int path2_regions_dense_small = 0;
+        int path2_regions_backoff_skipped = 0;
         size_t path2_dense_small_bytes = 0;
         size_t path2_dense_small_objects = 0;
         int path2_dense_last_resort_candidates = 0;
@@ -2106,6 +2107,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
+            if (rmm->is_region_in_eviction_backoff(i)) {
+              path2_regions_backoff_skipped++;
+              continue;
+            }
 
             RegionColdnessSample region_sample;
             path2_regions_scanned++;
@@ -2155,12 +2160,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           size_t hot_bytes = hot_words * HeapWordSize;
           size_t unknown_bytes = unknown_words * HeapWordSize;
           log_info(gc)("Path 2 cold scan: selected=%d/%d regions (" SIZE_FORMAT "MB), "
-                       "not_cold=%d, dense_small=%d (" SIZE_FORMAT "MB, "
+                       "not_cold=%d, backoff=%d, dense_small=%d (" SIZE_FORMAT "MB, "
                        SIZE_FORMAT " objs), sample cold=" SIZE_FORMAT "MB hot="
                        SIZE_FORMAT "MB unknown=" SIZE_FORMAT "MB sampled="
                        SIZE_FORMAT "MB",
                        path2_cold_candidates, path2_regions_scanned,
                        path2_cold_bytes / M, path2_regions_not_cold,
+                       path2_regions_backoff_skipped,
                        path2_regions_dense_small, path2_dense_small_bytes / M,
                        path2_dense_small_objects,
                        cold_bytes / M, hot_bytes / M, unknown_bytes / M,
@@ -2181,6 +2187,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
             if (dense_deferred_candidates[i]) continue;
+            if (rmm != nullptr && rmm->is_region_in_eviction_backoff(i)) {
+              path2_regions_backoff_skipped++;
+              continue;
+            }
 
             if (rmm != nullptr) {
               RegionColdnessSample region_sample;
@@ -2228,6 +2238,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
+            if (rmm != nullptr && rmm->is_region_in_eviction_backoff(i)) {
+              path2_regions_backoff_skipped++;
+              continue;
+            }
 
             RegionColdnessSample region_sample;
             if (rmm != nullptr) {
@@ -2810,12 +2824,21 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates, num_regions);
         if (missed > 0) {
           log_warning(gc)("Eviction ABORTED: %d untagged HEAP refs found after tagging", missed);
+          int backoff_regions = 0;
           for (uint i = 0; i < num_regions; i++) {
             if (eviction_candidates[i]) {
+              if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+                rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
+                backoff_regions++;
+              }
               HeapRegion* hr = _g1h->region_at(i);
               hr->clear_cold_destination();
               eviction_candidates[i] = false;
             }
+          }
+          if (backoff_regions > 0) {
+            log_warning(gc)("Eviction backoff: skipping %d aborted candidate regions for %u GC cycles",
+                            backoff_regions, G1RemoteEvictionAbortBackoffGCCycles);
           }
           total_candidates = 0;
           rmm->untag_all_heap_refs();

@@ -55,6 +55,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _edge_table_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
+    _eviction_backoff_until_epoch(nullptr), _eviction_backoff_capacity(0),
     _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
     _remote_roots_capacity(0),
     _cross_roots_count(0),
@@ -420,6 +421,12 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
   FREE_C_HEAP_ARRAY(HandleEntry*, _eviction_table);
   _eviction_table = nullptr;
 
+  if (_eviction_backoff_until_epoch != nullptr) {
+    FREE_C_HEAP_ARRAY(uint32_t, _eviction_backoff_until_epoch);
+    _eviction_backoff_until_epoch = nullptr;
+    _eviction_backoff_capacity = 0;
+  }
+
   // Free edge tables (chained hash)
   for (size_t i = 0; i < EDGE_TABLE_BUCKETS; i++) {
     EdgeTableEntry* e = _edge_buckets[i];
@@ -438,6 +445,36 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
       os::free(_sim_remote_slots[i]._data);
       _sim_remote_slots[i]._data = nullptr;
     }
+  }
+}
+
+void G1RemoteMemoryManager::ensure_eviction_backoff_capacity(uint num_regions) {
+  if (num_regions <= _eviction_backoff_capacity) {
+    return;
+  }
+  uint new_cap = MAX2(num_regions, _eviction_backoff_capacity * 2);
+  if (new_cap < 1024) {
+    new_cap = 1024;
+  }
+  uint32_t* new_backoff = NEW_C_HEAP_ARRAY(uint32_t, new_cap, mtGC);
+  memset(new_backoff, 0, new_cap * sizeof(uint32_t));
+  if (_eviction_backoff_until_epoch != nullptr) {
+    memcpy(new_backoff, _eviction_backoff_until_epoch,
+           _eviction_backoff_capacity * sizeof(uint32_t));
+    FREE_C_HEAP_ARRAY(uint32_t, _eviction_backoff_until_epoch);
+  }
+  _eviction_backoff_until_epoch = new_backoff;
+  _eviction_backoff_capacity = new_cap;
+}
+
+void G1RemoteMemoryManager::backoff_eviction_region(uint region_idx, uint gc_cycles) {
+  if (gc_cycles == 0) {
+    return;
+  }
+  ensure_eviction_backoff_capacity(region_idx + 1);
+  uint32_t until = _gc_epoch + gc_cycles;
+  if (_eviction_backoff_until_epoch[region_idx] < until) {
+    _eviction_backoff_until_epoch[region_idx] = until;
   }
 }
 
@@ -1180,13 +1217,17 @@ public:
     bool heap_source = _g1h->is_in((void*)p);
     if (heap_source) {
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
-      if (_cur_obj == nullptr || (source_klass != nullptr && source_klass->is_array_klass())) {
+      bool object_array_source = source_klass != nullptr && source_klass->is_obj_array_klass();
+      bool untaggable_source = _cur_obj == nullptr ||
+          (source_klass != nullptr && source_klass->is_array_klass() &&
+           (!object_array_source || !G1RemoteTagObjArraySources));
+      if (untaggable_source) {
         _untaggable++;
         if (_untaggable_reports_left > 0) {
           log_warning(gc)("Tagging: kept raw ref from %s heap source field=" PTR_FORMAT
                           " -> target=" PTR_FORMAT " in candidate region %u "
                           "(src_obj=" PTR_FORMAT " src_klass=%s)",
-                          _cur_obj == nullptr ? "unknown" : "array",
+                          _cur_obj == nullptr ? "unknown" : "untaggable-array",
                           p2i(p), p2i((void*)target), idx, p2i((void*)_cur_obj),
                           source_klass != nullptr ? source_klass->external_name() : "unknown");
           _untaggable_reports_left--;
