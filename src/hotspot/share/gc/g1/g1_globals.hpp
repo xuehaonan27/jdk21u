@@ -383,9 +383,10 @@
           "does not resume with raw oop temporaries into mprotected "         \
           "evicted regions.")                                                \
                                                                             \
-  product(uint, G1RemoteCollectionInterval, 8, DIAGNOSTIC,                   \
+  product(uint, G1RemoteCollectionInterval, 0, DIAGNOSTIC,                   \
           "Minimum number of young GC cycles between remote trace-and-report "\
-          "collections after one successful trace. 1 traces every GC.")       \
+          "collections after one successful trace. 0 disables this unsafe "   \
+          "diagnostic pass; 1 traces every GC.")                             \
                                                                             \
   product(size_t, G1RemoteCollectionHandleDelta, 256*K, DIAGNOSTIC,          \
           "Force remote trace-and-report before the interval expires when "   \

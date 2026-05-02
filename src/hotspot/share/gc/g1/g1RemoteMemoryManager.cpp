@@ -2475,6 +2475,15 @@ static inline bool insert_remote_root_id(uintptr_t* dedup_set, size_t set_mask,
 }
 
 size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
+  if (G1RemoteCollectionInterval == 0) {
+    // The current trace-and-report path is conservative diagnostic machinery:
+    // the JVM does not safely clear all dead shared-oops yet, so remote slots
+    // are reported but not reclaimed. Keep it opt-in to avoid per-GC full
+    // handle scans and remote graph traces on performance runs.
+    log_debug(gc)("collect_dead: SKIP disabled by G1RemoteCollectionInterval=0");
+    return 0;
+  }
+
   size_t handles_allocated = _handle_allocator.total_handles_allocated();
   if (_remote_collection_has_trace && G1RemoteCollectionInterval > 1) {
     size_t handle_delta =
