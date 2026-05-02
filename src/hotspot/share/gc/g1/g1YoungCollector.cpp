@@ -24,6 +24,7 @@
 
 #include "precompiled.hpp"
 
+#include "classfile/vmClasses.hpp"
 #include "classfile/classLoaderDataGraph.inline.hpp"
 #include "classfile/javaClasses.inline.hpp"
 #include "compiler/oopMap.hpp"
@@ -68,6 +69,7 @@
 #include "memory/resourceArea.hpp"
 #include "gc/shared/oopStorage.inline.hpp"
 #include "gc/shared/oopStorageSet.inline.hpp"
+#include "memory/universe.hpp"
 #include "oops/klass.hpp"
 #include "runtime/jniHandles.hpp"
 #include "runtime/javaThread.hpp"
@@ -1103,6 +1105,11 @@ static bool remote_eviction_is_block_start(G1CollectedHeap* g1h,
   return true;
 }
 
+static bool remote_eviction_is_filler_klass(Klass* k) {
+  return k == Universe::fillerArrayKlassObj() ||
+         k == vmClasses::FillerObject_klass();
+}
+
 static bool remote_eviction_is_relocatable_object(G1CollectedHeap* g1h,
                                                   uintptr_t obj_addr,
                                                   HeapRegion** region_out,
@@ -1115,7 +1122,7 @@ static bool remote_eviction_is_relocatable_object(G1CollectedHeap* g1h,
   }
 
   oop obj = cast_to_oop(obj_addr);
-  Klass* k = obj->klass_or_null();
+  Klass* k = obj->klass_or_null_acquire();
   if (k == nullptr) {
     if (reason_out != nullptr) *reason_out = "NULL-KLASS";
     if (region_out != nullptr) *region_out = hr;
@@ -1126,13 +1133,25 @@ static bool remote_eviction_is_relocatable_object(G1CollectedHeap* g1h,
     if (region_out != nullptr) *region_out = hr;
     return false;
   }
-  if (G1CollectedHeap::is_obj_filler(obj)) {
+  if (remote_eviction_is_filler_klass(k)) {
     if (reason_out != nullptr) *reason_out = "FILLER";
     if (region_out != nullptr) *region_out = hr;
     return false;
   }
 
-  size_t word_size = obj->size_given_klass(k);
+  Klass* size_k = obj->klass_or_null_acquire();
+  if (size_k == nullptr) {
+    if (reason_out != nullptr) *reason_out = "NULL-KLASS-SIZE";
+    if (region_out != nullptr) *region_out = hr;
+    return false;
+  }
+  if (size_k != k) {
+    if (reason_out != nullptr) *reason_out = "KLASS-CHANGED";
+    if (region_out != nullptr) *region_out = hr;
+    return false;
+  }
+
+  size_t word_size = obj->size_given_klass(size_k);
   if (word_size == 0 || (HeapWord*)obj_addr + word_size > hr->top()) {
     if (reason_out != nullptr) *reason_out = "BAD-SIZE";
     if (region_out != nullptr) *region_out = hr;
