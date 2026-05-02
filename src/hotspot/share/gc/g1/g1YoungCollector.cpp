@@ -49,6 +49,7 @@
 #include "gc/g1/g1RemSet.hpp"
 #include "gc/g1/g1RootProcessor.hpp"
 #include "gc/g1/g1Trace.hpp"
+#include "gc/g1/heapRegion.inline.hpp"
 #include "gc/g1/heapRegionSet.hpp"
 #include "gc/g1/g1YoungCollector.hpp"
 #include "gc/g1/g1YoungGCPostEvacuateTasks.hpp"
@@ -1042,6 +1043,99 @@ static int rpe_cmp(const void* a, const void* b) {
   uintptr_t aa = ((const RootPinEntry*)a)->obj_addr;
   uintptr_t bb = ((const RootPinEntry*)b)->obj_addr;
   return (aa < bb) ? -1 : (aa > bb) ? 1 : 0;
+}
+
+static bool remote_eviction_is_block_start(G1CollectedHeap* g1h,
+                                           uintptr_t obj_addr,
+                                           HeapRegion** region_out,
+                                           const char** reason_out) {
+  if (region_out != nullptr) {
+    *region_out = nullptr;
+  }
+  if (reason_out != nullptr) {
+    *reason_out = nullptr;
+  }
+
+  if (obj_addr == 0) {
+    if (reason_out != nullptr) *reason_out = "NULL";
+    return false;
+  }
+  if (!is_aligned((address)obj_addr, HeapWordSize)) {
+    if (reason_out != nullptr) *reason_out = "UNALIGNED";
+    return false;
+  }
+  if (!g1h->is_in_reserved((void*)obj_addr)) {
+    if (reason_out != nullptr) *reason_out = "NOT-IN-HEAP";
+    return false;
+  }
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null((void*)obj_addr);
+  if (hr == nullptr) {
+    if (reason_out != nullptr) *reason_out = "NO-REGION";
+    return false;
+  }
+  if (region_out != nullptr) {
+    *region_out = hr;
+  }
+  if (hr->is_free()) {
+    if (reason_out != nullptr) *reason_out = "FREE";
+    return false;
+  }
+  if (hr->is_empty()) {
+    if (reason_out != nullptr) *reason_out = "EMPTY";
+    return false;
+  }
+  if (hr->is_continues_humongous()) {
+    if (reason_out != nullptr) *reason_out = "CONT-HUMONGOUS";
+    return false;
+  }
+
+  HeapWord* addr = (HeapWord*)obj_addr;
+  if (addr < hr->bottom() || addr >= hr->top()) {
+    if (reason_out != nullptr) *reason_out = "OUTSIDE-TOP";
+    return false;
+  }
+  if (hr->block_start(addr) != addr) {
+    if (reason_out != nullptr) *reason_out = "INTERIOR";
+    return false;
+  }
+  return true;
+}
+
+static bool remote_eviction_is_relocatable_object(G1CollectedHeap* g1h,
+                                                  uintptr_t obj_addr,
+                                                  HeapRegion** region_out,
+                                                  size_t* word_size_out,
+                                                  const char** reason_out) {
+  HeapRegion* hr = nullptr;
+  if (!remote_eviction_is_block_start(g1h, obj_addr, &hr, reason_out)) {
+    if (region_out != nullptr) *region_out = hr;
+    return false;
+  }
+
+  oop obj = cast_to_oop(obj_addr);
+  Klass* k = obj->klass_or_null();
+  if (k == nullptr) {
+    if (reason_out != nullptr) *reason_out = "NULL-KLASS";
+    if (region_out != nullptr) *region_out = hr;
+    return false;
+  }
+  if (G1CollectedHeap::is_obj_filler(obj)) {
+    if (reason_out != nullptr) *reason_out = "FILLER";
+    if (region_out != nullptr) *region_out = hr;
+    return false;
+  }
+
+  size_t word_size = obj->size_given_klass(k);
+  if (word_size == 0 || (HeapWord*)obj_addr + word_size > hr->top()) {
+    if (reason_out != nullptr) *reason_out = "BAD-SIZE";
+    if (region_out != nullptr) *region_out = hr;
+    return false;
+  }
+
+  if (region_out != nullptr) *region_out = hr;
+  if (word_size_out != nullptr) *word_size_out = word_size;
+  return true;
 }
 
 static void dirty_root_catch_region(G1CollectedHeap* g1h, HeapRegion* root_catch, HeapWord* top) {
@@ -2197,23 +2291,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
 
         bool is_valid_root_object(oop obj, HeapRegion** region_out = nullptr) {
-          if (obj == nullptr || !_g1h->is_in(obj)) return false;
-          HeapRegion* hr = _g1h->heap_region_containing(obj);
-          if (hr == nullptr || hr->is_free() || hr->is_empty() ||
-              hr->is_continues_humongous()) {
-            return false;
-          }
-
-          HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
-          if (obj_addr < hr->bottom() || obj_addr >= hr->top()) return false;
-
-          HeapWord* pb = hr->parsable_bottom_acquire();
-          if (!hr->block_is_obj(obj_addr, pb)) return false;
-
-          if (region_out != nullptr) {
-            *region_out = hr;
-          }
-          return true;
+          size_t word_size = 0;
+          const char* reason = nullptr;
+          return remote_eviction_is_relocatable_object(
+              _g1h, cast_from_oop<uintptr_t>(obj), region_out, &word_size, &reason);
         }
 
       public:
@@ -2346,6 +2427,31 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             continue;
           }
 
+          HeapRegion* pin_hr = nullptr;
+          const char* invalid_reason = nullptr;
+          if (!remote_eviction_is_block_start(_g1h, obj_addr, &pin_hr, &invalid_reason)) {
+            if (pin_hr != nullptr) {
+              uint idx = pin_hr->hrm_index();
+              if (idx < num_regions && eviction_candidates[idx]) {
+                eviction_candidates[idx] = false;
+                pin_hr->clear_cold_destination();
+                regions_pinned++;
+                total_candidates--;
+                fallback_pinned++;
+              }
+            }
+            if (fallback_pinned <= 32) {
+              log_warning(gc)("Root-catch: skipped invalid pin addr=" PTR_FORMAT
+                              " reason=%s region=%u",
+                              obj_addr,
+                              invalid_reason == nullptr ? "?" : invalid_reason,
+                              pin_hr == nullptr ? 9999 : pin_hr->hrm_index());
+            }
+            prev_addr = obj_addr;
+            prev_new = nullptr;
+            continue;
+          }
+
           oop obj = cast_to_oop(obj_addr);
           if (obj->is_forwarded()) {
             // Already relocated by an earlier entry; update root to forwardee.
@@ -2361,7 +2467,30 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             continue;
           }
 
-          size_t word_sz = obj->size();
+          size_t word_sz = 0;
+          if (!remote_eviction_is_relocatable_object(_g1h, obj_addr, &pin_hr,
+                                                     &word_sz, &invalid_reason)) {
+            if (pin_hr != nullptr) {
+              uint idx = pin_hr->hrm_index();
+              if (idx < num_regions && eviction_candidates[idx]) {
+                eviction_candidates[idx] = false;
+                pin_hr->clear_cold_destination();
+                regions_pinned++;
+                total_candidates--;
+                fallback_pinned++;
+              }
+            }
+            if (fallback_pinned <= 32) {
+              log_warning(gc)("Root-catch: pinned region for invalid object addr="
+                              PTR_FORMAT " reason=%s region=%u",
+                              obj_addr,
+                              invalid_reason == nullptr ? "?" : invalid_reason,
+                              pin_hr == nullptr ? 9999 : pin_hr->hrm_index());
+            }
+            prev_addr = obj_addr;
+            prev_new = nullptr;
+            continue;
+          }
           if (root_catch == nullptr) {
             root_catch = _g1h->allocate_fcr_region();
             if (root_catch != nullptr) {

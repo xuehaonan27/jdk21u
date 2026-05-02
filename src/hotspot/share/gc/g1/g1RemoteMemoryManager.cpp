@@ -1126,6 +1126,7 @@ static bool remote_eviction_parse_obj(HeapRegion* hr, HeapWord* p,
 
   HeapWord* pb = hr->parsable_bottom_acquire();
   if (!hr->block_is_obj(p, pb)) return false;
+  if (hr->block_start(p, pb) != p) return false;
 
   oop obj = cast_to_oop(p);
   Klass* k = obj->klass_or_null();
@@ -2123,10 +2124,16 @@ bool G1RemoteMemoryManager::validate_local_handle_addr(RemoteHandle* h,
       reason = "GUARDED";
     } else if (hr->is_free()) {
       reason = "FREE";
+    } else if (hr->is_empty()) {
+      reason = "EMPTY";
+    } else if (hr->is_continues_humongous()) {
+      reason = "CONT-HUMONGOUS";
     } else if ((HeapWord*)addr < hr->bottom() || (HeapWord*)addr >= hr->top()) {
       reason = "OUTSIDE-TOP";
     } else if (!_g1h->is_in((void*)addr)) {
       reason = "NOT IN LIVE HEAP";
+    } else if (hr->block_start((void*)addr) != (HeapWord*)addr) {
+      reason = "INTERIOR";
     } else {
       oop obj = cast_to_oop((HeapWord*)addr);
       Klass* k = obj->klass_or_null();
@@ -2134,6 +2141,11 @@ bool G1RemoteMemoryManager::validate_local_handle_addr(RemoteHandle* h,
         reason = "NULL-KLASS";
       } else if (G1CollectedHeap::is_obj_filler(obj)) {
         reason = "FILLER";
+      } else {
+        size_t word_size = obj->size_given_klass(k);
+        if (word_size == 0 || (HeapWord*)addr + word_size > hr->top()) {
+          reason = "BAD-SIZE";
+        }
       }
     }
   }
@@ -2897,6 +2909,7 @@ static bool is_valid_region_object(G1CollectedHeap* g1h, oop obj, HeapRegion** r
 
   HeapWord* pb = hr->parsable_bottom_acquire();
   if (!hr->block_is_obj(obj_addr, pb)) return false;
+  if (hr->block_start(obj_addr, pb) != obj_addr) return false;
 
   if (region_out != nullptr) {
     *region_out = hr;
