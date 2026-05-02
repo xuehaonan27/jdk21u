@@ -25,6 +25,11 @@ set -e
 #       issues (LIBAPTH hooks sigaction/open/write).
 USE_LIBAPTH=${USE_LIBAPTH:-1}
 
+# REMOTE_BACKEND: Remote memory backend to compile into HotSpot when LIBAPTH is
+# enabled. SIM keeps the backend in-process for local tests; TCP/RDMA must match
+# the remote_executor binary used by the experiment.
+REMOTE_BACKEND=${REMOTE_BACKEND:-SIM}
+
 # DEBUG_LEVEL: JVM build optimization level
 #   release   = -O2, no asserts, production performance (default)
 #   fastdebug = -O1, asserts enabled, debug symbols. Best for debugging —
@@ -60,9 +65,10 @@ TEST_ROUNDS=${TEST_ROUNDS:-100}
 
 # ========================== Derived Variables ==============================
 
-BASEDIR="/home/ubuntu/jvm_libapth"
-JDKDIR="$BASEDIR/jdk21u"
-LIBAPTH_DIR="$BASEDIR/libapth"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASEDIR="${BASEDIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+JDKDIR="${JDKDIR:-$SCRIPT_DIR}"
+LIBAPTH_DIR="${LIBAPTH_DIR:-$BASEDIR/libapth}"
 BOOT_JDK="/usr/lib/jvm/java-21-openjdk-amd64"
 CONF="linux-x86_64-server-${DEBUG_LEVEL}"
 JDK_IMAGE="$JDKDIR/build/$CONF/images/jdk"
@@ -76,6 +82,7 @@ if [[ "$ACTION" == "build" || "$ACTION" == "buildtest" ]]; then
     echo "=== Build Configuration ==="
     echo "  DEBUG_LEVEL: $DEBUG_LEVEL"
     echo "  USE_LIBAPTH: $USE_LIBAPTH"
+    echo "  REMOTE_BACKEND: $REMOTE_BACKEND"
     echo "  CONF:        $CONF"
     echo ""
 
@@ -101,6 +108,7 @@ if [[ "$ACTION" == "build" || "$ACTION" == "buildtest" ]]; then
 
     if [[ "$USE_LIBAPTH" == "1" ]]; then
         CONFIGURE_ARGS+=(--with-libapth="$LIBAPTH_DIR")
+        CONFIGURE_ARGS+=(--with-remote="$REMOTE_BACKEND")
     fi
 
     bash configure "${CONFIGURE_ARGS[@]}"

@@ -90,6 +90,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _backend = new RDMAExecutorBackend();
 #elif defined(REMOTE_BACKEND_TCP)
     _backend = new TCPExecutorBackend();
+#elif defined(REMOTE_BACKEND_SIM)
+    _backend = new SimLocalBackend();
 #else
 #ifdef REMOTE_EXECUTOR_USE_RDMA
     _backend = new RDMAExecutorBackend();
