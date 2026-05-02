@@ -1217,7 +1217,7 @@ public:
     bool heap_source = _g1h->is_in((void*)p);
     if (heap_source) {
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
-      bool object_array_source = source_klass != nullptr && source_klass->is_obj_array_klass();
+      bool object_array_source = source_klass != nullptr && source_klass->is_objArray_klass();
       bool untaggable_source = _cur_obj == nullptr ||
           (source_klass != nullptr && source_klass->is_array_klass() &&
            (!object_array_source || !G1RemoteTagObjArraySources));
