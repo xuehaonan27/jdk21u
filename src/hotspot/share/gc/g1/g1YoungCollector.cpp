@@ -2787,10 +2787,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       int* region_count_arr = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
       bool* region_complete = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
       bool* entry_active = NEW_C_HEAP_ARRAY(bool, max_entries, mtGC);
+      bool* entry_sent = NEW_C_HEAP_ARRAY(bool, max_entries, mtGC);
       memset(region_start, 0, num_regions * sizeof(int));
       memset(region_count_arr, 0, num_regions * sizeof(int));
       memset(region_complete, 0, num_regions * sizeof(bool));
       memset(entry_active, 0, max_entries * sizeof(bool));
+      memset(entry_sent, 0, max_entries * sizeof(bool));
       int num_entries = 0;
 
       for (uint i = 0; i < num_regions; i++) {
@@ -3130,12 +3132,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       bool* send_failed_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
       memset(send_failed_regions, 0, num_regions * sizeof(bool));
       int send_failed_entries = 0;
+      int send_failed_sent_entries = 0;
+      static const int FAILED_LOCALIZE_BATCH = 8192;
+      uintptr_t* failed_localize_ids =
+          NEW_C_HEAP_ARRAY(uintptr_t, FAILED_LOCALIZE_BATCH, mtGC);
 
       if (num_entries > 0 && use_batch_evict && batch_buf_size > BATCH_HDR_SIZE) {
         uint8_t* batch_buf = (uint8_t*)os::malloc(batch_buf_size, mtGC);
         size_t batch_offset = BATCH_HDR_SIZE;
         int batch_count = 0;
         int batch_start_entry = 0;
+        bool backend_send_failed = false;
 
         if (batch_buf == nullptr) {
           log_warning(gc)("Pre-E batch send skipped: failed to allocate " SIZE_FORMAT
@@ -3183,6 +3190,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                   if (idx < num_regions) send_failed_regions[idx] = true;
                   send_failed_entries++;
                 }
+                for (int f = e; f < num_entries; f++) {
+                  if (!entry_active[f]) continue;
+                  HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
+                  uint idx = hr->hrm_index();
+                  if (idx < num_regions) send_failed_regions[idx] = true;
+                  send_failed_entries++;
+                }
+                backend_send_failed = true;
+                break;
+              } else {
+                for (int f = batch_start_entry; f < e; f++) {
+                  if (entry_active[f]) entry_sent[f] = true;
+                }
               }
               batches_sent++;
               batch_offset = BATCH_HDR_SIZE;
@@ -3215,7 +3235,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             batch_count++;
           }
 
-          if (batch_count > 0) {
+          if (!backend_send_failed && batch_count > 0) {
             *(uint32_t*)(batch_buf + 0) = 0x16; // CMD_BATCH_EVICT_WITH_EDGES
             *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
             *(uint64_t*)(batch_buf + 8) = 0;
@@ -3231,6 +3251,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 uint idx = hr->hrm_index();
                 if (idx < num_regions) send_failed_regions[idx] = true;
                 send_failed_entries++;
+              }
+            } else {
+              for (int f = batch_start_entry; f < num_entries; f++) {
+                if (entry_active[f]) entry_sent[f] = true;
               }
             }
             batches_sent++;
@@ -3283,6 +3307,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       int send_failed_region_count = 0;
       int send_failed_aborted = 0;
+      int failed_localize_count = 0;
       for (uint i = 0; i < num_regions; i++) {
         if (!send_failed_regions[i]) continue;
         if (!eviction_candidates[i]) continue;
@@ -3291,6 +3316,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int rcount = region_count_arr[i];
         for (int e = start; e < start + rcount; e++) {
           if (entry_active[e]) {
+            if (entry_sent[e]) {
+              failed_localize_ids[failed_localize_count++] = (uintptr_t)entries[e].handle;
+              send_failed_sent_entries++;
+              entry_sent[e] = false;
+              if (failed_localize_count == FAILED_LOCALIZE_BATCH) {
+                backend->localize_batch(failed_localize_ids, failed_localize_count);
+                failed_localize_count = 0;
+              }
+            }
             rmm->abort_prepared_eviction(&entries[e]);
             entry_active[e] = false;
             send_failed_aborted++;
@@ -3306,12 +3340,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         total_candidates--;
         send_failed_region_count++;
       }
+      if (failed_localize_count > 0) {
+        backend->localize_batch(failed_localize_ids, failed_localize_count);
+      }
       FREE_C_HEAP_ARRAY(bool, send_failed_regions);
+      FREE_C_HEAP_ARRAY(uintptr_t, failed_localize_ids);
       if (send_failed_region_count > 0) {
         log_warning(gc)("Pre-E batch failure guard: removed %d regions, aborted %d "
-                        "prepared entries (%d send-failed entries observed)",
+                        "prepared entries (%d send-failed entries observed, "
+                        "%d already-sent entries localized)",
                         send_failed_region_count, send_failed_aborted,
-                        send_failed_entries);
+                        send_failed_entries, send_failed_sent_entries);
       }
       double e2_ms = (Ticks::now() - e2_start).seconds() * 1000.0;
 
@@ -3374,6 +3413,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       FREE_C_HEAP_ARRAY(int, region_count_arr);
       FREE_C_HEAP_ARRAY(bool, region_complete);
       FREE_C_HEAP_ARRAY(bool, entry_active);
+      FREE_C_HEAP_ARRAY(bool, entry_sent);
 
       if (total_candidates > 0) {
         double phase_e_ms = (Ticks::now() - phase_e_start).seconds() * 1000.0;

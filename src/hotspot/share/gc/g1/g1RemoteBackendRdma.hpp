@@ -27,6 +27,8 @@
 #include <infiniband/verbs.h>
 
 class RDMAExecutorBackend : public G1RemoteBackend {
+  static const size_t RemoteExecutorMaxSlots = 16 * 1024 * 1024;
+
   // RDMA resources
   struct ibv_context*    _ctx;
   struct ibv_pd*         _pd;
@@ -93,7 +95,10 @@ public:
   void discard_slot(size_t slot_id) override;
   size_t slot_word_size(size_t slot_id) const override;
 
-  size_t allocate_slot_id() override { return _next_slot++; }
+  size_t allocate_slot_id() override {
+    if (_next_slot >= RemoteExecutorMaxSlots) return (size_t)-1;
+    return _next_slot++;
+  }
   size_t total_evicted() const override { return _total_evicted; }
   size_t total_fetched() const override { return _total_fetched; }
   void shutdown() override;
