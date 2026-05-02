@@ -73,6 +73,9 @@
 #include "runtime/os.hpp"
 #include "runtime/threads.hpp"
 #include "utilities/ticks.hpp"
+#ifdef LINUX
+#include "osContainer_linux.hpp"
+#endif
 
 #include <sys/mman.h>
 
@@ -1313,6 +1316,33 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   return enough_signal && mostly_cold && not_hot;
 }
 
+static bool read_remote_cgroup_pressure(size_t local_capacity,
+                                        size_t* usage,
+                                        size_t* capacity) {
+#ifdef LINUX
+  if (!G1RemoteUseCgroupPressure || !OSContainer::is_containerized()) {
+    return false;
+  }
+
+  jlong raw_usage = OSContainer::memory_usage_in_bytes();
+  jlong raw_limit = OSContainer::memory_limit_in_bytes();
+  if (raw_usage <= 0 || raw_limit <= 0 || local_capacity == 0) {
+    return false;
+  }
+
+  size_t pressure_capacity = MIN2(local_capacity, (size_t)raw_limit);
+  if (pressure_capacity == 0) {
+    return false;
+  }
+
+  *usage = (size_t)raw_usage;
+  *capacity = pressure_capacity;
+  return true;
+#else
+  return false;
+#endif
+}
+
 static void flush_free_region_trim(G1CollectedHeap* g1h,
                                    uint& run_start_idx,
                                    char*& run_start,
@@ -1691,6 +1721,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t native_reserve = MAX2(local_capacity / 2, (size_t)2 * G);
         native_reserve = MIN2(native_reserve, (local_capacity * 3) / 5);
         size_t heap_budget = local_capacity - native_reserve;
+        size_t cgroup_usage = 0;
+        size_t cgroup_capacity = 0;
+        bool has_cgroup_pressure =
+          read_remote_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity);
 
         // Allocation rate lookahead: predict bytes allocated before next GC.
         // predict_alloc_rate_ms() returns bytes/ms; multiply by 2000ms lookahead.
@@ -1698,17 +1732,22 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t lookahead_alloc = (size_t)(alloc_rate_ms * 2000.0);
         size_t effective_used = local_used + lookahead_alloc;
 
-        double pressure = (double)effective_used / (double)heap_budget;
+        double heap_pressure = (double)effective_used / (double)heap_budget;
+        double cgroup_pressure = has_cgroup_pressure ?
+          (double)cgroup_usage / (double)cgroup_capacity : 0.0;
+        double pressure = MAX2(heap_pressure, cgroup_pressure);
         // Do not evict at low pressure: object-granularity fetch is expensive,
         // and early eviction refetches hot Spark partitions while plenty of the
         // local budget is still unused. Keep headroom for the next young cycle,
         // but avoid pushing the heap down to an artificially low watermark.
         size_t target_low_percent = 0;
+        uint tier2_percent = G1RemoteTier2Percent;
+        uint tier3_percent = MAX2(G1RemoteTier3Percent, tier2_percent);
 
-        if (pressure > 0.95) {
+        if (pressure * 100.0 > (double)tier3_percent) {
           eviction_tier = 3;
           target_low_percent = 60;
-        } else if (pressure > 0.85) {
+        } else if (pressure * 100.0 > (double)tier2_percent) {
           eviction_tier = 2;
           target_low_percent = 70;
         }
@@ -1716,6 +1755,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (eviction_tier > 0) {
           size_t target_low = (heap_budget * target_low_percent) / 100;
           evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
+          if (has_cgroup_pressure) {
+            size_t cgroup_target_low = (cgroup_capacity * target_low_percent) / 100;
+            size_t cgroup_evict_target =
+              (cgroup_usage > cgroup_target_low) ? (cgroup_usage - cgroup_target_low) : 0;
+            evict_target_bytes = MAX2(evict_target_bytes, cgroup_evict_target);
+          }
           if (eviction_tier == 2) {
             evict_batch_cap_bytes = HeapRegion::GrainBytes * 8;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
@@ -1728,14 +1773,18 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (eviction_tier > 0) {
           log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB / heap_budget=" SIZE_FORMAT
                        "MB (local_cap=" SIZE_FORMAT "MB reserve=" SIZE_FORMAT "MB, %.1f%%), "
-                       "alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, "
+                       "alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, heap_effective=%.1f%%, "
+                       "cgroup=" SIZE_FORMAT "MB/" SIZE_FORMAT "MB %.1f%%, thresholds=T2:%u%%/T3:%u%%, "
                        "effective=%.1f%%, target=%zu%%, batch_cap=" SIZE_FORMAT
                        "MB, evict_target=" SIZE_FORMAT "MB, dense_last_resort=%s",
                        eviction_tier, local_used / M, heap_budget / M,
-                       local_capacity / M, native_reserve / M, pressure * 100.0,
+                       local_capacity / M, native_reserve / M, heap_pressure * 100.0,
                        alloc_rate_ms / 1024.0,
                        lookahead_alloc / M,
-                       (double)effective_used / (double)heap_budget * 100.0,
+                       heap_pressure * 100.0,
+                       cgroup_usage / M, cgroup_capacity / M, cgroup_pressure * 100.0,
+                       tier2_percent, tier3_percent,
+                       pressure * 100.0,
                        target_low_percent,
                        evict_batch_cap_bytes / M,
                        evict_target_bytes / M,
@@ -1901,13 +1950,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
         if (allow_dense_object_granularity_eviction &&
             eviction_tier >= 2 && path2_bytes < evict_target_bytes) {
-          size_t dense_last_resort_cap = HeapRegion::GrainBytes;
-          if (eviction_tier >= 3) {
-            size_t remaining_target = evict_target_bytes - path2_bytes;
-            dense_last_resort_cap = MAX2(HeapRegion::GrainBytes,
-                                         MIN2(remaining_target, evict_batch_cap_bytes));
-          }
-          for (uint i = 0; i < num_regions; i++) {
+          uint dense_region_cap = eviction_tier >= 3 ? G1RemoteDenseT3Regions : G1RemoteDenseT2Regions;
+          size_t dense_last_resort_cap = HeapRegion::GrainBytes * (size_t)dense_region_cap;
+          size_t remaining_target = evict_target_bytes - path2_bytes;
+          dense_last_resort_cap = MIN2(dense_last_resort_cap, remaining_target);
+          dense_last_resort_cap = MIN2(dense_last_resort_cap, evict_batch_cap_bytes);
+
+          for (uint i = 0; i < num_regions && dense_last_resort_cap > 0; i++) {
             if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
             if (!dense_deferred_candidates[i]) continue;
 

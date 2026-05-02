@@ -306,6 +306,33 @@
           "object-granularity fetch has poor economics for dense Spark "    \
           "regions and this path is only for controlled experiments.")      \
                                                                             \
+  product(bool, G1RemoteUseCgroupPressure, false, DIAGNOSTIC,               \
+          "In LocalMemoryRatio mode, include cgroup memory usage in "        \
+          "tiered remote eviction pressure decisions. Disabled by default "  \
+          "to preserve the heap-only policy.")                              \
+                                                                            \
+  product(uint, G1RemoteTier2Percent, 85, DIAGNOSTIC,                       \
+          "Local/cgroup pressure percentage above which tier 2 remote "      \
+          "eviction starts in LocalMemoryRatio mode.")                      \
+          range(1, 100)                                                     \
+                                                                            \
+  product(uint, G1RemoteTier3Percent, 95, DIAGNOSTIC,                       \
+          "Local/cgroup pressure percentage above which tier 3 remote "      \
+          "eviction starts in LocalMemoryRatio mode.")                      \
+          range(1, 100)                                                     \
+                                                                            \
+  product(uint, G1RemoteDenseT2Regions, 1, DIAGNOSTIC,                      \
+          "Maximum dense small-object regions selected by the tier 2 "       \
+          "dense last-resort path when G1RemoteAllowDenseObjectEviction "   \
+          "is enabled.")                                                    \
+          range(0, 1024)                                                    \
+                                                                            \
+  product(uint, G1RemoteDenseT3Regions, 16, DIAGNOSTIC,                     \
+          "Maximum dense small-object regions selected by the tier 3 "       \
+          "dense last-resort path when G1RemoteAllowDenseObjectEviction "   \
+          "is enabled.")                                                    \
+          range(0, 1024)                                                    \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \
