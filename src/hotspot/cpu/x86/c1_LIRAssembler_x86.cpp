@@ -1880,7 +1880,7 @@ void LIR_Assembler::emit_opTypeCheck(LIR_OpTypeCheck* op) {
     }
 
 #if INCLUDE_G1GC
-    if (UseRemoteExecutor || LocalMemoryRatio < 100 ||
+    if (LocalMemoryRatio < 100 ||
         G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
       // C1 store checks read value->klass directly. Resolve tagged values
       // before the klass load, but keep clean local oops on the fast path.

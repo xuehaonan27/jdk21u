@@ -1475,7 +1475,7 @@ nmethod* SharedRuntime::generate_native_wrapper(MacroAssembler* masm,
   // For Object.hashCode, System.identityHashCode try to pull hashCode from object header if available.
   const bool g1_remote_oops_may_be_protected =
       UseG1GC && (G1TagRefSites || G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0 ||
-                  LocalMemoryRatio < 100 || UseRemoteExecutor);
+                  LocalMemoryRatio < 100);
   if (!g1_remote_oops_may_be_protected &&
       ((InlineObjectHash && method->intrinsic_id() == vmIntrinsics::_hashCode) ||
        (method->intrinsic_id() == vmIntrinsics::_identityHashCode))) {

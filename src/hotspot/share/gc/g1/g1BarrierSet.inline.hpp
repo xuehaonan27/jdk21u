@@ -42,7 +42,7 @@
 #include "runtime/thread.hpp"
 
 static inline bool g1_remote_mode_active() {
-  return UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+  return LocalMemoryRatio < 100 || G1TagRefSites ||
          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
 }
 

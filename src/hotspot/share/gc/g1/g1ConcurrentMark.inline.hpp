@@ -47,7 +47,7 @@
 #include "utilities/bitMap.inline.hpp"
 
 static inline bool g1_cm_remote_marking_checks_enabled() {
-  return UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+  return LocalMemoryRatio < 100 || G1TagRefSites ||
          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
 }
 
@@ -400,8 +400,8 @@ inline bool G1CMTask::deal_with_reference(T* p) {
   if (!_g1h->is_in(obj)) {
     return false;
   }
-  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
-      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    if (LocalMemoryRatio < 100 || G1TagRefSites ||
+        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
       RemoteHandle* h = rmm->handle_for_addr_any_state(cast_from_oop<uintptr_t>(obj));

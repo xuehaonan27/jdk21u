@@ -60,7 +60,7 @@
 // Ladder: shared_oop(handle) → unique_oop(addr) → clean oop(addr)
 // For prototype simplicity, go directly shared → clean when safe.
 static inline bool g1_remote_gc_scan_checks_enabled() {
-  return UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+  return LocalMemoryRatio < 100 || G1TagRefSites ||
          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
 }
 
@@ -221,7 +221,7 @@ inline void G1RootRegionScanClosure::do_oop_work(T* p) {
   if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
     return;
   }
-  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+  if (LocalMemoryRatio < 100 || G1TagRefSites ||
       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {

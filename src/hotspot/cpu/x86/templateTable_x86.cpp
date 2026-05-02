@@ -1154,7 +1154,7 @@ void TemplateTable::aastore() {
   __ jcc(Assembler::zero, is_null);
 
 #if INCLUDE_G1GC
-  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+  if (LocalMemoryRatio < 100 || G1TagRefSites ||
       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     // The interpreter aastore stub reads value->klass directly. Resolve tagged
     // values before the klass load and update the operand stack for the store.

@@ -70,7 +70,7 @@ JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_pre_entry(oopDesc* orig, Jav
     return;
   }
 
-  if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+  if (LocalMemoryRatio < 100 || G1TagRefSites ||
       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     HeapRegion* hr = g1h->heap_region_containing(obj);
     if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
@@ -99,7 +99,7 @@ JRT_END
 // ============================================================
 
 static bool remote_resolve_enabled() {
-  return UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+  return LocalMemoryRatio < 100 || G1TagRefSites ||
          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
 }
 
@@ -229,7 +229,7 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
     // Remote eviction can leave a clean pre-eviction oop in Java/native state
     // that is not itself tagged. If it points into a guarded/free region, turn
     // it back into a shared handle so the caller's slow path can fetch it.
-    if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+    if (LocalMemoryRatio < 100 || G1TagRefSites ||
         G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
       G1CollectedHeap* g1h = G1CollectedHeap::heap();
       if (g1h != nullptr && g1h->is_in_reserved((void*)v)) {
@@ -286,7 +286,7 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
       return resolved;
     }
     // REMOTE or FETCHING: return tagged oop unchanged for slow path.
-    // This is normal when UseRemoteExecutor is active (real eviction).
+    // This is normal when remote eviction/tagged refs are active.
     // The slow path (resolve_tagged_oop_slow) handles REMOTE fetch.
     return tagged;
   }

@@ -1776,7 +1776,7 @@ private:
       return;
     }
 
-    if (UseRemoteExecutor || LocalMemoryRatio < 100 || G1TagRefSites ||
+    if (LocalMemoryRatio < 100 || G1TagRefSites ||
         G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
       G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
       if (rmm != nullptr) {
