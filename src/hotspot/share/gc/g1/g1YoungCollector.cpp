@@ -68,6 +68,7 @@
 #include "memory/resourceArea.hpp"
 #include "gc/shared/oopStorage.inline.hpp"
 #include "gc/shared/oopStorageSet.inline.hpp"
+#include "oops/klass.hpp"
 #include "runtime/jniHandles.hpp"
 #include "runtime/javaThread.hpp"
 #include "runtime/deoptimization.hpp"
@@ -1117,6 +1118,11 @@ static bool remote_eviction_is_relocatable_object(G1CollectedHeap* g1h,
   Klass* k = obj->klass_or_null();
   if (k == nullptr) {
     if (reason_out != nullptr) *reason_out = "NULL-KLASS";
+    if (region_out != nullptr) *region_out = hr;
+    return false;
+  }
+  if (!Klass::is_valid(k)) {
+    if (reason_out != nullptr) *reason_out = "BAD-KLASS";
     if (region_out != nullptr) *region_out = hr;
     return false;
   }
