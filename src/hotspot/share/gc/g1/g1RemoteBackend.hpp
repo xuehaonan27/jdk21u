@@ -101,6 +101,26 @@ public:
     return (size_t)-1;
   }
 
+  // Batch fetch/prefetch: request the faulting object plus nearby remote slots.
+  // Implementations call cl->do_object() once per returned object. The byte
+  // pointer is valid only for the duration of the callback.
+  class FetchBatchClosure : public StackObj {
+  public:
+    virtual void do_object(uintptr_t handle_id, size_t slot_id, Klass* klass,
+                           size_t word_size, const void* obj_bytes) = 0;
+  };
+
+  virtual bool supports_batch_fetch() const {
+    return false;
+  }
+
+  virtual size_t fetch_batch_around(uintptr_t handle_id, size_t slot_id,
+                                    uint max_objects, uint slot_window,
+                                    size_t max_response_bytes,
+                                    FetchBatchClosure* cl) {
+    return 0;
+  }
+
   // Notify executor that these handle_ids are now LOCAL (fetched back)
   virtual void localize_batch(const uintptr_t* handle_ids, size_t count) {
     // Default: no-op (SIM backend doesn't track handle state)

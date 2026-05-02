@@ -67,6 +67,9 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _fetch_success(0), _fetch_failures(0), _fetch_words(0), _fetch_elapsed_counter(0),
     _fetch_retries(0), _fetch_wait_slow(0), _fetch_wait_no_safepoint(0),
     _fetch_wait_hard(0), _fetch_wait_loops(0), _fetch_progress_next(1024),
+    _fetch_batch_requests(0), _fetch_batch_returned(0), _fetch_batch_installed(0),
+    _fetch_prefetch_installed(0), _fetch_prefetch_raced(0), _fetch_prefetch_failed(0),
+    _fetch_prefetch_words(0), _fetch_batch_elapsed_counter(0),
     _current_fcr(nullptr), _fcr_lock(0) {
   _table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
   _eviction_table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
@@ -149,6 +152,24 @@ void G1RemoteMemoryManager::record_fetch_result(size_t word_size,
   }
 }
 
+void G1RemoteMemoryManager::record_fetch_batch_result(size_t requested,
+                                                      size_t returned,
+                                                      size_t installed,
+                                                      size_t prefetched,
+                                                      size_t raced,
+                                                      size_t failed,
+                                                      size_t prefetch_words,
+                                                      jlong elapsed_counter) {
+  Atomic::add(&_fetch_batch_requests, (uint64_t)requested);
+  Atomic::add(&_fetch_batch_returned, (uint64_t)returned);
+  Atomic::add(&_fetch_batch_installed, (uint64_t)installed);
+  Atomic::add(&_fetch_prefetch_installed, (uint64_t)prefetched);
+  Atomic::add(&_fetch_prefetch_raced, (uint64_t)raced);
+  Atomic::add(&_fetch_prefetch_failed, (uint64_t)failed);
+  Atomic::add(&_fetch_prefetch_words, (uint64_t)prefetch_words);
+  Atomic::add(&_fetch_batch_elapsed_counter, (uint64_t)elapsed_counter);
+}
+
 void G1RemoteMemoryManager::log_remote_access_stats() const {
   uint64_t resolve_fast_local = Atomic::load(&_resolve_fast_local);
   uint64_t resolve_fast_remote = Atomic::load(&_resolve_fast_remote);
@@ -163,19 +184,31 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
   uint64_t fetch_wait_no_safepoint = Atomic::load(&_fetch_wait_no_safepoint);
   uint64_t fetch_wait_hard = Atomic::load(&_fetch_wait_hard);
   uint64_t fetch_wait_loops = Atomic::load(&_fetch_wait_loops);
+  uint64_t fetch_batch_requests = Atomic::load(&_fetch_batch_requests);
+  uint64_t fetch_batch_returned = Atomic::load(&_fetch_batch_returned);
+  uint64_t fetch_batch_installed = Atomic::load(&_fetch_batch_installed);
+  uint64_t fetch_prefetch_installed = Atomic::load(&_fetch_prefetch_installed);
+  uint64_t fetch_prefetch_raced = Atomic::load(&_fetch_prefetch_raced);
+  uint64_t fetch_prefetch_failed = Atomic::load(&_fetch_prefetch_failed);
 
   if (resolve_fast_local == 0 && resolve_fast_remote == 0 &&
       resolve_fast_fetching == 0 && resolve_fast_dead == 0 &&
       resolve_slow_entries == 0 && resolve_no_safepoint_entries == 0 &&
       fetch_success == 0 && fetch_failures == 0 && fetch_retries == 0 &&
       fetch_wait_slow == 0 && fetch_wait_no_safepoint == 0 &&
-      fetch_wait_hard == 0 && fetch_wait_loops == 0) {
+      fetch_wait_hard == 0 && fetch_wait_loops == 0 &&
+      fetch_batch_requests == 0 && fetch_batch_returned == 0 &&
+      fetch_batch_installed == 0 && fetch_prefetch_installed == 0 &&
+      fetch_prefetch_raced == 0 && fetch_prefetch_failed == 0) {
     return;
   }
 
   uint64_t fetch_words = Atomic::load(&_fetch_words);
   uint64_t fetch_counter = Atomic::load(&_fetch_elapsed_counter);
+  uint64_t fetch_prefetch_words = Atomic::load(&_fetch_prefetch_words);
+  uint64_t fetch_batch_counter = Atomic::load(&_fetch_batch_elapsed_counter);
   double fetch_ms = TimeHelper::counter_to_millis((jlong)fetch_counter);
+  double batch_ms = TimeHelper::counter_to_millis((jlong)fetch_batch_counter);
   double avg_us = fetch_success == 0 ? 0.0 : (fetch_ms * 1000.0) / (double)fetch_success;
 
   log_info(gc)("Remote access stats: resolve_fast(local=" UINT64_FORMAT
@@ -184,6 +217,10 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                " no_safepoint=" UINT64_FORMAT " fetch(ok=" UINT64_FORMAT
                " fail=" UINT64_FORMAT " retry=" UINT64_FORMAT
                " bytes=" UINT64_FORMAT " avg_us=%.1f total_ms=%.1f)"
+               " batch(req=" UINT64_FORMAT " ret=" UINT64_FORMAT
+               " inst=" UINT64_FORMAT " pref=" UINT64_FORMAT
+               " raced=" UINT64_FORMAT " fail=" UINT64_FORMAT
+               " pref_bytes=" UINT64_FORMAT " total_ms=%.1f)"
                " waits(slow=" UINT64_FORMAT " no_safepoint=" UINT64_FORMAT
                " hard=" UINT64_FORMAT " loops=" UINT64_FORMAT ")",
                resolve_fast_local,
@@ -198,6 +235,14 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                fetch_words * HeapWordSize,
                avg_us,
                fetch_ms,
+               fetch_batch_requests,
+               fetch_batch_returned,
+               fetch_batch_installed,
+               fetch_prefetch_installed,
+               fetch_prefetch_raced,
+               fetch_prefetch_failed,
+               fetch_prefetch_words * HeapWordSize,
+               batch_ms,
                fetch_wait_slow,
                fetch_wait_no_safepoint,
                fetch_wait_hard,

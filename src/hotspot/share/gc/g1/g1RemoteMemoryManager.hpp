@@ -705,6 +705,14 @@ public:
   volatile uint64_t _fetch_wait_hard;
   volatile uint64_t _fetch_wait_loops;
   volatile uint64_t _fetch_progress_next;
+  volatile uint64_t _fetch_batch_requests;
+  volatile uint64_t _fetch_batch_returned;
+  volatile uint64_t _fetch_batch_installed;
+  volatile uint64_t _fetch_prefetch_installed;
+  volatile uint64_t _fetch_prefetch_raced;
+  volatile uint64_t _fetch_prefetch_failed;
+  volatile uint64_t _fetch_prefetch_words;
+  volatile uint64_t _fetch_batch_elapsed_counter;
 
   void record_resolve_fast_state(uintptr_t state) {
     if (state == REMOTE_HANDLE_LOCAL) {
@@ -720,6 +728,9 @@ public:
   void record_resolve_slow_entry() { Atomic::inc(&_resolve_slow_entries); }
   void record_resolve_no_safepoint_entry() { Atomic::inc(&_resolve_no_safepoint_entries); }
   void record_fetch_result(size_t word_size, jlong elapsed_counter, bool success);
+  void record_fetch_batch_result(size_t requested, size_t returned, size_t installed,
+                                 size_t prefetched, size_t raced, size_t failed,
+                                 size_t prefetch_words, jlong elapsed_counter);
   void record_fetch_retry() { Atomic::inc(&_fetch_retries); }
   void record_fetch_wait(bool no_safepoint, bool hard, uint64_t loops) {
     Atomic::add(&_fetch_wait_loops, loops);

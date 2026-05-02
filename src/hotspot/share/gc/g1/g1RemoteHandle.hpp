@@ -91,6 +91,16 @@ struct RemoteHandle {
     return Atomic::cmpxchg(&_state_and_addr, expected, desired) == expected;
   }
 
+  // Try to claim a specific remote slot without relying on a prior non-atomic
+  // state load. Used by opportunistic prefetch where another mutator may race
+  // to fetch the same handle.
+  bool try_remote_to_fetching(uintptr_t remote_id) {
+    uintptr_t id = remote_id & REMOTE_HANDLE_ADDR_MASK;
+    uintptr_t expected = REMOTE_HANDLE_REMOTE | id;
+    uintptr_t desired = REMOTE_HANDLE_FETCHING | id;
+    return Atomic::cmpxchg(&_state_and_addr, expected, desired) == expected;
+  }
+
   // Try to revert FETCHING → REMOTE. Used by stuck-fetcher recovery: if the
   // original fetcher hangs and waiters time out, revert the state so a new
   // thread can retry. Returns true if this thread won the revert (state was
@@ -101,6 +111,14 @@ struct RemoteHandle {
     if ((expected & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_FETCHING) return false;
     uintptr_t desired = (expected & REMOTE_HANDLE_ADDR_MASK) | REMOTE_HANDLE_REMOTE;
     return Atomic::cmpxchg(&_state_and_addr, expected, desired) == expected;
+  }
+
+  // Restore REMOTE state after a failed fetch attempt. This intentionally does
+  // not update _eviction_addr; that field is the old local address captured
+  // when the object was evicted, not the remote slot id.
+  void restore_remote_release(uintptr_t remote_id) {
+    Atomic::release_store(&_state_and_addr,
+      (uintptr_t)(REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK)));
   }
 
   // Release-store: publish local address after RDMA completion.

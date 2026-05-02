@@ -44,7 +44,9 @@ static const uint32_t RE_CMD_LOCALIZE_BATCH         = 0x11;
 static const uint32_t RE_CMD_EVICT_WITH_EDGES       = 0x12;
 static const uint32_t RE_CMD_REPORT_REMOTE_ROOTS_V2 = 0x13;
 static const uint32_t RE_CMD_TRACE_AND_REPORT       = 0x17;
+static const uint32_t RE_CMD_FETCH_AROUND           = 0x18;
 static const uint32_t RE_RESP_TRACE_RESULT           = 0x86;
+static const uint32_t RE_RESP_BATCH_OBJECT_DATA      = 0x87;
 
 // RDMA parameters are set via JVM flags (g1_globals.hpp):
 //   -XX:RDMAMsgBufSize=65536    (SEND/RECV buffer, default 64K)
@@ -566,7 +568,11 @@ bool RDMAExecutorBackend::initialize() {
   // Pre-post recv buffers
   for (int i = 0; i < 4; i++) {
     void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
-    struct ibv_sge sge = { (uintptr_t)recv_buf, (size_t)RDMAMsgBufSize, _local_mr->lkey };
+    struct ibv_sge sge;
+    memset(&sge, 0, sizeof(sge));
+    sge.addr = (uintptr_t)recv_buf;
+    sge.length = (uint32_t)RDMAMsgBufSize;
+    sge.lkey = _local_mr->lkey;
     struct ibv_recv_wr wr;
     memset(&wr, 0, sizeof(wr));
     wr.sg_list = &sge; wr.num_sge = 1;
@@ -732,6 +738,114 @@ Klass* RDMAExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_s
   io_unlock();
   _total_fetched++;
   return (Klass*)resp_klass;
+}
+
+bool RDMAExecutorBackend::supports_batch_fetch() const {
+  return true;
+}
+
+size_t RDMAExecutorBackend::fetch_batch_around(uintptr_t handle_id, size_t slot_id,
+                                               uint max_objects, uint slot_window,
+                                               size_t max_response_bytes,
+                                               FetchBatchClosure* cl) {
+  if (!_connected || cl == nullptr || max_objects == 0) return 0;
+
+  if (max_response_bytes == 0 || max_response_bytes > RDMAMsgBufSize) {
+    max_response_bytes = RDMAMsgBufSize;
+  }
+  if (max_response_bytes < 24 + 32) {
+    return 0;
+  }
+  size_t max_by_header = (max_response_bytes - 24) / 32;
+  if (max_objects > max_by_header) {
+    max_objects = (uint)max_by_header;
+  }
+  if (max_objects == 0) {
+    return 0;
+  }
+
+  io_lock();
+
+  if (!rdma_post_recv()) { io_unlock(); return 0; }
+
+  uint8_t msg[48];
+  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_AROUND;
+  *(uint32_t*)(msg + 4) = sizeof(msg);
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = (uint64_t)handle_id;
+  *(uint64_t*)(msg + 24) = (uint64_t)slot_id;
+  *(uint32_t*)(msg + 32) = max_objects;
+  *(uint32_t*)(msg + 36) = slot_window;
+  *(uint64_t*)(msg + 40) = (uint64_t)max_response_bytes;
+  if (!rdma_send_msg(msg, sizeof(msg))) { io_unlock(); return 0; }
+
+  void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
+  struct ibv_wc wc;
+  if (!poll_cq_wait(_recv_cq, /*wr_id*/0, &wc)) { io_unlock(); return 0; }
+
+  uint8_t* resp = (uint8_t*)recv_buf;
+  size_t resp_len = wc.byte_len;
+  if (resp_len < 24) {
+    log_warning(gc)("RDMAExecutor: batch fetch response too short: " SIZE_FORMAT " bytes", resp_len);
+    io_unlock();
+    return 0;
+  }
+
+  if (*(uint32_t*)resp != RE_RESP_BATCH_OBJECT_DATA) {
+    io_unlock();
+    return 0;
+  }
+
+  uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+  if (resp_msg_len > resp_len || resp_msg_len > max_response_bytes) {
+    log_warning(gc)("RDMAExecutor: malformed batch fetch length: hdr=%u actual="
+                    SIZE_FORMAT " max=" SIZE_FORMAT,
+                    resp_msg_len, resp_len, max_response_bytes);
+    io_unlock();
+    return 0;
+  }
+
+  uint8_t* stable = (uint8_t*)os::malloc(resp_msg_len, mtGC);
+  if (stable == nullptr) {
+    io_unlock();
+    return 0;
+  }
+  memcpy(stable, resp, resp_msg_len);
+  io_unlock();
+
+  uint32_t num_objects = *(uint32_t*)(stable + 16);
+  uint8_t* cursor = stable + 24;
+  uint8_t* end = stable + resp_msg_len;
+  size_t fetched = 0;
+
+  for (uint32_t i = 0; i < num_objects; i++) {
+    if (cursor + 32 > end) {
+      log_warning(gc)("RDMAExecutor: truncated batch fetch entry header at %u/%u",
+                      i, num_objects);
+      break;
+    }
+    uintptr_t entry_handle = (uintptr_t)*(uint64_t*)(cursor + 0);
+    size_t entry_slot = (size_t)*(uint64_t*)(cursor + 8);
+    Klass* entry_klass = (Klass*)(uintptr_t)*(uint64_t*)(cursor + 16);
+    uint32_t word_size = *(uint32_t*)(cursor + 24);
+    uint32_t byte_size = *(uint32_t*)(cursor + 28);
+    cursor += 32;
+
+    if ((size_t)word_size * HeapWordSize != byte_size || cursor + byte_size > end) {
+      log_warning(gc)("RDMAExecutor: malformed batch fetch entry %u/%u "
+                      "(ws=%u bytes=%u remaining=" SIZE_FORMAT ")",
+                      i, num_objects, word_size, byte_size, (size_t)(end - cursor));
+      break;
+    }
+
+    cl->do_object(entry_handle, entry_slot, entry_klass, word_size, cursor);
+    cursor += byte_size;
+    fetched++;
+  }
+
+  os::free(stable);
+  _total_fetched += fetched;
+  return fetched;
 }
 
 void RDMAExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_roots) {

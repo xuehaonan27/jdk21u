@@ -319,6 +319,19 @@
   product(size_t, RDMAMsgBufSize, 64*K, DIAGNOSTIC,                         \
           "Size of each RDMA SEND/RECV message buffer in bytes.")           \
                                                                             \
+  product(uint, G1RemoteFetchBatchObjects, 1, DIAGNOSTIC,                   \
+          "Maximum objects to request from the remote executor on one "      \
+          "remote miss. 1 disables opportunistic batch fetch/prefetch.")     \
+                                                                            \
+  product(uint, G1RemoteFetchBatchSlotWindow, 64, DIAGNOSTIC,               \
+          "Number of neighboring remote slot ids to scan on the executor "   \
+          "when opportunistic batch fetch is enabled.")                      \
+                                                                            \
+  product(size_t, G1RemoteFetchBatchBytes, 0, DIAGNOSTIC,                   \
+          "Maximum bytes in one batch-fetch response. 0 uses the RDMA "      \
+          "message-buffer size. The effective cap never exceeds "           \
+          "RDMAMsgBufSize.")                                                \
+                                                                            \
   product(uint, RDMACQDepth, 256, DIAGNOSTIC,                               \
           "Depth of RDMA completion queues.")                               \
                                                                             \

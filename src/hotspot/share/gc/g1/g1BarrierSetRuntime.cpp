@@ -428,55 +428,18 @@ static void dirty_fetched_object_cards(G1CollectedHeap* g1h, HeapWord* start, si
   }
 }
 
-// Fetch a REMOTE object, install it locally, and publish the Handle as LOCAL.
-// Caller must have already CAS'd the Handle to FETCHING.
-// Returns the local oop on success, nullptr on failure (Handle set to DEAD
-// after max retries, or set back to REMOTE for caller to retry).
-// *out_retry is set to true if the caller should re-enter the state machine.
-static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* out_retry) {
-  *out_retry = false;
-  G1CollectedHeap* g1h = G1CollectedHeap::heap();
-  G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-  size_t word_size = h->eviction_word_size();
-
-  HeapWord* dest = rmm->allocate_in_fcr(word_size);
-  guarantee(dest != nullptr, "FCR allocation failed for fetch");
-
-  // Zero-fill before fetch so any partial/wrong copy is detectable
-  memset(dest, 0, word_size * HeapWordSize);
-
-  jlong fetch_start = os::elapsed_counter();
-  Klass* fetched_klass = rmm->fetch_remote_object(h, dest);
-  jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
-  rmm->record_fetch_result(word_size, fetch_elapsed, fetched_klass != nullptr);
-
-  if (fetched_klass == nullptr) {
-    fetch_attempts++;
-    rmm->record_fetch_retry();
-    if (fetch_attempts >= 3) {
-      h->set_dead();
-      log_warning(gc)("Fetch failed %d times for handle " PTR_FORMAT " — marking DEAD",
-                      fetch_attempts, p2i(h));
-      return nullptr;
-    }
-    uintptr_t sa2 = h->load_state_and_addr_acquire();
-    h->set_remote(sa2 & REMOTE_HANDLE_ADDR_MASK);
-    log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — retry %d/3",
-                    p2i(h), fetch_attempts);
-    *out_retry = true;
-    return nullptr;
-  }
-
-  // Capture raw fetched header for diagnostics
+static oopDesc* finish_fetched_object(G1CollectedHeap* g1h,
+                                      G1RemoteMemoryManager* rmm,
+                                      RemoteHandle* h,
+                                      HeapWord* dest,
+                                      Klass* fetched_klass,
+                                      size_t word_size) {
   uintptr_t raw_mark_after_fetch = *(uintptr_t*)dest;
   uintptr_t raw_klass_after_fetch = *((uintptr_t*)dest + 1);
 
   {
     markWord fetched_mw = cast_to_oop(dest)->mark();
-    if (fetched_mw.is_unlocked()) {
-      // Preserve unlocked mark word from remote — keeps identity hash + age
-    } else {
-      // Stale lock/monitor pointer from eviction time — cannot dereference
+    if (!fetched_mw.is_unlocked()) {
       cast_to_oop(dest)->set_mark(markWord::prototype());
       log_trace(gc)("Fetch: normalized locked mark 0x%lx", (unsigned long)fetched_mw.value());
     }
@@ -502,7 +465,6 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
     }
   }
 
-  // Post-patch integrity: verify header wasn't scribbled during patch
   {
     Klass* final_klass = cast_to_oop(dest)->klass_or_null();
     uintptr_t final_mark = *(uintptr_t*)dest;
@@ -520,12 +482,227 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
   }
 
   rmm->rekey_handle_on_fetch(h, (void*)dest);
+  return (oopDesc*)dest;
+}
+
+static const uint G1RemoteFetchBatchHardCap = 64;
+static volatile int g1_remote_fetch_batch_disabled = 0;
+
+class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
+  G1CollectedHeap* _g1h;
+  G1RemoteMemoryManager* _rmm;
+  RemoteHandle* _primary;
+  oopDesc* _primary_result;
+  size_t _primary_slot;
+  size_t _returned;
+  size_t _installed;
+  size_t _prefetched;
+  size_t _raced;
+  size_t _failed;
+  size_t _prefetch_words;
+  RemoteHandle* _publish_handles[G1RemoteFetchBatchHardCap];
+  HeapWord* _publish_dests[G1RemoteFetchBatchHardCap];
+  uintptr_t _publish_ids[G1RemoteFetchBatchHardCap];
+  uint _publish_count;
+
+public:
+  BatchFetchInstallClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm,
+                           RemoteHandle* primary, size_t primary_slot)
+    : _g1h(g1h), _rmm(rmm), _primary(primary), _primary_result(nullptr),
+      _primary_slot(primary_slot), _returned(0), _installed(0), _prefetched(0),
+      _raced(0), _failed(0), _prefetch_words(0), _publish_count(0) {}
+
+  void do_object(uintptr_t handle_id, size_t slot_id, Klass* klass,
+                 size_t word_size, const void* obj_bytes) override {
+    _returned++;
+    RemoteHandle* h = (RemoteHandle*)handle_id;
+    bool is_primary = (h == _primary);
+
+    if (h == nullptr || klass == nullptr || word_size == 0 || obj_bytes == nullptr) {
+      _failed++;
+      return;
+    }
+
+    if (_publish_count >= G1RemoteFetchBatchHardCap) {
+      _failed++;
+      return;
+    }
+
+    if (word_size != h->eviction_word_size()) {
+      _failed++;
+      log_warning(gc)("Batch fetch size MISMATCH: handle=" PTR_FORMAT
+                      " slot=" SIZE_FORMAT " expected=" SIZE_FORMAT
+                      "w got=" SIZE_FORMAT "w",
+                      p2i(h), slot_id, h->eviction_word_size(), word_size);
+      return;
+    }
+
+    if (is_primary) {
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      size_t current_slot = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+      if (state != REMOTE_HANDLE_FETCHING || current_slot != slot_id ||
+          slot_id != _primary_slot) {
+        _failed++;
+        return;
+      }
+    } else {
+      if (!h->try_remote_to_fetching(slot_id)) {
+        _raced++;
+        return;
+      }
+    }
+
+    HeapWord* dest = _rmm->allocate_in_fcr(word_size);
+    if (dest == nullptr) {
+      if (is_primary) {
+        guarantee(dest != nullptr, "FCR allocation failed for primary batch fetch");
+      } else {
+        h->cas_fetching_to_remote();
+        _failed++;
+        return;
+      }
+    }
+
+    memset(dest, 0, word_size * HeapWordSize);
+    memcpy(dest, obj_bytes, word_size * HeapWordSize);
+    oopDesc* installed = finish_fetched_object(_g1h, _rmm, h, dest, klass, word_size);
+
+    _publish_handles[_publish_count] = h;
+    _publish_dests[_publish_count] = dest;
+    _publish_ids[_publish_count] = (uintptr_t)h;
+    _publish_count++;
+
+    _installed++;
+    if (is_primary) {
+      _primary_result = installed;
+    } else {
+      _prefetched++;
+      _prefetch_words += word_size;
+    }
+  }
+
+  void publish(G1RemoteBackend* backend) {
+    if (_publish_count == 0) return;
+    backend->localize_batch(_publish_ids, _publish_count);
+    for (uint i = 0; i < _publish_count; i++) {
+      _publish_handles[i]->set_local_release(_publish_dests[i]);
+    }
+  }
+
+  oopDesc* primary_result() const { return _primary_result; }
+  size_t returned() const { return _returned; }
+  size_t installed() const { return _installed; }
+  size_t prefetched() const { return _prefetched; }
+  size_t raced() const { return _raced; }
+  size_t failed() const { return _failed; }
+  size_t prefetch_words() const { return _prefetch_words; }
+};
+
+static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
+                                        bool* out_retry) {
+  *out_retry = false;
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+  G1RemoteBackend* backend = rmm->backend();
+
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+  size_t word_size = h->eviction_word_size();
+  uint max_objects = MIN2((uint)G1RemoteFetchBatchObjects, G1RemoteFetchBatchHardCap);
+  size_t max_response_bytes = G1RemoteFetchBatchBytes == 0 ?
+      (size_t)RDMAMsgBufSize : MIN2((size_t)G1RemoteFetchBatchBytes, (size_t)RDMAMsgBufSize);
+
+  BatchFetchInstallClosure installer(g1h, rmm, h, slot_id);
+  jlong fetch_start = os::elapsed_counter();
+  size_t returned = backend->fetch_batch_around((uintptr_t)h, slot_id, max_objects,
+                                                G1RemoteFetchBatchSlotWindow,
+                                                max_response_bytes, &installer);
+  jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
+
+  installer.publish(backend);
+  bool primary_ok = installer.primary_result() != nullptr;
+  rmm->record_fetch_batch_result(max_objects, returned, installer.installed(),
+                                 installer.prefetched(), installer.raced(),
+                                 installer.failed(), installer.prefetch_words(),
+                                 fetch_elapsed);
+  rmm->record_fetch_result(word_size, fetch_elapsed, primary_ok);
+
+  if (primary_ok) {
+    return installer.primary_result();
+  }
+
+  Atomic::release_store(&g1_remote_fetch_batch_disabled, 1);
+  log_warning(gc)("Batch fetch did not install primary object for handle " PTR_FORMAT
+                  " slot=" SIZE_FORMAT " (returned=" SIZE_FORMAT
+                  "); disabling batch fetch for this JVM",
+                  p2i(h), slot_id, returned);
+
+  fetch_attempts++;
+  rmm->record_fetch_retry();
+  if (fetch_attempts >= 3) {
+    h->set_dead();
+    log_warning(gc)("Batch fetch failed %d times for handle " PTR_FORMAT
+                    " — marking DEAD", fetch_attempts, p2i(h));
+    return nullptr;
+  }
+
+  h->cas_fetching_to_remote();
+  *out_retry = true;
+  return nullptr;
+}
+
+// Fetch a REMOTE object, install it locally, and publish the Handle as LOCAL.
+// Caller must have already CAS'd the Handle to FETCHING.
+// Returns the local oop on success, nullptr on failure (Handle set to DEAD
+// after max retries, or set back to REMOTE for caller to retry).
+// *out_retry is set to true if the caller should re-enter the state machine.
+static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* out_retry) {
+  *out_retry = false;
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+  size_t word_size = h->eviction_word_size();
+
+  if (G1RemoteFetchBatchObjects > 1 &&
+      Atomic::load(&g1_remote_fetch_batch_disabled) == 0 &&
+      rmm->backend()->supports_batch_fetch()) {
+    return fetch_and_install_batch(h, fetch_attempts, out_retry);
+  }
+
+  HeapWord* dest = rmm->allocate_in_fcr(word_size);
+  guarantee(dest != nullptr, "FCR allocation failed for fetch");
+
+  // Zero-fill before fetch so any partial/wrong copy is detectable
+  memset(dest, 0, word_size * HeapWordSize);
+
+  jlong fetch_start = os::elapsed_counter();
+  Klass* fetched_klass = rmm->fetch_remote_object(h, dest);
+  jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
+  rmm->record_fetch_result(word_size, fetch_elapsed, fetched_klass != nullptr);
+
+  if (fetched_klass == nullptr) {
+    fetch_attempts++;
+    rmm->record_fetch_retry();
+    if (fetch_attempts >= 3) {
+      h->set_dead();
+      log_warning(gc)("Fetch failed %d times for handle " PTR_FORMAT " — marking DEAD",
+                      fetch_attempts, p2i(h));
+      return nullptr;
+    }
+    h->cas_fetching_to_remote();
+    log_warning(gc)("Fetch failed for handle " PTR_FORMAT " — retry %d/3",
+                    p2i(h), fetch_attempts);
+    *out_retry = true;
+    return nullptr;
+  }
+
+  oopDesc* result = finish_fetched_object(g1h, rmm, h, dest, fetched_klass, word_size);
 
   uintptr_t handle_id = (uintptr_t)h;
   rmm->backend()->localize_batch(&handle_id, 1);
 
   h->set_local_release(dest);
-  return (oopDesc*)dest;
+  return result;
 }
 
 // Shared fast-path checks for both slow-path variants.
