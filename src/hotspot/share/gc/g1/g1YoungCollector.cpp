@@ -1098,8 +1098,19 @@ static bool remote_eviction_is_block_start(G1CollectedHeap* g1h,
     if (reason_out != nullptr) *reason_out = "OUTSIDE-TOP";
     return false;
   }
-  if (hr->block_start(addr) != addr) {
-    if (reason_out != nullptr) *reason_out = "INTERIOR";
+  // Do not call HeapRegion::block_start() for remote-eviction root
+  // validation. The G1 block-start path may parse from a speculative/interior
+  // address and dereference payload bits as a Klass before it can report that
+  // the address is not a block boundary. Root scanners are supposed to supply
+  // real oop starts; validate the header directly and reject implausible roots.
+  oop obj = cast_to_oop(addr);
+  Klass* k = obj->klass_or_null_acquire();
+  if (k == nullptr) {
+    if (reason_out != nullptr) *reason_out = "NULL-KLASS";
+    return false;
+  }
+  if (!Klass::is_valid(k)) {
+    if (reason_out != nullptr) *reason_out = "BAD-KLASS";
     return false;
   }
   return true;
