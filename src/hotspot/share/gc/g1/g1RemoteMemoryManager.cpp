@@ -1124,15 +1124,19 @@ static bool remote_eviction_parse_obj(HeapRegion* hr, HeapWord* p,
   if (p < hr->bottom() || p >= limit || p >= hr->end()) return false;
   if (!is_object_aligned((void*)p)) return false;
 
-  HeapWord* pb = hr->parsable_bottom_acquire();
-  if (!hr->block_is_obj(p, pb)) return false;
-  if (hr->block_start(p, pb) != p) return false;
+  // Do not call HeapRegion::block_start()/block_is_obj() here. Phase C may
+  // probe conservative addresses while looking for missed object starts, and
+  // G1's block-start path can parse interior primitive-array payload as an
+  // object header before it has proved that the address is a real boundary.
 
   oop obj = cast_to_oop(p);
-  Klass* k = obj->klass_or_null();
+  Klass* k = obj->klass_or_null_acquire();
   if (!remote_eviction_valid_klass(k)) return false;
 
-  size_t sz = obj->size_given_klass(k);
+  Klass* size_k = obj->klass_or_null_acquire();
+  if (size_k != k) return false;
+
+  size_t sz = obj->size_given_klass(size_k);
   if (sz < (size_t)MinObjAlignment) return false;
   if (!is_object_aligned(sz)) return false;
   if (sz > (size_t)(limit - p)) return false;
