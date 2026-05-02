@@ -3180,6 +3180,37 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                      salvaged_regions, relocated_count, relocated_bytes / K);
       }
 
+      // Regions that are still incomplete after salvage must stay entirely
+      // local.  prepare_eviction_metadata() may have created LOCAL handles for
+      // the evictable subset, but those objects must not get edge tables,
+      // backend slots, or remote executor storage unless the whole region can
+      // be committed in E3.  Otherwise the backend can store orphaned objects
+      // while the JVM later logs "0 objects evicted".
+      int incomplete_guarded_regions = 0;
+      int incomplete_guarded_entries = 0;
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        if (region_complete[i]) continue;
+
+        int rcount = region_count_arr[i];
+        if (rcount <= 0) continue;
+
+        int start = region_start[i];
+        for (int e = start; e < start + rcount; e++) {
+          if (entry_active[e]) {
+            rmm->abort_prepared_eviction(&entries[e]);
+            entry_active[e] = false;
+            incomplete_guarded_entries++;
+          }
+        }
+        incomplete_guarded_regions++;
+      }
+      if (incomplete_guarded_regions > 0) {
+        log_info(gc)("Pre-E incomplete-region guard: kept %d partial regions local "
+                     "and skipped backend send for %d prepared entries",
+                     incomplete_guarded_regions, incomplete_guarded_entries);
+      }
+
       // E1.6: Guard regions that still have LOCAL handles not covered by the
       // prepared object list. If such a region is sent/finalized anyway, the
       // prepared objects are fillerized while the region remains mapped for
@@ -3546,6 +3577,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             uint idx = hr->hrm_index();
             if (idx < num_regions) send_failed_regions[idx] = true;
             send_failed_entries++;
+          } else {
+            entry_sent[e] = true;
           }
         }
       }
