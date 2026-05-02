@@ -2136,19 +2136,25 @@ bool G1RemoteMemoryManager::validate_local_handle_addr(RemoteHandle* h,
       reason = "OUTSIDE-TOP";
     } else if (!_g1h->is_in((void*)addr)) {
       reason = "NOT IN LIVE HEAP";
-    } else if (hr->block_start((void*)addr) != (HeapWord*)addr) {
-      reason = "INTERIOR";
     } else {
       oop obj = cast_to_oop((HeapWord*)addr);
-      Klass* k = obj->klass_or_null();
-      if (k == nullptr) {
-        reason = "NULL-KLASS";
+      Klass* k = obj->klass_or_null_acquire();
+      if (!remote_eviction_valid_klass(k)) {
+        reason = "BAD-KLASS";
       } else if (G1CollectedHeap::is_obj_filler(obj)) {
         reason = "FILLER";
       } else {
-        size_t word_size = obj->size_given_klass(k);
-        if (word_size == 0 || (HeapWord*)addr + word_size > hr->top()) {
-          reason = "BAD-SIZE";
+        Klass* size_k = obj->klass_or_null_acquire();
+        if (size_k != k) {
+          reason = "KLASS-CHANGED";
+        } else {
+          size_t word_size = obj->size_given_klass(size_k);
+          if (word_size < (size_t)MinObjAlignment ||
+              !is_object_aligned(word_size) ||
+              word_size > (size_t)(hr->top() - (HeapWord*)addr) ||
+              word_size > (size_t)(hr->end() - (HeapWord*)addr)) {
+            reason = "BAD-SIZE";
+          }
         }
       }
     }
@@ -2911,9 +2917,20 @@ static bool is_valid_region_object(G1CollectedHeap* g1h, oop obj, HeapRegion** r
   HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
   if (obj_addr < hr->bottom() || obj_addr >= hr->top()) return false;
 
-  HeapWord* pb = hr->parsable_bottom_acquire();
-  if (!hr->block_is_obj(obj_addr, pb)) return false;
-  if (hr->block_start(obj_addr, pb) != obj_addr) return false;
+  // Avoid G1 block-start validation here. Stale-ref fixup may inspect refs
+  // around recently fetched/evicted dense regions; BOT walking can parse
+  // interior payload as an object header before rejecting the address.
+  Klass* k = obj->klass_or_null_acquire();
+  if (!remote_eviction_valid_klass(k)) return false;
+
+  Klass* size_k = obj->klass_or_null_acquire();
+  if (size_k != k) return false;
+
+  size_t sz = obj->size_given_klass(size_k);
+  if (sz < (size_t)MinObjAlignment) return false;
+  if (!is_object_aligned(sz)) return false;
+  if (sz > (size_t)(hr->top() - obj_addr)) return false;
+  if (sz > (size_t)(hr->end() - obj_addr)) return false;
 
   if (region_out != nullptr) {
     *region_out = hr;
