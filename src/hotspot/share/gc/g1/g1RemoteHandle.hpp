@@ -54,6 +54,9 @@ struct RemoteHandle {
   uint32_t           _flags;           // REMOTE_HANDLE_FLAG_* bits
   uintptr_t          _eviction_addr;   // Local address at eviction time (for O(1) table rekey)
   size_t             _eviction_word_size; // Full object size for fetch-time FCR allocation
+  RemoteHandle*      _local_prev;      // Intrusive list of currently LOCAL handles
+  RemoteHandle*      _local_next;
+  bool               _local_listed;
 
   // State queries (non-atomic, for use under lock or single-threaded)
   uintptr_t state() const { return _state_and_addr & REMOTE_HANDLE_STATE_MASK; }
@@ -180,6 +183,9 @@ struct RemoteHandle {
     _flags = 0;
     _eviction_addr = 0;
     _eviction_word_size = 0;
+    _local_prev = nullptr;
+    _local_next = nullptr;
+    _local_listed = false;
   }
 
   // Initialize as dormant anchor (local object referenced by remote)
@@ -189,6 +195,9 @@ struct RemoteHandle {
     _flags = REMOTE_HANDLE_FLAG_DORMANT;
     _eviction_addr = 0;
     _eviction_word_size = 0;
+    _local_prev = nullptr;
+    _local_next = nullptr;
+    _local_listed = false;
   }
 };
 
@@ -210,6 +219,9 @@ struct RemoteHandleChunk : public CHeapObj<mtGC> {
       _handles[i]._flags = 0;
       _handles[i]._eviction_addr = 0;
       _handles[i]._eviction_word_size = 0;
+      _handles[i]._local_prev = nullptr;
+      _handles[i]._local_next = nullptr;
+      _handles[i]._local_listed = false;
     }
   }
 };

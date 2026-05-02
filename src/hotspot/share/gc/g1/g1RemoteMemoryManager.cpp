@@ -50,7 +50,8 @@
 G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   : _g1h(g1h), _backend(nullptr), _handle_allocator(),
     _entry_chunks(nullptr), _entry_free_list(nullptr), _entry_chunk_top(ENTRY_CHUNK_CAPACITY),
-    _table_lock(0), _alloc_lock(0),
+    _table_lock(0), _local_handles_head(nullptr), _local_handle_count(0),
+    _local_handle_lock(0), _alloc_lock(0),
     _edge_table_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
@@ -102,6 +103,80 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
 
   // Backend object created; connection deferred to initialize_backend()
   // (called from G1CollectedHeap::initialize() when heap info is available).
+}
+
+void G1RemoteMemoryManager::link_local_handle_locked(RemoteHandle* h) {
+  if (h == nullptr || h->_local_listed) {
+    return;
+  }
+  h->_local_prev = nullptr;
+  h->_local_next = _local_handles_head;
+  if (_local_handles_head != nullptr) {
+    _local_handles_head->_local_prev = h;
+  }
+  _local_handles_head = h;
+  h->_local_listed = true;
+  _local_handle_count++;
+}
+
+void G1RemoteMemoryManager::unlink_local_handle_locked(RemoteHandle* h) {
+  if (h == nullptr || !h->_local_listed) {
+    return;
+  }
+  if (h->_local_prev != nullptr) {
+    h->_local_prev->_local_next = h->_local_next;
+  } else {
+    _local_handles_head = h->_local_next;
+  }
+  if (h->_local_next != nullptr) {
+    h->_local_next->_local_prev = h->_local_prev;
+  }
+  h->_local_prev = nullptr;
+  h->_local_next = nullptr;
+  h->_local_listed = false;
+  _local_handle_count--;
+}
+
+void G1RemoteMemoryManager::link_local_handle(RemoteHandle* h) {
+  local_handle_lock();
+  link_local_handle_locked(h);
+  local_handle_unlock();
+}
+
+void G1RemoteMemoryManager::unlink_local_handle(RemoteHandle* h) {
+  local_handle_lock();
+  unlink_local_handle_locked(h);
+  local_handle_unlock();
+}
+
+void G1RemoteMemoryManager::publish_local_handle(RemoteHandle* h, void* local_addr) {
+  if (h == nullptr) {
+    return;
+  }
+  local_handle_lock();
+  link_local_handle_locked(h);
+  h->set_local_release(local_addr);
+  local_handle_unlock();
+}
+
+void G1RemoteMemoryManager::make_handle_remote(RemoteHandle* h, uintptr_t remote_id) {
+  if (h == nullptr) {
+    return;
+  }
+  local_handle_lock();
+  h->set_remote(remote_id);
+  unlink_local_handle_locked(h);
+  local_handle_unlock();
+}
+
+void G1RemoteMemoryManager::mark_handle_dead(RemoteHandle* h) {
+  if (h == nullptr) {
+    return;
+  }
+  local_handle_lock();
+  h->set_dead();
+  unlink_local_handle_locked(h);
+  local_handle_unlock();
 }
 
 bool G1RemoteMemoryManager::concurrent_marking_active() const {
@@ -521,6 +596,7 @@ G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
 
 static volatile int _prep_fail_null = 0;
 static volatile int _prep_fail_locked = 0;
+static volatile int _prep_fail_array = 0;
 static volatile int _prep_fail_edge = 0;
 static volatile int _prep_fail_slot = 0;
 static volatile int _prep_success = 0;
@@ -540,6 +616,14 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
   }
 
   Klass* klass = obj->klass();
+  if (klass->is_array_klass()) {
+    if (Atomic::add(&_prep_fail_array, 1) <= 3 && !_prep_diag_logged) {
+      log_info(gc)("prepare_eviction: array obj=" PTR_FORMAT " klass=%s kept local",
+                   p2i((void*)obj), klass->external_name());
+    }
+    return false;
+  }
+
   size_t word_size = obj->size_given_klass(klass);
 
   RemoteHandle* h = handle_for(obj);
@@ -592,18 +676,21 @@ bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* h
 }
 
 void G1RemoteMemoryManager::log_prepare_eviction_stats() {
-  if (_prep_fail_null + _prep_fail_locked + _prep_fail_edge + _prep_fail_slot + _prep_success > 0) {
-    log_info(gc)("prepare_eviction stats: success=%d null=%d locked=%d edge=%d slot=%d",
-                 _prep_success, _prep_fail_null, _prep_fail_locked, _prep_fail_edge, _prep_fail_slot);
+  if (_prep_fail_null + _prep_fail_locked + _prep_fail_array +
+      _prep_fail_edge + _prep_fail_slot + _prep_success > 0) {
+    log_info(gc)("prepare_eviction stats: success=%d null=%d locked=%d array=%d edge=%d slot=%d",
+                 _prep_success, _prep_fail_null, _prep_fail_locked,
+                 _prep_fail_array, _prep_fail_edge, _prep_fail_slot);
     _prep_diag_logged = 1;
   }
-  _prep_fail_null = _prep_fail_locked = _prep_fail_edge = _prep_fail_slot = _prep_success = 0;
+  _prep_fail_null = _prep_fail_locked = _prep_fail_array =
+      _prep_fail_edge = _prep_fail_slot = _prep_success = 0;
   _prep_diag_logged = 0;
 }
 
 void G1RemoteMemoryManager::finalize_eviction(PreparedEviction* entry) {
   entry->handle->set_eviction_word_size(entry->word_size);
-  entry->handle->set_remote(entry->slot_id);
+  make_handle_remote(entry->handle, entry->slot_id);
 
   markWord mw = entry->obj->mark();
   if (mw.is_unlocked()) {
@@ -676,31 +763,24 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
   uintptr_t end = (uintptr_t)hr->end();
   int blockers = 0;
 
-  table_lock();
-  for (size_t i = 0; i < TABLE_SIZE; i++) {
-    HandleEntry* e = _table[i];
-    while (e != nullptr) {
-      RemoteHandle* h = e->_handle;
-      uintptr_t sa = h->load_state_and_addr_acquire();
-      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-      if (state == REMOTE_HANDLE_LOCAL) {
-        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
-        if (addr >= bottom && addr < end &&
-            !prepared_entries_contain_handle(entries, start, count, addr, h)) {
-          blockers++;
-          if (blockers <= log_limit) {
-            log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
-                            PTR_FORMAT " local=" PTR_FORMAT " table_addr="
-                            PTR_FORMAT " dormant=%d rc=%u",
-                            hr->hrm_index(), p2i(h), addr, e->_obj_addr,
-                            h->is_dormant() ? 1 : 0, h->remote_refcount());
-          }
+  for (RemoteHandle* h = _local_handles_head; h != nullptr; h = h->_local_next) {
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    if (state == REMOTE_HANDLE_LOCAL) {
+      uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      if (addr >= bottom && addr < end &&
+          !prepared_entries_contain_handle(entries, start, count, addr, h)) {
+        blockers++;
+        if (blockers <= log_limit) {
+          log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
+                          PTR_FORMAT " local=" PTR_FORMAT
+                          " dormant=%d rc=%u",
+                          hr->hrm_index(), p2i(h), addr,
+                          h->is_dormant() ? 1 : 0, h->remote_refcount());
         }
       }
-      e = e->_next;
     }
   }
-  table_unlock();
 
   return blockers;
 }
@@ -785,7 +865,9 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
   UnpreparedLocalHandleClosure cl(this, eviction_candidates, region_complete,
                                   region_start, region_count, num_regions,
                                   entries, blockers_by_region, log_limit);
-  _handle_allocator.handles_do(&cl);
+  for (RemoteHandle* h = _local_handles_head; h != nullptr; h = h->_local_next) {
+    cl.do_handle(h);
+  }
   return cl.total_blockers();
 }
 
@@ -800,31 +882,32 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
   int count = 0;
   int stale_handles = 0;
 
-  table_lock();
-  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
-      RemoteHandle* h = e->_handle;
-      if (h == nullptr || !h->is_local() || h->remote_refcount() == 0) continue;
+  RemoteHandle* cur = _local_handles_head;
+  while (cur != nullptr) {
+    RemoteHandle* next = cur->_local_next;
+    RemoteHandle* h = cur;
+    if (h->is_local() && h->remote_refcount() != 0) {
       if (!validate_local_handle_addr(h, "ANCHOR-COLLECT",
                                       &stale_handles, 8)) {
+        cur = next;
         continue;
       }
 
       uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
-      if (addr == 0 || !_g1h->is_in((void*)addr)) continue;
-
-      HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
-      if (hr == nullptr) continue;
-      uint ridx = hr->hrm_index();
-      if (ridx >= num_regions || !region_set[ridx]) continue;
-
-      if (count < max_addrs && addrs != nullptr) {
-        addrs[count] = addr;
-      } else if (overflow != nullptr) {
-        *overflow = true;
+      if (addr != 0 && _g1h->is_in((void*)addr)) {
+        HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
+        uint ridx = hr == nullptr ? num_regions : hr->hrm_index();
+        if (ridx < num_regions && region_set[ridx]) {
+          if (count < max_addrs && addrs != nullptr) {
+            addrs[count] = addr;
+          } else if (overflow != nullptr) {
+            *overflow = true;
+          }
+          count++;
+        }
       }
-      count++;
     }
+    cur = next;
   }
 
   for (int i = 0; i < _cross_roots_count; i++) {
@@ -850,8 +933,6 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
     }
     count++;
   }
-  table_unlock();
-
   if (stale_handles > 8) {
     log_warning(gc)("Remote anchor collection marked %d stale LOCAL handles DEAD "
                     "(logged first 8)", stale_handles);
@@ -1021,6 +1102,9 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
   uint                   _num_regions;
   int                    _tagged;
   int                    _no_handle;
+  int                    _untaggable;
+  int                    _untaggable_reports_left;
+  oop                    _cur_obj;
 
   typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
   TaggedFieldEntry* _local_buf;
@@ -1048,6 +1132,7 @@ public:
                         const bool* eset, uint nregions)
     : _rmm(rmm), _g1h(g1h), _eviction_set(eset),
       _num_regions(nregions), _tagged(0), _no_handle(0),
+      _untaggable(0), _untaggable_reports_left(10), _cur_obj(nullptr),
       _local_buf(nullptr), _local_count(0), _local_capacity(0) {}
 
   ~EvictionSetTagClosure() {
@@ -1059,6 +1144,8 @@ public:
     _local_buf = nullptr;
     return buf;
   }
+
+  void set_cur_obj(oop obj) { _cur_obj = obj; }
 
   virtual void do_oop(oop* p) {
     uintptr_t raw = *(uintptr_t*)p;
@@ -1088,6 +1175,24 @@ public:
       return;
     }
 
+    bool heap_source = _g1h->is_in((void*)p);
+    if (heap_source) {
+      Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
+      if (_cur_obj == nullptr || (source_klass != nullptr && source_klass->is_array_klass())) {
+        _untaggable++;
+        if (_untaggable_reports_left > 0) {
+          log_warning(gc)("Tagging: kept raw ref from %s heap source field=" PTR_FORMAT
+                          " -> target=" PTR_FORMAT " in candidate region %u "
+                          "(src_obj=" PTR_FORMAT " src_klass=%s)",
+                          _cur_obj == nullptr ? "unknown" : "array",
+                          p2i(p), p2i((void*)target), idx, p2i((void*)_cur_obj),
+                          source_klass != nullptr ? source_klass->external_name() : "unknown");
+          _untaggable_reports_left--;
+        }
+        return;
+      }
+    }
+
     RemoteHandle* h = _rmm->handle_for(target);
     if (h != nullptr) {
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
@@ -1107,6 +1212,7 @@ public:
 
   int tagged() const { return _tagged; }
   int no_handle() const { return _no_handle; }
+  int untaggable() const { return _untaggable; }
   const TaggedFieldEntry* local_buf() const { return _local_buf; }
   int local_count() const { return _local_count; }
 };
@@ -1240,7 +1346,9 @@ class EvictionTagObjectClosure {
 public:
   EvictionTagObjectClosure(EvictionSetTagClosure* cl) : _cl(cl) {}
   void do_object(oop obj) {
+    _cl->set_cur_obj(obj);
     obj->oop_iterate(_cl);
+    _cl->set_cur_obj(nullptr);
   }
 };
 
@@ -1259,6 +1367,7 @@ class TagAllHeapRefsTask : public WorkerTask {
   HeapRegionClaimer      _claimer;
   volatile int           _total_tagged;
   volatile int           _total_no_handle;
+  volatile int           _total_untaggable;
 
   typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
   TaggedFieldEntry** _worker_bufs;
@@ -1273,6 +1382,7 @@ public:
       _rmm(rmm), _g1h(g1h), _eviction_set(eset), _num_regions(nregions),
       _bitmap(bitmap),
       _claimer(num_workers), _total_tagged(0), _total_no_handle(0),
+      _total_untaggable(0),
       _num_workers(num_workers) {
     _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
     _worker_counts = NEW_C_HEAP_ARRAY(int, num_workers, mtGC);
@@ -1301,6 +1411,7 @@ public:
     }
     Atomic::add(&_total_tagged, cl.tagged());
     Atomic::add(&_total_no_handle, cl.no_handle());
+    Atomic::add(&_total_untaggable, cl.untaggable());
     _worker_bufs[worker_id] = cl.release_local_buf();
     _worker_counts[worker_id] = cl.local_count();
   }
@@ -1316,13 +1427,14 @@ public:
 
   int total_tagged() const { return _total_tagged; }
   int total_no_handle() const { return _total_no_handle; }
+  int total_untaggable() const { return _total_untaggable; }
 };
 
 int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     const bool* eviction_set, uint num_regions,
     WorkerThreads* workers, uint num_workers) {
 
-  int total_tagged, total_no_handle;
+  int total_tagged, total_no_handle, total_untaggable;
 
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
@@ -1332,6 +1444,7 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     task.flush_to_rmm();
     total_tagged = task.total_tagged();
     total_no_handle = task.total_no_handle();
+    total_untaggable = task.total_untaggable();
   } else {
     EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
     for (uint i = 0; i < _g1h->num_regions(); i++) {
@@ -1345,11 +1458,18 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     }
     total_tagged = cl.tagged();
     total_no_handle = cl.no_handle();
+    total_untaggable = cl.untaggable();
   }
 
-  if (total_tagged > 0 || total_no_handle > 0) {
-    log_info(gc)("Full heap scan (%u workers): tagged %d refs, %d refs had no handle",
-                 (workers != nullptr ? num_workers : 1), total_tagged, total_no_handle);
+  if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
+    log_info(gc)("Full heap scan (%u workers): tagged %d refs, %d refs had no handle, "
+                 "%d refs from untaggable heap sources kept raw",
+                 (workers != nullptr ? num_workers : 1), total_tagged,
+                 total_no_handle, total_untaggable);
+  }
+  if (total_untaggable > 0) {
+    log_warning(gc)("Full heap scan: verifier will keep candidate regions local if "
+                    "array/unknown-source refs still point into them");
   }
   return total_tagged;
 }
@@ -1384,19 +1504,22 @@ int G1RemoteMemoryManager::tag_evacuated_area_refs_to_eviction_set(
       }
       size_t sz = obj->size();
       if (sz == 0 || sz > (size_t)(region_end - p)) break;
+      cl.set_cur_obj(obj);
       obj->oop_iterate(&cl);
+      cl.set_cur_obj(nullptr);
       p += sz;
     }
     regions_rescanned++;
   }
 
   int total_tagged = cl.tagged();
-  if (total_tagged > 0) {
+  if (total_tagged > 0 || cl.untaggable() > 0) {
     for (int j = 0; j < cl.local_count(); j++) {
       add_tagged_field(cl.local_buf()[j]._field_addr, cl.local_buf()[j]._handle);
     }
     log_warning(gc)("Phase C.1: re-scanned %d regions, tagged %d missed refs "
-                    "(%d no handle)", regions_rescanned, total_tagged, cl.no_handle());
+                    "(%d no handle, %d untaggable)",
+                    regions_rescanned, total_tagged, cl.no_handle(), cl.untaggable());
   }
   return total_tagged;
 }
@@ -1451,6 +1574,7 @@ class TagFastRefsTask : public WorkerTask {
   HeapRegionClaimer      _claimer;
   volatile int           _total_tagged;
   volatile int           _total_no_handle;
+  volatile int           _total_untaggable;
   volatile int           _regions_scanned;
 
   typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
@@ -1466,6 +1590,7 @@ public:
       _rmm(rmm), _g1h(g1h), _eviction_set(eset), _num_regions(nregions),
       _pre_evac_tops(pre_evac_tops), _bitmap(bitmap),
       _claimer(num_workers), _total_tagged(0), _total_no_handle(0),
+      _total_untaggable(0),
       _regions_scanned(0), _num_workers(num_workers) {
     _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
     _worker_counts = NEW_C_HEAP_ARRAY(int, num_workers, mtGC);
@@ -1517,6 +1642,7 @@ public:
 
     Atomic::add(&_total_tagged, cl.tagged());
     Atomic::add(&_total_no_handle, cl.no_handle());
+    Atomic::add(&_total_untaggable, cl.untaggable());
     Atomic::add(&_regions_scanned, scanned);
     _worker_bufs[worker_id] = cl.release_local_buf();
     _worker_counts[worker_id] = cl.local_count();
@@ -1533,6 +1659,7 @@ public:
 
   int total_tagged() const { return _total_tagged; }
   int total_no_handle() const { return _total_no_handle; }
+  int total_untaggable() const { return _total_untaggable; }
   int regions_scanned() const { return _regions_scanned; }
 };
 
@@ -1542,7 +1669,7 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     WorkerThreads* workers, uint num_workers) {
 
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
-  int total_tagged, total_no_handle;
+  int total_tagged, total_no_handle, total_untaggable;
 
   if (workers != nullptr && num_workers > 1) {
     TagFastRefsTask task(this, _g1h, eviction_set, num_regions,
@@ -1551,10 +1678,13 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     task.flush_to_rmm();
     total_tagged = task.total_tagged();
     total_no_handle = task.total_no_handle();
+    total_untaggable = task.total_untaggable();
 
-    if (total_tagged > 0 || total_no_handle > 0) {
-      log_info(gc)("Fast Phase C (%u workers, %d regions scanned): tagged %d refs, %d no handle",
-                   num_workers, task.regions_scanned(), total_tagged, total_no_handle);
+    if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
+      log_info(gc)("Fast Phase C (%u workers, %d regions scanned): tagged %d refs, "
+                   "%d no handle, %d untaggable",
+                   num_workers, task.regions_scanned(), total_tagged,
+                   total_no_handle, total_untaggable);
     }
   } else {
     EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
@@ -1592,10 +1722,12 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     }
     total_tagged = cl.tagged();
     total_no_handle = cl.no_handle();
+    total_untaggable = cl.untaggable();
 
-    if (total_tagged > 0 || total_no_handle > 0) {
-      log_info(gc)("Fast Phase C (1 worker, %d regions scanned): tagged %d refs, %d no handle",
-                   scanned, total_tagged, total_no_handle);
+    if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
+      log_info(gc)("Fast Phase C (1 worker, %d regions scanned): tagged %d refs, "
+                   "%d no handle, %d untaggable",
+                   scanned, total_tagged, total_no_handle, total_untaggable);
     }
   }
 
@@ -1628,10 +1760,11 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     int root_tagged = root_cl.tagged();
     total_tagged += root_tagged;
     total_no_handle += root_cl.no_handle();
+    total_untaggable += root_cl.untaggable();
 
-    if (root_tagged > 0 || root_cl.no_handle() > 0) {
-      log_info(gc)("Phase C root scan: tagged %d refs, %d no handle",
-                   root_tagged, root_cl.no_handle());
+    if (root_tagged > 0 || root_cl.no_handle() > 0 || root_cl.untaggable() > 0) {
+      log_info(gc)("Phase C root scan: tagged %d refs, %d no handle, %d untaggable",
+                   root_tagged, root_cl.no_handle(), root_cl.untaggable());
     }
 
     TaggedFieldEntry* buf = root_cl.release_local_buf();
@@ -2176,7 +2309,7 @@ bool G1RemoteMemoryManager::validate_local_handle_addr(RemoteHandle* h,
                     hr == nullptr ? 9999 : hr->hrm_index(),
                     h->is_dormant() ? 1 : 0, h->remote_refcount());
   }
-  h->set_dead();
+  mark_handle_dead(h);
   return false;
 }
 
@@ -2225,7 +2358,9 @@ int G1RemoteMemoryManager::count_local_handles_in_region(HeapRegion* hr, int log
   };
 
   CountLocalHandleClosure cl(bottom, end, hr->hrm_index(), log_limit);
-  _handle_allocator.handles_do(&cl);
+  for (RemoteHandle* h = _local_handles_head; h != nullptr; h = h->_local_next) {
+    cl.do_handle(h);
+  }
   return cl.count();
 }
 
@@ -2707,7 +2842,7 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
       markWord m = target_oop->mark();
       if (m.is_marked()) {
         oop forwardee = cast_to_oop(m.decode_pointer());
-        h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
+        update_handle_for_evacuation(h, target_oop, forwardee);
         updated++;
       }
     }
@@ -2726,156 +2861,54 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
 
 int G1RemoteMemoryManager::fixup_all_local_handles() {
   Ticks start = Ticks::now();
-  const size_t max_bucket_scan = 4 * 1024 * 1024;
   int updated = 0;
   size_t scanned = 0;
   size_t local_seen = 0;
-  size_t rekeyed = 0;
   size_t stale_region = 0;
   int stale_killed = 0;
-  size_t null_handles = 0;
-  size_t non_empty_buckets = 0;
-  size_t longest_bucket = 0;
-  size_t corrupt_buckets = 0;
 
-  log_info(gc)("Handle table fixup START: buckets=%zu tagged_entries=%d",
-               TABLE_SIZE, _tagged_field_count);
+  log_info(gc)("Handle table fixup START: local_handles=%zu tagged_entries=%d",
+               _local_handle_count, _tagged_field_count);
 
-  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    if (_table[idx] == nullptr) {
-      continue;
-    }
-    non_empty_buckets++;
-
-    // A corrupted chain would otherwise spin the VMThread inside a GC pause.
-    HandleEntry* slow = _table[idx];
-    HandleEntry* fast = _table[idx];
-    size_t cycle_probe = 0;
-    while (fast != nullptr && fast->_next != nullptr && cycle_probe < max_bucket_scan) {
-      slow = slow->_next;
-      fast = fast->_next->_next;
-      cycle_probe++;
-      if (slow == fast) {
-        HandleEntry* p1 = _table[idx];
-        HandleEntry* p2 = slow;
-        while (p1 != p2) {
-          p1 = p1->_next;
-          p2 = p2->_next;
-        }
-
-        HandleEntry* cycle_start = p1;
-        HandleEntry* tail = cycle_start;
-        size_t cycle_len = 1;
-        while (tail->_next != cycle_start && cycle_len < max_bucket_scan) {
-          tail = tail->_next;
-          cycle_len++;
-        }
-        if (tail->_next == cycle_start) {
-          tail->_next = nullptr;
-          log_warning(gc)("Handle table fixup repaired cycle in bucket %zu "
-                          "(cycle_start=" PTR_FORMAT ", cycle_len=%zu)",
-                          idx, p2i(cycle_start), cycle_len);
-        } else {
-          _table[idx] = nullptr;
-          log_warning(gc)("Handle table fixup dropped corrupt bucket %zu "
-                          "(cycle_start=" PTR_FORMAT ", probe_limit=%zu)",
-                          idx, p2i(cycle_start), max_bucket_scan);
-        }
-        corrupt_buckets++;
-        break;
-      }
-    }
-    if (cycle_probe >= max_bucket_scan) {
-      log_warning(gc)("Handle table fixup cycle probe exceeded limit in bucket %zu "
-                      "(limit=%zu, head=" PTR_FORMAT ")",
-                      idx, max_bucket_scan, p2i(_table[idx]));
-      corrupt_buckets++;
-    }
-
-    size_t bucket_entries = 0;
-    HandleEntry** pp = &_table[idx];
-    while (*pp != nullptr) {
-      HandleEntry* e = *pp;
-      bucket_entries++;
-      if (bucket_entries > max_bucket_scan) {
-        log_warning(gc)("Handle table fixup truncated bucket %zu after %zu entries "
-                        "(entry=" PTR_FORMAT ")",
-                        idx, max_bucket_scan, p2i(e));
-        *pp = nullptr;
-        corrupt_buckets++;
-        break;
-      }
-
-      scanned++;
-      RemoteHandle* h = e->_handle;
-      if (h == nullptr) {
-        null_handles++;
-        pp = &e->_next;
-        continue;
-      }
-      uintptr_t sa = h->load_state_and_addr_acquire();
-      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-      if (state != REMOTE_HANDLE_LOCAL) {
-        pp = &e->_next;
-        continue;
-      }
+  RemoteHandle* h = _local_handles_head;
+  while (h != nullptr) {
+    RemoteHandle* next = h->_local_next;
+    scanned++;
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    if (state == REMOTE_HANDLE_LOCAL) {
       local_seen++;
 
       uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
       if (!validate_local_handle_addr(h, "HANDLE-FIXUP",
                                       &stale_killed, 16)) {
         stale_region++;
-        pp = &e->_next;
-        continue;
-      }
-
-      oop target = cast_to_oop(addr);
-      markWord m = target->mark();
-      if (m.is_marked()) {
-        oop forwardee = cast_to_oop(m.decode_pointer());
-        uintptr_t forward_addr = cast_from_oop<uintptr_t>(forwardee);
-        h->set_local_release((void*)forward_addr);
-
-        size_t new_idx = hash_obj(forward_addr);
-        e->_obj_addr = forward_addr;
-        if (new_idx != idx) {
-          *pp = e->_next;
-          e->_next = _table[new_idx];
-          _table[new_idx] = e;
-          rekeyed++;
-        } else {
-          pp = &e->_next;
+      } else {
+        oop target = cast_to_oop(addr);
+        markWord m = target->mark();
+        if (m.is_marked()) {
+          oop forwardee = cast_to_oop(m.decode_pointer());
+          update_handle_for_evacuation(h, target, forwardee);
+          updated++;
         }
-        updated++;
-        continue;
       }
-
-      pp = &e->_next;
     }
-    if (bucket_entries > longest_bucket) {
-      longest_bucket = bucket_entries;
-    }
+    h = next;
   }
 
   double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
   log_info(gc)("Handle table fixup DONE: %.1fms scanned=%zu local=%zu updated=%d "
-               "rekeyed=%zu non_empty_buckets=%zu longest_bucket=%zu "
-               "stale_region=%zu stale_killed=%d null_handles=%zu corrupt_buckets=%zu",
-               elapsed_ms, scanned, local_seen, updated, rekeyed,
-               non_empty_buckets, longest_bucket, stale_region,
-               stale_killed, null_handles, corrupt_buckets);
+               "stale_region=%zu stale_killed=%d local_handles=%zu",
+               elapsed_ms, scanned, local_seen, updated,
+               stale_region, stale_killed, _local_handle_count);
   if (stale_killed > 16) {
     log_warning(gc)("Handle table fixup marked %d stale LOCAL handles DEAD "
                     "(logged first 16)", stale_killed);
   }
-  if (corrupt_buckets > 0) {
-    log_warning(gc)("Handle table fixup saw %zu corrupt buckets; table mutation "
-                    "paths need follow-up locking/cycle investigation",
-                    corrupt_buckets);
-  } else if (elapsed_ms > 1000.0) {
+  if (elapsed_ms > 1000.0) {
     log_warning(gc)("Handle table fixup took %.1fms for %zu entries "
-                    "(longest_bucket=%zu)",
-                    elapsed_ms, scanned, longest_bucket);
+                    "(local_handles=%zu)",
+                    elapsed_ms, scanned, _local_handle_count);
   } else if (updated > 0) {
     log_info(gc)("Handle table fixup: %d LOCAL handles updated for forwarded objects", updated);
   }
@@ -2888,23 +2921,19 @@ int G1RemoteMemoryManager::purge_stale_local_handles(const char* phase, int log_
   size_t local_seen = 0;
   int stale_killed = 0;
 
-  table_lock();
-  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    HandleEntry* e = _table[idx];
-    while (e != nullptr) {
-      RemoteHandle* h = e->_handle;
-      scanned++;
-      if (h != nullptr && h->is_local()) {
-        local_seen++;
-        validate_local_handle_addr(h,
-                                   phase == nullptr ? "STALE-HANDLE-SWEEP" : phase,
-                                   &stale_killed,
-                                   log_limit);
-      }
-      e = e->_next;
+  RemoteHandle* h = _local_handles_head;
+  while (h != nullptr) {
+    RemoteHandle* next = h->_local_next;
+    scanned++;
+    if (h->is_local()) {
+      local_seen++;
+      validate_local_handle_addr(h,
+                                 phase == nullptr ? "STALE-HANDLE-SWEEP" : phase,
+                                 &stale_killed,
+                                 log_limit);
     }
+    h = next;
   }
-  table_unlock();
 
   if (stale_killed > 0) {
     double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;

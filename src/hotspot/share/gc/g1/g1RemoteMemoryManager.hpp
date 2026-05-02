@@ -102,9 +102,19 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   HandleEntry** _table;
   HandleEntry** _eviction_table;
   volatile int _table_lock;
+  RemoteHandle* _local_handles_head;
+  size_t _local_handle_count;
+  volatile int _local_handle_lock;
 
   void table_lock()   { while (Atomic::cmpxchg(&_table_lock, 0, 1) != 0) { /* spin */ } }
   void table_unlock() { Atomic::release_store(&_table_lock, 0); }
+  void local_handle_lock()   { while (Atomic::cmpxchg(&_local_handle_lock, 0, 1) != 0) { /* spin */ } }
+  void local_handle_unlock() { Atomic::release_store(&_local_handle_lock, 0); }
+
+  void link_local_handle_locked(RemoteHandle* h);
+  void unlink_local_handle_locked(RemoteHandle* h);
+  void link_local_handle(RemoteHandle* h);
+  void unlink_local_handle(RemoteHandle* h);
 
   // Stripe locks for parallel ensure_handle_for (Phase B).
   static const int TABLE_STRIPES = 4096;
@@ -232,6 +242,7 @@ public:
     // Not found (or only stale entries) — create new Handle and entry
     RemoteHandle* h = _handle_allocator.allocate_handle(hab);
     h->initialize(cast_from_oop<void*>(obj));
+    link_local_handle(h);
 
     HandleEntry* entry = alloc_entry();
     entry->init(addr, h, _table[idx]);
@@ -268,6 +279,7 @@ public:
     }
     RemoteHandle* h = _handle_allocator.allocate_handle(hab);
     h->initialize(cast_from_oop<void*>(obj));
+    link_local_handle(h);
     entry->init(addr, h, _table[idx]);
     _table[idx] = entry;
     stripe_unlock(idx);
@@ -293,6 +305,7 @@ public:
     }
     RemoteHandle* h = _handle_allocator.allocate_handle(hab);
     h->initialize_dormant(cast_from_oop<void*>(obj));
+    link_local_handle(h);
 
     HandleEntry* entry = alloc_entry();
     entry->init(addr, h, _table[idx]);
@@ -349,7 +362,7 @@ public:
   // Update the mapping when an object is evacuated to a new address.
   // Called from do_copy_to_survivor_space() during STW for ANY object
   // with a Handle (not just SHARED — also dormant anchors).
-  void update_handle_for_evacuation(oop old_obj, oop new_obj) {
+  void update_handle_for_evacuation(RemoteHandle* expected_h, oop old_obj, oop new_obj) {
     uintptr_t old_addr = cast_from_oop<uintptr_t>(old_obj);
     uintptr_t new_addr = cast_from_oop<uintptr_t>(new_obj);
     size_t old_idx = hash_obj(old_addr);
@@ -357,7 +370,8 @@ public:
     table_lock();
     HandleEntry** pp = &_table[old_idx];
     while (*pp != nullptr) {
-      if ((*pp)->_obj_addr == old_addr) {
+      if ((*pp)->_obj_addr == old_addr &&
+          (expected_h == nullptr || (*pp)->_handle == expected_h)) {
         HandleEntry* entry = *pp;
         // Only rekey LOCAL handles. REMOTE/DEAD entries are stale —
         // the address was reused after the original object's region was freed.
@@ -379,7 +393,17 @@ public:
       }
       pp = &((*pp)->_next);
     }
+    if (expected_h != nullptr && expected_h->is_local()) {
+      expected_h->set_local(cast_from_oop<void*>(new_obj));
+      HandleEntry* entry = alloc_entry();
+      entry->init(new_addr, expected_h, _table[hash_obj(new_addr)]);
+      _table[hash_obj(new_addr)] = entry;
+    }
     table_unlock();
+  }
+
+  void update_handle_for_evacuation(oop old_obj, oop new_obj) {
+    update_handle_for_evacuation(nullptr, old_obj, new_obj);
   }
 
   // Rekey a Handle entry when an object is fetched to a new local address.
@@ -411,6 +435,11 @@ public:
     _table[hash_obj(new_uaddr)] = entry;
     table_unlock();
   }
+
+  void publish_local_handle(RemoteHandle* h, void* local_addr);
+  void make_handle_remote(RemoteHandle* h, uintptr_t remote_id);
+  void mark_handle_dead(RemoteHandle* h);
+  size_t local_handle_count() const { return _local_handle_count; }
 
   // ============================================================
   // Sidecar Edge Tables (P3)
@@ -1018,9 +1047,9 @@ public:
 // Template implementation — must be in header for instantiation.
 template <typename OopClosureType>
 void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
-  // Walk the primary Handle storage. The hash table is only a secondary index;
-  // edge-table references may still hold a valid RemoteHandle even if the
-  // address index is stale or missing.
+  // Walk only currently LOCAL handles. The allocator keeps every handle ever
+  // allocated, including REMOTE/DEAD entries, which makes root processing grow
+  // with eviction history instead of the live local anchor set.
   //
   // For each anchor (LOCAL + remote_refcount > 0), call cl->do_oop. If GC
   // moves the object, update the primary Handle immediately. Do not rebuild the
@@ -1045,14 +1074,15 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
         return;
       }
 
-      oop obj = cast_to_oop((HeapWord*)(sa & REMOTE_HANDLE_ADDR_MASK));
+      oop old_obj = cast_to_oop((HeapWord*)(sa & REMOTE_HANDLE_ADDR_MASK));
+      oop obj = old_obj;
       if (obj == nullptr || obj->klass_or_null() == nullptr) return;
 
       _cl->do_oop(&obj);
 
       uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
       if (new_addr != (sa & REMOTE_HANDLE_ADDR_MASK)) {
-        h->set_local(cast_from_oop<void*>(obj));
+        _rmm->update_handle_for_evacuation(h, old_obj, obj);
       }
     }
 
@@ -1060,7 +1090,12 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
   };
 
   AnchorHandleClosure hcl(this, cl);
-  _handle_allocator.handles_do(&hcl);
+  RemoteHandle* h = _local_handles_head;
+  while (h != nullptr) {
+    RemoteHandle* next = h->_local_next;
+    hcl.do_handle(h);
+    h = next;
+  }
 
   if (hcl.stale_anchors() > 16) {
     log_warning(gc)("STALE-ANCHOR: marked %d stale LOCAL anchor handles DEAD "
@@ -1081,12 +1116,13 @@ void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
       continue;
     }
     uintptr_t old_addr = (uintptr_t)h->local_addr();
-    oop obj = cast_to_oop(h->local_addr());
+    oop old_obj = cast_to_oop(h->local_addr());
+    oop obj = old_obj;
     if (obj == nullptr || obj->klass_or_null() == nullptr) continue;
     cl->do_oop(&obj);
     uintptr_t new_addr = cast_from_oop<uintptr_t>(obj);
     if (new_addr != old_addr) {
-      h->set_local(cast_from_oop<void*>(obj));
+      update_handle_for_evacuation(h, old_obj, obj);
     }
   }
 

@@ -586,7 +586,7 @@ public:
     if (_publish_count == 0) return;
     backend->localize_batch(_publish_ids, _publish_count);
     for (uint i = 0; i < _publish_count; i++) {
-      _publish_handles[i]->set_local_release(_publish_dests[i]);
+      _rmm->publish_local_handle(_publish_handles[i], _publish_dests[i]);
     }
   }
 
@@ -641,7 +641,7 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   fetch_attempts++;
   rmm->record_fetch_retry();
   if (fetch_attempts >= 3) {
-    h->set_dead();
+    rmm->mark_handle_dead(h);
     log_warning(gc)("Batch fetch failed %d times for handle " PTR_FORMAT
                     " — marking DEAD", fetch_attempts, p2i(h));
     return nullptr;
@@ -684,7 +684,7 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
     fetch_attempts++;
     rmm->record_fetch_retry();
     if (fetch_attempts >= 3) {
-      h->set_dead();
+      rmm->mark_handle_dead(h);
       log_warning(gc)("Fetch failed %d times for handle " PTR_FORMAT " — marking DEAD",
                       fetch_attempts, p2i(h));
       return nullptr;
@@ -701,7 +701,7 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
   uintptr_t handle_id = (uintptr_t)h;
   rmm->backend()->localize_batch(&handle_id, 1);
 
-  h->set_local_release(dest);
+  rmm->publish_local_handle(h, dest);
   return result;
 }
 

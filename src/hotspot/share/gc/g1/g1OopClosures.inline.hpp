@@ -384,7 +384,7 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
       uintptr_t raw = *(uintptr_t*)p;
       if (raw & G1_OOP_INDIRECT_BIT) {
         RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
-        h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
+        _g1h->remote_memory_manager()->update_handle_for_evacuation(h, obj, forwardee);
       } else {
         RawAccess<IS_NOT_NULL>::oop_store(p, forwardee);
         wrote_clean_oop = true;

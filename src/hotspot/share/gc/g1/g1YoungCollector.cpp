@@ -705,7 +705,7 @@ class G1EvacuateRegionsTask : public G1EvacuateRegionsBaseTask {
             forwardee = pss->copy_to_survivor_space(region_attr, target, m);
           }
           if (forwardee != nullptr) {
-            h->set_local_release((void*)cast_from_oop<uintptr_t>(forwardee));
+            rmm->update_handle_for_evacuation(h, target, forwardee);
             evacuated++;
           }
         }

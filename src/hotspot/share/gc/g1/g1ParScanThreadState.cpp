@@ -257,6 +257,7 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   }
 
   markWord m = obj->mark();
+  oop old_obj = obj;
   if (m.is_marked()) {
     obj = cast_to_oop(m.decode_pointer());
   } else {
@@ -269,7 +270,7 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
     uintptr_t raw = *(uintptr_t*)p;
     if (raw & G1_OOP_INDIRECT_BIT) {
       RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
-      h->set_local_release((void*)cast_from_oop<uintptr_t>(obj));
+      _g1h->remote_memory_manager()->update_handle_for_evacuation(h, old_obj, obj);
     } else {
       RawAccess<IS_NOT_NULL>::oop_store(p, obj);
       wrote_clean_oop = true;
