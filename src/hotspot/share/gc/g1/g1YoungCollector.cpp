@@ -73,10 +73,11 @@
 #include "runtime/os.hpp"
 #include "runtime/threads.hpp"
 #include "utilities/ticks.hpp"
-#ifdef LINUX
-#include "osContainer_linux.hpp"
-#endif
 
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 
 // GCTraceTime wrapper that constructs the message according to GC pause type and
@@ -1316,16 +1317,149 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   return enough_signal && mostly_cold && not_hot;
 }
 
+#ifdef LINUX
+static bool read_jlong_from_file(const char* path, jlong* value) {
+  FILE* fp = fopen(path, "r");
+  if (fp == nullptr) {
+    return false;
+  }
+
+  char buf[64];
+  bool ok = false;
+  if (fgets(buf, sizeof(buf), fp) != nullptr) {
+    errno = 0;
+    char* end = nullptr;
+    jlong parsed = strtoll(buf, &end, 10);
+    if (errno == 0 && end != buf && parsed > 0) {
+      *value = parsed;
+      ok = true;
+    }
+  }
+  fclose(fp);
+  return ok;
+}
+
+static bool cgroup_controller_matches(const char* controllers, const char* name) {
+  size_t name_len = strlen(name);
+  const char* cursor = controllers;
+  while (*cursor != '\0') {
+    const char* comma = strchr(cursor, ',');
+    size_t token_len = comma == nullptr ? strlen(cursor) : (size_t)(comma - cursor);
+    if (token_len == name_len && strncmp(cursor, name, name_len) == 0) {
+      return true;
+    }
+    if (comma == nullptr) {
+      return false;
+    }
+    cursor = comma + 1;
+  }
+  return false;
+}
+
+static bool build_cgroup_file_path(char* out,
+                                   size_t out_len,
+                                   const char* root,
+                                   const char* cgroup_path,
+                                   const char* file_name) {
+  if (cgroup_path == nullptr || cgroup_path[0] == '\0' ||
+      strcmp(cgroup_path, "/") == 0) {
+    return false;
+  }
+
+  int written;
+  if (cgroup_path[0] == '/') {
+    written = snprintf(out, out_len, "%s%s/%s", root, cgroup_path, file_name);
+  } else {
+    written = snprintf(out, out_len, "%s/%s/%s", root, cgroup_path, file_name);
+  }
+  return written > 0 && (size_t)written < out_len;
+}
+
+static bool init_remote_cgroup_memory_paths(char* usage_path,
+                                            size_t usage_path_len,
+                                            char* limit_path,
+                                            size_t limit_path_len) {
+  FILE* fp = fopen("/proc/self/cgroup", "r");
+  if (fp == nullptr) {
+    return false;
+  }
+
+  char line[1024];
+  bool found = false;
+  while (fgets(line, sizeof(line), fp) != nullptr && !found) {
+    char* first_colon = strchr(line, ':');
+    if (first_colon == nullptr) {
+      continue;
+    }
+    char* second_colon = strchr(first_colon + 1, ':');
+    if (second_colon == nullptr) {
+      continue;
+    }
+
+    *first_colon = '\0';
+    *second_colon = '\0';
+    const char* hierarchy = line;
+    const char* controllers = first_colon + 1;
+    char* cgroup_path = second_colon + 1;
+    cgroup_path[strcspn(cgroup_path, "\n")] = '\0';
+
+    if (cgroup_controller_matches(controllers, "memory")) {
+      found =
+        build_cgroup_file_path(usage_path, usage_path_len,
+                               "/sys/fs/cgroup/memory", cgroup_path,
+                               "memory.usage_in_bytes") &&
+        build_cgroup_file_path(limit_path, limit_path_len,
+                               "/sys/fs/cgroup/memory", cgroup_path,
+                               "memory.limit_in_bytes");
+    } else if (strcmp(hierarchy, "0") == 0 && controllers[0] == '\0') {
+      found =
+        build_cgroup_file_path(usage_path, usage_path_len,
+                               "/sys/fs/cgroup", cgroup_path,
+                               "memory.current") &&
+        build_cgroup_file_path(limit_path, limit_path_len,
+                               "/sys/fs/cgroup", cgroup_path,
+                               "memory.max");
+    }
+  }
+
+  fclose(fp);
+  return found;
+}
+
+static bool read_remote_cgroup_files(jlong* raw_usage, jlong* raw_limit) {
+  static bool paths_initialized = false;
+  static char usage_path[1024];
+  static char limit_path[1024];
+
+  if (!paths_initialized) {
+    paths_initialized =
+      init_remote_cgroup_memory_paths(usage_path, sizeof(usage_path),
+                                      limit_path, sizeof(limit_path));
+    if (!paths_initialized) {
+      // The Spark executor is moved into the cgexec memory cgroup shortly after
+      // launch. Retry later instead of caching a startup-time root cgroup miss.
+      return false;
+    }
+  }
+
+  return read_jlong_from_file(usage_path, raw_usage) &&
+         read_jlong_from_file(limit_path, raw_limit);
+}
+#endif
+
 static bool read_remote_cgroup_pressure(size_t local_capacity,
                                         size_t* usage,
                                         size_t* capacity) {
 #ifdef LINUX
-  if (!G1RemoteUseCgroupPressure || !OSContainer::is_containerized()) {
+  if (!G1RemoteUseCgroupPressure) {
     return false;
   }
 
-  jlong raw_usage = OSContainer::memory_usage_in_bytes();
-  jlong raw_limit = OSContainer::memory_limit_in_bytes();
+  jlong raw_usage = 0;
+  jlong raw_limit = 0;
+  if (!read_remote_cgroup_files(&raw_usage, &raw_limit)) {
+    return false;
+  }
   if (raw_usage <= 0 || raw_limit <= 0 || local_capacity == 0) {
     return false;
   }
