@@ -59,6 +59,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _fast_phase_c_source_hints(nullptr),
     _fast_phase_c_source_hint_capacity(0),
     _fast_phase_c_source_hint_count(0),
+    _fast_phase_c_source_hint_lock(0),
     _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
     _remote_roots_capacity(0),
     _cross_roots_count(0),
@@ -518,11 +519,15 @@ bool G1RemoteMemoryManager::remember_fast_phase_c_source_hint(uint region_idx) {
       region_idx == (uint)-1) {
     return false;
   }
+
+  fast_phase_c_source_hint_lock();
   ensure_fast_phase_c_source_hint_capacity(region_idx + 1);
   if (_fast_phase_c_source_hints[region_idx]) {
+    fast_phase_c_source_hint_unlock();
     return true;
   }
   if (_fast_phase_c_source_hint_count >= G1RemoteFastPhaseCSourceHintMaxRegions) {
+    fast_phase_c_source_hint_unlock();
     return false;
   }
   _fast_phase_c_source_hints[region_idx] = true;
@@ -530,6 +535,7 @@ bool G1RemoteMemoryManager::remember_fast_phase_c_source_hint(uint region_idx) {
   log_info(gc)("Fast Phase C source hint: learned clean old source region %u (%u/%u)",
                region_idx, _fast_phase_c_source_hint_count,
                G1RemoteFastPhaseCSourceHintMaxRegions);
+  fast_phase_c_source_hint_unlock();
   return true;
 }
 
@@ -2067,6 +2073,57 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     int*                   _src_region_counts;
     int*                   _target_region_counts;
     oop                    _cur_obj;
+    volatile int*          _repair_budget;
+    volatile int*          _report_budget;
+
+    typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
+    TaggedFieldEntry*      _local_buf;
+    int                    _local_count;
+    int                    _local_capacity;
+
+    void local_buf_add(oop* field_addr, RemoteHandle* h) {
+      if (_local_count >= _local_capacity) {
+        int new_cap = (_local_capacity == 0) ? 256 : _local_capacity * 2;
+        TaggedFieldEntry* nb = NEW_C_HEAP_ARRAY(TaggedFieldEntry, new_cap, mtGC);
+        if (_local_buf != nullptr) {
+          memcpy(nb, _local_buf, _local_count * sizeof(TaggedFieldEntry));
+          FREE_C_HEAP_ARRAY(TaggedFieldEntry, _local_buf);
+        }
+        _local_buf = nb;
+        _local_capacity = new_cap;
+      }
+      _local_buf[_local_count]._field_addr = field_addr;
+      _local_buf[_local_count]._handle = h;
+      _local_count++;
+    }
+
+    static bool take_budget(volatile int* budget) {
+      if (budget == nullptr) {
+        return false;
+      }
+      int current = Atomic::load(budget);
+      while (current > 0) {
+        if (Atomic::cmpxchg(budget, current, current - 1) == current) {
+          return true;
+        }
+        current = Atomic::load(budget);
+      }
+      return false;
+    }
+
+    bool can_repair_next() {
+      if (_repair_budget != nullptr) {
+        return take_budget(_repair_budget);
+      }
+      return (uint)_repaired < _repair_limit;
+    }
+
+    bool should_report_miss() {
+      if (_report_budget != nullptr) {
+        return take_budget(_report_budget);
+      }
+      return _missed <= 20;
+    }
 
     bool is_selected(uint idx, const uint* selected, int selected_len) const {
       for (int i = 0; i < selected_len; i++) {
@@ -2120,7 +2177,9 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     VerifyTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
                      const bool* eset, uint nregions,
                      HeapWord* const* pre_evac_tops,
-                     bool repair, uint repair_limit)
+                     bool repair, uint repair_limit,
+                     volatile int* repair_budget = nullptr,
+                     volatile int* report_budget = nullptr)
       : _rmm(rmm), _g1h(g1h), _ct(g1h->card_table()), _eviction_set(eset),
         _num_regions(nregions), _pre_evac_tops(pre_evac_tops),
         _repair(repair), _repair_limit(repair_limit),
@@ -2134,12 +2193,17 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         _region_count(nregions),
         _src_region_counts(NEW_C_HEAP_ARRAY(int, nregions, mtGC)),
         _target_region_counts(NEW_C_HEAP_ARRAY(int, nregions, mtGC)),
-        _cur_obj(nullptr) {
+        _cur_obj(nullptr),
+        _repair_budget(repair_budget), _report_budget(report_budget),
+        _local_buf(nullptr), _local_count(0), _local_capacity(0) {
       memset(_src_region_counts, 0, nregions * sizeof(int));
       memset(_target_region_counts, 0, nregions * sizeof(int));
     }
 
     ~VerifyTagClosure() {
+      if (_local_buf != nullptr) {
+        FREE_C_HEAP_ARRAY(TaggedFieldEntry, _local_buf);
+      }
       FREE_C_HEAP_ARRAY(int, _src_region_counts);
       FREE_C_HEAP_ARRAY(int, _target_region_counts);
     }
@@ -2229,21 +2293,23 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       if (_repair) {
         if (untaggable_source) {
           _repair_untaggable++;
-        } else if ((uint)_repaired >= _repair_limit) {
-          _repair_limit_skipped++;
         } else {
           RemoteHandle* h = _rmm->handle_for(target);
           if (h != nullptr) {
-            *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
-            _rmm->add_tagged_field(p, h);
-            _repaired++;
+            if (can_repair_next()) {
+              *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+              local_buf_add(p, h);
+              _repaired++;
+            } else {
+              _repair_limit_skipped++;
+            }
           } else {
             _repair_no_handle++;
           }
         }
       }
 
-      if (_missed <= 20) {
+      if (should_report_miss()) {
         log_warning(gc)("VERIFY: untagged ref field=" PTR_FORMAT " -> target=" PTR_FORMAT
                         " in candidate region %u, src_obj=" PTR_FORMAT " klass=%s src_region=%u"
                         " src_type=%s src_candidate=%s src_young=%s src_destination=%s"
@@ -2265,6 +2331,37 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     }
 
     virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
+
+    void merge_from(const VerifyTagClosure& other) {
+      _missed += other._missed;
+      _repaired += other._repaired;
+      _repair_no_handle += other._repair_no_handle;
+      _repair_untaggable += other._repair_untaggable;
+      _repair_limit_skipped += other._repair_limit_skipped;
+      _heap_source += other._heap_source;
+      _root_source += other._root_source;
+      _candidate_source += other._candidate_source;
+      _young_source += other._young_source;
+      _destination_source += other._destination_source;
+      _direct_scanned_source += other._direct_scanned_source;
+      _dirty_card_source += other._dirty_card_source;
+      _clean_old_source += other._clean_old_source;
+      _same_region += other._same_region;
+      _array_source += other._array_source;
+      _obj_array_source += other._obj_array_source;
+      _non_array_source += other._non_array_source;
+      _continue_humongous_source += other._continue_humongous_source;
+      for (uint i = 0; i < _region_count; i++) {
+        _src_region_counts[i] += other._src_region_counts[i];
+        _target_region_counts[i] += other._target_region_counts[i];
+      }
+    }
+
+    void flush_repaired_fields() {
+      for (int i = 0; i < _local_count; i++) {
+        _rmm->add_tagged_field(_local_buf[i]._field_addr, _local_buf[i]._handle);
+      }
+    }
 
     int missed() const { return _missed; }
     int repaired() const { return _repaired; }
@@ -2311,12 +2408,89 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
   // 1. Verify heap: use the same conservative walk as Phase C tagging so the
   // verifier can catch bitmap/parser blind spots instead of repeating them.
-  for (uint i = 0; i < _g1h->num_regions(); i++) {
-    HeapRegion* hr = _g1h->region_at(i);
-    if (hr->is_empty() || hr->is_free()) continue;
-    if (hr->is_continues_humongous()) continue;
-    VerifyObjectClosure obj_cl(&cl);
-    remote_eviction_scan_region_objects(hr, bitmap, "VERIFY", &obj_cl);
+  WorkerThreads* verify_workers = _g1h->workers();
+  uint active_workers = verify_workers != nullptr ? verify_workers->active_workers() : 0;
+  if (G1RemoteParallelVerifyEvictionRefs &&
+      verify_workers != nullptr &&
+      active_workers > 1) {
+    class VerifyHeapRefsTask : public WorkerTask {
+      G1RemoteMemoryManager* _rmm;
+      G1CollectedHeap*       _g1h;
+      const bool*            _eviction_set;
+      uint                   _num_regions;
+      HeapWord* const*       _pre_evac_tops;
+      const G1CMBitMap*      _bitmap;
+      bool                   _repair;
+      uint                   _repair_limit;
+      VerifyTagClosure*      _summary;
+      HeapRegionClaimer      _claimer;
+      volatile int           _merge_lock;
+      volatile int           _repair_budget;
+      volatile int           _report_budget;
+
+      void merge_lock() {
+        while (Atomic::cmpxchg(&_merge_lock, 0, 1) != 0) { /* spin */ }
+      }
+
+      void merge_unlock() {
+        Atomic::release_store(&_merge_lock, 0);
+      }
+
+    public:
+      VerifyHeapRefsTask(G1RemoteMemoryManager* rmm,
+                         G1CollectedHeap* g1h,
+                         const bool* eviction_set,
+                         uint num_regions,
+                         HeapWord* const* pre_evac_tops,
+                         const G1CMBitMap* bitmap,
+                         bool repair,
+                         uint repair_limit,
+                         VerifyTagClosure* summary,
+                         uint num_workers)
+        : WorkerTask("Verify remote eviction refs"),
+          _rmm(rmm), _g1h(g1h), _eviction_set(eviction_set),
+          _num_regions(num_regions), _pre_evac_tops(pre_evac_tops),
+          _bitmap(bitmap), _repair(repair), _repair_limit(repair_limit),
+          _summary(summary), _claimer(num_workers), _merge_lock(0),
+          _repair_budget((int)repair_limit), _report_budget(20) {}
+
+      void work(uint worker_id) {
+        VerifyTagClosure worker_cl(_rmm, _g1h, _eviction_set, _num_regions,
+                                   _pre_evac_tops, _repair, _repair_limit,
+                                   &_repair_budget, &_report_budget);
+        VerifyObjectClosure obj_cl(&worker_cl);
+
+        for (uint i = _claimer.offset_for_worker(worker_id);
+             i < _g1h->num_regions();
+             i++) {
+          if (!_claimer.claim_region(i)) continue;
+          HeapRegion* hr = _g1h->region_at(i);
+          if (hr->is_empty() || hr->is_free()) continue;
+          if (hr->is_continues_humongous()) continue;
+          remote_eviction_scan_region_objects(hr, _bitmap, "VERIFY", &obj_cl);
+        }
+
+        merge_lock();
+        worker_cl.flush_repaired_fields();
+        _summary->merge_from(worker_cl);
+        merge_unlock();
+      }
+    };
+
+    VerifyHeapRefsTask task(this, _g1h, eviction_set, num_regions, pre_evac_tops,
+                            bitmap, repair_misses,
+                            G1RemoteFastPhaseCRepairMissLimit, &cl,
+                            active_workers);
+    verify_workers->run_task(&task, active_workers);
+  } else {
+    for (uint i = 0; i < _g1h->num_regions(); i++) {
+      HeapRegion* hr = _g1h->region_at(i);
+      if (hr->is_empty() || hr->is_free()) continue;
+      if (hr->is_continues_humongous()) continue;
+      VerifyObjectClosure obj_cl(&cl);
+      remote_eviction_scan_region_objects(hr, bitmap, "VERIFY", &obj_cl);
+    }
+    cl.flush_repaired_fields();
   }
 
   int heap_missed = cl.missed();

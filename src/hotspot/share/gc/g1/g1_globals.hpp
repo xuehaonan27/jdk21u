@@ -412,6 +412,15 @@
           "controlled performance ablations after Fast Phase C has passed "   \
           "verification on the target workload.")                             \
                                                                             \
+  product(bool, G1RemoteParallelVerifyEvictionRefs, true, DIAGNOSTIC,        \
+          "Use GC worker threads for the heap portion of remote-eviction "    \
+          "reference verification. Root verification remains serial.")        \
+                                                                            \
+  product(bool, G1RemoteSkipFastPhaseCSafetyNetWhenVerifying, true, DIAGNOSTIC, \
+          "When Fast Phase C is enabled and G1RemoteVerifyEvictionRefs is "   \
+          "also enabled, skip the duplicate evacuated-area safety-net scan. " \
+          "The verifier still repairs or aborts on any missed heap refs.")    \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \

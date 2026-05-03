@@ -613,8 +613,15 @@ private:
   bool*     _fast_phase_c_source_hints;
   uint      _fast_phase_c_source_hint_capacity;
   uint      _fast_phase_c_source_hint_count;
+  volatile int _fast_phase_c_source_hint_lock;
   void ensure_eviction_backoff_capacity(uint num_regions);
   void ensure_fast_phase_c_source_hint_capacity(uint num_regions);
+  void fast_phase_c_source_hint_lock() {
+    while (Atomic::cmpxchg(&_fast_phase_c_source_hint_lock, 0, 1) != 0) { /* spin */ }
+  }
+  void fast_phase_c_source_hint_unlock() {
+    Atomic::release_store(&_fast_phase_c_source_hint_lock, 0);
+  }
 
 public:
   // Remote root set: handle_ids for CMD_REPORT_REMOTE_ROOTS_V2.

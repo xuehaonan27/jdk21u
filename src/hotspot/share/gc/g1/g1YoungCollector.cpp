@@ -2910,7 +2910,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       // sequential iteration above parsable_bottom, but truncation on
       // unexpected heap gaps can silently skip objects.  This targeted
       // pass re-scans only the newly-evacuated portion of each region.
-      if (_pre_evac_tops != nullptr) {
+      if (_pre_evac_tops != nullptr &&
+          !(G1RemoteUseFastPhaseC &&
+            G1RemoteVerifyEvictionRefs &&
+            G1RemoteSkipFastPhaseCSafetyNetWhenVerifying)) {
         Ticks phase_c1_start = Ticks::now();
         int c1_tagged = rmm->tag_evacuated_area_refs_to_eviction_set(
             eviction_candidates, num_regions, _pre_evac_tops);
@@ -2921,6 +2924,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         } else {
           log_info(gc)("Phase C.1 safety-net: %.1fms, 0 missed refs", phase_c1_ms);
         }
+      } else if (_pre_evac_tops != nullptr) {
+        log_info(gc)("Phase C.1 safety-net: skipped because Fast Phase C is verifier-backed");
       }
 
       // ---- Phase C.5: Verify no untagged refs remain ----
