@@ -1361,6 +1361,15 @@ struct RegionColdnessSample {
     dense_small_objects(false) {}
 };
 
+static bool remote_old_region_meets_min_evict_used(HeapRegion* hr) {
+  uint min_used_percent = G1RemoteMinOldRegionEvictUsedPercent;
+  if (min_used_percent == 0) {
+    return true;
+  }
+  size_t min_used = (HeapRegion::GrainBytes * (size_t)min_used_percent) / 100;
+  return hr->used() >= min_used;
+}
+
 static bool region_is_cold_by_epoch(HeapRegion* hr,
                                     G1RemoteMemoryManager* rmm,
                                     bool guard_dense_small_objects,
@@ -2093,6 +2102,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_regions_not_cold = 0;
         int path2_regions_dense_small = 0;
         int path2_regions_backoff_skipped = 0;
+        int path2_regions_sparse_skipped = 0;
         size_t path2_dense_small_bytes = 0;
         size_t path2_dense_small_objects = 0;
         int path2_dense_last_resort_candidates = 0;
@@ -2120,6 +2130,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (eviction_candidates[i]) continue;
             if (rmm->is_region_in_eviction_backoff(i)) {
               path2_regions_backoff_skipped++;
+              continue;
+            }
+            if (!remote_old_region_meets_min_evict_used(hr)) {
+              path2_regions_sparse_skipped++;
               continue;
             }
 
@@ -2171,13 +2185,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           size_t hot_bytes = hot_words * HeapWordSize;
           size_t unknown_bytes = unknown_words * HeapWordSize;
           log_info(gc)("Path 2 cold scan: selected=%d/%d regions (" SIZE_FORMAT "MB), "
-                       "not_cold=%d, backoff=%d, dense_small=%d (" SIZE_FORMAT "MB, "
+                       "not_cold=%d, backoff=%d, sparse=%d, dense_small=%d ("
+                       SIZE_FORMAT "MB, "
                        SIZE_FORMAT " objs), sample cold=" SIZE_FORMAT "MB hot="
                        SIZE_FORMAT "MB unknown=" SIZE_FORMAT "MB sampled="
                        SIZE_FORMAT "MB",
                        path2_cold_candidates, path2_regions_scanned,
                        path2_cold_bytes / M, path2_regions_not_cold,
                        path2_regions_backoff_skipped,
+                       path2_regions_sparse_skipped,
                        path2_regions_dense_small, path2_dense_small_bytes / M,
                        path2_dense_small_objects,
                        cold_bytes / M, hot_bytes / M, unknown_bytes / M,
@@ -2200,6 +2216,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (dense_deferred_candidates[i]) continue;
             if (rmm != nullptr && rmm->is_region_in_eviction_backoff(i)) {
               path2_regions_backoff_skipped++;
+              continue;
+            }
+            if (!remote_old_region_meets_min_evict_used(hr)) {
+              path2_regions_sparse_skipped++;
               continue;
             }
 

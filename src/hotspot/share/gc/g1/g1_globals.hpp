@@ -346,6 +346,13 @@
           "is diagnostic and remains guarded by normal root and verifier "   \
           "checks.")                                                        \
                                                                             \
+  product(uint, G1RemoteMinOldRegionEvictUsedPercent, 0, DIAGNOSTIC,        \
+          "Skip Path 2 pressure-eviction candidates whose old region used "   \
+          "bytes are below this percentage of a G1 region. Sparse old "       \
+          "regions often contain JVM/control objects, reclaim little memory, "\
+          "and are poor remote-eviction targets.")                           \
+          range(0, 100)                                                      \
+                                                                            \
   product(uint, G1RemoteEvictionAbortBackoffGCCycles, 16, DIAGNOSTIC,       \
           "Number of GC cycles to skip a region after remote eviction "      \
           "verification aborts with untagged heap refs. 0 disables the "     \
