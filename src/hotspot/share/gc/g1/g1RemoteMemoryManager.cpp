@@ -1724,9 +1724,10 @@ public:
 
   void work(uint worker_id) {
     EvictionSetTagClosure cl(_rmm, _g1h, _eviction_set, _num_regions);
-    for (uint i = _claimer.offset_for_worker(worker_id); i < _g1h->num_regions(); i++) {
+    for (uint i = _claimer.offset_for_worker(worker_id); i < _claimer.n_regions(); i++) {
       if (!_claimer.claim_region(i)) continue;
-      HeapRegion* hr = _g1h->region_at(i);
+      HeapRegion* hr = _g1h->region_at_or_null(i);
+      if (hr == nullptr) continue;
       if (hr->is_empty() || hr->is_free()) continue;
       if (hr->is_continues_humongous()) continue;
       scan_region_for_eviction_tags(hr, &cl, _bitmap);
@@ -1769,8 +1770,9 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     total_untaggable = task.total_untaggable();
   } else {
     EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
-    for (uint i = 0; i < _g1h->num_regions(); i++) {
-      HeapRegion* hr = _g1h->region_at(i);
+    for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
+      HeapRegion* hr = _g1h->region_at_or_null(i);
+      if (hr == nullptr) continue;
       if (hr->is_empty() || hr->is_free()) continue;
       if (hr->is_continues_humongous()) continue;
       scan_region_for_eviction_tags(hr, &cl, bitmap);
@@ -1803,12 +1805,14 @@ int G1RemoteMemoryManager::tag_evacuated_area_refs_to_eviction_set(
   EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
   int regions_rescanned = 0;
 
-  for (uint i = 0; i < _g1h->num_regions(); i++) {
-    HeapRegion* hr = _g1h->region_at(i);
+  for (uint i = 0; i < num_regions; i++) {
+    HeapRegion* hr = _g1h->region_at_or_null(i);
+    if (hr == nullptr) continue;
     if (hr->is_empty() || hr->is_free()) continue;
     if (hr->is_continues_humongous()) continue;
 
     HeapWord* pre_top = pre_evac_tops[i];
+    if (pre_top == nullptr) continue;
     HeapWord* cur_top = hr->top();
     if (pre_top >= cur_top) continue;
 
@@ -1971,9 +1975,10 @@ public:
     int source_hint_regions = 0;
     int old_prefix_regions = 0;
 
-    for (uint i = _claimer.offset_for_worker(worker_id); i < _num_regions; i++) {
+    for (uint i = _claimer.offset_for_worker(worker_id); i < _claimer.n_regions(); i++) {
       if (!_claimer.claim_region(i)) continue;
-      HeapRegion* hr = _g1h->region_at(i);
+      HeapRegion* hr = _g1h->region_at_or_null(i);
+      if (hr == nullptr) continue;
 
       if (_eviction_set[i]) {
         scan_region_for_eviction_tags(hr, &cl, _bitmap);
@@ -2092,7 +2097,8 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     int old_prefix_regions = 0;
 
     for (uint i = 0; i < num_regions; i++) {
-      HeapRegion* hr = _g1h->region_at(i);
+      HeapRegion* hr = _g1h->region_at_or_null(i);
+      if (hr == nullptr) continue;
 
       if (eviction_set[i]) {
         scan_region_for_eviction_tags(hr, &cl, bitmap);
@@ -2229,8 +2235,9 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
   };
 
   UntagClosure cl;
-  for (uint i = 0; i < _g1h->num_regions(); i++) {
-    HeapRegion* hr = _g1h->region_at(i);
+  for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
+    HeapRegion* hr = _g1h->region_at_or_null(i);
+    if (hr == nullptr) continue;
     if (hr->is_empty() || hr->is_free()) continue;
     HeapWord* p = hr->bottom();
     HeapWord* region_end = hr->end();
@@ -2373,7 +2380,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         if (best_count == 0 || best_idx == (uint)-1) break;
 
         selected[rank] = best_idx;
-        HeapRegion* hr = best_idx < _g1h->num_regions() ? _g1h->region_at(best_idx) : nullptr;
+        HeapRegion* hr = best_idx < _g1h->max_reserved_regions()
+          ? _g1h->region_at_or_null(best_idx) : nullptr;
         bool candidate = best_idx < _num_regions && _eviction_set[best_idx];
         bool young = hr != nullptr && hr->is_young();
         bool dest = is_destination_region(best_idx, hr);
@@ -2675,10 +2683,11 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         VerifyObjectClosure obj_cl(&worker_cl);
 
         for (uint i = _claimer.offset_for_worker(worker_id);
-             i < _g1h->num_regions();
+             i < _claimer.n_regions();
              i++) {
           if (!_claimer.claim_region(i)) continue;
-          HeapRegion* hr = _g1h->region_at(i);
+          HeapRegion* hr = _g1h->region_at_or_null(i);
+          if (hr == nullptr) continue;
           if (hr->is_empty() || hr->is_free()) continue;
           if (hr->is_continues_humongous()) continue;
           remote_eviction_scan_region_objects(hr, _bitmap, "VERIFY", &obj_cl);
@@ -2697,8 +2706,9 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
                             active_workers);
     verify_workers->run_task(&task, active_workers);
   } else {
-    for (uint i = 0; i < _g1h->num_regions(); i++) {
-      HeapRegion* hr = _g1h->region_at(i);
+    for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
+      HeapRegion* hr = _g1h->region_at_or_null(i);
+      if (hr == nullptr) continue;
       if (hr->is_empty() || hr->is_free()) continue;
       if (hr->is_continues_humongous()) continue;
       VerifyObjectClosure obj_cl(&cl);
@@ -2994,8 +3004,9 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
     }
   };
 
-  for (uint i = 0; i < _g1h->num_regions(); i++) {
-    HeapRegion* hr = _g1h->region_at(i);
+  for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
+    HeapRegion* hr = _g1h->region_at_or_null(i);
+    if (hr == nullptr) continue;
     if (hr->is_empty() || hr->is_free()) continue;
     if (hr->is_continues_humongous()) continue;
     if (hr->is_evict_guarded()) continue;
@@ -4042,9 +4053,10 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
   int regions_scanned = 0;
   int objects_scanned = 0;
-  log_debug(gc)("Old/cset fixup heap scan START: heap_regions=%u", _g1h->num_regions());
-  for (uint i = 0; i < _g1h->num_regions(); i++) {
-    HeapRegion* hr = _g1h->region_at(i);
+  log_debug(gc)("Old/cset fixup heap scan START: heap_regions=%u", _g1h->max_reserved_regions());
+  for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
+    HeapRegion* hr = _g1h->region_at_or_null(i);
+    if (hr == nullptr) continue;
     if (hr->is_empty() || hr->is_free()) continue;
     if (hr->is_continues_humongous()) continue;
     if (!hr->is_old() && !hr->is_starts_humongous()) continue;

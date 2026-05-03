@@ -1641,7 +1641,10 @@ static void flush_free_region_trim(G1CollectedHeap* g1h,
   size_t run_bytes = (size_t)(run_end - run_start);
   if (::madvise(run_start, run_bytes, MADV_DONTNEED) == 0) {
     for (uint i = 0; i < run_region_count; i++) {
-      g1h->region_at(run_start_idx + i)->set_rss_trimmed_free();
+      HeapRegion* hr = g1h->region_at_or_null(run_start_idx + i);
+      if (hr != nullptr) {
+        hr->set_rss_trimmed_free();
+      }
     }
     trimmed_regions += run_region_count;
     trimmed_ranges++;
@@ -1664,14 +1667,14 @@ static void trim_free_region_rss(G1CollectedHeap* g1h) {
   uint trimmed_ranges = 0;
   uint failed_ranges = 0;
   size_t trimmed_bytes = 0;
-  uint num_regions = g1h->num_regions();
+  uint num_regions = g1h->max_reserved_regions();
   uint run_start_idx = 0;
   char* run_start = nullptr;
   char* run_end = nullptr;
   uint run_region_count = 0;
 
   for (uint i = 0; i < num_regions; i++) {
-    HeapRegion* hr = g1h->region_at(i);
+    HeapRegion* hr = g1h->region_at_or_null(i);
     if (hr == nullptr || !hr->is_free() || hr->is_evict_guarded() ||
         hr->is_rss_trimmed_free()) {
       flush_free_region_trim(g1h, run_start_idx, run_start, run_end, run_region_count,
@@ -1941,7 +1944,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     uint freed_regions = 0;
     size_t total_freed_bytes = 0;
     FreeRegionList freed_list("Evicted Cold Regions");
-    uint num_regions = _g1h->num_regions();
+    uint num_regions = _g1h->max_reserved_regions();
 
     // ---- Phase A: Collect eviction candidates ----
     bool* eviction_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
@@ -1954,7 +1957,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     // Path 1: cold-destination regions from this evacuation (root-pinned already filtered)
     for (uint i = 0; i < num_regions; i++) {
-      HeapRegion* hr = _g1h->region_at(i);
+      HeapRegion* hr = _g1h->region_at_or_null(i);
+      if (hr == nullptr) continue;
       if (!hr->is_cold_destination()) continue;
       if (hr->is_free() || hr->is_empty()) {
         hr->clear_cold_destination();
@@ -2124,7 +2128,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           for (uint i = 0; i < num_regions; i++) {
             if (!unlimited && path2_bytes >= evict_target_bytes) break;
 
-            HeapRegion* hr = _g1h->region_at(i);
+            HeapRegion* hr = _g1h->region_at_or_null(i);
+            if (hr == nullptr) continue;
             if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
@@ -2209,7 +2214,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           for (uint i = 0; i < num_regions; i++) {
             if (!unlimited && path2_bytes >= evict_target_bytes) break;
 
-            HeapRegion* hr = _g1h->region_at(i);
+            HeapRegion* hr = _g1h->region_at_or_null(i);
+            if (hr == nullptr) continue;
             if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
@@ -2268,7 +2274,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
             if (!dense_deferred_candidates[i]) continue;
 
-            HeapRegion* hr = _g1h->region_at(i);
+            HeapRegion* hr = _g1h->region_at_or_null(i);
+            if (hr == nullptr) continue;
             if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
@@ -2360,7 +2367,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           if (!dense_deferred_candidates[i]) continue;
           if (raw_stack_guarded_regions != nullptr && raw_stack_guarded_regions[i]) continue;
 
-          HeapRegion* hr = _g1h->region_at(i);
+          HeapRegion* hr = _g1h->region_at_or_null(i);
+          if (hr == nullptr) continue;
           if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
           if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
           if (eviction_candidates[i]) continue;
@@ -2583,7 +2591,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int overflow_pinned = 0;
         for (uint i = 0; i < num_regions; i++) {
           if (eviction_candidates[i]) {
-            HeapRegion* hr = _g1h->region_at(i);
+            HeapRegion* hr = _g1h->region_at_or_null(i);
+            if (hr == nullptr) continue;
             eviction_candidates[i] = false;
             hr->clear_cold_destination();
             regions_pinned++;
@@ -2785,7 +2794,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       // Clean up cold_destination/root_pinned flags from earlier scan
       for (uint i = 0; i < num_regions; i++) {
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         if (hr->is_root_pinned()) {
           hr->clear_cold_destination();
           hr->clear_root_pinned();
@@ -2828,7 +2838,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             for (uint i = _claimer.offset_for_worker(worker_id); i < _num_regions; i++) {
               if (!_eviction_candidates[i]) continue;
               if (!_claimer.claim_region(i)) continue;
-              HeapRegion* hr = _g1h->region_at(i);
+              HeapRegion* hr = _g1h->region_at_or_null(i);
+              if (hr == nullptr) continue;
               HeapWord* p = hr->bottom();
               HeapWord* region_end = hr->end();
               while (p < hr->top()) {
@@ -2864,7 +2875,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           int count = 0;
           for (uint i = 0; i < num_regions; i++) {
             if (!eviction_candidates[i]) continue;
-            HeapRegion* hr = _g1h->region_at(i);
+            HeapRegion* hr = _g1h->region_at_or_null(i);
+            if (hr == nullptr) continue;
             HeapWord* p = hr->bottom();
             HeapWord* region_end = hr->end();
             while (p < hr->top()) {
@@ -2951,8 +2963,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
                 backoff_regions++;
               }
-              HeapRegion* hr = _g1h->region_at(i);
-              hr->clear_cold_destination();
+              HeapRegion* hr = _g1h->region_at_or_null(i);
+              if (hr != nullptr) {
+                hr->clear_cold_destination();
+              }
               eviction_candidates[i] = false;
             }
           }
@@ -3143,7 +3157,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       int max_entries = 0;
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         max_entries += (int)((hr->top() - hr->bottom()) / MinObjAlignmentInBytes) + 1;
       }
       if (max_entries > 8 * 1024 * 1024) max_entries = 8 * 1024 * 1024;
@@ -3162,7 +3177,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         region_start[i] = num_entries;
         int rcount = 0;
         bool all_prepared = true;
@@ -3222,7 +3238,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           if (!eviction_candidates[i]) continue;
           if (region_complete[i]) continue;
           if (region_count_arr[i] == 0) continue;  // nothing to salvage
-          HeapRegion* hr = _g1h->region_at(i);
+          HeapRegion* hr = _g1h->region_at_or_null(i);
+          if (hr == nullptr) continue;
           int rstart = region_start[i];
           int rend   = rstart + region_count_arr[i];
           int next_entry = rstart;
@@ -3355,7 +3372,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int rcount = region_count_arr[i];
         if (rcount <= 0) continue;
 
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         int start = region_start[i];
         int blockers = handle_blockers_by_region[i];
         if (blockers == 0) continue;
@@ -3557,7 +3575,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         eviction_candidates[i] = false;
         region_complete[i] = false;
         region_count_arr[i] = 0;
@@ -3609,7 +3628,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         eviction_candidates[i] = false;
         region_complete[i] = false;
         region_count_arr[i] = 0;
@@ -3691,7 +3711,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         eviction_candidates[i] = false;
         region_complete[i] = false;
         region_count_arr[i] = 0;
@@ -4295,7 +4316,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         eviction_candidates[i] = false;
         region_complete[i] = false;
         region_count_arr[i] = 0;
@@ -4337,7 +4359,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
-        HeapRegion* hr = _g1h->region_at(i);
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
         int rcount = region_count_arr[i];
 
         if (rcount > 0 && region_complete[i]) {
@@ -4571,11 +4594,11 @@ void G1YoungCollector::collect() {
     log_trace(gc)("DIAG: pre_evacuate_collection_set DONE");
 
     // Save region tops before evacuation for fast Phase C destination scan.
-    uint num_regions = _g1h->num_regions();
+    uint num_regions = _g1h->max_reserved_regions();
     _pre_evac_tops = NEW_C_HEAP_ARRAY(HeapWord*, num_regions, mtGC);
     for (uint i = 0; i < num_regions; i++) {
-      HeapRegion* hr = _g1h->region_at(i);
-      _pre_evac_tops[i] = hr->top();
+      HeapRegion* hr = _g1h->region_at_or_null(i);
+      _pre_evac_tops[i] = hr == nullptr ? nullptr : hr->top();
     }
 
     G1ParScanThreadStateSet per_thread_states(_g1h,
