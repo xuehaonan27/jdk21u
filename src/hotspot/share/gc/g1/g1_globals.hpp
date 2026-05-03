@@ -365,6 +365,16 @@
           "candidate remembered sets. Verification remains controlled by "    \
           "G1RemoteVerifyEvictionRefs.")                                      \
                                                                             \
+  product(bool, G1RemoteRepairFastPhaseCMisses, false, DIAGNOSTIC,           \
+          "After Fast Phase C, let the verifier repair bounded taggable "     \
+          "heap refs it finds before deciding whether to abort eviction. "    \
+          "Only applies when G1RemoteUseFastPhaseC is enabled.")             \
+                                                                            \
+  product(uint, G1RemoteFastPhaseCRepairMissLimit, 10000, DIAGNOSTIC,        \
+          "Maximum verifier-discovered heap refs to repair after Fast "       \
+          "Phase C. If more unrepaired refs remain, eviction still aborts.")  \
+          range(0, 10000000)                                                 \
+                                                                            \
   product(bool, G1RemoteVerifyEvictionRefs, true, DIAGNOSTIC,                \
           "After remote-eviction Phase C, verify that no untagged heap refs " \
           "still point into eviction candidate regions. Disable only for "    \

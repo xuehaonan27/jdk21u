@@ -1932,12 +1932,19 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     HeapWord* const* pre_evac_tops) {
 
   class VerifyTagClosure : public BasicOopIterateClosure {
+    G1RemoteMemoryManager* _rmm;
     G1CollectedHeap*       _g1h;
     G1CardTable*           _ct;
     const bool*            _eviction_set;
     uint                   _num_regions;
     HeapWord* const*       _pre_evac_tops;
+    bool                   _repair;
+    uint                   _repair_limit;
     int                    _missed;
+    int                    _repaired;
+    int                    _repair_no_handle;
+    int                    _repair_untaggable;
+    int                    _repair_limit_skipped;
     int                    _heap_source;
     int                    _root_source;
     int                    _candidate_source;
@@ -2005,11 +2012,16 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     }
 
   public:
-    VerifyTagClosure(G1CollectedHeap* g1h, const bool* eset, uint nregions,
-                     HeapWord* const* pre_evac_tops)
-      : _g1h(g1h), _ct(g1h->card_table()), _eviction_set(eset),
+    VerifyTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
+                     const bool* eset, uint nregions,
+                     HeapWord* const* pre_evac_tops,
+                     bool repair, uint repair_limit)
+      : _rmm(rmm), _g1h(g1h), _ct(g1h->card_table()), _eviction_set(eset),
         _num_regions(nregions), _pre_evac_tops(pre_evac_tops),
-        _missed(0), _heap_source(0), _root_source(0),
+        _repair(repair), _repair_limit(repair_limit),
+        _missed(0), _repaired(0), _repair_no_handle(0),
+        _repair_untaggable(0), _repair_limit_skipped(0),
+        _heap_source(0), _root_source(0),
         _candidate_source(0), _young_source(0), _destination_source(0),
         _direct_scanned_source(0), _dirty_card_source(0), _clean_old_source(0),
         _same_region(0), _array_source(0), _obj_array_source(0),
@@ -2080,6 +2092,11 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
       bool source_array = source_klass != nullptr && source_klass->is_array_klass();
       bool source_obj_array = source_klass != nullptr && source_klass->is_objArray_klass();
+      bool heap_source = src_hr != nullptr && _g1h->is_in((void*)p);
+      bool untaggable_source =
+          !heap_source ||
+          source_klass == nullptr ||
+          (source_array && (!source_obj_array || !G1RemoteTagObjArraySources));
 
       _missed++;
       if (src_hr != nullptr) {
@@ -2100,6 +2117,23 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       if (src_continue_humongous) _continue_humongous_source++;
       if (src_idx < _region_count) _src_region_counts[src_idx]++;
       if (idx < _region_count) _target_region_counts[idx]++;
+
+      if (_repair) {
+        if (untaggable_source) {
+          _repair_untaggable++;
+        } else if ((uint)_repaired >= _repair_limit) {
+          _repair_limit_skipped++;
+        } else {
+          RemoteHandle* h = _rmm->handle_for(target);
+          if (h != nullptr) {
+            *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+            _rmm->add_tagged_field(p, h);
+            _repaired++;
+          } else {
+            _repair_no_handle++;
+          }
+        }
+      }
 
       if (_missed <= 20) {
         log_warning(gc)("VERIFY: untagged ref field=" PTR_FORMAT " -> target=" PTR_FORMAT
@@ -2125,6 +2159,11 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
 
     int missed() const { return _missed; }
+    int repaired() const { return _repaired; }
+    int unrepaired() const {
+      int unrepaired_count = _missed - _repaired;
+      return unrepaired_count > 0 ? unrepaired_count : 0;
+    }
     void log_summary(const char* phase, int phase_missed) const {
       if (phase_missed <= 0) return;
       log_warning(gc)("VERIFY detail (%s): missed=%d heap_src=%d root_src=%d "
@@ -2136,12 +2175,20 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
                       _destination_source, _dirty_card_source, _clean_old_source,
                       _same_region, _array_source, _obj_array_source,
                       _non_array_source, _continue_humongous_source);
+      if (_repair) {
+        log_warning(gc)("VERIFY repair (%s): repaired=%d unrepaired=%d "
+                        "no_handle=%d untaggable=%d limit_skipped=%d limit=%u",
+                        phase, _repaired, unrepaired(), _repair_no_handle,
+                        _repair_untaggable, _repair_limit_skipped, _repair_limit);
+      }
       log_top_regions(phase, "src", _src_region_counts);
       log_top_regions(phase, "target", _target_region_counts);
     }
   };
 
-  VerifyTagClosure cl(_g1h, eviction_set, num_regions, pre_evac_tops);
+  bool repair_misses = G1RemoteUseFastPhaseC && G1RemoteRepairFastPhaseCMisses;
+  VerifyTagClosure cl(this, _g1h, eviction_set, num_regions, pre_evac_tops,
+                      repair_misses, G1RemoteFastPhaseCRepairMissLimit);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
   class VerifyObjectClosure {
@@ -2165,6 +2212,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
   }
 
   int heap_missed = cl.missed();
+  int heap_unrepaired = cl.unrepaired();
   cl.log_summary("heap", heap_missed);
 
   // 2. Verify roots (informational only — root refs are handled by
@@ -2184,15 +2232,19 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
   _g1h->ref_processor_cm()->weak_oops_do(&cl);
 
   int root_missed = cl.missed() - heap_missed;
-  if (heap_missed > 0) {
-    log_warning(gc)("VERIFY: %d untagged HEAP refs to eviction candidates AFTER tagging!",
-                    heap_missed);
+  if (heap_unrepaired > 0) {
+    log_warning(gc)("VERIFY: %d untagged HEAP refs to eviction candidates AFTER tagging! "
+                    "(%d repaired)",
+                    heap_unrepaired, cl.repaired());
+  } else if (cl.repaired() > 0) {
+    log_info(gc)("VERIFY: repaired %d heap refs to eviction candidates after Fast Phase C",
+                 cl.repaired());
   }
   if (root_missed > 0) {
     log_info(gc)("VERIFY: %d root refs to candidates (handled by Pre-E guard, not Phase C)",
                  root_missed);
   }
-  return heap_missed;
+  return heap_unrepaired;
 }
 
 int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
