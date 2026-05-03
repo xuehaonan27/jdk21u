@@ -1590,6 +1590,33 @@ public:
   void do_card(uint card_idx) { scan_card(card_idx, 1); }
   void do_card_range(uint start_card_idx, uint length) { scan_card(start_card_idx, length); }
 
+  int scan_dirty_cards_in_region(HeapRegion* source_hr) {
+    if (source_hr == nullptr || source_hr->is_empty() || source_hr->is_free()) return 0;
+    if (source_hr->is_young() || source_hr->is_continues_humongous()) return 0;
+    if (source_hr->bottom() >= source_hr->top()) return 0;
+
+    CardTable::CardValue* card = _ct->byte_for(source_hr->bottom());
+    CardTable::CardValue* end_card = _ct->byte_for(source_hr->top() - 1) + 1;
+    int dirty_cards = 0;
+
+    while (card < end_card) {
+      while (card < end_card && *card != G1CardTable::dirty_card_val()) {
+        card++;
+      }
+      CardTable::CardValue* run_start = card;
+      while (card < end_card && *card == G1CardTable::dirty_card_val()) {
+        card++;
+        dirty_cards++;
+      }
+      if (run_start < card) {
+        uint card_idx = (uint)_ct->index_for_cardvalue(run_start);
+        uint length = (uint)(card - run_start);
+        scan_card(card_idx, length);
+      }
+    }
+    return dirty_cards;
+  }
+
 private:
   void scan_card(uint card_idx, uint length) {
     HeapWord* card_start = _ct->addr_for(_ct->byte_for_index(card_idx));
@@ -1623,6 +1650,7 @@ class TagFastRefsTask : public WorkerTask {
   volatile int           _total_no_handle;
   volatile int           _total_untaggable;
   volatile int           _regions_scanned;
+  volatile int           _dirty_cards_scanned;
 
   typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
   TaggedFieldEntry** _worker_bufs;
@@ -1638,7 +1666,7 @@ public:
       _pre_evac_tops(pre_evac_tops), _bitmap(bitmap),
       _claimer(num_workers), _total_tagged(0), _total_no_handle(0),
       _total_untaggable(0),
-      _regions_scanned(0), _num_workers(num_workers) {
+      _regions_scanned(0), _dirty_cards_scanned(0), _num_workers(num_workers) {
     _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
     _worker_counts = NEW_C_HEAP_ARRAY(int, num_workers, mtGC);
     memset(_worker_bufs, 0, num_workers * sizeof(TaggedFieldEntry*));
@@ -1660,6 +1688,7 @@ public:
                              true /* allow_unknown_heap_source for RSet card scans */);
     EvictionSetRsetScanner rset_scanner(_g1h, &cl, _eviction_set, _num_regions);
     int scanned = 0;
+    int dirty_cards = 0;
 
     for (uint i = _claimer.offset_for_worker(worker_id); i < _num_regions; i++) {
       if (!_claimer.claim_region(i)) continue;
@@ -1693,12 +1722,19 @@ public:
         scanned++;
         continue;
       }
+
+      int region_dirty_cards = rset_scanner.scan_dirty_cards_in_region(hr);
+      if (region_dirty_cards > 0) {
+        dirty_cards += region_dirty_cards;
+        scanned++;
+      }
     }
 
     Atomic::add(&_total_tagged, cl.tagged());
     Atomic::add(&_total_no_handle, cl.no_handle());
     Atomic::add(&_total_untaggable, cl.untaggable());
     Atomic::add(&_regions_scanned, scanned);
+    Atomic::add(&_dirty_cards_scanned, dirty_cards);
     _worker_bufs[worker_id] = cl.release_local_buf();
     _worker_counts[worker_id] = cl.local_count();
   }
@@ -1716,6 +1752,7 @@ public:
   int total_no_handle() const { return _total_no_handle; }
   int total_untaggable() const { return _total_untaggable; }
   int regions_scanned() const { return _regions_scanned; }
+  int dirty_cards_scanned() const { return _dirty_cards_scanned; }
 };
 
 int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
@@ -1736,9 +1773,9 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     total_untaggable = task.total_untaggable();
 
     if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
-      log_info(gc)("Fast Phase C (%u workers, %d regions scanned): tagged %d refs, "
-                   "%d no handle, %d untaggable",
-                   num_workers, task.regions_scanned(), total_tagged,
+      log_info(gc)("Fast Phase C (%u workers, %d regions scanned, %d dirty cards): "
+                   "tagged %d refs, %d no handle, %d untaggable",
+                   num_workers, task.regions_scanned(), task.dirty_cards_scanned(), total_tagged,
                    total_no_handle, total_untaggable);
     }
   } else {
@@ -1746,6 +1783,7 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
                              true /* allow_unknown_heap_source for RSet card scans */);
     EvictionSetRsetScanner rset_scanner(_g1h, &cl, eviction_set, num_regions);
     int scanned = 0;
+    int dirty_cards = 0;
 
     for (uint i = 0; i < num_regions; i++) {
       HeapRegion* hr = _g1h->region_at(i);
@@ -1775,6 +1813,12 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
         scanned++;
         continue;
       }
+
+      int region_dirty_cards = rset_scanner.scan_dirty_cards_in_region(hr);
+      if (region_dirty_cards > 0) {
+        dirty_cards += region_dirty_cards;
+        scanned++;
+      }
     }
 
     for (int j = 0; j < cl.local_count(); j++) {
@@ -1785,9 +1829,9 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     total_untaggable = cl.untaggable();
 
     if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
-      log_info(gc)("Fast Phase C (1 worker, %d regions scanned): tagged %d refs, "
-                   "%d no handle, %d untaggable",
-                   scanned, total_tagged, total_no_handle, total_untaggable);
+      log_info(gc)("Fast Phase C (1 worker, %d regions scanned, %d dirty cards): "
+                   "tagged %d refs, %d no handle, %d untaggable",
+                   scanned, dirty_cards, total_tagged, total_no_handle, total_untaggable);
     }
   }
 
