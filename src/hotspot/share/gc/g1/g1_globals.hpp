@@ -438,6 +438,12 @@
           "Requires a remote executor that supports "                        \
           "CMD_BATCH_EVICT_HOMOG_WITH_EDGES.")                              \
                                                                             \
+  product(bool, G1RemoteUseRdmaStagedHomogeneousBatch, false, DIAGNOSTIC,    \
+          "For homogeneous eviction batches on RDMA, write object bytes to "  \
+          "the executor staging arena with one-sided RDMA WRITE, then send "  \
+          "only compact metadata with "                                      \
+          "CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES.")                       \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \

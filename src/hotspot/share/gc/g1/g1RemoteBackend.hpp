@@ -101,6 +101,22 @@ public:
     return (size_t)-1;
   }
 
+  // RDMA-staged homogeneous batch: object bytes are written through a backend
+  // data path first, then msg_buf carries only compact metadata.
+  virtual bool supports_staged_homogeneous_batch_evict() const {
+    return false;
+  }
+
+  virtual size_t max_staged_batch_data_size() const {
+    return 0;
+  }
+
+  virtual int batch_evict_staged_homogeneous(const void* msg_buf, size_t msg_len,
+                                             const void* data_buf, size_t data_len,
+                                             uint64_t remote_data_offset) {
+    return -1;
+  }
+
   // Batch fetch/prefetch: request the faulting object plus nearby remote slots.
   // Implementations call cl->do_object() once per returned object. The byte
   // pointer is valid only for the duration of the callback.

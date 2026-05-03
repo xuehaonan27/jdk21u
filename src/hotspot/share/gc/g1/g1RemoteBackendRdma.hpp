@@ -106,6 +106,11 @@ public:
   int batch_evict(const void* msg_buf, size_t msg_len) override;
   bool supports_batch_evict() const override;
   size_t max_batch_evict_message_size() const override;
+  bool supports_staged_homogeneous_batch_evict() const override;
+  size_t max_staged_batch_data_size() const override;
+  int batch_evict_staged_homogeneous(const void* msg_buf, size_t msg_len,
+                                     const void* data_buf, size_t data_len,
+                                     uint64_t remote_data_offset) override;
   bool supports_batch_fetch() const override;
   size_t fetch_batch_around(uintptr_t handle_id, size_t slot_id,
                             uint max_objects, uint slot_window,

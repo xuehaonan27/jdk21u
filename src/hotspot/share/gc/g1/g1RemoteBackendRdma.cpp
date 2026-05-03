@@ -45,6 +45,7 @@ static const uint32_t RE_CMD_EVICT_WITH_EDGES       = 0x12;
 static const uint32_t RE_CMD_REPORT_REMOTE_ROOTS_V2 = 0x13;
 static const uint32_t RE_CMD_TRACE_AND_REPORT       = 0x17;
 static const uint32_t RE_CMD_FETCH_AROUND           = 0x18;
+static const uint32_t RE_CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES = 0x1A;
 static const uint32_t RE_RESP_TRACE_RESULT           = 0x86;
 static const uint32_t RE_RESP_BATCH_OBJECT_DATA      = 0x87;
 
@@ -1051,6 +1052,43 @@ bool RDMAExecutorBackend::supports_batch_evict() const {
 
 size_t RDMAExecutorBackend::max_batch_evict_message_size() const {
   return RDMAMsgBufSize;
+}
+
+bool RDMAExecutorBackend::supports_staged_homogeneous_batch_evict() const {
+  return true;
+}
+
+size_t RDMAExecutorBackend::max_staged_batch_data_size() const {
+  return MIN2((size_t)RDMADataBufSize, _remote_arena_size);
+}
+
+int RDMAExecutorBackend::batch_evict_staged_homogeneous(const void* msg_buf, size_t msg_len,
+                                                        const void* data_buf, size_t data_len,
+                                                        uint64_t remote_data_offset) {
+  if (!_connected) return -1;
+  if (msg_len > RDMAMsgBufSize) return -1;
+  if (data_len > max_staged_batch_data_size()) return -1;
+  if (remote_data_offset > _remote_arena_size ||
+      data_len > _remote_arena_size - remote_data_offset) {
+    return -1;
+  }
+
+  io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return -1; }
+  if (data_len > 0 && !rdma_write(remote_data_offset, data_buf, data_len)) {
+    io_unlock();
+    return -1;
+  }
+  if (!rdma_post_recv()) { io_unlock(); return -1; }
+  bool ok = rdma_send_msg(msg_buf, msg_len);
+  if (!ok) { io_unlock(); return -1; }
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  if (!rdma_wait_recv(resp, sizeof(resp), &resp_len)) { io_unlock(); return -1; }
+
+  io_unlock();
+  return (resp_len >= 4 && *(uint32_t*)resp == RE_RESP_OK) ? 0 : -1;
 }
 
 size_t RDMAExecutorBackend::slot_word_size(size_t /*slot_id*/) const {

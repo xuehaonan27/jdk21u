@@ -3581,6 +3581,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       G1RemoteBackend* backend = rmm->backend();
       int batches_sent = 0;
       int compact_batches_sent = 0;
+      int staged_batches_sent = 0;
       double e2_backend_ms = 0.0;
       size_t e2_backend_bytes = 0;
       int e2_backend_objects = 0;
@@ -3677,6 +3678,197 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (eviction_candidates[i] && region_count_arr[i] > 0) {
               send_failed_regions[i] = true;
             }
+          }
+        } else if (G1RemoteUseRdmaStagedHomogeneousBatch &&
+                   backend->supports_staged_homogeneous_batch_evict() &&
+                   backend->max_staged_batch_data_size() > 0) {
+          static const size_t STAGED_HDR_SIZE = 56;
+          static const uint64_t STAGED_REMOTE_OFFSET = 0;
+          const size_t staged_data_buf_size = backend->max_staged_batch_data_size();
+          uint8_t* data_buf = (uint8_t*)os::malloc(staged_data_buf_size, mtGC);
+          int batch_word_size = 0;
+          Klass* batch_klass = nullptr;
+          uint32_t batch_num_edges = 0;
+          size_t batch_data_offset = 0;
+
+          if (data_buf == nullptr) {
+            log_warning(gc)("Pre-E staged batch send skipped: failed to allocate "
+                            SIZE_FORMAT "KB data buffer; keeping prepared entries local",
+                            staged_data_buf_size / K);
+            for (uint i = 0; i < num_regions; i++) {
+              if (eviction_candidates[i] && region_count_arr[i] > 0) {
+                send_failed_regions[i] = true;
+              }
+            }
+          } else {
+            for (int e = 0; e < num_entries; e++) {
+              if (!entry_active[e]) continue;
+              PreparedEviction* pe = &entries[e];
+              size_t byte_size = pe->word_size * HeapWordSize;
+              uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
+              size_t legacy_edge_bytes = num_edges * 12;
+              size_t legacy_entry_size = 32 + byte_size + legacy_edge_bytes;
+              size_t metadata_entry_size = 16 + (size_t)num_edges * 8;
+              size_t staged_header_size = STAGED_HDR_SIZE + (size_t)num_edges * 4;
+
+              if (legacy_entry_size > max_entry_payload ||
+                  staged_header_size + metadata_entry_size > batch_buf_size ||
+                  byte_size > staged_data_buf_size) {
+                // Guard should have removed the containing region before E2.
+                rmm->abort_prepared_eviction(pe);
+                entry_active[e] = false;
+                continue;
+              }
+
+              bool compatible = true;
+              if (batch_count > 0) {
+                compatible = pe->klass == batch_klass &&
+                             (int)pe->word_size == batch_word_size &&
+                             num_edges == batch_num_edges;
+                if (compatible && num_edges > 0) {
+                  for (uint32_t j = 0; j < num_edges; j++) {
+                    uint32_t existing_offset =
+                        *(uint32_t*)(batch_buf + STAGED_HDR_SIZE + j * 4);
+                    if (existing_offset != pe->edge_table->_entries[j]._field_offset) {
+                      compatible = false;
+                      break;
+                    }
+                  }
+                }
+              }
+
+              if (batch_count > 0 &&
+                  (!compatible ||
+                   batch_offset + metadata_entry_size > batch_buf_size ||
+                   batch_data_offset + byte_size > staged_data_buf_size)) {
+                *(uint32_t*)(batch_buf + 0) = 0x1A; // CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES
+                *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
+                *(uint64_t*)(batch_buf + 8) = 0;
+                *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
+                *(uint32_t*)(batch_buf + 20) = (uint32_t)batch_word_size;
+                *(uint64_t*)(batch_buf + 24) = (uint64_t)(uintptr_t)batch_klass;
+                *(uint32_t*)(batch_buf + 32) = batch_num_edges;
+                *(uint32_t*)(batch_buf + 36) = 0;
+                *(uint64_t*)(batch_buf + 40) = STAGED_REMOTE_OFFSET;
+                *(uint64_t*)(batch_buf + 48) = (uint64_t)batch_data_offset;
+                Ticks backend_start = Ticks::now();
+                int rc = backend->batch_evict_staged_homogeneous(
+                    batch_buf, batch_offset, data_buf, batch_data_offset,
+                    STAGED_REMOTE_OFFSET);
+                e2_backend_ms += (Ticks::now() - backend_start).seconds() * 1000.0;
+                e2_backend_bytes += batch_offset + batch_data_offset;
+                e2_backend_objects += batch_count;
+                if (rc < 0) {
+                  log_warning(gc)("Pre-E staged batch send failed for %d objects "
+                                  "(" SIZE_FORMAT "KB metadata, " SIZE_FORMAT
+                                  "KB data); keeping affected regions local",
+                                  batch_count, batch_offset / K, batch_data_offset / K);
+                  for (int f = batch_start_entry; f < e; f++) {
+                    if (!entry_active[f]) continue;
+                    HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
+                    uint idx = hr->hrm_index();
+                    if (idx < num_regions) send_failed_regions[idx] = true;
+                    send_failed_entries++;
+                  }
+                  for (int f = e; f < num_entries; f++) {
+                    if (!entry_active[f]) continue;
+                    HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
+                    uint idx = hr->hrm_index();
+                    if (idx < num_regions) send_failed_regions[idx] = true;
+                    send_failed_entries++;
+                  }
+                  backend_send_failed = true;
+                  break;
+                } else {
+                  for (int f = batch_start_entry; f < e; f++) {
+                    if (entry_active[f]) entry_sent[f] = true;
+                  }
+                }
+                batches_sent++;
+                staged_batches_sent++;
+                batch_offset = BATCH_HDR_SIZE;
+                batch_data_offset = 0;
+                batch_count = 0;
+                batch_start_entry = e;
+              }
+
+              if (batch_count == 0) {
+                batch_start_entry = e;
+                batch_klass = pe->klass;
+                batch_word_size = (int)pe->word_size;
+                batch_num_edges = num_edges;
+                batch_offset = STAGED_HDR_SIZE + (size_t)num_edges * 4;
+                batch_data_offset = 0;
+                for (uint32_t j = 0; j < num_edges; j++) {
+                  *(uint32_t*)(batch_buf + STAGED_HDR_SIZE + j * 4) =
+                      pe->edge_table->_entries[j]._field_offset;
+                }
+              }
+
+              *(uint64_t*)(batch_buf + batch_offset) = (uint64_t)pe->slot_id;
+              *(uint64_t*)(batch_buf + batch_offset + 8) = (uintptr_t)pe->handle;
+              uint8_t* edge_ptr = batch_buf + batch_offset + 16;
+              if (pe->edge_table != nullptr) {
+                for (uint32_t j = 0; j < num_edges; j++) {
+                  *(uint64_t*)edge_ptr =
+                      (uintptr_t)pe->edge_table->_entries[j]._target_handle;
+                  edge_ptr += 8;
+                }
+              }
+              memcpy(data_buf + batch_data_offset, cast_from_oop<void*>(pe->obj), byte_size);
+              {
+                uintptr_t* mw_in_buf = (uintptr_t*)(data_buf + batch_data_offset);
+                markWord mw(*mw_in_buf);
+                if (!mw.is_unlocked()) {
+                  *mw_in_buf = markWord::prototype().value();
+                }
+              }
+              batch_offset += metadata_entry_size;
+              batch_data_offset += byte_size;
+              batch_count++;
+            }
+
+            if (!backend_send_failed && batch_count > 0) {
+              *(uint32_t*)(batch_buf + 0) = 0x1A; // CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES
+              *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
+              *(uint64_t*)(batch_buf + 8) = 0;
+              *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
+              *(uint32_t*)(batch_buf + 20) = (uint32_t)batch_word_size;
+              *(uint64_t*)(batch_buf + 24) = (uint64_t)(uintptr_t)batch_klass;
+              *(uint32_t*)(batch_buf + 32) = batch_num_edges;
+              *(uint32_t*)(batch_buf + 36) = 0;
+              *(uint64_t*)(batch_buf + 40) = STAGED_REMOTE_OFFSET;
+              *(uint64_t*)(batch_buf + 48) = (uint64_t)batch_data_offset;
+              Ticks backend_start = Ticks::now();
+              int rc = backend->batch_evict_staged_homogeneous(
+                  batch_buf, batch_offset, data_buf, batch_data_offset,
+                  STAGED_REMOTE_OFFSET);
+              e2_backend_ms += (Ticks::now() - backend_start).seconds() * 1000.0;
+              e2_backend_bytes += batch_offset + batch_data_offset;
+              e2_backend_objects += batch_count;
+              if (rc < 0) {
+                log_warning(gc)("Pre-E staged batch send failed for %d objects "
+                                "(" SIZE_FORMAT "KB metadata, " SIZE_FORMAT
+                                "KB data); keeping affected regions local",
+                                batch_count, batch_offset / K, batch_data_offset / K);
+                for (int f = batch_start_entry; f < num_entries; f++) {
+                  if (!entry_active[f]) continue;
+                  HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
+                  uint idx = hr->hrm_index();
+                  if (idx < num_regions) send_failed_regions[idx] = true;
+                  send_failed_entries++;
+                }
+              } else {
+                for (int f = batch_start_entry; f < num_entries; f++) {
+                  if (entry_active[f]) entry_sent[f] = true;
+                }
+              }
+              batches_sent++;
+              staged_batches_sent++;
+            }
+          }
+          if (data_buf != nullptr) {
+            os::free(data_buf);
           }
         } else if (G1RemoteUseCompactHomogeneousBatch) {
           static const size_t COMPACT_HDR_SIZE = 40;
@@ -4055,10 +4247,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       if (num_entries > 0) {
         log_info(gc)("Phase E2 detail: total=%.1fms local_pack_guard=%.1fms "
                      "backend_wait=%.1fms backend_objects=%d backend_bytes=" SIZE_FORMAT
-                     "KB compact_batches=%d",
+                     "KB compact_batches=%d staged_batches=%d",
                      e2_ms, e2_local_ms, e2_backend_ms,
                      e2_backend_objects, e2_backend_bytes / K,
-                     compact_batches_sent);
+                     compact_batches_sent, staged_batches_sent);
       }
 
       // E3: Finalize complete regions' evictions + free them.
