@@ -432,6 +432,12 @@
           "effective size is capped by the backend's transport message "      \
           "buffer, e.g. RDMAMsgBufSize for RDMA.")                           \
                                                                             \
+  product(bool, G1RemoteUseCompactHomogeneousBatch, false, DIAGNOSTIC,       \
+          "Use a compact batch-eviction wire format for runs of objects "    \
+          "that share klass, word size, edge count, and edge field offsets. " \
+          "Requires a remote executor that supports "                        \
+          "CMD_BATCH_EVICT_HOMOG_WITH_EDGES.")                              \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \
