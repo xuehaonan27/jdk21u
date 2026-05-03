@@ -3580,6 +3580,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       Ticks e2_start = Ticks::now();
       G1RemoteBackend* backend = rmm->backend();
       int batches_sent = 0;
+      double e2_backend_ms = 0.0;
+      size_t e2_backend_bytes = 0;
+      int e2_backend_objects = 0;
 
       // CMD_BATCH_EVICT_WITH_EDGES format:
       // header(24) + N × [slot_id(8) + handle_id(8) + klass(8) + word_size(4) +
@@ -3699,7 +3702,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
               *(uint64_t*)(batch_buf + 8) = 0;
               *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
+              Ticks backend_start = Ticks::now();
               int rc = backend->batch_evict(batch_buf, batch_offset);
+              e2_backend_ms += (Ticks::now() - backend_start).seconds() * 1000.0;
+              e2_backend_bytes += batch_offset;
+              e2_backend_objects += batch_count;
               if (rc < 0) {
                 log_warning(gc)("Pre-E batch send failed for %d objects (" SIZE_FORMAT "KB); "
                                 "keeping affected regions local",
@@ -3761,7 +3768,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
             *(uint64_t*)(batch_buf + 8) = 0;
             *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
+            Ticks backend_start = Ticks::now();
             int rc = backend->batch_evict(batch_buf, batch_offset);
+            e2_backend_ms += (Ticks::now() - backend_start).seconds() * 1000.0;
+            e2_backend_bytes += batch_offset;
+            e2_backend_objects += batch_count;
             if (rc < 0) {
               log_warning(gc)("Pre-E batch send failed for %d objects (" SIZE_FORMAT "KB); "
                               "keeping affected regions local",
@@ -3807,6 +3818,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             }
           }
 
+          size_t entry_size = 32 + pe->word_size * HeapWordSize + num_edges * 12;
+          Ticks backend_start = Ticks::now();
           size_t sid = backend->evict_with_edges(cast_from_oop<void*>(pe->obj),
                                                  pe->word_size,
                                                  pe->klass,
@@ -3814,6 +3827,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                                  edge_infos,
                                                  num_edges,
                                                  pe->slot_id);
+          e2_backend_ms += (Ticks::now() - backend_start).seconds() * 1000.0;
+          e2_backend_bytes += entry_size;
+          e2_backend_objects++;
           if (edge_infos != nullptr) {
             FREE_C_HEAP_ARRAY(G1RemoteBackend::EdgeInfo, edge_infos);
           }
@@ -3876,6 +3892,16 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                         send_failed_entries, send_failed_sent_entries);
       }
       double e2_ms = (Ticks::now() - e2_start).seconds() * 1000.0;
+      double e2_local_ms = e2_ms - e2_backend_ms;
+      if (e2_local_ms < 0.0) {
+        e2_local_ms = 0.0;
+      }
+      if (num_entries > 0) {
+        log_info(gc)("Phase E2 detail: total=%.1fms local_pack_guard=%.1fms "
+                     "backend_wait=%.1fms backend_objects=%d backend_bytes=" SIZE_FORMAT "KB",
+                     e2_ms, e2_local_ms, e2_backend_ms,
+                     e2_backend_objects, e2_backend_bytes / K);
+      }
 
       // E3: Finalize complete regions' evictions + free them.
       // Incomplete regions (where prepare_eviction failed for some objects)
