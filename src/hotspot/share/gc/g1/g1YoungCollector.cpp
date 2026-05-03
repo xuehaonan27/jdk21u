@@ -3582,6 +3582,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       int batches_sent = 0;
       int compact_batches_sent = 0;
       int staged_batches_sent = 0;
+      int derived_batches_sent = 0;
       double e2_backend_ms = 0.0;
       size_t e2_backend_bytes = 0;
       int e2_backend_objects = 0;
@@ -3679,11 +3680,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               send_failed_regions[i] = true;
             }
           }
-        } else if (G1RemoteUseRdmaStagedHomogeneousBatch &&
+        } else if ((G1RemoteUseRdmaStagedHomogeneousBatch ||
+                    G1RemoteUseRdmaDerivedEdgeBatch) &&
                    backend->supports_staged_homogeneous_batch_evict() &&
                    backend->max_staged_batch_data_size() > 0) {
           static const size_t STAGED_HDR_SIZE = 56;
           static const uint64_t STAGED_REMOTE_OFFSET = 0;
+          const bool derive_edges_from_staged_copy =
+              G1RemoteUseRdmaDerivedEdgeBatch;
           const size_t staged_data_buf_size = backend->max_staged_batch_data_size();
           uint8_t* data_buf = (uint8_t*)os::malloc(staged_data_buf_size, mtGC);
           int batch_word_size = 0;
@@ -3708,7 +3712,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
               size_t legacy_edge_bytes = num_edges * 12;
               size_t legacy_entry_size = 32 + byte_size + legacy_edge_bytes;
-              size_t metadata_entry_size = 16 + (size_t)num_edges * 8;
+              size_t metadata_entry_size = 16 +
+                  (derive_edges_from_staged_copy ? 0 : (size_t)num_edges * 8);
               size_t staged_header_size = STAGED_HDR_SIZE + (size_t)num_edges * 4;
 
               if (legacy_entry_size > max_entry_payload ||
@@ -3741,7 +3746,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                   (!compatible ||
                    batch_offset + metadata_entry_size > batch_buf_size ||
                    batch_data_offset + byte_size > staged_data_buf_size)) {
-                *(uint32_t*)(batch_buf + 0) = 0x1A; // CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES
+                *(uint32_t*)(batch_buf + 0) =
+                    derive_edges_from_staged_copy ? 0x1B : 0x1A;
                 *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
                 *(uint64_t*)(batch_buf + 8) = 0;
                 *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
@@ -3786,6 +3792,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 }
                 batches_sent++;
                 staged_batches_sent++;
+                if (derive_edges_from_staged_copy) {
+                  derived_batches_sent++;
+                }
                 batch_offset = BATCH_HDR_SIZE;
                 batch_data_offset = 0;
                 batch_count = 0;
@@ -3808,7 +3817,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               *(uint64_t*)(batch_buf + batch_offset) = (uint64_t)pe->slot_id;
               *(uint64_t*)(batch_buf + batch_offset + 8) = (uintptr_t)pe->handle;
               uint8_t* edge_ptr = batch_buf + batch_offset + 16;
-              if (pe->edge_table != nullptr) {
+              if (!derive_edges_from_staged_copy && pe->edge_table != nullptr) {
                 for (uint32_t j = 0; j < num_edges; j++) {
                   *(uint64_t*)edge_ptr =
                       (uintptr_t)pe->edge_table->_entries[j]._target_handle;
@@ -3823,13 +3832,24 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                   *mw_in_buf = markWord::prototype().value();
                 }
               }
+              if (derive_edges_from_staged_copy && pe->edge_table != nullptr) {
+                for (uint32_t j = 0; j < num_edges; j++) {
+                  uint32_t field_offset = pe->edge_table->_entries[j]._field_offset;
+                  if ((size_t)field_offset + sizeof(uintptr_t) <= byte_size) {
+                    *(uintptr_t*)(data_buf + batch_data_offset + field_offset) =
+                        G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT |
+                        (uintptr_t)pe->edge_table->_entries[j]._target_handle;
+                  }
+                }
+              }
               batch_offset += metadata_entry_size;
               batch_data_offset += byte_size;
               batch_count++;
             }
 
             if (!backend_send_failed && batch_count > 0) {
-              *(uint32_t*)(batch_buf + 0) = 0x1A; // CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES
+              *(uint32_t*)(batch_buf + 0) =
+                  derive_edges_from_staged_copy ? 0x1B : 0x1A;
               *(uint32_t*)(batch_buf + 4) = (uint32_t)batch_offset;
               *(uint64_t*)(batch_buf + 8) = 0;
               *(uint32_t*)(batch_buf + 16) = (uint32_t)batch_count;
@@ -3865,6 +3885,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               }
               batches_sent++;
               staged_batches_sent++;
+              if (derive_edges_from_staged_copy) {
+                derived_batches_sent++;
+              }
             }
           }
           if (data_buf != nullptr) {
@@ -4247,10 +4270,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       if (num_entries > 0) {
         log_info(gc)("Phase E2 detail: total=%.1fms local_pack_guard=%.1fms "
                      "backend_wait=%.1fms backend_objects=%d backend_bytes=" SIZE_FORMAT
-                     "KB compact_batches=%d staged_batches=%d",
+                     "KB compact_batches=%d staged_batches=%d derived_batches=%d",
                      e2_ms, e2_local_ms, e2_backend_ms,
                      e2_backend_objects, e2_backend_bytes / K,
-                     compact_batches_sent, staged_batches_sent);
+                     compact_batches_sent, staged_batches_sent, derived_batches_sent);
       }
 
       // E3: Finalize complete regions' evictions + free them.
