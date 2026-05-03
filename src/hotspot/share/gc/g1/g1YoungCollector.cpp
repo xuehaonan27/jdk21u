@@ -3949,8 +3949,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-          os::free(batch_buf);
-        }
+        os::free(batch_buf);
       } else if (num_entries > 0 && use_batch_evict) {
         log_warning(gc)("Pre-E batch send skipped: backend batch message limit "
                         SIZE_FORMAT "B is too small; keeping prepared entries local",
