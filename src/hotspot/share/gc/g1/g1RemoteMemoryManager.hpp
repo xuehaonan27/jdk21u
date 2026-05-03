@@ -405,6 +405,33 @@ public:
     return handle_for_eviction_addr(addr);
   }
 
+  RemoteHandle* handle_for_stale_eviction_addr(uintptr_t addr) const {
+    size_t idx = hash_obj(addr);
+
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      if (e->_obj_addr == addr) {
+        uintptr_t state = e->_handle->load_state_and_addr_acquire() &
+                          REMOTE_HANDLE_STATE_MASK;
+        if (state == REMOTE_HANDLE_REMOTE ||
+            state == REMOTE_HANDLE_FETCHING) {
+          return e->_handle;
+        }
+      }
+      e = e->_next;
+    }
+
+    RemoteHandle* alias = handle_for_eviction_addr(addr);
+    if (alias != nullptr) {
+      uintptr_t state = alias->load_state_and_addr_acquire() &
+                        REMOTE_HANDLE_STATE_MASK;
+      if (state != REMOTE_HANDLE_DEAD) {
+        return alias;
+      }
+    }
+    return nullptr;
+  }
+
   // Check if an object has a Handle (fast negative via table lookup).
   bool has_handle(oop obj) const {
     return handle_for(obj) != nullptr;

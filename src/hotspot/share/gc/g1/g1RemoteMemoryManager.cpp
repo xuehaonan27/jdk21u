@@ -612,6 +612,8 @@ Klass* G1RemoteMemoryManager::sim_remote_fetch(size_t slot_id, void* dest, size_
 // For each non-null oop field, creates a dormant anchor Handle for the
 // target and records the edge (field_offset → target_handle).
 
+static bool remote_eviction_valid_klass(Klass* k);
+
 class EdgeTableBuildClosure : public BasicOopIterateClosure {
   G1RemoteMemoryManager* _rmm;
   G1CollectedHeap*       _g1h;
@@ -650,12 +652,50 @@ class EdgeTableBuildClosure : public BasicOopIterateClosure {
   }
 
   oop canonical_target(oop target) {
-    if (!_g1h->is_in(target)) return nullptr;
+    if (target == nullptr || !_g1h->is_in_reserved(target)) return nullptr;
+    HeapRegion* hr = _g1h->heap_region_containing_or_null(target);
+    if (hr == nullptr || hr->is_free() || hr->is_evict_guarded() ||
+        hr->is_empty() || hr->is_continues_humongous() ||
+        !_g1h->is_in(target)) {
+      return nullptr;
+    }
     if (target->is_forwarded()) {
       target = target->forwardee();
-      if (target == nullptr || !_g1h->is_in(target)) return nullptr;
+      if (target == nullptr || !_g1h->is_in_reserved(target)) return nullptr;
+      hr = _g1h->heap_region_containing_or_null(target);
+      if (hr == nullptr || hr->is_free() || hr->is_evict_guarded() ||
+          hr->is_empty() || hr->is_continues_humongous() ||
+          !_g1h->is_in(target)) {
+        return nullptr;
+      }
+    }
+
+    Klass* k = target->klass_or_null_acquire();
+    if (!remote_eviction_valid_klass(k) ||
+        G1CollectedHeap::is_obj_filler(target)) {
+      return nullptr;
+    }
+    size_t word_size = target->size_given_klass(k);
+    if (word_size < (size_t)MinObjAlignment ||
+        !is_object_aligned(word_size) ||
+        word_size > (size_t)(hr->top() - cast_from_oop<HeapWord*>(target)) ||
+        word_size > (size_t)(hr->end() - cast_from_oop<HeapWord*>(target))) {
+      return nullptr;
     }
     return target;
+  }
+
+  RemoteHandle* remap_stale_raw_target(uintptr_t raw) {
+    RemoteHandle* h = _rmm->handle_for_stale_eviction_addr(raw);
+    if (h == nullptr) {
+      return nullptr;
+    }
+    uintptr_t state = h->load_state_and_addr_acquire() & REMOTE_HANDLE_STATE_MASK;
+    if (state == REMOTE_HANDLE_LOCAL &&
+        !_rmm->validate_local_handle_addr(h, "EDGE-STALE-ALIAS", nullptr, 0)) {
+      return nullptr;
+    }
+    return h;
   }
 
 public:
@@ -708,6 +748,7 @@ public:
     }
 
     // Clean oop — create dormant anchor for the target
+    uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
     oop target = cast_to_oop(raw);
     target = canonical_target(target);
     if (target != nullptr) {
@@ -716,7 +757,13 @@ public:
                                                    _pending_head, _pending_tail,
                                                    _pending_count)
         : _rmm->ensure_dormant_anchor_for(target, _hab);
-      uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
+      append(offset, h);
+      h->increment_remote_refcount();
+      return;
+    }
+
+    RemoteHandle* h = remap_stale_raw_target(raw);
+    if (h != nullptr) {
       append(offset, h);
       h->increment_remote_refcount();
     }
