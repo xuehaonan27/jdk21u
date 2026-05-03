@@ -616,6 +616,10 @@ class EdgeTableBuildClosure : public BasicOopIterateClosure {
   G1RemoteMemoryManager* _rmm;
   G1CollectedHeap*       _g1h;
   RemoteHandleAllocBuffer* _hab;
+  G1RemoteMemoryManager::HandleEntryAllocBuffer* _eab;
+  RemoteHandle**        _pending_head;
+  RemoteHandle**        _pending_tail;
+  size_t*               _pending_count;
   oop                    _base_obj;
 
   // Heap-allocated, growable. Replaces the old fixed MAX_EDGES=8192 stack
@@ -656,8 +660,14 @@ class EdgeTableBuildClosure : public BasicOopIterateClosure {
 
 public:
   EdgeTableBuildClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
-                        RemoteHandleAllocBuffer* hab, oop base)
-    : _rmm(rmm), _g1h(g1h), _hab(hab), _base_obj(base),
+                        RemoteHandleAllocBuffer* hab, oop base,
+                        G1RemoteMemoryManager::HandleEntryAllocBuffer* eab = nullptr,
+                        RemoteHandle** pending_head = nullptr,
+                        RemoteHandle** pending_tail = nullptr,
+                        size_t* pending_count = nullptr)
+    : _rmm(rmm), _g1h(g1h), _hab(hab), _eab(eab),
+      _pending_head(pending_head), _pending_tail(pending_tail),
+      _pending_count(pending_count), _base_obj(base),
       _edges(nullptr), _count(0), _capacity(0) {}
 
   ~EdgeTableBuildClosure() {
@@ -684,7 +694,11 @@ public:
         oop target = (oop)(raw & G1_OOP_ADDR_MASK);
         target = canonical_target(target);
         if (target != nullptr) {
-          RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, _hab);
+          RemoteHandle* h = _eab != nullptr
+            ? _rmm->ensure_dormant_anchor_for_parallel(target, _hab, _eab,
+                                                       _pending_head, _pending_tail,
+                                                       _pending_count)
+            : _rmm->ensure_dormant_anchor_for(target, _hab);
           uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
           append(offset, h);
           h->increment_remote_refcount();
@@ -697,7 +711,11 @@ public:
     oop target = cast_to_oop(raw);
     target = canonical_target(target);
     if (target != nullptr) {
-      RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, _hab);
+      RemoteHandle* h = _eab != nullptr
+        ? _rmm->ensure_dormant_anchor_for_parallel(target, _hab, _eab,
+                                                   _pending_head, _pending_tail,
+                                                   _pending_count)
+        : _rmm->ensure_dormant_anchor_for(target, _hab);
       uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
       append(offset, h);
       h->increment_remote_refcount();
@@ -714,9 +732,26 @@ public:
 
 G1RemoteMemoryManager::ObjectEdgeTable*
 G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
-                                        RemoteHandleAllocBuffer* hab) {
-  EdgeTableBuildClosure cl(this, _g1h, hab, obj);
+                                        RemoteHandleAllocBuffer* hab,
+                                        bool* zero_edges,
+                                        HandleEntryAllocBuffer* eab,
+                                        RemoteHandle** pending_head,
+                                        RemoteHandle** pending_tail,
+                                        size_t* pending_count) {
+  if (zero_edges != nullptr) {
+    *zero_edges = false;
+  }
+
+  EdgeTableBuildClosure cl(this, _g1h, hab, obj, eab,
+                           pending_head, pending_tail, pending_count);
   obj->oop_iterate(&cl);
+
+  if (cl.count() == 0) {
+    if (zero_edges != nullptr) {
+      *zero_edges = true;
+    }
+    return nullptr;
+  }
 
   // Allocate exact-sized ObjectEdgeTable and copy from the (now-sized) build
   // buffer. The build buffer is freed by the closure destructor below.
@@ -786,22 +821,66 @@ bool G1RemoteMemoryManager::finish_prepared_eviction(PreparedEviction* entry,
     return true;
   }
 
-  oop obj = entry->obj;
-  RemoteHandle* h = entry->handle;
-  ObjectEdgeTable* et = build_edge_table(obj, h, hab);
-  if (et == nullptr) { Atomic::add(&_prep_fail_edge, 1); return false; }
-  store_edge_table(et);
-  entry->edge_table = et;
+  if (entry->slot_id == (size_t)-1) {
+    size_t slot_id = _backend->allocate_slot_id();
+    if (slot_id == (size_t)-1) {
+      Atomic::add(&_prep_fail_slot, 1);
+      return false;
+    }
+    entry->slot_id = slot_id;
+  }
 
-  size_t slot_id = _backend->allocate_slot_id();
-  if (slot_id == (size_t)-1) {
-    abort_prepared_eviction(entry);
-    Atomic::add(&_prep_fail_slot, 1);
+  if (!finish_prepared_eviction_edges(entry, hab)) {
+    entry->slot_id = (size_t)-1;
     return false;
   }
 
+  return true;
+}
+
+bool G1RemoteMemoryManager::finish_prepared_eviction_edges(
+    PreparedEviction* entry,
+    RemoteHandleAllocBuffer* hab,
+    HandleEntryAllocBuffer* eab,
+    RemoteHandle** pending_head,
+    RemoteHandle** pending_tail,
+    size_t* pending_count,
+    EdgeTableEntry** pending_edge_head,
+    EdgeTableEntry** pending_edge_tail,
+    size_t* pending_edge_count) {
+  if (entry == nullptr || entry->obj == nullptr || entry->handle == nullptr ||
+      entry->slot_id == (size_t)-1) {
+    Atomic::add(&_prep_fail_null, 1);
+    return false;
+  }
+  if (entry->edge_table != nullptr) {
+    return true;
+  }
+
+  bool zero_edges = false;
+  ObjectEdgeTable* et = build_edge_table(entry->obj, entry->handle, hab,
+                                         &zero_edges, eab,
+                                         pending_head, pending_tail,
+                                         pending_count);
+  if (et == nullptr) {
+    if (zero_edges) {
+      Atomic::add(&_prep_success, 1);
+      return true;
+    }
+    Atomic::add(&_prep_fail_edge, 1);
+    return false;
+  }
+
+  entry->edge_table = et;
+  if (pending_edge_head != nullptr && pending_edge_tail != nullptr &&
+      pending_edge_count != nullptr) {
+    append_pending_edge_table(et, pending_edge_head, pending_edge_tail,
+                              pending_edge_count);
+  } else {
+    store_edge_table(et);
+  }
+
   Atomic::add(&_prep_success, 1);
-  entry->slot_id = slot_id;
   return true;
 }
 

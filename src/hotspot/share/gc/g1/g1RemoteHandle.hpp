@@ -50,8 +50,8 @@ const uint32_t REMOTE_HANDLE_FLAG_DORMANT   = 0x1;  // Dormant anchor (local obj
 
 struct RemoteHandle {
   volatile uintptr_t _state_and_addr;  // [63:62]=state, [47:0]=addr or remote_loc
-  uint32_t           _remote_refcount; // Count of remote oop fields pointing to this Handle
-  uint32_t           _flags;           // REMOTE_HANDLE_FLAG_* bits
+  volatile uint32_t  _remote_refcount; // Count of remote oop fields pointing to this Handle
+  volatile uint32_t  _flags;           // REMOTE_HANDLE_FLAG_* bits
   uintptr_t          _eviction_addr;   // Local address at eviction time (for O(1) table rekey)
   size_t             _eviction_word_size; // Full object size for fetch-time FCR allocation
   RemoteHandle*      _local_prev;      // Intrusive list of currently LOCAL handles
@@ -154,16 +154,39 @@ struct RemoteHandle {
 
   // Remote refcount: tracks how many oop fields in remote objects reference this Handle.
   // Used to determine when de-handleification is safe (refcount == 0 → no remote refs).
-  void increment_remote_refcount() { _remote_refcount++; }
-  void decrement_remote_refcount() {
-    assert(_remote_refcount > 0, "underflow");
-    _remote_refcount--;
+  void increment_remote_refcount() {
+    Atomic::inc(&_remote_refcount);
   }
-  uint32_t remote_refcount() const { return _remote_refcount; }
+  void decrement_remote_refcount() {
+    uint32_t cur = Atomic::load_acquire(&_remote_refcount);
+    while (true) {
+      assert(cur > 0, "underflow");
+      if (cur == 0) {
+        return;
+      }
+      uint32_t next = cur - 1;
+      uint32_t observed = Atomic::cmpxchg(&_remote_refcount, cur, next);
+      if (observed == cur) {
+        return;
+      }
+      cur = observed;
+    }
+  }
+  uint32_t remote_refcount() const { return Atomic::load_acquire(&_remote_refcount); }
 
   // Flags
-  void set_dormant()   { _flags |= REMOTE_HANDLE_FLAG_DORMANT; }
-  void clear_dormant() { _flags &= ~REMOTE_HANDLE_FLAG_DORMANT; }
+  void set_dormant()   { Atomic::fetch_then_or(&_flags, REMOTE_HANDLE_FLAG_DORMANT); }
+  void clear_dormant() {
+    uint32_t cur = Atomic::load_acquire(&_flags);
+    while (true) {
+      uint32_t next = cur & ~REMOTE_HANDLE_FLAG_DORMANT;
+      uint32_t observed = Atomic::cmpxchg(&_flags, cur, next);
+      if (observed == cur) {
+        return;
+      }
+      cur = observed;
+    }
+  }
 
   // Store/retrieve eviction metadata. word_size is needed at fetch time for
   // FCR allocation without querying the backend. This must not be packed into

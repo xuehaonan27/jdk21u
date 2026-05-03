@@ -325,6 +325,46 @@ public:
     return h;
   }
 
+  RemoteHandle* ensure_dormant_anchor_for_parallel(oop obj, RemoteHandleAllocBuffer* hab,
+                                                   HandleEntryAllocBuffer* eab,
+                                                   RemoteHandle** pending_head,
+                                                   RemoteHandle** pending_tail,
+                                                   size_t* pending_count) {
+    uintptr_t addr = cast_from_oop<uintptr_t>(obj);
+    size_t idx = hash_obj(addr);
+
+    stripe_lock(idx);
+    HandleEntry* e = _table[idx];
+    while (e != nullptr) {
+      if (e->_obj_addr == addr && e->_handle->is_local()) {
+        RemoteHandle* existing = e->_handle;
+        existing->set_dormant();
+        stripe_unlock(idx);
+        return existing;
+      }
+      e = e->_next;
+    }
+
+    HandleEntry* entry = eab->allocate();
+    if (entry == nullptr) {
+      HandleEntryChunk* chunk = alloc_new_entry_chunk();
+      eab->set_chunk(chunk);
+      entry = eab->allocate();
+    }
+    RemoteHandle* h = _handle_allocator.allocate_handle(hab);
+    h->initialize_dormant(cast_from_oop<void*>(obj));
+    entry->init(addr, h, _table[idx]);
+    _table[idx] = entry;
+    stripe_unlock(idx);
+
+    if (pending_head != nullptr && pending_tail != nullptr && pending_count != nullptr) {
+      append_pending_local_handle(h, pending_head, pending_tail, pending_count);
+    } else {
+      link_local_handle(h);
+    }
+    return h;
+  }
+
   int collect_remote_anchor_addrs_in_regions(const bool* region_set, uint num_regions,
                                              uintptr_t* addrs, int max_addrs,
                                              bool* overflow);
@@ -528,6 +568,41 @@ public:
     edge_table_unlock();
   }
 
+  void append_pending_edge_table(ObjectEdgeTable* et,
+                                 EdgeTableEntry** head,
+                                 EdgeTableEntry** tail,
+                                 size_t* count) {
+    if (et == nullptr || head == nullptr || tail == nullptr || count == nullptr) {
+      return;
+    }
+    EdgeTableEntry* entry = (EdgeTableEntry*)os::malloc(sizeof(EdgeTableEntry), mtGC);
+    entry->_table = et;
+    entry->_next = nullptr;
+    if (*tail != nullptr) {
+      (*tail)->_next = entry;
+    } else {
+      *head = entry;
+    }
+    *tail = entry;
+    (*count)++;
+  }
+
+  void store_edge_table_batch(EdgeTableEntry* head, size_t count) {
+    if (head == nullptr || count == 0) {
+      return;
+    }
+    edge_table_lock();
+    EdgeTableEntry* cur = head;
+    while (cur != nullptr) {
+      EdgeTableEntry* next = cur->_next;
+      size_t idx = hash_handle(cur->_table->_source_handle);
+      cur->_next = _edge_buckets[idx];
+      _edge_buckets[idx] = cur;
+      cur = next;
+    }
+    edge_table_unlock();
+  }
+
   ObjectEdgeTable* take_edge_table(RemoteHandle* h) {
     size_t idx = hash_handle(h);
     edge_table_lock();
@@ -569,7 +644,12 @@ public:
   // Scans all oop fields, creates dormant anchors for targets, records edges.
   // Must be called BEFORE eviction (object bytes still readable locally).
   ObjectEdgeTable* build_edge_table(oop obj, RemoteHandle* obj_handle,
-                                    RemoteHandleAllocBuffer* hab);
+                                    RemoteHandleAllocBuffer* hab,
+                                    bool* zero_edges = nullptr,
+                                    HandleEntryAllocBuffer* eab = nullptr,
+                                    RemoteHandle** pending_head = nullptr,
+                                    RemoteHandle** pending_tail = nullptr,
+                                    size_t* pending_count = nullptr);
 
 private:
   // ============================================================
@@ -967,6 +1047,16 @@ public:
   // Finish preparation for entries that survived late guards: build edge table
   // and assign backend slot. Does NOT send to backend.
   bool finish_prepared_eviction(PreparedEviction* entry, RemoteHandleAllocBuffer* hab);
+
+  bool finish_prepared_eviction_edges(PreparedEviction* entry,
+                                      RemoteHandleAllocBuffer* hab,
+                                      HandleEntryAllocBuffer* eab = nullptr,
+                                      RemoteHandle** pending_head = nullptr,
+                                      RemoteHandle** pending_tail = nullptr,
+                                      size_t* pending_count = nullptr,
+                                      EdgeTableEntry** pending_edge_head = nullptr,
+                                      EdgeTableEntry** pending_edge_tail = nullptr,
+                                      size_t* pending_edge_count = nullptr);
 
   // Prepare: metadata + finish. Does NOT send to backend.
   bool prepare_eviction(oop obj, RemoteHandleAllocBuffer* hab, PreparedEviction* out);

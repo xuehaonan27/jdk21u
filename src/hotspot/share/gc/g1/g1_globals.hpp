@@ -421,6 +421,12 @@
           "also enabled, skip the duplicate evacuated-area safety-net scan. " \
           "The verifier still repairs or aborts on any missed heap refs.")    \
                                                                             \
+  product(bool, G1RemoteParallelFinishEviction, true, DIAGNOSTIC,            \
+          "Use GC worker threads to build remote-eviction edge metadata "     \
+          "after late candidate guards. Slot assignment remains serial; "     \
+          "edge-table construction, dormant-anchor lookup, and edge-table "   \
+          "publication are batched per worker.")                              \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \

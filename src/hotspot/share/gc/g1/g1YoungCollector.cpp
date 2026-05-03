@@ -3392,13 +3392,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       // Building edge tables before the local-handle guard made each rejected
       // dense region unwind tens of thousands of edge tables during STW.
       Ticks e1_7_start = Ticks::now();
-      RemoteHandleAllocBuffer finish_hab;
-      bool* finish_failed_region_set = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
-      memset(finish_failed_region_set, 0, num_regions * sizeof(bool));
+      int* finish_failed_region_set = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
+      memset(finish_failed_region_set, 0, num_regions * sizeof(int));
       int finish_success_entries = 0;
       int finish_failed_entries = 0;
       int finish_failed_regions = 0;
       int finish_failed_aborted = 0;
+      G1RemoteBackend* finish_backend = rmm->backend();
       for (int e = 0; e < num_entries; e++) {
         if (!entry_active[e]) continue;
         HeapRegion* hr = _g1h->heap_region_containing(entries[e].obj);
@@ -3408,20 +3408,143 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           continue;
         }
         uint idx = hr->hrm_index();
-        if (idx >= num_regions || finish_failed_region_set[idx]) {
+        if (idx >= num_regions || finish_failed_region_set[idx] != 0) {
           entry_active[e] = false;
           continue;
         }
-        if (rmm->finish_prepared_eviction(&entries[e], &finish_hab)) {
-          finish_success_entries++;
-        } else {
-          finish_failed_region_set[idx] = true;
+
+        size_t slot_id = finish_backend->allocate_slot_id();
+        if (slot_id == (size_t)-1) {
+          finish_failed_region_set[idx] = 1;
           entry_active[e] = false;
           finish_failed_entries++;
+          continue;
+        }
+        entries[e].slot_id = slot_id;
+      }
+
+      uint finish_workers = _g1h->workers()->active_workers();
+      if (G1RemoteParallelFinishEviction && finish_workers > 1) {
+        class FinishPreparedEvictionsTask : public WorkerTask {
+          G1RemoteMemoryManager* _rmm;
+          G1CollectedHeap*       _g1h;
+          PreparedEviction*      _entries;
+          bool*                  _entry_active;
+          int*                   _finish_failed_region_set;
+          uint                   _num_regions;
+          int                    _num_entries;
+          volatile int           _next_entry;
+          volatile int           _success_entries;
+          volatile int           _failed_entries;
+
+          enum { ClaimChunk = 256 };
+
+        public:
+          FinishPreparedEvictionsTask(G1RemoteMemoryManager* rmm,
+                                      G1CollectedHeap* g1h,
+                                      PreparedEviction* entries,
+                                      bool* entry_active,
+                                      int* finish_failed_region_set,
+                                      uint num_regions,
+                                      int num_entries)
+            : WorkerTask("G1 Finish Remote Evictions"),
+              _rmm(rmm), _g1h(g1h), _entries(entries),
+              _entry_active(entry_active),
+              _finish_failed_region_set(finish_failed_region_set),
+              _num_regions(num_regions), _num_entries(num_entries),
+              _next_entry(0), _success_entries(0), _failed_entries(0) {}
+
+          void work(uint worker_id) {
+            RemoteHandleAllocBuffer hab;
+            G1RemoteMemoryManager::HandleEntryAllocBuffer eab;
+            RemoteHandle* pending_head = nullptr;
+            RemoteHandle* pending_tail = nullptr;
+            size_t pending_count = 0;
+            G1RemoteMemoryManager::EdgeTableEntry* pending_edge_head = nullptr;
+            G1RemoteMemoryManager::EdgeTableEntry* pending_edge_tail = nullptr;
+            size_t pending_edge_count = 0;
+            int local_success = 0;
+            int local_failed = 0;
+
+            while (true) {
+              int start = Atomic::fetch_then_add(&_next_entry, (int)ClaimChunk);
+              if (start >= _num_entries) {
+                break;
+              }
+              int end = MIN2(start + ClaimChunk, _num_entries);
+              for (int e = start; e < end; e++) {
+                if (!_entry_active[e]) continue;
+                PreparedEviction* pe = &_entries[e];
+                HeapRegion* hr = _g1h->heap_region_containing(pe->obj);
+                if (hr == nullptr) {
+                  _entry_active[e] = false;
+                  local_failed++;
+                  continue;
+                }
+                uint idx = hr->hrm_index();
+                if (idx >= _num_regions ||
+                    Atomic::load(&_finish_failed_region_set[idx]) != 0) {
+                  _entry_active[e] = false;
+                  continue;
+                }
+                if (_rmm->finish_prepared_eviction_edges(pe, &hab, &eab,
+                                                         &pending_head,
+                                                         &pending_tail,
+                                                         &pending_count,
+                                                         &pending_edge_head,
+                                                         &pending_edge_tail,
+                                                         &pending_edge_count)) {
+                  local_success++;
+                } else {
+                  Atomic::cmpxchg(&_finish_failed_region_set[idx], 0, 1);
+                  _entry_active[e] = false;
+                  local_failed++;
+                }
+              }
+            }
+
+            _rmm->link_local_handle_batch(pending_head, pending_tail, pending_count);
+            _rmm->store_edge_table_batch(pending_edge_head, pending_edge_count);
+            Atomic::add(&_success_entries, local_success);
+            Atomic::add(&_failed_entries, local_failed);
+          }
+
+          int success_entries() const { return _success_entries; }
+          int failed_entries() const { return _failed_entries; }
+        };
+
+        FinishPreparedEvictionsTask task(rmm, _g1h, entries, entry_active,
+                                         finish_failed_region_set,
+                                         num_regions, num_entries);
+        _g1h->workers()->run_task(&task, finish_workers);
+        finish_success_entries += task.success_entries();
+        finish_failed_entries += task.failed_entries();
+      } else {
+        RemoteHandleAllocBuffer finish_hab;
+        for (int e = 0; e < num_entries; e++) {
+          if (!entry_active[e]) continue;
+          HeapRegion* hr = _g1h->heap_region_containing(entries[e].obj);
+          if (hr == nullptr) {
+            entry_active[e] = false;
+            finish_failed_entries++;
+            continue;
+          }
+          uint idx = hr->hrm_index();
+          if (idx >= num_regions || finish_failed_region_set[idx] != 0) {
+            entry_active[e] = false;
+            continue;
+          }
+          if (rmm->finish_prepared_eviction_edges(&entries[e], &finish_hab)) {
+            finish_success_entries++;
+          } else {
+            finish_failed_region_set[idx] = 1;
+            entry_active[e] = false;
+            finish_failed_entries++;
+          }
         }
       }
       for (uint i = 0; i < num_regions; i++) {
-        if (!finish_failed_region_set[i]) continue;
+        if (finish_failed_region_set[i] == 0) continue;
         if (!eviction_candidates[i]) continue;
 
         int start = region_start[i];
@@ -3443,14 +3566,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         total_candidates--;
         finish_failed_regions++;
       }
-      FREE_C_HEAP_ARRAY(bool, finish_failed_region_set);
+      FREE_C_HEAP_ARRAY(int, finish_failed_region_set);
       double e1_7_ms = (Ticks::now() - e1_7_start).seconds() * 1000.0;
       e1_ms += e1_7_ms;
       G1RemoteMemoryManager::log_prepare_eviction_stats();
       log_info(gc)("Phase E finish prepare: %.1fms (%d entries finished, %d failed, "
-                   "%d regions removed, %d finished entries aborted)",
+                   "%d regions removed, %d finished entries aborted, %u workers, parallel=%d)",
                    e1_7_ms, finish_success_entries, finish_failed_entries,
-                   finish_failed_regions, finish_failed_aborted);
+                   finish_failed_regions, finish_failed_aborted, finish_workers,
+                   G1RemoteParallelFinishEviction ? 1 : 0);
 
       // E2: Batch-send to remote backend.
       Ticks e2_start = Ticks::now();
