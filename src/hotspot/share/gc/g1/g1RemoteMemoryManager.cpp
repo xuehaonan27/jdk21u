@@ -1023,36 +1023,54 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
     return 0;
   }
 
-  uintptr_t bottom = (uintptr_t)hr->bottom();
-  uintptr_t end = (uintptr_t)hr->end();
-  int blockers = 0;
+  class SingleRegionUnpreparedLocalHandleClosure {
+    HeapRegion* _hr;
+    const PreparedEviction* _entries;
+    int _start;
+    int _count;
+    int _log_limit;
+    uintptr_t _bottom;
+    uintptr_t _end;
+    int _blockers;
 
-  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
-      RemoteHandle* h = e->_handle;
-      if (h == nullptr) continue;
+  public:
+    SingleRegionUnpreparedLocalHandleClosure(HeapRegion* hr,
+                                             const PreparedEviction* entries,
+                                             int start,
+                                             int count,
+                                             int log_limit)
+      : _hr(hr), _entries(entries), _start(start), _count(count),
+        _log_limit(log_limit), _bottom((uintptr_t)hr->bottom()),
+        _end((uintptr_t)hr->end()), _blockers(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
 
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
       if (state == REMOTE_HANDLE_LOCAL) {
         uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
-        if (addr >= bottom && addr < end &&
-            !prepared_entries_contain_handle(entries, start, count, addr, h)) {
-          blockers++;
-          if (blockers <= log_limit) {
+        if (addr >= _bottom && addr < _end &&
+            !prepared_entries_contain_handle(_entries, _start, _count, addr, h)) {
+          _blockers++;
+          if (_blockers <= _log_limit) {
             log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
                             PTR_FORMAT " local=" PTR_FORMAT
                             " listed=%d dormant=%d rc=%u",
-                            hr->hrm_index(), p2i(h), addr,
+                            _hr->hrm_index(), p2i(h), addr,
                             h->_local_listed ? 1 : 0,
                             h->is_dormant() ? 1 : 0, h->remote_refcount());
           }
         }
       }
     }
-  }
 
-  return blockers;
+    int blockers() const { return _blockers; }
+  };
+
+  SingleRegionUnpreparedLocalHandleClosure cl(hr, entries, start, count, log_limit);
+  _handle_allocator.handles_do(&cl);
+  return cl.blockers();
 }
 
 int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
@@ -1136,11 +1154,7 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
   UnpreparedLocalHandleClosure cl(this, eviction_candidates, region_complete,
                                   region_start, region_count, num_regions,
                                   entries, blockers_by_region, log_limit);
-  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
-    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
-      cl.do_handle(e->_handle);
-    }
-  }
+  _handle_allocator.handles_do(&cl);
   return cl.total_blockers();
 }
 
@@ -1155,33 +1169,60 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
   int count = 0;
   int stale_handles = 0;
 
-  RemoteHandle* cur = _local_handles_head;
-  while (cur != nullptr) {
-    RemoteHandle* next = cur->_local_next;
-    RemoteHandle* h = cur;
-    if (h->is_local() && h->remote_refcount() != 0) {
-      if (!validate_local_handle_addr(h, "ANCHOR-COLLECT",
-                                      &stale_handles, 8)) {
-        cur = next;
-        continue;
+  class RemoteAnchorCollectClosure {
+    G1RemoteMemoryManager* _rmm;
+    const bool* _region_set;
+    uint _num_regions;
+    uintptr_t* _addrs;
+    int _max_addrs;
+    bool* _overflow;
+    int _count;
+    int _stale_handles;
+
+  public:
+    RemoteAnchorCollectClosure(G1RemoteMemoryManager* rmm,
+                               const bool* region_set,
+                               uint num_regions,
+                               uintptr_t* addrs,
+                               int max_addrs,
+                               bool* overflow)
+      : _rmm(rmm), _region_set(region_set), _num_regions(num_regions),
+        _addrs(addrs), _max_addrs(max_addrs), _overflow(overflow),
+        _count(0), _stale_handles(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+      if (!h->is_local() || h->remote_refcount() == 0) return;
+
+      if (!_rmm->validate_local_handle_addr(h, "ANCHOR-COLLECT",
+                                            &_stale_handles, 8)) {
+        return;
       }
 
       uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
-      if (addr != 0 && _g1h->is_in((void*)addr)) {
-        HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
-        uint ridx = hr == nullptr ? num_regions : hr->hrm_index();
-        if (ridx < num_regions && region_set[ridx]) {
-          if (count < max_addrs && addrs != nullptr) {
-            addrs[count] = addr;
-          } else if (overflow != nullptr) {
-            *overflow = true;
+      if (addr != 0 && _rmm->_g1h->is_in((void*)addr)) {
+        HeapRegion* hr = _rmm->_g1h->heap_region_containing((void*)addr);
+        uint ridx = hr == nullptr ? _num_regions : hr->hrm_index();
+        if (ridx < _num_regions && _region_set[ridx]) {
+          if (_count < _max_addrs && _addrs != nullptr) {
+            _addrs[_count] = addr;
+          } else if (_overflow != nullptr) {
+            *_overflow = true;
           }
-          count++;
+          _count++;
         }
       }
     }
-    cur = next;
-  }
+
+    int count() const { return _count; }
+    int stale_handles() const { return _stale_handles; }
+  };
+
+  RemoteAnchorCollectClosure cl(this, region_set, num_regions, addrs,
+                                max_addrs, overflow);
+  _handle_allocator.handles_do(&cl);
+  count = cl.count();
+  stale_handles = cl.stale_handles();
 
   for (int i = 0; i < _cross_roots_count; i++) {
     RemoteHandle* h = _cross_roots[i];

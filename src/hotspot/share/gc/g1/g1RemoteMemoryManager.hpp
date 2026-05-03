@@ -1109,8 +1109,8 @@ public:
                                                int count,
                                                int log_limit = 0);
 
-  // Batched form of count_unprepared_local_handles_in_region(). Scans the
-  // Handle table once for all candidate regions and fills blockers_by_region.
+  // Batched form of count_unprepared_local_handles_in_region(). Scans all
+  // allocated handles once for all candidate regions and fills blockers_by_region.
   int count_unprepared_local_handles_in_regions(const bool* eviction_candidates,
                                                 const bool* region_complete,
                                                 const int* region_start,
