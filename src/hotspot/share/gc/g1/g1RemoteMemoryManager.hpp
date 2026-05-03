@@ -610,7 +610,11 @@ public:
 private:
   uint32_t* _eviction_backoff_until_epoch;
   uint      _eviction_backoff_capacity;
+  bool*     _fast_phase_c_source_hints;
+  uint      _fast_phase_c_source_hint_capacity;
+  uint      _fast_phase_c_source_hint_count;
   void ensure_eviction_backoff_capacity(uint num_regions);
+  void ensure_fast_phase_c_source_hint_capacity(uint num_regions);
 
 public:
   // Remote root set: handle_ids for CMD_REPORT_REMOTE_ROOTS_V2.
@@ -836,6 +840,13 @@ public:
            _eviction_backoff_until_epoch[region_idx] > _gc_epoch;
   }
   void backoff_eviction_region(uint region_idx, uint gc_cycles);
+  bool is_fast_phase_c_source_hint(uint region_idx) const {
+    return G1RemoteUseFastPhaseCSourceHints &&
+           region_idx < _fast_phase_c_source_hint_capacity &&
+           _fast_phase_c_source_hints[region_idx];
+  }
+  bool remember_fast_phase_c_source_hint(uint region_idx);
+  uint fast_phase_c_source_hint_count() const { return _fast_phase_c_source_hint_count; }
 
   // Determine eviction threshold: objects at or above this distance are cold.
   // Returns the distance threshold, or HOTNESS_LEVELS if nothing to evict.

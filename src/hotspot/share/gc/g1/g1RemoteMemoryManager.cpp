@@ -56,6 +56,9 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
     _eviction_backoff_until_epoch(nullptr), _eviction_backoff_capacity(0),
+    _fast_phase_c_source_hints(nullptr),
+    _fast_phase_c_source_hint_capacity(0),
+    _fast_phase_c_source_hint_count(0),
     _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
     _remote_roots_capacity(0),
     _cross_roots_count(0),
@@ -426,6 +429,12 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     _eviction_backoff_until_epoch = nullptr;
     _eviction_backoff_capacity = 0;
   }
+  if (_fast_phase_c_source_hints != nullptr) {
+    FREE_C_HEAP_ARRAY(bool, _fast_phase_c_source_hints);
+    _fast_phase_c_source_hints = nullptr;
+    _fast_phase_c_source_hint_capacity = 0;
+    _fast_phase_c_source_hint_count = 0;
+  }
 
   // Free edge tables (chained hash)
   for (size_t i = 0; i < EDGE_TABLE_BUCKETS; i++) {
@@ -476,6 +485,46 @@ void G1RemoteMemoryManager::backoff_eviction_region(uint region_idx, uint gc_cyc
   if (_eviction_backoff_until_epoch[region_idx] < until) {
     _eviction_backoff_until_epoch[region_idx] = until;
   }
+}
+
+void G1RemoteMemoryManager::ensure_fast_phase_c_source_hint_capacity(uint num_regions) {
+  if (num_regions <= _fast_phase_c_source_hint_capacity) {
+    return;
+  }
+  uint new_cap = MAX2(num_regions, _fast_phase_c_source_hint_capacity * 2);
+  if (new_cap < 1024) {
+    new_cap = 1024;
+  }
+  bool* new_hints = NEW_C_HEAP_ARRAY(bool, new_cap, mtGC);
+  memset(new_hints, 0, new_cap * sizeof(bool));
+  if (_fast_phase_c_source_hints != nullptr) {
+    memcpy(new_hints, _fast_phase_c_source_hints,
+           _fast_phase_c_source_hint_capacity * sizeof(bool));
+    FREE_C_HEAP_ARRAY(bool, _fast_phase_c_source_hints);
+  }
+  _fast_phase_c_source_hints = new_hints;
+  _fast_phase_c_source_hint_capacity = new_cap;
+}
+
+bool G1RemoteMemoryManager::remember_fast_phase_c_source_hint(uint region_idx) {
+  if (!G1RemoteUseFastPhaseCSourceHints ||
+      G1RemoteFastPhaseCSourceHintMaxRegions == 0 ||
+      region_idx == (uint)-1) {
+    return false;
+  }
+  ensure_fast_phase_c_source_hint_capacity(region_idx + 1);
+  if (_fast_phase_c_source_hints[region_idx]) {
+    return true;
+  }
+  if (_fast_phase_c_source_hint_count >= G1RemoteFastPhaseCSourceHintMaxRegions) {
+    return false;
+  }
+  _fast_phase_c_source_hints[region_idx] = true;
+  _fast_phase_c_source_hint_count++;
+  log_info(gc)("Fast Phase C source hint: learned clean old source region %u (%u/%u)",
+               region_idx, _fast_phase_c_source_hint_count,
+               G1RemoteFastPhaseCSourceHintMaxRegions);
+  return true;
 }
 
 size_t G1RemoteMemoryManager::sim_remote_evict(oop obj, size_t word_size, Klass* klass) {
@@ -1651,6 +1700,8 @@ class TagFastRefsTask : public WorkerTask {
   volatile int           _total_untaggable;
   volatile int           _regions_scanned;
   volatile int           _dirty_cards_scanned;
+  volatile int           _source_hint_regions_scanned;
+  volatile int           _old_prefix_regions_scanned;
 
   typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
   TaggedFieldEntry** _worker_bufs;
@@ -1666,7 +1717,9 @@ public:
       _pre_evac_tops(pre_evac_tops), _bitmap(bitmap),
       _claimer(num_workers), _total_tagged(0), _total_no_handle(0),
       _total_untaggable(0),
-      _regions_scanned(0), _dirty_cards_scanned(0), _num_workers(num_workers) {
+      _regions_scanned(0), _dirty_cards_scanned(0),
+      _source_hint_regions_scanned(0), _old_prefix_regions_scanned(0),
+      _num_workers(num_workers) {
     _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
     _worker_counts = NEW_C_HEAP_ARRAY(int, num_workers, mtGC);
     memset(_worker_bufs, 0, num_workers * sizeof(TaggedFieldEntry*));
@@ -1689,6 +1742,8 @@ public:
     EvictionSetRsetScanner rset_scanner(_g1h, &cl, _eviction_set, _num_regions);
     int scanned = 0;
     int dirty_cards = 0;
+    int source_hint_regions = 0;
+    int old_prefix_regions = 0;
 
     for (uint i = _claimer.offset_for_worker(worker_id); i < _num_regions; i++) {
       if (!_claimer.claim_region(i)) continue;
@@ -1723,6 +1778,24 @@ public:
         continue;
       }
 
+      if (_rmm->is_fast_phase_c_source_hint(i)) {
+        scan_region_for_eviction_tags(hr, &cl, _bitmap);
+        scanned++;
+        source_hint_regions++;
+        continue;
+      }
+
+      if (G1RemoteFastPhaseCOldPrefixRegions > 0 &&
+          i < G1RemoteFastPhaseCOldPrefixRegions &&
+          hr->is_old() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
+        scan_region_for_eviction_tags(hr, &cl, _bitmap);
+        scanned++;
+        old_prefix_regions++;
+        continue;
+      }
+
       int region_dirty_cards = rset_scanner.scan_dirty_cards_in_region(hr);
       if (region_dirty_cards > 0) {
         dirty_cards += region_dirty_cards;
@@ -1735,6 +1808,8 @@ public:
     Atomic::add(&_total_untaggable, cl.untaggable());
     Atomic::add(&_regions_scanned, scanned);
     Atomic::add(&_dirty_cards_scanned, dirty_cards);
+    Atomic::add(&_source_hint_regions_scanned, source_hint_regions);
+    Atomic::add(&_old_prefix_regions_scanned, old_prefix_regions);
     _worker_bufs[worker_id] = cl.release_local_buf();
     _worker_counts[worker_id] = cl.local_count();
   }
@@ -1753,6 +1828,8 @@ public:
   int total_untaggable() const { return _total_untaggable; }
   int regions_scanned() const { return _regions_scanned; }
   int dirty_cards_scanned() const { return _dirty_cards_scanned; }
+  int source_hint_regions_scanned() const { return _source_hint_regions_scanned; }
+  int old_prefix_regions_scanned() const { return _old_prefix_regions_scanned; }
 };
 
 int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
@@ -1773,10 +1850,11 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     total_untaggable = task.total_untaggable();
 
     if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
-      log_info(gc)("Fast Phase C (%u workers, %d regions scanned, %d dirty cards): "
-                   "tagged %d refs, %d no handle, %d untaggable",
-                   num_workers, task.regions_scanned(), task.dirty_cards_scanned(), total_tagged,
-                   total_no_handle, total_untaggable);
+      log_info(gc)("Fast Phase C (%u workers, %d regions scanned, %d dirty cards, "
+                   "%d source hints, %d old-prefix): tagged %d refs, %d no handle, %d untaggable",
+                   num_workers, task.regions_scanned(), task.dirty_cards_scanned(),
+                   task.source_hint_regions_scanned(), task.old_prefix_regions_scanned(),
+                   total_tagged, total_no_handle, total_untaggable);
     }
   } else {
     EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions,
@@ -1784,6 +1862,8 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     EvictionSetRsetScanner rset_scanner(_g1h, &cl, eviction_set, num_regions);
     int scanned = 0;
     int dirty_cards = 0;
+    int source_hint_regions = 0;
+    int old_prefix_regions = 0;
 
     for (uint i = 0; i < num_regions; i++) {
       HeapRegion* hr = _g1h->region_at(i);
@@ -1814,6 +1894,24 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
         continue;
       }
 
+      if (is_fast_phase_c_source_hint(i)) {
+        scan_region_for_eviction_tags(hr, &cl, bitmap);
+        scanned++;
+        source_hint_regions++;
+        continue;
+      }
+
+      if (G1RemoteFastPhaseCOldPrefixRegions > 0 &&
+          i < G1RemoteFastPhaseCOldPrefixRegions &&
+          hr->is_old() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
+        scan_region_for_eviction_tags(hr, &cl, bitmap);
+        scanned++;
+        old_prefix_regions++;
+        continue;
+      }
+
       int region_dirty_cards = rset_scanner.scan_dirty_cards_in_region(hr);
       if (region_dirty_cards > 0) {
         dirty_cards += region_dirty_cards;
@@ -1829,9 +1927,10 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     total_untaggable = cl.untaggable();
 
     if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
-      log_info(gc)("Fast Phase C (1 worker, %d regions scanned, %d dirty cards): "
-                   "tagged %d refs, %d no handle, %d untaggable",
-                   scanned, dirty_cards, total_tagged, total_no_handle, total_untaggable);
+      log_info(gc)("Fast Phase C (1 worker, %d regions scanned, %d dirty cards, "
+                   "%d source hints, %d old-prefix): tagged %d refs, %d no handle, %d untaggable",
+                   scanned, dirty_cards, source_hint_regions, old_prefix_regions,
+                   total_tagged, total_no_handle, total_untaggable);
     }
   }
 
@@ -2117,6 +2216,9 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       if (src_continue_humongous) _continue_humongous_source++;
       if (src_idx < _region_count) _src_region_counts[src_idx]++;
       if (idx < _region_count) _target_region_counts[idx]++;
+      if (!src_direct && src_hr != nullptr && !src_dirty_card && !src_young) {
+        _rmm->remember_fast_phase_c_source_hint(src_idx);
+      }
 
       if (_repair) {
         if (untaggable_source) {

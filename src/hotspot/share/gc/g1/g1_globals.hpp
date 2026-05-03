@@ -372,6 +372,23 @@
           "candidate remembered sets. Verification remains controlled by "    \
           "G1RemoteVerifyEvictionRefs.")                                      \
                                                                             \
+  product(bool, G1RemoteUseFastPhaseCSourceHints, false, DIAGNOSTIC,          \
+          "Let Fast Phase C learn clean old source regions from verifier "     \
+          "misses and scan those regions in later eviction attempts. This "    \
+          "turns repeated verifier repairs into bounded steady-state scans.")  \
+                                                                            \
+  product(uint, G1RemoteFastPhaseCSourceHintMaxRegions, 64, DIAGNOSTIC,       \
+          "Maximum number of clean old source regions remembered by "          \
+          "G1RemoteUseFastPhaseCSourceHints.")                                \
+          range(0, 4096)                                                      \
+                                                                            \
+  product(uint, G1RemoteFastPhaseCOldPrefixRegions, 0, DIAGNOSTIC,            \
+          "When Fast Phase C is enabled, additionally scan old regions with "  \
+          "heap indices below this value. Useful as a conservative seed for " \
+          "workloads where stable graph roots in low old regions point into " \
+          "newer dense regions.")                                             \
+          range(0, 4096)                                                      \
+                                                                            \
   product(bool, G1RemoteRepairFastPhaseCMisses, false, DIAGNOSTIC,           \
           "After Fast Phase C, let the verifier repair bounded taggable "     \
           "heap refs it finds before deciding whether to abort eviction. "    \
