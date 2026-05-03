@@ -353,6 +353,18 @@
           "as Object[]/Tuple3[]; unknown sources and non-oop arrays remain "  \
           "untaggable.")                                                      \
                                                                             \
+  product(bool, G1RemoteUseFastPhaseC, false, DIAGNOSTIC,                    \
+          "Use the bounded remote-eviction Phase C scanner: candidate "       \
+          "regions, young regions, newly evacuated ranges, roots, and "       \
+          "candidate remembered sets. Verification remains controlled by "    \
+          "G1RemoteVerifyEvictionRefs.")                                      \
+                                                                            \
+  product(bool, G1RemoteVerifyEvictionRefs, true, DIAGNOSTIC,                \
+          "After remote-eviction Phase C, verify that no untagged heap refs " \
+          "still point into eviction candidate regions. Disable only for "    \
+          "controlled performance ablations after Fast Phase C has passed "   \
+          "verification on the target workload.")                             \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \

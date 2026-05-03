@@ -1144,6 +1144,7 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
   int                    _untaggable;
   int                    _untaggable_reports_left;
   oop                    _cur_obj;
+  bool                   _allow_unknown_heap_source;
 
   typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
   TaggedFieldEntry* _local_buf;
@@ -1168,10 +1169,12 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
 
 public:
   EvictionSetTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
-                        const bool* eset, uint nregions)
+                        const bool* eset, uint nregions,
+                        bool allow_unknown_heap_source = false)
     : _rmm(rmm), _g1h(g1h), _eviction_set(eset),
       _num_regions(nregions), _tagged(0), _no_handle(0),
       _untaggable(0), _untaggable_reports_left(10), _cur_obj(nullptr),
+      _allow_unknown_heap_source(allow_unknown_heap_source),
       _local_buf(nullptr), _local_count(0), _local_capacity(0) {}
 
   ~EvictionSetTagClosure() {
@@ -1218,7 +1221,8 @@ public:
     if (heap_source) {
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
       bool object_array_source = source_klass != nullptr && source_klass->is_objArray_klass();
-      bool untaggable_source = _cur_obj == nullptr ||
+      bool unknown_source = _cur_obj == nullptr && !_allow_unknown_heap_source;
+      bool untaggable_source = unknown_source ||
           (source_klass != nullptr && source_klass->is_array_klass() &&
            (!object_array_source || !G1RemoteTagObjArraySources));
       if (untaggable_source) {
@@ -1652,7 +1656,8 @@ public:
   }
 
   void work(uint worker_id) {
-    EvictionSetTagClosure cl(_rmm, _g1h, _eviction_set, _num_regions);
+    EvictionSetTagClosure cl(_rmm, _g1h, _eviction_set, _num_regions,
+                             true /* allow_unknown_heap_source for RSet card scans */);
     EvictionSetRsetScanner rset_scanner(_g1h, &cl, _eviction_set, _num_regions);
     int scanned = 0;
 
@@ -1676,7 +1681,14 @@ public:
         continue;
       }
 
-      if (hr->is_old_or_humongous() && !hr->is_empty() && !hr->is_continues_humongous()) {
+      // Destination regions that received evacuated/promoted objects after the
+      // snapshot may contain fresh refs into candidates but are not yet fully
+      // represented by remembered sets.
+      if (_pre_evac_tops != nullptr &&
+          _pre_evac_tops[i] != nullptr &&
+          _pre_evac_tops[i] < hr->top() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
         scan_region_for_eviction_tags(hr, &cl, _bitmap);
         scanned++;
         continue;
@@ -1730,7 +1742,8 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
                    total_no_handle, total_untaggable);
     }
   } else {
-    EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions);
+    EvictionSetTagClosure cl(this, _g1h, eviction_set, num_regions,
+                             true /* allow_unknown_heap_source for RSet card scans */);
     EvictionSetRsetScanner rset_scanner(_g1h, &cl, eviction_set, num_regions);
     int scanned = 0;
 
@@ -1753,7 +1766,11 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
         continue;
       }
 
-      if (hr->is_old_or_humongous() && !hr->is_empty() && !hr->is_continues_humongous()) {
+      if (pre_evac_tops != nullptr &&
+          pre_evac_tops[i] != nullptr &&
+          pre_evac_tops[i] < hr->top() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
         scan_region_for_eviction_tags(hr, &cl, bitmap);
         scanned++;
         continue;
