@@ -1951,7 +1951,59 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     int                    _obj_array_source;
     int                    _non_array_source;
     int                    _continue_humongous_source;
+    uint                   _region_count;
+    int*                   _src_region_counts;
+    int*                   _target_region_counts;
     oop                    _cur_obj;
+
+    bool is_selected(uint idx, const uint* selected, int selected_len) const {
+      for (int i = 0; i < selected_len; i++) {
+        if (selected[i] == idx) return true;
+      }
+      return false;
+    }
+
+    bool is_destination_region(uint idx, HeapRegion* hr) const {
+      return hr != nullptr &&
+             idx < _num_regions &&
+             _pre_evac_tops != nullptr &&
+             _pre_evac_tops[idx] != nullptr &&
+             _pre_evac_tops[idx] < hr->top() &&
+             !hr->is_empty() &&
+             !hr->is_continues_humongous();
+    }
+
+    void log_top_regions(const char* phase, const char* kind, const int* counts) const {
+      const int limit = 8;
+      uint selected[limit];
+      for (int i = 0; i < limit; i++) selected[i] = (uint)-1;
+
+      for (int rank = 0; rank < limit; rank++) {
+        int best_count = 0;
+        uint best_idx = (uint)-1;
+        for (uint i = 0; i < _region_count; i++) {
+          if (counts[i] > best_count && !is_selected(i, selected, rank)) {
+            best_count = counts[i];
+            best_idx = i;
+          }
+        }
+        if (best_count == 0 || best_idx == (uint)-1) break;
+
+        selected[rank] = best_idx;
+        HeapRegion* hr = best_idx < _g1h->num_regions() ? _g1h->region_at(best_idx) : nullptr;
+        bool candidate = best_idx < _num_regions && _eviction_set[best_idx];
+        bool young = hr != nullptr && hr->is_young();
+        bool dest = is_destination_region(best_idx, hr);
+        log_warning(gc)("VERIFY detail (%s): top_%s[%d] region=%u count=%d type=%s "
+                        "candidate=%s young=%s dest=%s",
+                        phase, kind, rank + 1, best_idx, best_count,
+                        hr != nullptr ? hr->get_short_type_str() : "?",
+                        candidate ? "yes" : "no",
+                        young ? "yes" : "no",
+                        dest ? "yes" : "no");
+      }
+    }
+
   public:
     VerifyTagClosure(G1CollectedHeap* g1h, const bool* eset, uint nregions,
                      HeapWord* const* pre_evac_tops)
@@ -1962,7 +2014,18 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         _direct_scanned_source(0), _dirty_card_source(0), _clean_old_source(0),
         _same_region(0), _array_source(0), _obj_array_source(0),
         _non_array_source(0), _continue_humongous_source(0),
-        _cur_obj(nullptr) {}
+        _region_count(nregions),
+        _src_region_counts(NEW_C_HEAP_ARRAY(int, nregions, mtGC)),
+        _target_region_counts(NEW_C_HEAP_ARRAY(int, nregions, mtGC)),
+        _cur_obj(nullptr) {
+      memset(_src_region_counts, 0, nregions * sizeof(int));
+      memset(_target_region_counts, 0, nregions * sizeof(int));
+    }
+
+    ~VerifyTagClosure() {
+      FREE_C_HEAP_ARRAY(int, _src_region_counts);
+      FREE_C_HEAP_ARRAY(int, _target_region_counts);
+    }
 
     void set_cur_obj(oop obj) { _cur_obj = obj; }
 
@@ -2035,6 +2098,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       if (source_obj_array) _obj_array_source++;
       if (source_klass != nullptr && !source_array) _non_array_source++;
       if (src_continue_humongous) _continue_humongous_source++;
+      if (src_idx < _region_count) _src_region_counts[src_idx]++;
+      if (idx < _region_count) _target_region_counts[idx]++;
 
       if (_missed <= 20) {
         log_warning(gc)("VERIFY: untagged ref field=" PTR_FORMAT " -> target=" PTR_FORMAT
@@ -2071,6 +2136,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
                       _destination_source, _dirty_card_source, _clean_old_source,
                       _same_region, _array_source, _obj_array_source,
                       _non_array_source, _continue_humongous_source);
+      log_top_regions(phase, "src", _src_region_counts);
+      log_top_regions(phase, "target", _target_region_counts);
     }
   };
 
