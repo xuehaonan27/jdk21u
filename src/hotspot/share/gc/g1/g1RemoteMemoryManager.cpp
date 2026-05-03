@@ -3176,6 +3176,7 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
   uintptr_t base = (uintptr_t)dest;
   int patched = 0;
   int stale_targets = 0;
+  int stale_remapped = 0;
   bool cm_active = concurrent_marking_active();
 
   size_t obj_byte_size = et->_eviction_word_size * HeapWordSize;
@@ -3202,12 +3203,34 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
       *field_addr = 0;
       patched++;
       if (cm_active) { defer_refcount_decrement(target); } else { target->decrement_remote_refcount(); }
-    } else if (target_state == REMOTE_HANDLE_LOCAL &&
-               !validate_local_handle_addr(target, "FETCH-PATCH",
-                                           &stale_targets, 16)) {
-      *field_addr = 0;
-      patched++;
-      if (cm_active) { defer_refcount_decrement(target); } else { target->decrement_remote_refcount(); }
+    } else if (target_state == REMOTE_HANDLE_LOCAL) {
+      uintptr_t target_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      if (validate_local_handle_addr(target, "FETCH-PATCH",
+                                     &stale_targets, 16)) {
+        *field_addr = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)target;
+        patched++;
+      } else {
+        RemoteHandle* alias = handle_for_stale_eviction_addr(target_addr);
+        if (alias != nullptr && alias != target) {
+          uintptr_t alias_state =
+              alias->load_state_and_addr_acquire() & REMOTE_HANDLE_STATE_MASK;
+          if (alias_state != REMOTE_HANDLE_DEAD) {
+            alias->increment_remote_refcount();
+            if (cm_active) {
+              defer_refcount_decrement(target);
+            } else {
+              target->decrement_remote_refcount();
+            }
+            *field_addr = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)alias;
+            patched++;
+            stale_remapped++;
+            continue;
+          }
+        }
+        *field_addr = 0;
+        patched++;
+        if (cm_active) { defer_refcount_decrement(target); } else { target->decrement_remote_refcount(); }
+      }
     } else {
       // LOCAL, REMOTE, or FETCHING — write shared_oop(handle).
       // The load barrier resolves through the handle on every access,
@@ -3222,6 +3245,10 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
   if (stale_targets > 16) {
     log_warning(gc)("FETCH-PATCH: marked %d stale LOCAL target handles DEAD "
                     "(logged first 16)", stale_targets);
+  }
+  if (stale_remapped > 0) {
+    log_info(gc)("FETCH-PATCH: remapped %d stale LOCAL target handles via "
+                 "eviction aliases", stale_remapped);
   }
 
   // Enqueue dirty cards covering the fetched object into the G1 dirty card
