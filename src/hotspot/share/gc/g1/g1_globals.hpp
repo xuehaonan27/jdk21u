@@ -333,6 +333,12 @@
           "is enabled.")                                                    \
           range(0, 1024)                                                    \
                                                                             \
+  product(bool, G1RemoteDenseLastResortHighFirst, false, DIAGNOSTIC,        \
+          "When dense small-object last-resort eviction is enabled, select " \
+          "dense old regions from high heap region indices first. This is "  \
+          "a diagnostic policy for graph-shaped workloads where newer old "  \
+          "regions often reference older old regions.")                     \
+                                                                            \
   product(uint, G1RemoteEvictionAbortBackoffGCCycles, 16, DIAGNOSTIC,       \
           "Number of GC cycles to skip a region after remote eviction "      \
           "verification aborts with untagged heap refs. 0 disables the "     \

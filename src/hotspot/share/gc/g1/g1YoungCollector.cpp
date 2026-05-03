@@ -2230,7 +2230,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           dense_last_resort_cap = MIN2(dense_last_resort_cap, remaining_target);
           dense_last_resort_cap = MIN2(dense_last_resort_cap, evict_batch_cap_bytes);
 
-          for (uint i = 0; i < num_regions && dense_last_resort_cap > 0; i++) {
+          for (uint scan = 0; scan < num_regions && dense_last_resort_cap > 0; scan++) {
+            uint i = G1RemoteDenseLastResortHighFirst ? (num_regions - 1 - scan) : scan;
             if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
             if (!dense_deferred_candidates[i]) continue;
 
@@ -2261,11 +2262,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
           if (path2_dense_last_resort_candidates > 0) {
             log_info(gc)("Path 2 dense last-resort selected %d regions ("
-                         SIZE_FORMAT "MB, " SIZE_FORMAT " objs) for T%d pressure",
+                         SIZE_FORMAT "MB, " SIZE_FORMAT " objs) for T%d pressure (%s)",
                          path2_dense_last_resort_candidates,
                          path2_dense_last_resort_bytes / M,
                          path2_dense_last_resort_objects,
-                         eviction_tier);
+                         eviction_tier,
+                         G1RemoteDenseLastResortHighFirst ? "high-first" : "low-first");
           }
         }
 
