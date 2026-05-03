@@ -3585,10 +3585,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       // header(24) + N × [slot_id(8) + handle_id(8) + klass(8) + word_size(4) +
       //                    num_edges(4) + obj_bytes(ws*8) + edges(num_edges*12)]
       static const size_t BATCH_HDR_SIZE = 24;
-      static const size_t LOCAL_BATCH_BUF_SIZE = 4 * 1024 * 1024;
       const bool use_batch_evict = backend->supports_batch_evict();
+      const size_t requested_batch_buf_size =
+          MAX2((size_t)G1RemoteEvictBatchBytes, BATCH_HDR_SIZE);
       const size_t batch_buf_size =
-          MIN2(LOCAL_BATCH_BUF_SIZE, backend->max_batch_evict_message_size());
+          MIN2(requested_batch_buf_size, backend->max_batch_evict_message_size());
       const size_t max_entry_payload =
           use_batch_evict && batch_buf_size > BATCH_HDR_SIZE ?
           (batch_buf_size - BATCH_HDR_SIZE) : (size_t)-1;

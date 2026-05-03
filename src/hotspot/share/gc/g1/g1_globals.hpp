@@ -427,6 +427,11 @@
           "edge-table construction, dormant-anchor lookup, and edge-table "   \
           "publication are batched per worker.")                              \
                                                                             \
+  product(size_t, G1RemoteEvictBatchBytes, 4*M, DIAGNOSTIC,                 \
+          "Maximum JVM-side batch-eviction control message size. The "       \
+          "effective size is capped by the backend's transport message "      \
+          "buffer, e.g. RDMAMsgBufSize for RDMA.")                           \
+                                                                            \
   product(bool, UseRemoteExecutor, false, DIAGNOSTIC,                       \
           "Connect to a remote executor process for disaggregated memory "  \
           "object storage instead of local simulation (sim-remote).")       \
