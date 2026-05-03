@@ -2821,6 +2821,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           void work(uint worker_id) {
             RemoteHandleAllocBuffer hab;
             G1RemoteMemoryManager::HandleEntryAllocBuffer eab;
+            RemoteHandle* pending_head = nullptr;
+            RemoteHandle* pending_tail = nullptr;
+            size_t pending_count = 0;
             int count = 0;
             for (uint i = _claimer.offset_for_worker(worker_id); i < _num_regions; i++) {
               if (!_eviction_candidates[i]) continue;
@@ -2838,11 +2841,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 if (obj->klass_or_null() == nullptr) break;
                 size_t sz = obj->size();
                 if (sz == 0 || sz > (size_t)(region_end - p)) break;
-                _rmm->ensure_handle_for_parallel(obj, &hab, &eab);
+                _rmm->ensure_handle_for_parallel(obj, &hab, &eab,
+                                                 &pending_head, &pending_tail,
+                                                 &pending_count);
                 count++;
                 p += sz;
               }
             }
+            _rmm->link_local_handle_batch(pending_head, pending_tail, pending_count);
             Atomic::add(&_total_handles, count);
           }
           int total_handles() const { return _total_handles; }

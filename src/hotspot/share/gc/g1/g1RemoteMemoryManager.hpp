@@ -115,6 +115,10 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   void unlink_local_handle_locked(RemoteHandle* h);
   void link_local_handle(RemoteHandle* h);
   void unlink_local_handle(RemoteHandle* h);
+  void append_pending_local_handle(RemoteHandle* h,
+                                   RemoteHandle** head,
+                                   RemoteHandle** tail,
+                                   size_t* count);
 
   // Stripe locks for parallel ensure_handle_for (Phase B).
   static const int TABLE_STRIPES = 4096;
@@ -257,7 +261,10 @@ public:
   // Each worker supplies its own HandleEntryAllocBuffer (EAB) for lock-free
   // entry allocation (one alloc_lock acquisition per 256 entries).
   RemoteHandle* ensure_handle_for_parallel(oop obj, RemoteHandleAllocBuffer* hab,
-                                           HandleEntryAllocBuffer* eab) {
+                                           HandleEntryAllocBuffer* eab,
+                                           RemoteHandle** pending_head = nullptr,
+                                           RemoteHandle** pending_tail = nullptr,
+                                           size_t* pending_count = nullptr) {
     uintptr_t addr = cast_from_oop<uintptr_t>(obj);
     size_t idx = hash_obj(addr);
 
@@ -279,10 +286,14 @@ public:
     }
     RemoteHandle* h = _handle_allocator.allocate_handle(hab);
     h->initialize(cast_from_oop<void*>(obj));
-    link_local_handle(h);
     entry->init(addr, h, _table[idx]);
     _table[idx] = entry;
     stripe_unlock(idx);
+    if (pending_head != nullptr && pending_tail != nullptr && pending_count != nullptr) {
+      append_pending_local_handle(h, pending_head, pending_tail, pending_count);
+    } else {
+      link_local_handle(h);
+    }
     return h;
   }
 
@@ -964,6 +975,10 @@ public:
   // Abort a prepared eviction before it is sent to the backend.
   // Drops edge-table refcounts installed by prepare_eviction().
   void abort_prepared_eviction(PreparedEviction* entry);
+
+  // Link a per-worker chain of freshly created LOCAL handles with one global
+  // list lock acquisition. Used by parallel Phase B handle creation.
+  void link_local_handle_batch(RemoteHandle* head, RemoteHandle* tail, size_t count);
 
   // Count LOCAL handles into hr that are not among the prepared objects for
   // that region. These handles would remain LOCAL after publishing prepared

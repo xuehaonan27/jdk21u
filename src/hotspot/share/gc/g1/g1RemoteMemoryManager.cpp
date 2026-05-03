@@ -156,6 +156,44 @@ void G1RemoteMemoryManager::unlink_local_handle(RemoteHandle* h) {
   local_handle_unlock();
 }
 
+void G1RemoteMemoryManager::append_pending_local_handle(RemoteHandle* h,
+                                                        RemoteHandle** head,
+                                                        RemoteHandle** tail,
+                                                        size_t* count) {
+  if (h == nullptr || head == nullptr || tail == nullptr || count == nullptr) {
+    return;
+  }
+  assert(!h->_local_listed, "fresh handle must not already be listed");
+  h->_local_prev = *tail;
+  h->_local_next = nullptr;
+  h->_local_listed = true;
+  if (*tail != nullptr) {
+    (*tail)->_local_next = h;
+  } else {
+    *head = h;
+  }
+  *tail = h;
+  (*count)++;
+}
+
+void G1RemoteMemoryManager::link_local_handle_batch(RemoteHandle* head,
+                                                    RemoteHandle* tail,
+                                                    size_t count) {
+  if (head == nullptr || tail == nullptr || count == 0) {
+    return;
+  }
+
+  local_handle_lock();
+  head->_local_prev = nullptr;
+  tail->_local_next = _local_handles_head;
+  if (_local_handles_head != nullptr) {
+    _local_handles_head->_local_prev = tail;
+  }
+  _local_handles_head = head;
+  _local_handle_count += count;
+  local_handle_unlock();
+}
+
 void G1RemoteMemoryManager::publish_local_handle(RemoteHandle* h, void* local_addr) {
   if (h == nullptr) {
     return;
