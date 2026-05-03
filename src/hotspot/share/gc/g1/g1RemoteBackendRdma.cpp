@@ -65,7 +65,16 @@ struct RdmaQPInfo {
     uint32_t rkey;
     uint64_t base_addr;
     uint64_t arena_size;
+    uint8_t  active_mtu;
 } __attribute__((packed));
+
+static enum ibv_mtu choose_path_mtu(uint8_t local_mtu, uint8_t remote_mtu) {
+  uint8_t mtu = local_mtu < remote_mtu ? local_mtu : remote_mtu;
+  if (mtu < IBV_MTU_256 || mtu > IBV_MTU_4096) {
+    return IBV_MTU_1024;
+  }
+  return (enum ibv_mtu)mtu;
+}
 
 // ================================================================
 // TCP helpers for bootstrap
@@ -262,6 +271,7 @@ bool RDMAExecutorBackend::exchange_qp_info() {
   local_info.qpn = _qp->qp_num;
   local_info.psn = local_psn;
   local_info.lid = port_attr.lid;
+  local_info.active_mtu = (uint8_t)port_attr.active_mtu;
   memcpy(local_info.gid, &gid, 16);
   local_info.rkey = _local_mr->rkey;
   local_info.base_addr = (uint64_t)_local_mr->addr;
@@ -279,12 +289,15 @@ bool RDMAExecutorBackend::exchange_qp_info() {
   log_info(gc)("RDMA: local QP=%u PSN=%u LID=%u, remote QP=%u PSN=%u LID=%u rkey=0x%x",
                local_info.qpn, local_info.psn, local_info.lid,
                remote_info.qpn, remote_info.psn, remote_info.lid, remote_info.rkey);
+  enum ibv_mtu path_mtu = choose_path_mtu(local_info.active_mtu, remote_info.active_mtu);
+  log_info(gc)("RDMA: path MTU enum=%d (local=%u remote=%u)",
+               path_mtu, local_info.active_mtu, remote_info.active_mtu);
 
   // Transition QP: INIT → RTR
   struct ibv_qp_attr rtr_attr;
   memset(&rtr_attr, 0, sizeof(rtr_attr));
   rtr_attr.qp_state = IBV_QPS_RTR;
-  rtr_attr.path_mtu = IBV_MTU_1024;
+  rtr_attr.path_mtu = path_mtu;
   rtr_attr.dest_qp_num = remote_info.qpn;
   rtr_attr.rq_psn = remote_info.psn;
   rtr_attr.max_dest_rd_atomic = 1;
