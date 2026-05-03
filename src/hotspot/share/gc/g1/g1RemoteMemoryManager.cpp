@@ -1027,20 +1027,26 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
   uintptr_t end = (uintptr_t)hr->end();
   int blockers = 0;
 
-  for (RemoteHandle* h = _local_handles_head; h != nullptr; h = h->_local_next) {
-    uintptr_t sa = h->load_state_and_addr_acquire();
-    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-    if (state == REMOTE_HANDLE_LOCAL) {
-      uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
-      if (addr >= bottom && addr < end &&
-          !prepared_entries_contain_handle(entries, start, count, addr, h)) {
-        blockers++;
-        if (blockers <= log_limit) {
-          log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
-                          PTR_FORMAT " local=" PTR_FORMAT
-                          " dormant=%d rc=%u",
-                          hr->hrm_index(), p2i(h), addr,
-                          h->is_dormant() ? 1 : 0, h->remote_refcount());
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+      RemoteHandle* h = e->_handle;
+      if (h == nullptr) continue;
+
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_LOCAL) {
+        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+        if (addr >= bottom && addr < end &&
+            !prepared_entries_contain_handle(entries, start, count, addr, h)) {
+          blockers++;
+          if (blockers <= log_limit) {
+            log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
+                            PTR_FORMAT " local=" PTR_FORMAT
+                            " listed=%d dormant=%d rc=%u",
+                            hr->hrm_index(), p2i(h), addr,
+                            h->_local_listed ? 1 : 0,
+                            h->is_dormant() ? 1 : 0, h->remote_refcount());
+          }
         }
       }
     }
@@ -1113,8 +1119,9 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
               if (blockers <= _log_limit) {
                 log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
                                 PTR_FORMAT " local=" PTR_FORMAT
-                                " dormant=%d rc=%u",
+                                " listed=%d dormant=%d rc=%u",
                                 ridx, p2i(h), addr,
+                                h->_local_listed ? 1 : 0,
                                 h->is_dormant() ? 1 : 0, h->remote_refcount());
               }
             }
@@ -1129,8 +1136,10 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
   UnpreparedLocalHandleClosure cl(this, eviction_candidates, region_complete,
                                   region_start, region_count, num_regions,
                                   entries, blockers_by_region, log_limit);
-  for (RemoteHandle* h = _local_handles_head; h != nullptr; h = h->_local_next) {
-    cl.do_handle(h);
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+      cl.do_handle(e->_handle);
+    }
   }
   return cl.total_blockers();
 }
@@ -3105,8 +3114,9 @@ int G1RemoteMemoryManager::count_local_handles_in_region(HeapRegion* hr, int log
           if (_count <= _log_limit) {
             log_warning(gc)("LOCAL handle blocks eviction free: region=%u handle=" PTR_FORMAT
                             " local=" PTR_FORMAT
-                            " dormant=%d rc=%u",
+                            " listed=%d dormant=%d rc=%u",
                             _region_idx, p2i(h), addr,
+                            h->_local_listed ? 1 : 0,
                             h->is_dormant() ? 1 : 0, h->remote_refcount());
           }
         }
@@ -3117,8 +3127,10 @@ int G1RemoteMemoryManager::count_local_handles_in_region(HeapRegion* hr, int log
   };
 
   CountLocalHandleClosure cl(bottom, end, hr->hrm_index(), log_limit);
-  for (RemoteHandle* h = _local_handles_head; h != nullptr; h = h->_local_next) {
-    cl.do_handle(h);
+  for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
+    for (HandleEntry* e = _table[idx]; e != nullptr; e = e->_next) {
+      cl.do_handle(e->_handle);
+    }
   }
   return cl.count();
 }

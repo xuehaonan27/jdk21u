@@ -3576,6 +3576,60 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                    finish_failed_regions, finish_failed_aborted, finish_workers,
                    G1RemoteParallelFinishEviction ? 1 : 0);
 
+      // E1.8: Edge-table construction can create new dormant anchors for
+      // outgoing references. Re-run the unprepared-handle guard after those
+      // anchors are published and before any backend send or fillerization.
+      int post_edge_guarded_regions = 0;
+      int post_edge_guarded_entries = 0;
+      int post_edge_blockers = 0;
+      int* post_edge_blockers_by_region = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
+      rmm->count_unprepared_local_handles_in_regions(eviction_candidates,
+                                                     region_complete,
+                                                     region_start,
+                                                     region_count_arr,
+                                                     num_regions,
+                                                     entries,
+                                                     post_edge_blockers_by_region,
+                                                     4);
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        if (!region_complete[i]) continue;
+
+        int blockers = post_edge_blockers_by_region[i];
+        if (blockers == 0) continue;
+
+        int start = region_start[i];
+        int rcount = region_count_arr[i];
+        for (int e = start; e < start + rcount; e++) {
+          if (entry_active[e]) {
+            rmm->abort_prepared_eviction(&entries[e]);
+            entries[e].slot_id = (size_t)-1;
+            entry_active[e] = false;
+            post_edge_guarded_entries++;
+          }
+        }
+
+        HeapRegion* hr = _g1h->region_at(i);
+        eviction_candidates[i] = false;
+        region_complete[i] = false;
+        region_count_arr[i] = 0;
+        hr->clear_cold_destination();
+        regions_kept_alive++;
+        total_candidates--;
+        post_edge_guarded_regions++;
+        post_edge_blockers += blockers;
+        log_warning(gc)("Post-edge local-handle guard: removed candidate region %u "
+                        "with %d unprepared LOCAL handles before backend send",
+                        hr->hrm_index(), blockers);
+      }
+      FREE_C_HEAP_ARRAY(int, post_edge_blockers_by_region);
+      if (post_edge_guarded_regions > 0) {
+        log_warning(gc)("Post-edge local-handle guard: removed %d regions, aborted %d "
+                        "finished entries, found %d blocking LOCAL handles",
+                        post_edge_guarded_regions, post_edge_guarded_entries,
+                        post_edge_blockers);
+      }
+
       // E2: Batch-send to remote backend.
       Ticks e2_start = Ticks::now();
       G1RemoteBackend* backend = rmm->backend();

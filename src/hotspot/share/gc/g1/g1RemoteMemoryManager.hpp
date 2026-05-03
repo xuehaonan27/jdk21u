@@ -444,17 +444,18 @@ public:
     uintptr_t old_addr = cast_from_oop<uintptr_t>(old_obj);
     uintptr_t new_addr = cast_from_oop<uintptr_t>(new_obj);
     size_t old_idx = hash_obj(old_addr);
+    size_t new_idx = hash_obj(new_addr);
 
     table_lock();
     HandleEntry** pp = &_table[old_idx];
     while (*pp != nullptr) {
-      if ((*pp)->_obj_addr == old_addr &&
-          (expected_h == nullptr || (*pp)->_handle == expected_h)) {
-        HandleEntry* entry = *pp;
+      HandleEntry* entry = *pp;
+      if (entry->_obj_addr == old_addr &&
+          (expected_h == nullptr || entry->_handle == expected_h)) {
         // Only rekey LOCAL handles. REMOTE/DEAD entries are stale —
         // the address was reused after the original object's region was freed.
         if (!entry->_handle->is_local()) {
-          pp = &((*pp)->_next);
+          pp = &(entry->_next);
           continue;
         }
         *pp = entry->_next;  // unlink from old bucket
@@ -462,20 +463,22 @@ public:
         entry->_handle->set_local(cast_from_oop<void*>(new_obj));
 
         entry->_obj_addr = new_addr;
-        size_t new_idx = hash_obj(new_addr);
         entry->_next = _table[new_idx];
         _table[new_idx] = entry;
 
-        table_unlock();
-        return;
+        if (expected_h != nullptr) {
+          table_unlock();
+          return;
+        }
+        continue;
       }
-      pp = &((*pp)->_next);
+      pp = &(entry->_next);
     }
     if (expected_h != nullptr && expected_h->is_local()) {
       expected_h->set_local(cast_from_oop<void*>(new_obj));
       HandleEntry* entry = alloc_entry();
-      entry->init(new_addr, expected_h, _table[hash_obj(new_addr)]);
-      _table[hash_obj(new_addr)] = entry;
+      entry->init(new_addr, expected_h, _table[new_idx]);
+      _table[new_idx] = entry;
     }
     table_unlock();
   }
