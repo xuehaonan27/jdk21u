@@ -2831,7 +2831,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       // ---- Phase C.5: Verify no untagged refs remain ----
       if (G1RemoteVerifyEvictionRefs) {
         Ticks phase_c5_start = Ticks::now();
-        int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates, num_regions);
+        int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates,
+                                                                  num_regions,
+                                                                  _pre_evac_tops);
         double phase_c5_ms = (Ticks::now() - phase_c5_start).seconds() * 1000.0;
         log_info(gc)("Phase C.5 verify: %.1fms (%d missed heap refs)", phase_c5_ms, missed);
         if (missed > 0) {

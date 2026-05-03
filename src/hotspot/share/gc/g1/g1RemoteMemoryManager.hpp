@@ -1030,7 +1030,8 @@ public:
                                     HeapWord* const* pre_evac_tops,
                                     WorkerThreads* workers = nullptr, uint num_workers = 0);
 
-  int verify_no_untagged_refs_to_eviction_set(const bool* eviction_set, uint num_regions);
+  int verify_no_untagged_refs_to_eviction_set(const bool* eviction_set, uint num_regions,
+                                              HeapWord* const* pre_evac_tops = nullptr);
 
   // Untag all tagged oop fields in the heap. Called on eviction abort to
   // restore clean oops, preventing barrier gaps from causing crashes.

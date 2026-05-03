@@ -1928,18 +1928,41 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
 }
 
 int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
-    const bool* eviction_set, uint num_regions) {
+    const bool* eviction_set, uint num_regions,
+    HeapWord* const* pre_evac_tops) {
 
   class VerifyTagClosure : public BasicOopIterateClosure {
     G1CollectedHeap*       _g1h;
+    G1CardTable*           _ct;
     const bool*            _eviction_set;
     uint                   _num_regions;
+    HeapWord* const*       _pre_evac_tops;
     int                    _missed;
+    int                    _heap_source;
+    int                    _root_source;
+    int                    _candidate_source;
+    int                    _young_source;
+    int                    _destination_source;
+    int                    _direct_scanned_source;
+    int                    _dirty_card_source;
+    int                    _clean_old_source;
+    int                    _same_region;
+    int                    _array_source;
+    int                    _obj_array_source;
+    int                    _non_array_source;
+    int                    _continue_humongous_source;
     oop                    _cur_obj;
   public:
-    VerifyTagClosure(G1CollectedHeap* g1h, const bool* eset, uint nregions)
-      : _g1h(g1h), _eviction_set(eset), _num_regions(nregions),
-        _missed(0), _cur_obj(nullptr) {}
+    VerifyTagClosure(G1CollectedHeap* g1h, const bool* eset, uint nregions,
+                     HeapWord* const* pre_evac_tops)
+      : _g1h(g1h), _ct(g1h->card_table()), _eviction_set(eset),
+        _num_regions(nregions), _pre_evac_tops(pre_evac_tops),
+        _missed(0), _heap_source(0), _root_source(0),
+        _candidate_source(0), _young_source(0), _destination_source(0),
+        _direct_scanned_source(0), _dirty_card_source(0), _clean_old_source(0),
+        _same_region(0), _array_source(0), _obj_array_source(0),
+        _non_array_source(0), _continue_humongous_source(0),
+        _cur_obj(nullptr) {}
 
     void set_cur_obj(oop obj) { _cur_obj = obj; }
 
@@ -1965,17 +1988,71 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       // Root-catch relocated objects have forwarding pointers — OK
       if (target->is_forwarded()) return;
 
+      HeapRegion* src_hr = (_cur_obj != nullptr && _g1h->is_in(_cur_obj))
+        ? _g1h->heap_region_containing(_cur_obj) : nullptr;
+      uint src_idx = src_hr != nullptr ? src_hr->hrm_index() : (uint)-1;
+      bool src_candidate = src_idx < _num_regions && _eviction_set[src_idx];
+      bool src_young = src_hr != nullptr && src_hr->is_young();
+      bool src_destination = false;
+      if (src_hr != nullptr &&
+          src_idx < _num_regions &&
+          _pre_evac_tops != nullptr &&
+          _pre_evac_tops[src_idx] != nullptr &&
+          _pre_evac_tops[src_idx] < src_hr->top() &&
+          !src_hr->is_empty() &&
+          !src_hr->is_continues_humongous()) {
+        src_destination = true;
+      }
+      bool src_direct = src_candidate || src_young || src_destination;
+      bool src_continue_humongous = src_hr != nullptr && src_hr->is_continues_humongous();
+
+      int card_val = -1;
+      bool src_dirty_card = false;
+      if (src_hr != nullptr && _g1h->is_in((void*)p)) {
+        CardTable::CardValue* card = _ct->byte_for((HeapWord*)p);
+        card_val = (int)(*card);
+        src_dirty_card = (*card == G1CardTable::dirty_card_val());
+      }
+
+      Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
+      bool source_array = source_klass != nullptr && source_klass->is_array_klass();
+      bool source_obj_array = source_klass != nullptr && source_klass->is_objArray_klass();
+
       _missed++;
+      if (src_hr != nullptr) {
+        _heap_source++;
+      } else {
+        _root_source++;
+      }
+      if (src_candidate) _candidate_source++;
+      if (src_young) _young_source++;
+      if (src_destination) _destination_source++;
+      if (src_direct) _direct_scanned_source++;
+      if (src_dirty_card) _dirty_card_source++;
+      if (!src_direct && src_hr != nullptr && !src_dirty_card && !src_young) _clean_old_source++;
+      if (src_idx == idx) _same_region++;
+      if (source_array) _array_source++;
+      if (source_obj_array) _obj_array_source++;
+      if (source_klass != nullptr && !source_array) _non_array_source++;
+      if (src_continue_humongous) _continue_humongous_source++;
+
       if (_missed <= 20) {
-        HeapRegion* src_hr = (_cur_obj != nullptr && _g1h->is_in(_cur_obj))
-          ? _g1h->heap_region_containing(_cur_obj) : nullptr;
         log_warning(gc)("VERIFY: untagged ref field=" PTR_FORMAT " -> target=" PTR_FORMAT
                         " in candidate region %u, src_obj=" PTR_FORMAT " klass=%s src_region=%u"
-                        " raw=0x%lx",
+                        " src_type=%s src_candidate=%s src_young=%s src_destination=%s"
+                        " src_direct=%s card=0x%02x dirty=%s same_region=%s raw=0x%lx",
                         p2i(p), p2i((void*)target), idx,
                         p2i((void*)_cur_obj),
-                        (_cur_obj != nullptr ? _cur_obj->klass()->external_name() : "root"),
+                        (source_klass != nullptr ? source_klass->external_name() : "root"),
                         (src_hr != nullptr ? src_hr->hrm_index() : 9999),
+                        (src_hr != nullptr ? src_hr->get_short_type_str() : "?"),
+                        src_candidate ? "yes" : "no",
+                        src_young ? "yes" : "no",
+                        src_destination ? "yes" : "no",
+                        src_direct ? "yes" : "no",
+                        (unsigned)card_val & 0xff,
+                        src_dirty_card ? "yes" : "no",
+                        (src_idx == idx) ? "yes" : "no",
                         (unsigned long)raw);
       }
     }
@@ -1983,9 +2060,21 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
 
     int missed() const { return _missed; }
+    void log_summary(const char* phase, int phase_missed) const {
+      if (phase_missed <= 0) return;
+      log_warning(gc)("VERIFY detail (%s): missed=%d heap_src=%d root_src=%d "
+                      "direct_src=%d candidate_src=%d young_src=%d dest_src=%d "
+                      "dirty_card_src=%d clean_old_src=%d same_region=%d "
+                      "array_src=%d obj_array_src=%d non_array_src=%d cont_hum_src=%d",
+                      phase, phase_missed, _heap_source, _root_source,
+                      _direct_scanned_source, _candidate_source, _young_source,
+                      _destination_source, _dirty_card_source, _clean_old_source,
+                      _same_region, _array_source, _obj_array_source,
+                      _non_array_source, _continue_humongous_source);
+    }
   };
 
-  VerifyTagClosure cl(_g1h, eviction_set, num_regions);
+  VerifyTagClosure cl(_g1h, eviction_set, num_regions, pre_evac_tops);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
 
   class VerifyObjectClosure {
@@ -2009,6 +2098,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
   }
 
   int heap_missed = cl.missed();
+  cl.log_summary("heap", heap_missed);
 
   // 2. Verify roots (informational only — root refs are handled by
   // root-catch relocation and Pre-E guard, not by Phase C tagging).
