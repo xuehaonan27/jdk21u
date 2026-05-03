@@ -506,6 +506,12 @@ void G1RemoteMemoryManager::ensure_fast_phase_c_source_hint_capacity(uint num_re
   _fast_phase_c_source_hint_capacity = new_cap;
 }
 
+bool G1RemoteMemoryManager::is_fast_phase_c_source_hint(uint region_idx) const {
+  return G1RemoteUseFastPhaseCSourceHints &&
+         region_idx < _fast_phase_c_source_hint_capacity &&
+         _fast_phase_c_source_hints[region_idx];
+}
+
 bool G1RemoteMemoryManager::remember_fast_phase_c_source_hint(uint region_idx) {
   if (!G1RemoteUseFastPhaseCSourceHints ||
       G1RemoteFastPhaseCSourceHintMaxRegions == 0 ||

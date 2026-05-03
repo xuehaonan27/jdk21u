@@ -840,11 +840,7 @@ public:
            _eviction_backoff_until_epoch[region_idx] > _gc_epoch;
   }
   void backoff_eviction_region(uint region_idx, uint gc_cycles);
-  bool is_fast_phase_c_source_hint(uint region_idx) const {
-    return G1RemoteUseFastPhaseCSourceHints &&
-           region_idx < _fast_phase_c_source_hint_capacity &&
-           _fast_phase_c_source_hints[region_idx];
-  }
+  bool is_fast_phase_c_source_hint(uint region_idx) const;
   bool remember_fast_phase_c_source_hint(uint region_idx);
   uint fast_phase_c_source_hint_count() const { return _fast_phase_c_source_hint_count; }
 
