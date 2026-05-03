@@ -339,6 +339,13 @@
           "a diagnostic policy for graph-shaped workloads where newer old "  \
           "regions often reference older old regions.")                     \
                                                                             \
+  product(bool, G1RemoteDenseRefillAfterStackGuard, false, DIAGNOSTIC,      \
+          "After the conservative Pre-D raw-stack guard removes dense "      \
+          "last-resort eviction candidates, refill the candidate set from "  \
+          "other deferred dense regions that had no raw stack words. This "  \
+          "is diagnostic and remains guarded by normal root and verifier "   \
+          "checks.")                                                        \
+                                                                            \
   product(uint, G1RemoteEvictionAbortBackoffGCCycles, 16, DIAGNOSTIC,       \
           "Number of GC cycles to skip a region after remote eviction "      \
           "verification aborts with untagged heap refs. 0 disables the "     \

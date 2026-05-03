@@ -1198,10 +1198,12 @@ static void dirty_root_catch_region(G1CollectedHeap* g1h, HeapRegion* root_catch
 static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
                                                     bool* eviction_candidates,
                                                     uint num_regions,
-                                                    const char* log_prefix) {
+                                                    const char* log_prefix,
+                                                    bool* raw_stack_regions = nullptr) {
   class RawStackGuardClosure : public ThreadClosure {
     G1CollectedHeap* _g1h;
     bool*            _eviction_candidates;
+    bool*            _raw_stack_regions;
     uint             _num_regions;
     int              _regions_guarded;
     int              _stack_words_found;
@@ -1232,6 +1234,9 @@ static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
 
       uint idx = hr->hrm_index();
       if (idx >= _num_regions) return false;
+      if (_raw_stack_regions != nullptr) {
+        _raw_stack_regions[idx] = true;
+      }
 
       if (_eviction_candidates[idx]) {
         _eviction_candidates[idx] = false;
@@ -1253,8 +1258,10 @@ static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
 
   public:
     RawStackGuardClosure(G1CollectedHeap* g1h, bool* candidates,
+                         bool* raw_stack_regions,
                          uint num_regions, const char* log_prefix)
-      : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
+      : _g1h(g1h), _eviction_candidates(candidates),
+        _raw_stack_regions(raw_stack_regions), _num_regions(num_regions),
         _regions_guarded(0), _stack_words_found(0), _threads_scanned(0),
         _words_scanned(0), _reports_left(32), _log_prefix(log_prefix) {}
 
@@ -1290,7 +1297,8 @@ static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
     size_t words_scanned() const { return _words_scanned; }
   };
 
-  RawStackGuardClosure raw_stack_cl(g1h, eviction_candidates, num_regions, log_prefix);
+  RawStackGuardClosure raw_stack_cl(g1h, eviction_candidates, raw_stack_regions,
+                                    num_regions, log_prefix);
   Threads::java_threads_do(&raw_stack_cl);
   if (raw_stack_cl.regions_guarded() > 0) {
     log_info(gc)("%s: removed %d candidate regions with %d stack words "
@@ -1929,6 +1937,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // ---- Phase A: Collect eviction candidates ----
     bool* eviction_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
     memset(eviction_candidates, 0, num_regions * sizeof(bool));
+    bool* dense_deferred_candidates = nullptr;
+    bool dense_refill_after_stack_guard = false;
+    uint dense_refill_region_cap = 0;
     int path1_candidates = 0;
     int path2_candidates = 0;
 
@@ -2091,7 +2102,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           G1RemoteAllowDenseObjectEviction;
         bool unlimited = false;
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
-        bool* dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+        dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
         memset(dense_deferred_candidates, 0, num_regions * sizeof(bool));
 
         // Prefer old regions whose sampled objects have stale hotness epochs.
@@ -2225,6 +2236,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (allow_dense_object_granularity_eviction &&
             eviction_tier >= 2 && path2_bytes < evict_target_bytes) {
           uint dense_region_cap = eviction_tier >= 3 ? G1RemoteDenseT3Regions : G1RemoteDenseT2Regions;
+          dense_refill_after_stack_guard = G1RemoteDenseRefillAfterStackGuard;
+          dense_refill_region_cap = dense_region_cap;
           size_t dense_last_resort_cap = HeapRegion::GrainBytes * (size_t)dense_region_cap;
           size_t remaining_target = evict_target_bytes - path2_bytes;
           dense_last_resort_cap = MIN2(dense_last_resort_cap, remaining_target);
@@ -2278,7 +2291,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        path2_fallback_bytes / M, eviction_tier);
         }
 
-        FREE_C_HEAP_ARRAY(bool, dense_deferred_candidates);
       }
     }
 
@@ -2301,11 +2313,72 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // stubs become mutator-visible. Guard stack-held regions before any
     // relocation so kept-local regions remain untouched.
     if (total_candidates > 0) {
+      bool* raw_stack_guarded_regions = nullptr;
+      if (dense_refill_after_stack_guard && dense_deferred_candidates != nullptr) {
+        raw_stack_guarded_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+        memset(raw_stack_guarded_regions, 0, num_regions * sizeof(bool));
+      }
+
       int raw_guarded = guard_eviction_candidates_with_raw_stack(
-          _g1h, eviction_candidates, num_regions, "Pre-D raw stack guard");
+          _g1h, eviction_candidates, num_regions, "Pre-D raw stack guard",
+          raw_stack_guarded_regions);
       if (raw_guarded > 0) {
         total_candidates -= raw_guarded;
       }
+
+      if (raw_guarded > 0 &&
+          dense_refill_after_stack_guard &&
+          dense_deferred_candidates != nullptr &&
+          dense_refill_region_cap > 0) {
+        uint refill_budget = MIN2((uint)raw_guarded, dense_refill_region_cap);
+        int refilled = 0;
+        size_t refill_bytes = 0;
+        size_t refill_objects = 0;
+
+        for (uint scan = 0; scan < num_regions && (uint)refilled < refill_budget; scan++) {
+          uint i = G1RemoteDenseLastResortHighFirst ? (num_regions - 1 - scan) : scan;
+          if (!dense_deferred_candidates[i]) continue;
+          if (raw_stack_guarded_regions != nullptr && raw_stack_guarded_regions[i]) continue;
+
+          HeapRegion* hr = _g1h->region_at(i);
+          if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
+          if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
+          if (eviction_candidates[i]) continue;
+          if (rmm != nullptr && rmm->is_region_in_eviction_backoff(i)) continue;
+
+          RegionColdnessSample region_sample;
+          if (rmm != nullptr) {
+            (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
+            if (!region_sample.dense_small_objects) continue;
+          }
+
+          hr->set_cold_destination();
+          eviction_candidates[i] = true;
+          path2_candidates++;
+          total_candidates++;
+          refilled++;
+          refill_bytes += hr->used();
+          refill_objects += region_sample.object_count;
+        }
+
+        if (refilled > 0) {
+          log_info(gc)("Pre-D dense refill: added %d replacement regions ("
+                       SIZE_FORMAT "MB, " SIZE_FORMAT " objs) after %d stack-guard removals (%s)",
+                       refilled, refill_bytes / M, refill_objects, raw_guarded,
+                       G1RemoteDenseLastResortHighFirst ? "high-first" : "low-first");
+        } else {
+          log_info(gc)("Pre-D dense refill: no replacement regions found after %d stack-guard removals",
+                       raw_guarded);
+        }
+      }
+
+      if (raw_stack_guarded_regions != nullptr) {
+        FREE_C_HEAP_ARRAY(bool, raw_stack_guarded_regions);
+      }
+    }
+
+    if (dense_deferred_candidates != nullptr) {
+      FREE_C_HEAP_ARRAY(bool, dense_deferred_candidates);
     }
 
     // ---- Phase D: Root-catch relocation ----
