@@ -1208,9 +1208,9 @@ public:
 // Template implementation — must be in header for instantiation.
 template <typename OopClosureType>
 void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
-  // Walk only currently LOCAL handles. The allocator keeps every handle ever
-  // allocated, including REMOTE/DEAD entries, which makes root processing grow
-  // with eviction history instead of the live local anchor set.
+  // Walk the allocator, not the intrusive LOCAL list. A missed list link must
+  // not make a remote edge anchor invisible to root processing; stale anchors
+  // are correctness-critical because fetch-time edge patching trusts them.
   //
   // For each anchor (LOCAL + remote_refcount > 0), call cl->do_oop. If GC
   // moves the object, update the primary Handle immediately. Do not rebuild the
@@ -1251,12 +1251,7 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
   };
 
   AnchorHandleClosure hcl(this, cl);
-  RemoteHandle* h = _local_handles_head;
-  while (h != nullptr) {
-    RemoteHandle* next = h->_local_next;
-    hcl.do_handle(h);
-    h = next;
-  }
+  _handle_allocator.handles_do(&hcl);
 
   if (hcl.stale_anchors() > 16) {
     log_warning(gc)("STALE-ANCHOR: marked %d stale LOCAL anchor handles DEAD "

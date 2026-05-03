@@ -3659,88 +3659,135 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
 
 int G1RemoteMemoryManager::fixup_all_local_handles() {
   Ticks start = Ticks::now();
-  int updated = 0;
-  size_t scanned = 0;
-  size_t local_seen = 0;
-  size_t stale_region = 0;
-  int stale_killed = 0;
 
-  log_info(gc)("Handle table fixup START: local_handles=%zu tagged_entries=%d",
-               _local_handle_count, _tagged_field_count);
+  class FixupLocalHandleClosure {
+    G1RemoteMemoryManager* _rmm;
+    int _updated;
+    size_t _scanned;
+    size_t _local_seen;
+    size_t _stale_region;
+    int _stale_killed;
 
-  RemoteHandle* h = _local_handles_head;
-  while (h != nullptr) {
-    RemoteHandle* next = h->_local_next;
-    scanned++;
-    uintptr_t sa = h->load_state_and_addr_acquire();
-    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-    if (state == REMOTE_HANDLE_LOCAL) {
-      local_seen++;
+  public:
+    FixupLocalHandleClosure(G1RemoteMemoryManager* rmm)
+      : _rmm(rmm), _updated(0), _scanned(0), _local_seen(0),
+        _stale_region(0), _stale_killed(0) {}
 
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_DEAD && h->remote_refcount() == 0) return;
+
+      _scanned++;
+      if (state != REMOTE_HANDLE_LOCAL) return;
+
+      _local_seen++;
       uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
-      if (!validate_local_handle_addr(h, "HANDLE-FIXUP",
-                                      &stale_killed, 16)) {
-        stale_region++;
-      } else {
-        oop target = cast_to_oop(addr);
-        markWord m = target->mark();
-        if (m.is_marked()) {
-          oop forwardee = cast_to_oop(m.decode_pointer());
-          update_handle_for_evacuation(h, target, forwardee);
-          updated++;
-        }
+      if (!_rmm->validate_local_handle_addr(h, "HANDLE-FIXUP",
+                                            &_stale_killed, 16)) {
+        _stale_region++;
+        return;
+      }
+
+      oop target = cast_to_oop(addr);
+      markWord m = target->mark();
+      if (m.is_marked()) {
+        oop forwardee = cast_to_oop(m.decode_pointer());
+        _rmm->update_handle_for_evacuation(h, target, forwardee);
+        _updated++;
       }
     }
-    h = next;
-  }
+
+    int updated() const { return _updated; }
+    size_t scanned() const { return _scanned; }
+    size_t local_seen() const { return _local_seen; }
+    size_t stale_region() const { return _stale_region; }
+    int stale_killed() const { return _stale_killed; }
+  };
+
+  log_info(gc)("Handle table fixup START: local_handles=%zu allocated_handles=%zu "
+               "tagged_entries=%d",
+               _local_handle_count, _handle_allocator.total_handles_allocated(),
+               _tagged_field_count);
+
+  FixupLocalHandleClosure cl(this);
+  _handle_allocator.handles_do(&cl);
 
   double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
   log_info(gc)("Handle table fixup DONE: %.1fms scanned=%zu local=%zu updated=%d "
-               "stale_region=%zu stale_killed=%d local_handles=%zu",
-               elapsed_ms, scanned, local_seen, updated,
-               stale_region, stale_killed, _local_handle_count);
-  if (stale_killed > 16) {
+               "stale_region=%zu stale_killed=%d local_handles=%zu allocated_handles=%zu",
+               elapsed_ms, cl.scanned(), cl.local_seen(), cl.updated(),
+               cl.stale_region(), cl.stale_killed(), _local_handle_count,
+               _handle_allocator.total_handles_allocated());
+  if (cl.stale_killed() > 16) {
     log_warning(gc)("Handle table fixup marked %d stale LOCAL handles DEAD "
-                    "(logged first 16)", stale_killed);
+                    "(logged first 16)", cl.stale_killed());
   }
   if (elapsed_ms > 1000.0) {
     log_warning(gc)("Handle table fixup took %.1fms for %zu entries "
                     "(local_handles=%zu)",
-                    elapsed_ms, scanned, _local_handle_count);
-  } else if (updated > 0) {
-    log_info(gc)("Handle table fixup: %d LOCAL handles updated for forwarded objects", updated);
+                    elapsed_ms, cl.scanned(), _local_handle_count);
+  } else if (cl.updated() > 0) {
+    log_info(gc)("Handle table fixup: %d LOCAL handles updated for forwarded objects",
+                 cl.updated());
   }
-  return updated;
+  return cl.updated();
 }
 
 int G1RemoteMemoryManager::purge_stale_local_handles(const char* phase, int log_limit) {
   Ticks start = Ticks::now();
-  size_t scanned = 0;
-  size_t local_seen = 0;
-  int stale_killed = 0;
 
-  RemoteHandle* h = _local_handles_head;
-  while (h != nullptr) {
-    RemoteHandle* next = h->_local_next;
-    scanned++;
-    if (h->is_local()) {
-      local_seen++;
-      validate_local_handle_addr(h,
-                                 phase == nullptr ? "STALE-HANDLE-SWEEP" : phase,
-                                 &stale_killed,
-                                 log_limit);
+  class PurgeStaleLocalHandleClosure {
+    G1RemoteMemoryManager* _rmm;
+    const char* _phase;
+    int _log_limit;
+    size_t _scanned;
+    size_t _local_seen;
+    int _stale_killed;
+
+  public:
+    PurgeStaleLocalHandleClosure(G1RemoteMemoryManager* rmm,
+                                 const char* phase,
+                                 int log_limit)
+      : _rmm(rmm), _phase(phase), _log_limit(log_limit),
+        _scanned(0), _local_seen(0), _stale_killed(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_DEAD && h->remote_refcount() == 0) return;
+
+      _scanned++;
+      if (state != REMOTE_HANDLE_LOCAL) return;
+
+      _local_seen++;
+      _rmm->validate_local_handle_addr(h,
+                                       _phase == nullptr ? "STALE-HANDLE-SWEEP" : _phase,
+                                       &_stale_killed,
+                                       _log_limit);
     }
-    h = next;
-  }
 
-  if (stale_killed > 0) {
+    size_t scanned() const { return _scanned; }
+    size_t local_seen() const { return _local_seen; }
+    int stale_killed() const { return _stale_killed; }
+  };
+
+  PurgeStaleLocalHandleClosure cl(this, phase, log_limit);
+  _handle_allocator.handles_do(&cl);
+
+  if (cl.stale_killed() > 0) {
     double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
     log_warning(gc)("%s: marked %d stale LOCAL handles DEAD in %.1fms "
-                    "(scanned=%zu local=%zu)",
+                    "(scanned=%zu local=%zu allocated_handles=%zu)",
                     phase == nullptr ? "STALE-HANDLE-SWEEP" : phase,
-                    stale_killed, elapsed_ms, scanned, local_seen);
+                    cl.stale_killed(), elapsed_ms, cl.scanned(), cl.local_seen(),
+                    _handle_allocator.total_handles_allocated());
   }
-  return stale_killed;
+  return cl.stale_killed();
 }
 
 static bool is_valid_region_object(G1CollectedHeap* g1h, oop obj, HeapRegion** region_out = nullptr) {
