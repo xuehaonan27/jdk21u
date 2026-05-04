@@ -321,6 +321,26 @@
           "eviction starts in LocalMemoryRatio mode.")                      \
           range(1, 100)                                                     \
                                                                             \
+  product(uint, G1RemoteTier2TargetPercent, 70, DIAGNOSTIC,                 \
+          "Local/cgroup pressure percentage tier 2 tries to return to "      \
+          "after remote eviction starts in LocalMemoryRatio mode.")          \
+          range(1, 100)                                                     \
+                                                                            \
+  product(uint, G1RemoteTier3TargetPercent, 60, DIAGNOSTIC,                 \
+          "Local/cgroup pressure percentage tier 3 tries to return to "      \
+          "after remote eviction starts in LocalMemoryRatio mode.")          \
+          range(1, 100)                                                     \
+                                                                            \
+  product(uint, G1RemoteTier2MaxEvictRegions, 8, DIAGNOSTIC,                \
+          "Maximum old regions selected by one tier 2 remote eviction "      \
+          "cycle in LocalMemoryRatio mode.")                                \
+          range(1, 1024)                                                    \
+                                                                            \
+  product(uint, G1RemoteTier3MaxEvictRegions, 16, DIAGNOSTIC,               \
+          "Maximum old regions selected by one tier 3 remote eviction "      \
+          "cycle in LocalMemoryRatio mode.")                                \
+          range(1, 1024)                                                    \
+                                                                            \
   product(uint, G1RemoteDenseT2Regions, 1, DIAGNOSTIC,                      \
           "Maximum dense small-object regions selected by the tier 2 "       \
           "dense last-resort path when G1RemoteAllowDenseObjectEviction "   \

@@ -2029,15 +2029,20 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         // local budget is still unused. Keep headroom for the next young cycle,
         // but avoid pushing the heap down to an artificially low watermark.
         size_t target_low_percent = 0;
+        uint max_evict_regions = 0;
         uint tier2_percent = G1RemoteTier2Percent;
         uint tier3_percent = MAX2(G1RemoteTier3Percent, tier2_percent);
 
         if (pressure * 100.0 > (double)tier3_percent) {
           eviction_tier = 3;
-          target_low_percent = 60;
+          target_low_percent = MIN2((size_t)G1RemoteTier3TargetPercent,
+                                    (size_t)tier3_percent);
+          max_evict_regions = G1RemoteTier3MaxEvictRegions;
         } else if (pressure * 100.0 > (double)tier2_percent) {
           eviction_tier = 2;
-          target_low_percent = 70;
+          target_low_percent = MIN2((size_t)G1RemoteTier2TargetPercent,
+                                    (size_t)tier2_percent);
+          max_evict_regions = G1RemoteTier2MaxEvictRegions;
         }
 
         if (eviction_tier > 0) {
@@ -2049,11 +2054,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               (cgroup_usage > cgroup_target_low) ? (cgroup_usage - cgroup_target_low) : 0;
             evict_target_bytes = MAX2(evict_target_bytes, cgroup_evict_target);
           }
-          if (eviction_tier == 2) {
-            evict_batch_cap_bytes = HeapRegion::GrainBytes * 8;
-            evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
-          } else if (eviction_tier == 3) {
-            evict_batch_cap_bytes = HeapRegion::GrainBytes * 16;
+          if (max_evict_regions > 0) {
+            evict_batch_cap_bytes = HeapRegion::GrainBytes * (size_t)max_evict_regions;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
           }
         }
