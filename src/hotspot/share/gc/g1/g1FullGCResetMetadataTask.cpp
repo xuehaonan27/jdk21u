@@ -39,6 +39,11 @@ void G1FullGCResetMetadataTask::G1ResetMetadataClosure::reset_region_metadata(He
 bool G1FullGCResetMetadataTask::G1ResetMetadataClosure::do_heap_region(HeapRegion* hr) {
   uint const region_idx = hr->hrm_index();
   if (!_collector->is_compaction_target(region_idx)) {
+    if (hr->is_free() && hr->is_evict_guarded()) {
+      reset_region_metadata(hr);
+      return false;
+    }
+
     assert(!hr->is_free(), "all free regions should be compaction targets");
     assert(_collector->is_skip_compacting(region_idx), "must be");
     if (hr->needs_scrubbing_during_full_gc()) {

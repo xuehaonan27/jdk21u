@@ -262,7 +262,14 @@ void G1FullCollector::complete_collection() {
 
 void G1FullCollector::before_marking_update_attribute_table(HeapRegion* hr) {
   if (hr->is_free()) {
-    _region_attr_table.set_free(hr->hrm_index());
+    // Remote-evicted regions stay on the free list with PROT_NONE guards so
+    // stale raw oops fault reliably. Normal allocation skips them; Full GC must
+    // not choose them as compaction destinations either.
+    if (hr->is_evict_guarded()) {
+      _region_attr_table.set_skip_compacting(hr->hrm_index());
+    } else {
+      _region_attr_table.set_free(hr->hrm_index());
+    }
   } else if (hr->is_humongous()) {
     // Humongous objects will never be moved in the "main" compaction phase, but
     // afterwards in a special phase if needed.

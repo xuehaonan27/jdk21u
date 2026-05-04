@@ -74,6 +74,10 @@ inline void G1DetermineCompactionQueueClosure::add_to_compaction_queue(HeapRegio
 }
 
 inline bool G1DetermineCompactionQueueClosure::do_heap_region(HeapRegion* hr) {
+  if (hr->is_free() && hr->is_evict_guarded()) {
+    return false;
+  }
+
   if (should_compact(hr)) {
     assert(!hr->is_humongous(), "moving humongous objects not supported.");
     add_to_compaction_queue(hr);
