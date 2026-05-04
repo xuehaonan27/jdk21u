@@ -518,6 +518,7 @@ public:
   }
 
   void publish_local_handle(RemoteHandle* h, void* local_addr);
+  void publish_local_handles(RemoteHandle** handles, HeapWord** local_addrs, uint count);
   void make_handle_remote(RemoteHandle* h, uintptr_t remote_id);
   void mark_handle_dead(RemoteHandle* h);
   size_t local_handle_count() const { return _local_handle_count; }

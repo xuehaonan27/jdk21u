@@ -204,6 +204,26 @@ void G1RemoteMemoryManager::publish_local_handle(RemoteHandle* h, void* local_ad
   local_handle_unlock();
 }
 
+void G1RemoteMemoryManager::publish_local_handles(RemoteHandle** handles,
+                                                  HeapWord** local_addrs,
+                                                  uint count) {
+  if (handles == nullptr || local_addrs == nullptr || count == 0) {
+    return;
+  }
+
+  local_handle_lock();
+  for (uint i = 0; i < count; i++) {
+    RemoteHandle* h = handles[i];
+    HeapWord* local_addr = local_addrs[i];
+    if (h == nullptr || local_addr == nullptr) {
+      continue;
+    }
+    link_local_handle_locked(h);
+    h->set_local_release(local_addr);
+  }
+  local_handle_unlock();
+}
+
 void G1RemoteMemoryManager::make_handle_remote(RemoteHandle* h, uintptr_t remote_id) {
   if (h == nullptr) {
     return;

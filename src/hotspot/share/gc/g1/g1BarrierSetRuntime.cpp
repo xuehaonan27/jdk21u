@@ -485,7 +485,7 @@ static oopDesc* finish_fetched_object(G1CollectedHeap* g1h,
   return (oopDesc*)dest;
 }
 
-static const uint G1RemoteFetchBatchHardCap = 64;
+static const uint G1RemoteFetchBatchHardCap = 256;
 static volatile int g1_remote_fetch_batch_disabled = 0;
 
 class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
@@ -585,9 +585,7 @@ public:
   void publish(G1RemoteBackend* backend) {
     if (_publish_count == 0) return;
     backend->localize_batch(_publish_ids, _publish_count);
-    for (uint i = 0; i < _publish_count; i++) {
-      _rmm->publish_local_handle(_publish_handles[i], _publish_dests[i]);
-    }
+    _rmm->publish_local_handles(_publish_handles, _publish_dests, _publish_count);
   }
 
   oopDesc* primary_result() const { return _primary_result; }
