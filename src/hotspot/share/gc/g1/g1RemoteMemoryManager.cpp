@@ -3252,6 +3252,89 @@ int G1RemoteMemoryManager::count_local_handles_in_region(HeapRegion* hr, int log
   return cl.count();
 }
 
+int G1RemoteMemoryManager::count_local_handles_in_regions(
+    const bool* eviction_candidates,
+    const bool* region_complete,
+    const int* region_count,
+    uint num_regions,
+    int* blockers_by_region,
+    int log_limit) {
+  if (eviction_candidates == nullptr || region_complete == nullptr ||
+      region_count == nullptr || blockers_by_region == nullptr || num_regions == 0) {
+    return 0;
+  }
+
+  memset(blockers_by_region, 0, num_regions * sizeof(int));
+
+  class CountLocalHandlesInRegionsClosure {
+    G1RemoteMemoryManager* _rmm;
+    const bool* _eviction_candidates;
+    const bool* _region_complete;
+    const int* _region_count;
+    uint _num_regions;
+    int* _blockers_by_region;
+    int _log_limit;
+    int _total_blockers;
+
+  public:
+    CountLocalHandlesInRegionsClosure(G1RemoteMemoryManager* rmm,
+                                      const bool* eviction_candidates,
+                                      const bool* region_complete,
+                                      const int* region_count,
+                                      uint num_regions,
+                                      int* blockers_by_region,
+                                      int log_limit)
+      : _rmm(rmm), _eviction_candidates(eviction_candidates),
+        _region_complete(region_complete), _region_count(region_count),
+        _num_regions(num_regions), _blockers_by_region(blockers_by_region),
+        _log_limit(log_limit), _total_blockers(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
+        return;
+      }
+
+      uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      if (addr == 0 || !_rmm->_g1h->is_in_reserved((void*)addr)) {
+        return;
+      }
+
+      HeapRegion* hr = _rmm->_g1h->heap_region_containing_or_null((void*)addr);
+      if (hr == nullptr) {
+        return;
+      }
+
+      uint ridx = hr->hrm_index();
+      if (ridx >= _num_regions || !_eviction_candidates[ridx] ||
+          !_region_complete[ridx] || _region_count[ridx] <= 0) {
+        return;
+      }
+
+      int blockers = ++_blockers_by_region[ridx];
+      _total_blockers++;
+      if (blockers <= _log_limit) {
+        log_warning(gc)("E3 local-handle guard: region=%u blocker handle="
+                        PTR_FORMAT " local=" PTR_FORMAT
+                        " listed=%d dormant=%d rc=%u",
+                        ridx, p2i(h), addr,
+                        h->_local_listed ? 1 : 0,
+                        h->is_dormant() ? 1 : 0, h->remote_refcount());
+      }
+    }
+
+    int total_blockers() const { return _total_blockers; }
+  };
+
+  CountLocalHandlesInRegionsClosure cl(this, eviction_candidates, region_complete,
+                                       region_count, num_regions, blockers_by_region,
+                                       log_limit);
+  _handle_allocator.handles_do(&cl);
+  return cl.total_blockers();
+}
+
 Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
   assert(h != nullptr, "Handle must not be null");
 

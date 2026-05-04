@@ -1121,6 +1121,15 @@ public:
                                                 int* blockers_by_region,
                                                 int log_limit = 0);
 
+  // Count any remaining LOCAL handles into complete candidate regions with one
+  // allocator-wide scan. Used after publishing prepared handles REMOTE in E3.
+  int count_local_handles_in_regions(const bool* eviction_candidates,
+                                     const bool* region_complete,
+                                     const int* region_count,
+                                     uint num_regions,
+                                     int* blockers_by_region,
+                                     int log_limit = 0);
+
   // Finalize: set handle remote, mark word, fill with filler.
   // Called after backend confirms batch eviction.
   void finalize_eviction(PreparedEviction* entry);

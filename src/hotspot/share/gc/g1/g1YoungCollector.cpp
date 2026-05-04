@@ -4357,6 +4357,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       // must NOT be freed — their LOCAL handles still point into the region.
       Ticks e3_start = Ticks::now();
 
+      int* e3_blockers_by_region = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
+      memset(e3_blockers_by_region, 0, num_regions * sizeof(int));
+
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at_or_null(i);
@@ -4366,8 +4369,29 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (rcount > 0 && region_complete[i]) {
           int start = region_start[i];
           rmm->finalize_evictions(entries, start, rcount, hr);
+        }
+      }
 
-          int remaining_local_handles = rmm->count_local_handles_in_region(hr, 4);
+      int e3_blockers = rmm->count_local_handles_in_regions(eviction_candidates,
+                                                            region_complete,
+                                                            region_count_arr,
+                                                            num_regions,
+                                                            e3_blockers_by_region,
+                                                            4);
+      if (e3_blockers > 0) {
+        log_warning(gc)("E3 local-handle guard: found %d LOCAL handles in "
+                        "complete eviction regions after finalization",
+                        e3_blockers);
+      }
+
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr) continue;
+        int rcount = region_count_arr[i];
+
+        if (rcount > 0 && region_complete[i]) {
+          int remaining_local_handles = e3_blockers_by_region[i];
           if (remaining_local_handles > 0) {
             log_warning(gc)("Region %u NOT freed after eviction: %d LOCAL handles "
                             "still point into [" PTR_FORMAT ", " PTR_FORMAT ")",
@@ -4405,6 +4429,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
       double e3_ms = (Ticks::now() - e3_start).seconds() * 1000.0;
 
+      FREE_C_HEAP_ARRAY(int, e3_blockers_by_region);
       FREE_C_HEAP_ARRAY(PreparedEviction, entries);
       FREE_C_HEAP_ARRAY(int, region_start);
       FREE_C_HEAP_ARRAY(int, region_count_arr);
