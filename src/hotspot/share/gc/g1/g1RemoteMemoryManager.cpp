@@ -1013,6 +1013,10 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
     hr->set_has_classified_objects();
   }
 
+  if (G1RemoteSkipFillerOnCompleteEviction) {
+    return;
+  }
+
   for (int e = start; e < start + count; e++) {
     PreparedEviction* entry = &entries[e];
     if (entry->obj == nullptr || entry->word_size == 0) {

@@ -339,6 +339,11 @@
           "a diagnostic policy for graph-shaped workloads where newer old "  \
           "regions often reference older old regions.")                     \
                                                                             \
+  product(bool, G1RemoteSkipFillerOnCompleteEviction, false, DIAGNOSTIC,    \
+          "Skip per-object filler writes when a candidate region has been "  \
+          "fully evicted and is about to be freed and guarded. Experimental "\
+          "fast path for dense object-granularity eviction.")                \
+                                                                            \
   product(bool, G1RemoteDenseRefillAfterStackGuard, false, DIAGNOSTIC,      \
           "After the conservative Pre-D raw-stack guard removes dense "      \
           "last-resort eviction candidates, refill the candidate set from "  \
