@@ -1124,6 +1124,7 @@ public:
   // Finalize: set handle remote, mark word, fill with filler.
   // Called after backend confirms batch eviction.
   void finalize_eviction(PreparedEviction* entry);
+  void finalize_evictions(PreparedEviction* entries, int start, int count, HeapRegion* hr);
 
   // Fetch a remote object back to a local destination address.
   // Called from the load barrier when a REMOTE Handle is encountered.

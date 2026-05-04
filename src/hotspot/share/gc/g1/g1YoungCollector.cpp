@@ -4365,9 +4365,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
         if (rcount > 0 && region_complete[i]) {
           int start = region_start[i];
-          for (int e = start; e < start + rcount; e++) {
-            rmm->finalize_eviction(&entries[e]);
-          }
+          rmm->finalize_evictions(entries, start, rcount, hr);
 
           int remaining_local_handles = rmm->count_local_handles_in_region(hr, 4);
           if (remaining_local_handles > 0) {

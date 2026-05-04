@@ -988,6 +988,47 @@ void G1RemoteMemoryManager::finalize_eviction(PreparedEviction* entry) {
   CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(entry->obj), entry->word_size, false);
 }
 
+void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
+                                               int start,
+                                               int count,
+                                               HeapRegion* hr) {
+  if (entries == nullptr || count <= 0) {
+    return;
+  }
+
+  local_handle_lock();
+  for (int e = start; e < start + count; e++) {
+    PreparedEviction* entry = &entries[e];
+    RemoteHandle* h = entry->handle;
+    if (h == nullptr) {
+      continue;
+    }
+    h->set_eviction_word_size(entry->word_size);
+    h->set_remote(entry->slot_id);
+    unlink_local_handle_locked(h);
+  }
+  local_handle_unlock();
+
+  if (hr != nullptr) {
+    hr->set_has_classified_objects();
+  }
+
+  for (int e = start; e < start + count; e++) {
+    PreparedEviction* entry = &entries[e];
+    if (entry->obj == nullptr || entry->word_size == 0) {
+      continue;
+    }
+    markWord mw = entry->obj->mark();
+    if (mw.is_unlocked()) {
+      entry->obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
+    }
+
+    CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(entry->obj),
+                                    entry->word_size,
+                                    false);
+  }
+}
+
 void G1RemoteMemoryManager::abort_prepared_eviction(PreparedEviction* entry) {
   if (entry == nullptr || entry->edge_table == nullptr) {
     return;
