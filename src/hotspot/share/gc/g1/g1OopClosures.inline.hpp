@@ -81,6 +81,14 @@ static inline bool g1_gc_scan_region_contains_oop(G1CollectedHeap* g1h, oop obj)
   }
 
   HeapWord* obj_addr = (HeapWord*)addr;
+  if (hr->is_humongous()) {
+    HeapRegion* start = hr->humongous_start_region();
+    return start != nullptr &&
+           !start->is_free() &&
+           !start->is_evict_guarded() &&
+           obj_addr == start->bottom();
+  }
+
   return obj_addr >= hr->bottom() && obj_addr < hr->top();
 }
 
