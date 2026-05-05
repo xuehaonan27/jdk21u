@@ -105,6 +105,7 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   RemoteHandle* _local_handles_head;
   size_t _local_handle_count;
   size_t* _local_handle_region_counts;
+  RemoteHandle** _local_handle_region_heads;
   uint _local_handle_region_capacity;
   volatile int _local_handle_lock;
 
@@ -115,11 +116,11 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
 
   bool ensure_local_handle_region_counts_locked();
   uint local_handle_region_index(uintptr_t addr) const;
-  void inc_local_handle_region_count(uintptr_t addr);
-  void dec_local_handle_region_count(uintptr_t addr);
-  void move_local_handle_region_count(RemoteHandle* h,
-                                      uintptr_t old_addr,
-                                      uintptr_t new_addr);
+  void link_local_handle_region_locked(RemoteHandle* h, uintptr_t addr);
+  void unlink_local_handle_region_locked(RemoteHandle* h);
+  void move_local_handle_region(RemoteHandle* h,
+                                uintptr_t old_addr,
+                                uintptr_t new_addr);
   void link_local_handle_locked(RemoteHandle* h, uintptr_t local_addr = 0);
   void unlink_local_handle_locked(RemoteHandle* h, uintptr_t local_addr = 0);
   void link_local_handle(RemoteHandle* h);
@@ -476,7 +477,7 @@ public:
         }
         *pp = entry->_next;  // unlink from old bucket
 
-        move_local_handle_region_count(entry->_handle, old_addr, new_addr);
+        move_local_handle_region(entry->_handle, old_addr, new_addr);
         entry->_handle->set_local(cast_from_oop<void*>(new_obj));
 
         entry->_obj_addr = new_addr;
@@ -492,7 +493,7 @@ public:
       pp = &(entry->_next);
     }
     if (expected_h != nullptr && expected_h->is_local()) {
-      move_local_handle_region_count(expected_h, old_addr, new_addr);
+      move_local_handle_region(expected_h, old_addr, new_addr);
       expected_h->set_local(cast_from_oop<void*>(new_obj));
       HandleEntry* entry = alloc_entry();
       entry->init(new_addr, expected_h, _table[new_idx]);
@@ -880,6 +881,7 @@ public:
   // entries (fields no longer tagged). Returns number of handles updated.
   int fixup_tagged_field_handles();
   int fixup_all_local_handles();
+  int fixup_local_handles_in_regions(const bool* region_set, uint num_regions);
   int purge_stale_local_handles(const char* phase, int log_limit = 16);
   size_t rebuild_handle_table_from_handles();
 

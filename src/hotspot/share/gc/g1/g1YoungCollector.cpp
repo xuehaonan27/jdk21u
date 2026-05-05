@@ -2013,6 +2013,35 @@ static size_t remote_local_handles_in_collection_set(G1RemoteMemoryManager* rmm,
   return cl.count();
 }
 
+static void mark_collection_set_regions(G1CollectionSet* cset,
+                                        bool* region_set,
+                                        uint num_regions) {
+  if (cset == nullptr || region_set == nullptr || num_regions == 0) {
+    return;
+  }
+
+  class MarkCSetRegionsClosure : public HeapRegionClosure {
+    bool* _region_set;
+    uint _num_regions;
+
+  public:
+    MarkCSetRegionsClosure(bool* region_set, uint num_regions)
+      : HeapRegionClosure(), _region_set(region_set), _num_regions(num_regions) {}
+
+    virtual bool do_heap_region(HeapRegion* hr) {
+      uint idx = hr->hrm_index();
+      if (idx < _num_regions) {
+        _region_set[idx] = true;
+      }
+      return false;
+    }
+  };
+
+  MarkCSetRegionsClosure cl(region_set, num_regions);
+  cset->iterate(&cl);
+  cset->iterate_optional(&cl);
+}
+
 void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                                     G1ParScanThreadStateSet* per_thread_states) {
   G1GCPhaseTimes* p = phase_times();
@@ -2060,7 +2089,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           tagged_updated = rmm->fixup_tagged_field_handles();
         }
         if (cset_local_handles == SIZE_MAX || cset_local_handles > 0) {
-          local_updated = rmm->fixup_all_local_handles();
+          if (cset_local_handles == SIZE_MAX) {
+            local_updated = rmm->fixup_all_local_handles();
+          } else {
+            uint num_regions = _g1h->max_reserved_regions();
+            bool* cset_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+            memset(cset_regions, 0, num_regions * sizeof(bool));
+            mark_collection_set_regions(collection_set(), cset_regions, num_regions);
+            local_updated = rmm->fixup_local_handles_in_regions(cset_regions,
+                                                                num_regions);
+            FREE_C_HEAP_ARRAY(bool, cset_regions);
+          }
         } else {
           log_info(gc)("Handle table fixup SKIP: no LOCAL handles in collection set");
         }

@@ -56,6 +56,9 @@ struct RemoteHandle {
   size_t             _eviction_word_size; // Full object size for fetch-time FCR allocation
   RemoteHandle*      _local_prev;      // Intrusive list of currently LOCAL handles
   RemoteHandle*      _local_next;
+  RemoteHandle*      _region_prev;     // Intrusive list of LOCAL handles by heap region
+  RemoteHandle*      _region_next;
+  uint               _local_region_index;
   bool               _local_listed;
 
   // State queries (non-atomic, for use under lock or single-threaded)
@@ -208,6 +211,9 @@ struct RemoteHandle {
     _eviction_word_size = 0;
     _local_prev = nullptr;
     _local_next = nullptr;
+    _region_prev = nullptr;
+    _region_next = nullptr;
+    _local_region_index = UINT_MAX;
     _local_listed = false;
   }
 
@@ -220,6 +226,9 @@ struct RemoteHandle {
     _eviction_word_size = 0;
     _local_prev = nullptr;
     _local_next = nullptr;
+    _region_prev = nullptr;
+    _region_next = nullptr;
+    _local_region_index = UINT_MAX;
     _local_listed = false;
   }
 };
@@ -244,6 +253,9 @@ struct RemoteHandleChunk : public CHeapObj<mtGC> {
       _handles[i]._eviction_word_size = 0;
       _handles[i]._local_prev = nullptr;
       _handles[i]._local_next = nullptr;
+      _handles[i]._region_prev = nullptr;
+      _handles[i]._region_next = nullptr;
+      _handles[i]._local_region_index = UINT_MAX;
       _handles[i]._local_listed = false;
     }
   }

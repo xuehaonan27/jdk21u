@@ -52,7 +52,8 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   : _g1h(g1h), _backend(nullptr), _handle_allocator(),
     _entry_chunks(nullptr), _entry_free_list(nullptr), _entry_chunk_top(ENTRY_CHUNK_CAPACITY),
     _table_lock(0), _local_handles_head(nullptr), _local_handle_count(0),
-    _local_handle_region_counts(nullptr), _local_handle_region_capacity(0),
+    _local_handle_region_counts(nullptr), _local_handle_region_heads(nullptr),
+    _local_handle_region_capacity(0),
     _local_handle_lock(0), _alloc_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
@@ -127,8 +128,11 @@ bool G1RemoteMemoryManager::ensure_local_handle_region_counts_locked() {
   }
 
   size_t* counts = NEW_C_HEAP_ARRAY(size_t, capacity, mtGC);
+  RemoteHandle** heads = NEW_C_HEAP_ARRAY(RemoteHandle*, capacity, mtGC);
   memset(counts, 0, capacity * sizeof(size_t));
+  memset(heads, 0, capacity * sizeof(RemoteHandle*));
   _local_handle_region_counts = counts;
+  _local_handle_region_heads = heads;
   _local_handle_region_capacity = capacity;
 
   for (RemoteHandle* cur = _local_handles_head;
@@ -140,6 +144,13 @@ bool G1RemoteMemoryManager::ensure_local_handle_region_counts_locked() {
     }
     uint idx = local_handle_region_index(sa & REMOTE_HANDLE_ADDR_MASK);
     if (idx < _local_handle_region_capacity) {
+      cur->_region_prev = nullptr;
+      cur->_region_next = _local_handle_region_heads[idx];
+      if (_local_handle_region_heads[idx] != nullptr) {
+        _local_handle_region_heads[idx]->_region_prev = cur;
+      }
+      _local_handle_region_heads[idx] = cur;
+      cur->_local_region_index = idx;
       _local_handle_region_counts[idx]++;
     }
   }
@@ -157,24 +168,48 @@ uint G1RemoteMemoryManager::local_handle_region_index(uintptr_t addr) const {
   return hr->hrm_index();
 }
 
-void G1RemoteMemoryManager::inc_local_handle_region_count(uintptr_t addr) {
+void G1RemoteMemoryManager::link_local_handle_region_locked(RemoteHandle* h,
+                                                            uintptr_t addr) {
+  if (h == nullptr) {
+    return;
+  }
   if (!ensure_local_handle_region_counts_locked()) {
     return;
   }
   uint idx = local_handle_region_index(addr);
   if (idx < _local_handle_region_capacity) {
+    h->_region_prev = nullptr;
+    h->_region_next = _local_handle_region_heads[idx];
+    if (_local_handle_region_heads[idx] != nullptr) {
+      _local_handle_region_heads[idx]->_region_prev = h;
+    }
+    _local_handle_region_heads[idx] = h;
+    h->_local_region_index = idx;
     Atomic::add(&_local_handle_region_counts[idx], (size_t)1);
   }
 }
 
-void G1RemoteMemoryManager::dec_local_handle_region_count(uintptr_t addr) {
-  if (_local_handle_region_counts == nullptr) {
+void G1RemoteMemoryManager::unlink_local_handle_region_locked(RemoteHandle* h) {
+  if (h == nullptr || _local_handle_region_counts == nullptr ||
+      _local_handle_region_heads == nullptr) {
     return;
   }
-  uint idx = local_handle_region_index(addr);
+  uint idx = h->_local_region_index;
   if (idx >= _local_handle_region_capacity) {
     return;
   }
+  if (h->_region_prev != nullptr) {
+    h->_region_prev->_region_next = h->_region_next;
+  } else if (_local_handle_region_heads[idx] == h) {
+    _local_handle_region_heads[idx] = h->_region_next;
+  }
+  if (h->_region_next != nullptr) {
+    h->_region_next->_region_prev = h->_region_prev;
+  }
+  h->_region_prev = nullptr;
+  h->_region_next = nullptr;
+  h->_local_region_index = UINT_MAX;
+
   size_t cur = Atomic::load(&_local_handle_region_counts[idx]);
   while (cur > 0) {
     size_t next = cur - 1;
@@ -186,25 +221,26 @@ void G1RemoteMemoryManager::dec_local_handle_region_count(uintptr_t addr) {
   }
 }
 
-void G1RemoteMemoryManager::move_local_handle_region_count(RemoteHandle* h,
-                                                           uintptr_t old_addr,
-                                                           uintptr_t new_addr) {
-  if (h == nullptr || !h->_local_listed ||
-      _local_handle_region_counts == nullptr ||
-      old_addr == new_addr) {
+void G1RemoteMemoryManager::move_local_handle_region(RemoteHandle* h,
+                                                     uintptr_t old_addr,
+                                                     uintptr_t new_addr) {
+  if (h == nullptr || !h->_local_listed || old_addr == new_addr) {
+    return;
+  }
+  local_handle_lock();
+  if (!ensure_local_handle_region_counts_locked()) {
+    local_handle_unlock();
     return;
   }
   uint old_idx = local_handle_region_index(old_addr);
   uint new_idx = local_handle_region_index(new_addr);
   if (old_idx == new_idx) {
+    local_handle_unlock();
     return;
   }
-  if (old_idx < _local_handle_region_capacity) {
-    dec_local_handle_region_count(old_addr);
-  }
-  if (new_idx < _local_handle_region_capacity) {
-    Atomic::add(&_local_handle_region_counts[new_idx], (size_t)1);
-  }
+  unlink_local_handle_region_locked(h);
+  link_local_handle_region_locked(h, new_addr);
+  local_handle_unlock();
 }
 
 void G1RemoteMemoryManager::link_local_handle_locked(RemoteHandle* h,
@@ -219,7 +255,7 @@ void G1RemoteMemoryManager::link_local_handle_locked(RemoteHandle* h,
       addr = sa & REMOTE_HANDLE_ADDR_MASK;
     }
   }
-  inc_local_handle_region_count(addr);
+  link_local_handle_region_locked(h, addr);
   h->_local_prev = nullptr;
   h->_local_next = _local_handles_head;
   if (_local_handles_head != nullptr) {
@@ -232,17 +268,11 @@ void G1RemoteMemoryManager::link_local_handle_locked(RemoteHandle* h,
 
 void G1RemoteMemoryManager::unlink_local_handle_locked(RemoteHandle* h,
                                                        uintptr_t local_addr) {
+  (void)local_addr;
   if (h == nullptr || !h->_local_listed) {
     return;
   }
-  uintptr_t addr = local_addr;
-  if (addr == 0) {
-    uintptr_t sa = h->load_state_and_addr_acquire();
-    if ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL) {
-      addr = sa & REMOTE_HANDLE_ADDR_MASK;
-    }
-  }
-  dec_local_handle_region_count(addr);
+  unlink_local_handle_region_locked(h);
   if (h->_local_prev != nullptr) {
     h->_local_prev->_local_next = h->_local_next;
   } else {
@@ -301,7 +331,7 @@ void G1RemoteMemoryManager::link_local_handle_batch(RemoteHandle* head,
   for (RemoteHandle* cur = head; cur != nullptr; cur = cur->_local_next) {
     uintptr_t sa = cur->load_state_and_addr_acquire();
     if ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL) {
-      inc_local_handle_region_count(sa & REMOTE_HANDLE_ADDR_MASK);
+      link_local_handle_region_locked(cur, sa & REMOTE_HANDLE_ADDR_MASK);
     }
     if (cur == tail) {
       break;
@@ -614,8 +644,12 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
   if (_local_handle_region_counts != nullptr) {
     FREE_C_HEAP_ARRAY(size_t, _local_handle_region_counts);
     _local_handle_region_counts = nullptr;
-    _local_handle_region_capacity = 0;
   }
+  if (_local_handle_region_heads != nullptr) {
+    FREE_C_HEAP_ARRAY(RemoteHandle*, _local_handle_region_heads);
+    _local_handle_region_heads = nullptr;
+  }
+  _local_handle_region_capacity = 0;
 
   if (_eviction_backoff_until_epoch != nullptr) {
     FREE_C_HEAP_ARRAY(uint32_t, _eviction_backoff_until_epoch);
@@ -4485,6 +4519,114 @@ int G1RemoteMemoryManager::fixup_all_local_handles() {
     log_warning(gc)("Handle table fixup local-list count mismatch: scanned=%zu "
                     "start_local_handles=%zu current_local_handles=%zu",
                     cl.scanned(), local_count_start, _local_handle_count);
+  }
+  return cl.updated();
+}
+
+int G1RemoteMemoryManager::fixup_local_handles_in_regions(const bool* region_set,
+                                                          uint num_regions) {
+  if (region_set == nullptr || num_regions == 0 ||
+      _local_handle_region_heads == nullptr ||
+      _local_handle_region_counts == nullptr) {
+    return fixup_all_local_handles();
+  }
+
+  Ticks start = Ticks::now();
+
+  class FixupScopedLocalHandleClosure {
+    G1RemoteMemoryManager* _rmm;
+    int _updated;
+    size_t _scanned;
+    size_t _local_seen;
+    size_t _stale_region;
+    int _stale_killed;
+
+  public:
+    FixupScopedLocalHandleClosure(G1RemoteMemoryManager* rmm)
+      : _rmm(rmm), _updated(0), _scanned(0), _local_seen(0),
+        _stale_region(0), _stale_killed(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_DEAD && h->remote_refcount() == 0) return;
+
+      _scanned++;
+      if (state != REMOTE_HANDLE_LOCAL) return;
+
+      _local_seen++;
+      uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      if (!_rmm->validate_local_handle_addr(h, "HANDLE-FIXUP-CSET",
+                                            &_stale_killed, 16)) {
+        _stale_region++;
+        return;
+      }
+
+      oop target = cast_to_oop(addr);
+      markWord m = target->mark();
+      if (m.is_marked()) {
+        oop forwardee = cast_to_oop(m.decode_pointer());
+        _rmm->update_handle_for_evacuation(h, target, forwardee);
+        _updated++;
+      }
+    }
+
+    int updated() const { return _updated; }
+    size_t scanned() const { return _scanned; }
+    size_t local_seen() const { return _local_seen; }
+    size_t stale_region() const { return _stale_region; }
+    int stale_killed() const { return _stale_killed; }
+  };
+
+  uint scoped_regions = 0;
+  size_t expected_handles = 0;
+  for (uint idx = 0; idx < num_regions && idx < _local_handle_region_capacity; idx++) {
+    if (!region_set[idx]) {
+      continue;
+    }
+    scoped_regions++;
+    expected_handles += Atomic::load(&_local_handle_region_counts[idx]);
+  }
+
+  log_info(gc)("Handle table fixup START: scoped_regions=%u scoped_handles=%zu "
+               "local_handles=%zu allocated_handles=%zu tagged_entries=%d",
+               scoped_regions, expected_handles, _local_handle_count,
+               _handle_allocator.total_handles_allocated(), _tagged_field_count);
+
+  FixupScopedLocalHandleClosure cl(this);
+  for (uint idx = 0; idx < num_regions && idx < _local_handle_region_capacity; idx++) {
+    if (!region_set[idx]) {
+      continue;
+    }
+    RemoteHandle* cur = _local_handle_region_heads[idx];
+    while (cur != nullptr) {
+      RemoteHandle* next = cur->_region_next;
+      cl.do_handle(cur);
+      cur = next;
+    }
+  }
+
+  double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
+  log_info(gc)("Handle table fixup DONE: %.1fms scoped_regions=%u expected=%zu "
+               "scanned=%zu local=%zu updated=%d stale_region=%zu stale_killed=%d "
+               "local_handles=%zu allocated_handles=%zu",
+               elapsed_ms, scoped_regions, expected_handles, cl.scanned(),
+               cl.local_seen(), cl.updated(), cl.stale_region(),
+               cl.stale_killed(), _local_handle_count,
+               _handle_allocator.total_handles_allocated());
+  if (cl.stale_killed() > 16) {
+    log_warning(gc)("Scoped handle table fixup marked %d stale LOCAL handles DEAD "
+                    "(logged first 16)", cl.stale_killed());
+  }
+  if (elapsed_ms > 1000.0) {
+    log_warning(gc)("Scoped handle table fixup took %.1fms for %zu entries "
+                    "(local_handles=%zu)",
+                    elapsed_ms, cl.scanned(), _local_handle_count);
+  } else if (cl.updated() > 0) {
+    log_info(gc)("Scoped handle table fixup: %d LOCAL handles updated for forwarded objects",
+                 cl.updated());
   }
   return cl.updated();
 }
