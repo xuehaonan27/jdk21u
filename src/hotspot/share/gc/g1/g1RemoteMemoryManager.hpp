@@ -104,6 +104,8 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   volatile int _table_lock;
   RemoteHandle* _local_handles_head;
   size_t _local_handle_count;
+  size_t* _local_handle_region_counts;
+  uint _local_handle_region_capacity;
   volatile int _local_handle_lock;
 
   void table_lock()   { while (Atomic::cmpxchg(&_table_lock, 0, 1) != 0) { /* spin */ } }
@@ -111,8 +113,15 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   void local_handle_lock()   { while (Atomic::cmpxchg(&_local_handle_lock, 0, 1) != 0) { /* spin */ } }
   void local_handle_unlock() { Atomic::release_store(&_local_handle_lock, 0); }
 
-  void link_local_handle_locked(RemoteHandle* h);
-  void unlink_local_handle_locked(RemoteHandle* h);
+  bool ensure_local_handle_region_counts_locked();
+  uint local_handle_region_index(uintptr_t addr) const;
+  void inc_local_handle_region_count(uintptr_t addr);
+  void dec_local_handle_region_count(uintptr_t addr);
+  void move_local_handle_region_count(RemoteHandle* h,
+                                      uintptr_t old_addr,
+                                      uintptr_t new_addr);
+  void link_local_handle_locked(RemoteHandle* h, uintptr_t local_addr = 0);
+  void unlink_local_handle_locked(RemoteHandle* h, uintptr_t local_addr = 0);
   void link_local_handle(RemoteHandle* h);
   void unlink_local_handle(RemoteHandle* h);
   void append_pending_local_handle(RemoteHandle* h,
@@ -467,6 +476,7 @@ public:
         }
         *pp = entry->_next;  // unlink from old bucket
 
+        move_local_handle_region_count(entry->_handle, old_addr, new_addr);
         entry->_handle->set_local(cast_from_oop<void*>(new_obj));
 
         entry->_obj_addr = new_addr;
@@ -482,6 +492,7 @@ public:
       pp = &(entry->_next);
     }
     if (expected_h != nullptr && expected_h->is_local()) {
+      move_local_handle_region_count(expected_h, old_addr, new_addr);
       expected_h->set_local(cast_from_oop<void*>(new_obj));
       HandleEntry* entry = alloc_entry();
       entry->init(new_addr, expected_h, _table[new_idx]);
@@ -853,6 +864,16 @@ public:
   int last_phase_c_tagged() const { return _last_phase_c_tagged; }
   int last_phase_c_no_handle() const { return _last_phase_c_no_handle; }
   int last_phase_c_untaggable() const { return _last_phase_c_untaggable; }
+  bool has_local_handle_region_counts() const {
+    return _local_handle_region_counts != nullptr;
+  }
+  size_t local_handle_count_for_region(uint region_idx) const {
+    if (_local_handle_region_counts == nullptr ||
+        region_idx >= _local_handle_region_capacity) {
+      return SIZE_MAX;
+    }
+    return Atomic::load(&_local_handle_region_counts[region_idx]);
+  }
 
   // Post-evacuation fixup: iterate tagged fields, update Handles whose
   // targets have been forwarded during evacuation. Lazily removes stale

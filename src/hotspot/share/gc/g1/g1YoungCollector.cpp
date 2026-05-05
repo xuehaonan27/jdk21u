@@ -1974,6 +1974,45 @@ static bool has_remote_heap_activity(G1RemoteMemoryManager* rmm) {
           (backend->total_evicted() > 0 || backend->total_fetched() > 0));
 }
 
+static size_t remote_local_handles_in_collection_set(G1RemoteMemoryManager* rmm,
+                                                     G1CollectionSet* cset) {
+  if (rmm == nullptr || cset == nullptr) {
+    return 0;
+  }
+  if (!rmm->has_local_handle_region_counts()) {
+    return SIZE_MAX;
+  }
+
+  class CountLocalHandlesInCSetClosure : public HeapRegionClosure {
+    G1RemoteMemoryManager* _rmm;
+    size_t _count;
+    bool _unknown;
+
+  public:
+    CountLocalHandlesInCSetClosure(G1RemoteMemoryManager* rmm)
+      : HeapRegionClosure(), _rmm(rmm), _count(0), _unknown(false) {}
+
+    virtual bool do_heap_region(HeapRegion* hr) {
+      size_t count = _rmm->local_handle_count_for_region(hr->hrm_index());
+      if (count == SIZE_MAX) {
+        _unknown = true;
+        return false;
+      }
+      _count += count;
+      return false;
+    }
+
+    size_t count() const { return _unknown ? SIZE_MAX : _count; }
+  };
+
+  CountLocalHandlesInCSetClosure cl(rmm);
+  cset->iterate(&cl);
+  if (cl.count() != SIZE_MAX) {
+    cset->iterate_optional(&cl);
+  }
+  return cl.count();
+}
+
 void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                                     G1ParScanThreadStateSet* per_thread_states) {
   G1GCPhaseTimes* p = phase_times();
@@ -2002,21 +2041,43 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     if (rmm != nullptr) {
       const bool remote_activity = has_remote_heap_activity(rmm);
       const int tagged_count = rmm->tagged_field_count();
+      const size_t cset_local_handles =
+          remote_local_handles_in_collection_set(rmm, collection_set());
       Ticks fixup_start = Ticks::now();
       int tagged_updated = 0;
       int local_updated = 0;
       if (remote_activity || tagged_count > 0) {
-        log_info(gc)("Remote handle post-evac fixup START (tagged_entries=%d)",
-                     tagged_count);
+        if (cset_local_handles == SIZE_MAX) {
+          log_info(gc)("Remote handle post-evac fixup START (tagged_entries=%d "
+                       "cset_local_handles=unknown)",
+                       tagged_count);
+        } else {
+          log_info(gc)("Remote handle post-evac fixup START (tagged_entries=%d "
+                       "cset_local_handles=%zu)",
+                       tagged_count, cset_local_handles);
+        }
         if (tagged_count > 0) {
           tagged_updated = rmm->fixup_tagged_field_handles();
         }
-        local_updated = rmm->fixup_all_local_handles();
+        if (cset_local_handles == SIZE_MAX || cset_local_handles > 0) {
+          local_updated = rmm->fixup_all_local_handles();
+        } else {
+          log_info(gc)("Handle table fixup SKIP: no LOCAL handles in collection set");
+        }
         double fixup_ms = (Ticks::now() - fixup_start).seconds() * 1000.0;
-        log_info(gc)("Remote handle post-evac fixup DONE: %.1fms "
-                     "(tagged_updated=%d local_updated=%d tagged_remaining=%d)",
-                     fixup_ms, tagged_updated, local_updated,
-                     rmm->tagged_field_count());
+        if (cset_local_handles == SIZE_MAX) {
+          log_info(gc)("Remote handle post-evac fixup DONE: %.1fms "
+                       "(tagged_updated=%d local_updated=%d tagged_remaining=%d "
+                       "cset_local_handles=unknown)",
+                       fixup_ms, tagged_updated, local_updated,
+                       rmm->tagged_field_count());
+        } else {
+          log_info(gc)("Remote handle post-evac fixup DONE: %.1fms "
+                       "(tagged_updated=%d local_updated=%d tagged_remaining=%d "
+                       "cset_local_handles=%zu)",
+                       fixup_ms, tagged_updated, local_updated,
+                       rmm->tagged_field_count(), cset_local_handles);
+        }
       } else {
         log_debug(gc)("Remote handle post-evac fixup SKIP: no remote heap activity");
       }
