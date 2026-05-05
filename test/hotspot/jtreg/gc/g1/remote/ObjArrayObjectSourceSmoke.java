@@ -2,13 +2,14 @@
  * @test
  * @summary Stress object-array references to ordinary objects under remote eviction.
  * @requires vm.gc.G1
- * @run main/othervm -Xms512m -Xmx512m -XX:+UseG1GC -XX:+UnlockDiagnosticVMOptions -XX:+G1SimulateRemoteEviction -XX:G1RemoteEvictionThreshold=0 -XX:+G1TagRefSites -XX:+G1RemoteAllowDenseObjectEviction -XX:+G1RemoteUseFastPhaseC -XX:+G1RemoteUseFastPhaseCSourceHints -XX:+G1RemoteTagObjArrayObjectSources -XX:+G1RemoteRepairFastPhaseCMisses -XX:G1RemoteFastPhaseCRepairMissLimit=200000 -XX:-G1RemoteUseRootCatchRelocation -XX:-UseCompressedOops -XX:-UseCompressedClassPointers -Xshare:off ObjArrayObjectSourceSmoke
+ * @run main/othervm -Xms512m -Xmx512m -XX:+UseG1GC -XX:+UnlockDiagnosticVMOptions -XX:+G1SimulateRemoteEviction -XX:LocalMemoryRatio=10 -XX:-G1RemoteUseCgroupPressure -XX:+G1TagRefSites -XX:+G1RemoteAllowDenseObjectEviction -XX:+G1RemoteUseFastPhaseC -XX:+G1RemoteUseFastPhaseCSourceHints -XX:+G1RemoteTagObjArrayObjectSources -XX:+G1RemoteRepairFastPhaseCMisses -XX:G1RemoteFastPhaseCRepairMissLimit=200000 -XX:-G1RemoteUseRootCatchRelocation -XX:-UseCompressedOops -XX:-UseCompressedClassPointers -Xshare:off ObjArrayObjectSourceSmoke
  */
 
 public class ObjArrayObjectSourceSmoke {
-    static final int SHARDS = 96;
+    static final int SHARDS = 256;
     static final int PER_SHARD = 8192;
     static final Object[] ROOTS = new Object[SHARDS * PER_SHARD];
+    static volatile int guard;
 
     static final class Box {
         final int value;
@@ -62,9 +63,11 @@ public class ObjArrayObjectSourceSmoke {
     }
 
     static void churn(int round) {
-        Object[] garbage = new Object[24_000];
-        for (int i = 0; i < garbage.length; i++) {
-            garbage[i] = new byte[2048 + ((i + round) & 127)];
+        int sum = 0;
+        for (int i = 0; i < 900_000; i++) {
+            Box box = new Box(round + i);
+            sum += box.value;
         }
+        guard = sum;
     }
 }
