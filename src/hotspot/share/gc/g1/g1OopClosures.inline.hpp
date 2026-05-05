@@ -447,7 +447,7 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
 }
 
 template <class T> void G1RebuildRemSetClosure::do_oop_work(T* p) {
-  oop const obj = g1_resolved_load<MO_RELAXED>(p);
+  oop obj = g1_resolved_load<MO_RELAXED>(p);
   if (obj == nullptr) {
     return;
   }
