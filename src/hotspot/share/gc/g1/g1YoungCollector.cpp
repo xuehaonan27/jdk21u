@@ -1575,31 +1575,6 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   return enough_signal && mostly_cold && not_hot;
 }
 
-static int mark_remote_anchor_regions_for_set(G1CollectedHeap* g1h,
-                                              G1RemoteMemoryManager* rmm,
-                                              const bool* region_set,
-                                              uint num_regions,
-                                              bool* guarded_regions,
-                                              const char* reason,
-                                              bool* overflow_out) {
-  if (overflow_out != nullptr) {
-    *overflow_out = false;
-  }
-  if (g1h == nullptr || rmm == nullptr || region_set == nullptr ||
-      guarded_regions == nullptr || num_regions == 0) {
-    return 0;
-  }
-
-  int anchor_seen = 0;
-  int marked = rmm->mark_remote_anchor_regions_in_set(
-      region_set, num_regions, guarded_regions, &anchor_seen);
-  if (marked > 0) {
-    log_debug(gc)("%s: remote-anchor guard marked %d regions from %d anchors",
-                  reason, marked, anchor_seen);
-  }
-  return marked;
-}
-
 static int refill_dense_eviction_candidates(G1CollectedHeap* g1h,
                                             G1RemoteMemoryManager* rmm,
                                             bool* eviction_candidates,
@@ -2789,25 +2764,26 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
         _g1h->ref_processor_cm()->weak_oops_do(&root_pin_cl);
 
+        bool* remote_anchor_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+        memset(remote_anchor_regions, 0, num_regions * sizeof(bool));
+        int remote_anchor_seen = 0;
         bool remote_anchor_refill_overflow = false;
         if (root_guarded_regions != nullptr && dense_deferred_candidates != nullptr) {
-          int anchor_refill_blockers = mark_remote_anchor_regions_for_set(
-              _g1h, rmm, dense_deferred_candidates, num_regions,
-              root_guarded_regions, "Root-catch disabled",
-              &remote_anchor_refill_overflow);
+          int anchor_refill_blockers = rmm->mark_remote_anchor_regions_in_set(
+              dense_deferred_candidates, num_regions, root_guarded_regions,
+              nullptr, eviction_candidates, remote_anchor_regions, nullptr,
+              &remote_anchor_seen);
           if (anchor_refill_blockers > 0) {
             log_info(gc)("Root-catch disabled: marked %d dense refill regions "
                          "guarded by remote anchors",
                          anchor_refill_blockers);
           }
+        } else {
+          (void)rmm->mark_remote_anchor_regions_in_set(
+              eviction_candidates, num_regions, remote_anchor_regions,
+              &remote_anchor_seen);
         }
 
-        bool* remote_anchor_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
-        memset(remote_anchor_regions, 0, num_regions * sizeof(bool));
-        int remote_anchor_seen = 0;
-        (void)rmm->mark_remote_anchor_regions_in_set(
-            eviction_candidates, num_regions, remote_anchor_regions,
-            &remote_anchor_seen);
         int remote_anchor_pinned = 0;
         for (uint idx = 0; idx < num_regions; idx++) {
           if (remote_anchor_regions[idx] && eviction_candidates[idx]) {

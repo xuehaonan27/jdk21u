@@ -370,7 +370,11 @@ public:
                                              bool* overflow);
   int mark_remote_anchor_regions_in_set(const bool* region_set, uint num_regions,
                                         bool* anchor_regions,
-                                        int* anchors_seen = nullptr);
+                                        int* anchors_seen = nullptr,
+                                        const bool* region_set2 = nullptr,
+                                        bool* anchor_regions2 = nullptr,
+                                        int* marked_regions2 = nullptr,
+                                        int* anchors_seen2 = nullptr);
 
   // Legacy API: create_handle_for (delegates to ensure_handle_for).
   // Kept for backward compatibility with existing eviction/classification code.

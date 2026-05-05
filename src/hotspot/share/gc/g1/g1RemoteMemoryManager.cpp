@@ -1378,9 +1378,19 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
 int G1RemoteMemoryManager::mark_remote_anchor_regions_in_set(const bool* region_set,
                                                              uint num_regions,
                                                              bool* anchor_regions,
-                                                             int* anchors_seen) {
+                                                             int* anchors_seen,
+                                                             const bool* region_set2,
+                                                             bool* anchor_regions2,
+                                                             int* marked_regions2,
+                                                             int* anchors_seen2) {
   if (anchors_seen != nullptr) {
     *anchors_seen = 0;
+  }
+  if (marked_regions2 != nullptr) {
+    *marked_regions2 = 0;
+  }
+  if (anchors_seen2 != nullptr) {
+    *anchors_seen2 = 0;
   }
   if (region_set == nullptr || anchor_regions == nullptr || num_regions == 0) {
     return 0;
@@ -1388,6 +1398,8 @@ int G1RemoteMemoryManager::mark_remote_anchor_regions_in_set(const bool* region_
 
   int marked_regions = 0;
   int seen = 0;
+  int marked2 = 0;
+  int seen2 = 0;
   int stale_handles = 0;
 
   class RemoteAnchorMarkClosure {
@@ -1395,17 +1407,37 @@ int G1RemoteMemoryManager::mark_remote_anchor_regions_in_set(const bool* region_
     const bool* _region_set;
     uint _num_regions;
     bool* _anchor_regions;
+    const bool* _region_set2;
+    bool* _anchor_regions2;
     int _marked_regions;
     int _seen;
+    int _marked_regions2;
+    int _seen2;
     int _stale_handles;
+
+    void maybe_mark(uint ridx, const bool* region_set, bool* anchor_regions,
+                    int* seen, int* marked_regions) {
+      if (region_set == nullptr || anchor_regions == nullptr) return;
+      if (ridx >= _num_regions || !region_set[ridx]) return;
+
+      (*seen)++;
+      if (!anchor_regions[ridx]) {
+        anchor_regions[ridx] = true;
+        (*marked_regions)++;
+      }
+    }
 
   public:
     RemoteAnchorMarkClosure(G1RemoteMemoryManager* rmm,
                             const bool* region_set,
                             uint num_regions,
-                            bool* anchor_regions)
+                            bool* anchor_regions,
+                            const bool* region_set2,
+                            bool* anchor_regions2)
       : _rmm(rmm), _region_set(region_set), _num_regions(num_regions),
-        _anchor_regions(anchor_regions), _marked_regions(0), _seen(0),
+        _anchor_regions(anchor_regions),
+        _region_set2(region_set2), _anchor_regions2(anchor_regions2),
+        _marked_regions(0), _seen(0), _marked_regions2(0), _seen2(0),
         _stale_handles(0) {}
 
     void do_handle(RemoteHandle* h) {
@@ -1423,24 +1455,26 @@ int G1RemoteMemoryManager::mark_remote_anchor_regions_in_set(const bool* region_
       HeapRegion* hr = _rmm->_g1h->heap_region_containing((void*)addr);
       if (hr == nullptr) return;
       uint ridx = hr->hrm_index();
-      if (ridx >= _num_regions || !_region_set[ridx]) return;
-
-      _seen++;
-      if (!_anchor_regions[ridx]) {
-        _anchor_regions[ridx] = true;
-        _marked_regions++;
-      }
+      maybe_mark(ridx, _region_set, _anchor_regions,
+                 &_seen, &_marked_regions);
+      maybe_mark(ridx, _region_set2, _anchor_regions2,
+                 &_seen2, &_marked_regions2);
     }
 
     int marked_regions() const { return _marked_regions; }
     int seen() const { return _seen; }
+    int marked_regions2() const { return _marked_regions2; }
+    int seen2() const { return _seen2; }
     int stale_handles() const { return _stale_handles; }
   };
 
-  RemoteAnchorMarkClosure cl(this, region_set, num_regions, anchor_regions);
+  RemoteAnchorMarkClosure cl(this, region_set, num_regions, anchor_regions,
+                             region_set2, anchor_regions2);
   _handle_allocator.handles_do(&cl);
   marked_regions = cl.marked_regions();
   seen = cl.seen();
+  marked2 = cl.marked_regions2();
+  seen2 = cl.seen2();
   stale_handles = cl.stale_handles();
 
   for (int i = 0; i < _cross_roots_count; i++) {
@@ -1457,17 +1491,31 @@ int G1RemoteMemoryManager::mark_remote_anchor_regions_in_set(const bool* region_
     HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
     if (hr == nullptr) continue;
     uint ridx = hr->hrm_index();
-    if (ridx >= num_regions || !region_set[ridx]) continue;
-
-    seen++;
-    if (!anchor_regions[ridx]) {
-      anchor_regions[ridx] = true;
-      marked_regions++;
+    if (ridx < num_regions && region_set[ridx]) {
+      seen++;
+      if (!anchor_regions[ridx]) {
+        anchor_regions[ridx] = true;
+        marked_regions++;
+      }
+    }
+    if (region_set2 != nullptr && anchor_regions2 != nullptr &&
+        ridx < num_regions && region_set2[ridx]) {
+      seen2++;
+      if (!anchor_regions2[ridx]) {
+        anchor_regions2[ridx] = true;
+        marked2++;
+      }
     }
   }
 
   if (anchors_seen != nullptr) {
     *anchors_seen = seen;
+  }
+  if (marked_regions2 != nullptr) {
+    *marked_regions2 = marked2;
+  }
+  if (anchors_seen2 != nullptr) {
+    *anchors_seen2 = seen2;
   }
   if (stale_handles > 8) {
     log_warning(gc)("Remote anchor marking marked %d stale LOCAL handles DEAD "
