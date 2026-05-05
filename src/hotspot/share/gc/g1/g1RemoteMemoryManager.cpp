@@ -4377,8 +4377,6 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
 
   HeapRegion* new_fcr = nullptr;
   if (SafepointSynchronize::is_at_safepoint()) {
-    log_info(gc)("FCR allocate new region at safepoint: word_size=" SIZE_FORMAT
-                 " old_fcr=" PTR_FORMAT, word_size, p2i(fcr));
     new_fcr = allocate_new_fcr_region();
   } else {
     if (!Heap_lock->try_lock()) {

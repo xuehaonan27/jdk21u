@@ -29,6 +29,7 @@
 
 #include "gc/g1/g1Allocator.inline.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
+#include "gc/g1/g1OopClosures.inline.hpp"
 #include "gc/g1/g1FullCollector.inline.hpp"
 #include "gc/g1/g1ConcurrentMarkBitMap.inline.hpp"
 #include "gc/g1/g1FullGCMarker.inline.hpp"
@@ -57,7 +58,11 @@ template <class T> inline void G1AdjustClosure::adjust_pointer(T* p) {
   if (obj == nullptr) {
     return;
   }
-  assert(Universe::heap()->is_in(obj), "should be in heap");
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  if (!g1_gc_resolved_oop_safe_for_scan(g1h, p, obj)) {
+    return;
+  }
+  assert(g1h->is_in(obj), "should be in heap");
   if (!_collector->is_compacting(obj)) {
     // We never forward objects in non-compacting regions so there is no need to
     // process them further.
