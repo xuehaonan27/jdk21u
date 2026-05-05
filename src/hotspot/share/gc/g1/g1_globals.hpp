@@ -377,7 +377,7 @@
           "is diagnostic and remains guarded by normal root and verifier "   \
           "checks.")                                                        \
                                                                             \
-  product(bool, G1RemoteDenseRefillAfterRootGuard, true, DIAGNOSTIC,        \
+  product(bool, G1RemoteDenseRefillAfterRootGuard, false, DIAGNOSTIC,       \
           "After root or remote-anchor guards remove dense last-resort "      \
           "eviction candidates, refill the candidate set from other "         \
           "deferred dense regions that were not seen on raw stacks, roots, "  \
