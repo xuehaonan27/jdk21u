@@ -398,6 +398,11 @@
           "as Object[]/Tuple3[]; unknown sources and non-oop arrays remain "  \
           "untaggable.")                                                      \
                                                                             \
+  product(bool, G1RemoteAllowTypeArrayEviction, false, DIAGNOSTIC,           \
+          "Allow remote eviction of primitive arrays as whole objects. "       \
+          "Object arrays remain local unless covered by separate reference "   \
+          "edge correctness support.")                                        \
+                                                                            \
   product(bool, G1RemoteUseFastPhaseC, false, DIAGNOSTIC,                    \
           "Use the bounded remote-eviction Phase C scanner: candidate "       \
           "regions, young regions, newly evacuated ranges, roots, and "       \

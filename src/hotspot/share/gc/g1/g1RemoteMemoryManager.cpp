@@ -837,9 +837,12 @@ G1RemoteMemoryManager::build_edge_table(oop obj, RemoteHandle* obj_handle,
 static volatile int _prep_fail_null = 0;
 static volatile int _prep_fail_locked = 0;
 static volatile int _prep_fail_array = 0;
+static volatile int _prep_fail_obj_array = 0;
+static volatile int _prep_fail_type_array_disabled = 0;
 static volatile int _prep_fail_edge = 0;
 static volatile int _prep_fail_slot = 0;
 static volatile int _prep_success = 0;
+static volatile int _prep_success_type_array = 0;
 static volatile int _prep_diag_logged = 0;
 
 bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAllocBuffer* hab,
@@ -857,11 +860,25 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
 
   Klass* klass = obj->klass();
   if (klass->is_array_klass()) {
-    if (Atomic::add(&_prep_fail_array, 1) <= 3 && !_prep_diag_logged) {
-      log_info(gc)("prepare_eviction: array obj=" PTR_FORMAT " klass=%s kept local",
-                   p2i((void*)obj), klass->external_name());
+    if (!klass->is_typeArray_klass()) {
+      Atomic::add(&_prep_fail_array, 1);
+      if (Atomic::add(&_prep_fail_obj_array, 1) <= 3 && !_prep_diag_logged) {
+        log_info(gc)("prepare_eviction: object/unknown array obj=" PTR_FORMAT
+                     " klass=%s kept local",
+                     p2i((void*)obj), klass->external_name());
+      }
+      return false;
     }
-    return false;
+
+    if (!G1RemoteAllowTypeArrayEviction) {
+      Atomic::add(&_prep_fail_array, 1);
+      if (Atomic::add(&_prep_fail_type_array_disabled, 1) <= 3 && !_prep_diag_logged) {
+        log_info(gc)("prepare_eviction: primitive array obj=" PTR_FORMAT
+                     " klass=%s kept local (G1RemoteAllowTypeArrayEviction=false)",
+                     p2i((void*)obj), klass->external_name());
+      }
+      return false;
+    }
   }
 
   size_t word_size = obj->size_given_klass(klass);
@@ -924,6 +941,12 @@ bool G1RemoteMemoryManager::finish_prepared_eviction_edges(
     return true;
   }
 
+  if (entry->klass != nullptr && entry->klass->is_typeArray_klass()) {
+    Atomic::add(&_prep_success, 1);
+    Atomic::add(&_prep_success_type_array, 1);
+    return true;
+  }
+
   bool zero_edges = false;
   ObjectEdgeTable* et = build_edge_table(entry->obj, entry->handle, hab,
                                          &zero_edges, eab,
@@ -962,13 +985,18 @@ bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* h
 void G1RemoteMemoryManager::log_prepare_eviction_stats() {
   if (_prep_fail_null + _prep_fail_locked + _prep_fail_array +
       _prep_fail_edge + _prep_fail_slot + _prep_success > 0) {
-    log_info(gc)("prepare_eviction stats: success=%d null=%d locked=%d array=%d edge=%d slot=%d",
-                 _prep_success, _prep_fail_null, _prep_fail_locked,
-                 _prep_fail_array, _prep_fail_edge, _prep_fail_slot);
+    log_info(gc)("prepare_eviction stats: success=%d(type_array=%d) null=%d "
+                 "locked=%d array=%d(obj=%d type_disabled=%d) edge=%d slot=%d",
+                 _prep_success, _prep_success_type_array,
+                 _prep_fail_null, _prep_fail_locked, _prep_fail_array,
+                 _prep_fail_obj_array, _prep_fail_type_array_disabled,
+                 _prep_fail_edge, _prep_fail_slot);
     _prep_diag_logged = 1;
   }
   _prep_fail_null = _prep_fail_locked = _prep_fail_array =
-      _prep_fail_edge = _prep_fail_slot = _prep_success = 0;
+      _prep_fail_obj_array = _prep_fail_type_array_disabled =
+      _prep_fail_edge = _prep_fail_slot = _prep_success =
+      _prep_success_type_array = 0;
   _prep_diag_logged = 0;
 }
 
