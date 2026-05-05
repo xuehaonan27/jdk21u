@@ -2854,6 +2854,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 if (obj->klass_or_null() == nullptr) break;
                 size_t sz = obj->size();
                 if (sz == 0 || sz > (size_t)(region_end - p)) break;
+                if (G1CollectedHeap::is_obj_filler(obj)) {
+                  p += sz;
+                  continue;
+                }
                 _rmm->ensure_handle_for_parallel(obj, &hab, &eab,
                                                  &pending_head, &pending_tail,
                                                  &pending_count);
@@ -2891,6 +2895,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               if (obj->klass_or_null() == nullptr) break;
               size_t sz = obj->size();
               if (sz == 0 || sz > (size_t)(region_end - p)) break;
+              if (G1CollectedHeap::is_obj_filler(obj)) {
+                p += sz;
+                continue;
+              }
               rmm->ensure_handle_for(obj, &hab);
               count++;
               p += sz;
@@ -3192,6 +3200,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             continue;
           }
           size_t sz = obj->size();
+          if (G1CollectedHeap::is_obj_filler(obj)) {
+            p += sz;
+            continue;
+          }
           if (rmm->prepare_eviction_metadata(obj, &hab, &entries[num_entries])) {
             entry_active[num_entries] = true;
             num_entries++;
@@ -3258,6 +3270,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             bool is_prepared = (next_entry < rend && entries[next_entry].obj == obj);
             if (is_prepared) {
               next_entry++;
+              p += sz;
+              continue;
+            }
+            if (G1CollectedHeap::is_obj_filler(obj)) {
               p += sz;
               continue;
             }

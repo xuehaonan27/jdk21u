@@ -840,6 +840,7 @@ static volatile int _prep_fail_locked = 0;
 static volatile int _prep_fail_array = 0;
 static volatile int _prep_fail_obj_array = 0;
 static volatile int _prep_fail_type_array_disabled = 0;
+static volatile int _prep_fail_filler = 0;
 static volatile int _prep_fail_edge = 0;
 static volatile int _prep_fail_slot = 0;
 static volatile int _prep_success = 0;
@@ -860,6 +861,11 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
   }
 
   Klass* klass = obj->klass();
+  if (G1CollectedHeap::is_obj_filler(obj)) {
+    Atomic::add(&_prep_fail_filler, 1);
+    return false;
+  }
+
   if (klass->is_array_klass()) {
     if (!klass->is_typeArray_klass()) {
       Atomic::add(&_prep_fail_array, 1);
@@ -985,18 +991,18 @@ bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* h
 
 void G1RemoteMemoryManager::log_prepare_eviction_stats() {
   if (_prep_fail_null + _prep_fail_locked + _prep_fail_array +
-      _prep_fail_edge + _prep_fail_slot + _prep_success > 0) {
+      _prep_fail_filler + _prep_fail_edge + _prep_fail_slot + _prep_success > 0) {
     log_info(gc)("prepare_eviction stats: success=%d(type_array=%d) null=%d "
-                 "locked=%d array=%d(obj=%d type_disabled=%d) edge=%d slot=%d",
+                 "locked=%d array=%d(obj=%d type_disabled=%d) filler=%d edge=%d slot=%d",
                  _prep_success, _prep_success_type_array,
                  _prep_fail_null, _prep_fail_locked, _prep_fail_array,
                  _prep_fail_obj_array, _prep_fail_type_array_disabled,
-                 _prep_fail_edge, _prep_fail_slot);
+                 _prep_fail_filler, _prep_fail_edge, _prep_fail_slot);
     _prep_diag_logged = 1;
   }
   _prep_fail_null = _prep_fail_locked = _prep_fail_array =
       _prep_fail_obj_array = _prep_fail_type_array_disabled =
-      _prep_fail_edge = _prep_fail_slot = _prep_success =
+      _prep_fail_filler = _prep_fail_edge = _prep_fail_slot = _prep_success =
       _prep_success_type_array = 0;
   _prep_diag_logged = 0;
 }
