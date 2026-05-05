@@ -392,11 +392,12 @@
           "eviction Phase C may still tag refs during a bounded STW "         \
           "eviction attempt.")                                                \
                                                                             \
-  product(bool, G1RemoteTagObjArraySources, true, DIAGNOSTIC,                \
+  product(bool, G1RemoteTagObjArraySources, false, DIAGNOSTIC,               \
           "Allow remote eviction Phase C to tag references stored in object " \
-          "array elements. This is needed for Spark cached partitions such "  \
-          "as Object[]/Tuple3[]; unknown sources and non-oop arrays remain "  \
-          "untaggable.")                                                      \
+          "array elements. Disabled by default because some object-array "    \
+          "load/null-check paths can observe the unresolved tagged handle "   \
+          "before the receiver is resolved. Unknown sources and non-oop "     \
+          "arrays remain untaggable.")                                        \
                                                                             \
   product(bool, G1RemoteAllowTypeArrayEviction, false, DIAGNOSTIC,           \
           "Allow remote eviction of primitive arrays as whole objects. "       \
