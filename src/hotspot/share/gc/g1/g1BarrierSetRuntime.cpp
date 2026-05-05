@@ -501,6 +501,8 @@ struct RemotePrefetchCacheEntry {
 
 static const uint RemotePrefetchCacheSlots = 16384;
 static const uint RemotePrefetchCacheProbeLimit = 64;
+static const size_t RemotePrefetchCacheMaxBytes = 64 * 1024 * 1024;
+static const size_t RemotePrefetchCacheMaxObjectBytes = 16 * 1024;
 static volatile int g1_remote_prefetch_cache_lock = 0;
 static RemotePrefetchCacheEntry* g1_remote_prefetch_cache = nullptr;
 static size_t g1_remote_prefetch_cache_bytes = 0;
@@ -508,6 +510,7 @@ static uint64_t g1_remote_prefetch_cache_hits = 0;
 static uint64_t g1_remote_prefetch_cache_stores = 0;
 static uint64_t g1_remote_prefetch_cache_evictions = 0;
 static uint64_t g1_remote_prefetch_cache_drops = 0;
+static uint g1_remote_prefetch_cache_evict_cursor = 0;
 
 static void remote_prefetch_cache_lock() {
   while (Atomic::cmpxchg(&g1_remote_prefetch_cache_lock, 0, 1) != 0) {
@@ -538,12 +541,154 @@ static void remote_prefetch_cache_free_entry_locked(uint idx) {
   e.stamp = 0;
 }
 
+static bool remote_prefetch_cache_ensure_locked() {
+  if (g1_remote_prefetch_cache != nullptr) {
+    return true;
+  }
+  size_t bytes = sizeof(RemotePrefetchCacheEntry) * RemotePrefetchCacheSlots;
+  RemotePrefetchCacheEntry* entries =
+      (RemotePrefetchCacheEntry*)os::malloc(bytes, mtGC);
+  if (entries == nullptr) {
+    return false;
+  }
+  memset(entries, 0, bytes);
+  g1_remote_prefetch_cache = entries;
+  return true;
+}
+
+static bool remote_prefetch_cache_evict_one_locked() {
+  if (g1_remote_prefetch_cache == nullptr) {
+    return false;
+  }
+  for (uint i = 0; i < RemotePrefetchCacheSlots; i++) {
+    uint idx = (g1_remote_prefetch_cache_evict_cursor + i) % RemotePrefetchCacheSlots;
+    if (g1_remote_prefetch_cache[idx].handle != nullptr) {
+      remote_prefetch_cache_free_entry_locked(idx);
+      g1_remote_prefetch_cache_evictions++;
+      g1_remote_prefetch_cache_evict_cursor = (idx + 1) % RemotePrefetchCacheSlots;
+      return true;
+    }
+  }
+  return false;
+}
+
 static uint remote_prefetch_cache_hash(RemoteHandle* h, size_t slot_id) {
   uintptr_t x = (uintptr_t)h ^ (slot_id * 11400714819323198485ull);
   x ^= x >> 33;
   x *= 0xff51afd7ed558ccdull;
   x ^= x >> 33;
   return (uint)(x % RemotePrefetchCacheSlots);
+}
+
+static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
+                                        Klass* klass, size_t word_size,
+                                        const void* obj_bytes) {
+  if (h == nullptr || klass == nullptr || obj_bytes == nullptr || word_size == 0) {
+    return false;
+  }
+  if (word_size > SIZE_MAX / HeapWordSize) {
+    return false;
+  }
+  size_t byte_size = word_size * HeapWordSize;
+  if (byte_size > RemotePrefetchCacheMaxObjectBytes ||
+      byte_size > RemotePrefetchCacheMaxBytes) {
+    return false;
+  }
+
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE ||
+      (size_t)(sa & REMOTE_HANDLE_ADDR_MASK) != slot_id ||
+      word_size != h->eviction_word_size()) {
+    return false;
+  }
+
+  uint8_t* bytes = (uint8_t*)os::malloc(byte_size, mtGC);
+  if (bytes == nullptr) {
+    return false;
+  }
+  memcpy(bytes, obj_bytes, byte_size);
+
+  remote_prefetch_cache_lock();
+  if (!remote_prefetch_cache_ensure_locked()) {
+    remote_prefetch_cache_unlock();
+    os::free(bytes);
+    return false;
+  }
+
+  sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE ||
+      (size_t)(sa & REMOTE_HANDLE_ADDR_MASK) != slot_id ||
+      word_size != h->eviction_word_size()) {
+    remote_prefetch_cache_unlock();
+    os::free(bytes);
+    return false;
+  }
+
+  while (g1_remote_prefetch_cache_bytes + byte_size > RemotePrefetchCacheMaxBytes) {
+    if (!remote_prefetch_cache_evict_one_locked()) {
+      remote_prefetch_cache_unlock();
+      os::free(bytes);
+      return false;
+    }
+  }
+
+  uint start = remote_prefetch_cache_hash(h, slot_id);
+  uint target = UINT_MAX;
+  uint oldest = UINT_MAX;
+  uint64_t oldest_stamp = UINT64_MAX;
+  for (uint probe = 0; probe < RemotePrefetchCacheProbeLimit; probe++) {
+    uint idx = (start + probe) % RemotePrefetchCacheSlots;
+    RemotePrefetchCacheEntry& e = g1_remote_prefetch_cache[idx];
+    if (e.handle == h && e.slot_id == slot_id) {
+      target = idx;
+      break;
+    }
+    if (e.handle == nullptr) {
+      target = idx;
+      break;
+    }
+    if (e.stamp < oldest_stamp) {
+      oldest_stamp = e.stamp;
+      oldest = idx;
+    }
+  }
+  if (target == UINT_MAX) {
+    target = oldest;
+  }
+  if (target == UINT_MAX) {
+    remote_prefetch_cache_unlock();
+    os::free(bytes);
+    return false;
+  }
+
+  if (g1_remote_prefetch_cache[target].handle != nullptr) {
+    remote_prefetch_cache_free_entry_locked(target);
+    g1_remote_prefetch_cache_evictions++;
+  }
+
+  uint64_t stamp = ++g1_remote_prefetch_cache_stores;
+  RemotePrefetchCacheEntry& e = g1_remote_prefetch_cache[target];
+  e.handle = h;
+  e.slot_id = slot_id;
+  e.klass = klass;
+  e.word_size = word_size;
+  e.bytes = bytes;
+  e.byte_size = byte_size;
+  e.stamp = stamp;
+  g1_remote_prefetch_cache_bytes += byte_size;
+
+  if (stamp == 1 || (stamp & (stamp - 1)) == 0) {
+    log_info(gc)("Remote prefetch cache: hits=" UINT64_FORMAT
+                 " stores=" UINT64_FORMAT " evictions=" UINT64_FORMAT
+                 " drops=" UINT64_FORMAT " bytes=" SIZE_FORMAT,
+                 g1_remote_prefetch_cache_hits, stamp,
+                 g1_remote_prefetch_cache_evictions,
+                 g1_remote_prefetch_cache_drops,
+                 g1_remote_prefetch_cache_bytes);
+  }
+
+  remote_prefetch_cache_unlock();
+  return true;
 }
 
 static bool remote_prefetch_cache_take(RemoteHandle* h, size_t slot_id,
@@ -674,11 +819,6 @@ public:
       return;
     }
 
-    if (_publish_count >= G1RemoteFetchBatchHardCap) {
-      _failed++;
-      return;
-    }
-
     if (word_size != h->eviction_word_size()) {
       _failed++;
       log_warning(gc)("Batch fetch size MISMATCH: handle=" PTR_FORMAT
@@ -689,6 +829,10 @@ public:
     }
 
     if (is_primary) {
+      if (_publish_count >= G1RemoteFetchBatchHardCap) {
+        _failed++;
+        return;
+      }
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
       size_t current_slot = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
@@ -698,10 +842,13 @@ public:
         return;
       }
     } else {
-      if (!h->try_remote_to_fetching(slot_id)) {
+      if (remote_prefetch_cache_store(h, slot_id, klass, word_size, obj_bytes)) {
+        _prefetched++;
+        _prefetch_words += word_size;
+      } else {
         _raced++;
-        return;
       }
+      return;
     }
 
     HeapWord* dest = _rmm->allocate_in_fcr(word_size);
@@ -731,9 +878,6 @@ public:
     _installed++;
     if (is_primary) {
       _primary_result = installed;
-    } else {
-      _prefetched++;
-      _prefetch_words += word_size;
     }
   }
 
