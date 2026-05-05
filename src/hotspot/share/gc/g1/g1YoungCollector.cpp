@@ -1199,11 +1199,13 @@ static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
                                                     bool* eviction_candidates,
                                                     uint num_regions,
                                                     const char* log_prefix,
-                                                    bool* raw_stack_regions = nullptr) {
+                                                    bool* raw_stack_regions = nullptr,
+                                                    bool* candidate_guarded_regions = nullptr) {
   class RawStackGuardClosure : public ThreadClosure {
     G1CollectedHeap* _g1h;
     bool*            _eviction_candidates;
     bool*            _raw_stack_regions;
+    bool*            _candidate_guarded_regions;
     uint             _num_regions;
     int              _regions_guarded;
     int              _stack_words_found;
@@ -1240,6 +1242,9 @@ static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
 
       if (_eviction_candidates[idx]) {
         _eviction_candidates[idx] = false;
+        if (_candidate_guarded_regions != nullptr) {
+          _candidate_guarded_regions[idx] = true;
+        }
         hr->clear_cold_destination();
         _regions_guarded++;
         _stack_words_found++;
@@ -1259,9 +1264,12 @@ static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
   public:
     RawStackGuardClosure(G1CollectedHeap* g1h, bool* candidates,
                          bool* raw_stack_regions,
+                         bool* candidate_guarded_regions,
                          uint num_regions, const char* log_prefix)
       : _g1h(g1h), _eviction_candidates(candidates),
-        _raw_stack_regions(raw_stack_regions), _num_regions(num_regions),
+        _raw_stack_regions(raw_stack_regions),
+        _candidate_guarded_regions(candidate_guarded_regions),
+        _num_regions(num_regions),
         _regions_guarded(0), _stack_words_found(0), _threads_scanned(0),
         _words_scanned(0), _reports_left(32), _log_prefix(log_prefix) {}
 
@@ -1298,7 +1306,8 @@ static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
   };
 
   RawStackGuardClosure raw_stack_cl(g1h, eviction_candidates, raw_stack_regions,
-                                    num_regions, log_prefix);
+                                    candidate_guarded_regions, num_regions,
+                                    log_prefix);
   Threads::java_threads_do(&raw_stack_cl);
   if (raw_stack_cl.regions_guarded() > 0) {
     log_info(gc)("%s: removed %d candidate regions with %d stack words "
@@ -1722,6 +1731,31 @@ static int abort_remote_eviction_candidates(G1CollectedHeap* g1h,
   int restored = rmm->untag_recorded_local_refs();
   if (restored < rmm->last_phase_c_tagged()) {
     rmm->untag_all_heap_refs();
+  }
+  return backoff_regions;
+}
+
+static int backoff_remote_eviction_guarded_regions(G1RemoteMemoryManager* rmm,
+                                                   const bool* guarded_regions,
+                                                   uint num_regions,
+                                                   const char* reason) {
+  if (rmm == nullptr || guarded_regions == nullptr ||
+      G1RemoteEvictionAbortBackoffGCCycles == 0) {
+    return 0;
+  }
+
+  int backoff_regions = 0;
+  for (uint i = 0; i < num_regions; i++) {
+    if (!guarded_regions[i]) {
+      continue;
+    }
+    rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
+    backoff_regions++;
+  }
+
+  if (backoff_regions > 0) {
+    log_info(gc)("Eviction backoff: skipping %d %s regions for %u GC cycles",
+                 backoff_regions, reason, G1RemoteEvictionAbortBackoffGCCycles);
   }
   return backoff_regions;
 }
@@ -2213,6 +2247,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     memset(eviction_candidates, 0, num_regions * sizeof(bool));
     bool* dense_deferred_candidates = nullptr;
     bool* raw_stack_guarded_regions = nullptr;
+    bool* raw_stack_backoff_regions = nullptr;
     bool dense_refill_after_stack_guard = false;
     bool dense_refill_after_root_guard = false;
     uint dense_refill_region_cap = 0;
@@ -2646,13 +2681,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         raw_stack_guarded_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
         memset(raw_stack_guarded_regions, 0, num_regions * sizeof(bool));
       }
+      if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+        raw_stack_backoff_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+        memset(raw_stack_backoff_regions, 0, num_regions * sizeof(bool));
+      }
 
       int raw_guarded = guard_eviction_candidates_with_raw_stack(
           _g1h, eviction_candidates, num_regions, "Pre-D raw stack guard",
-          raw_stack_guarded_regions);
+          raw_stack_guarded_regions, raw_stack_backoff_regions);
       if (raw_guarded > 0) {
         total_candidates -= raw_guarded;
         dense_pre_d_guarded += raw_guarded;
+        (void)backoff_remote_eviction_guarded_regions(
+            rmm, raw_stack_backoff_regions, num_regions, "raw-stack guarded");
       }
 
       if (raw_guarded > 0 &&
@@ -2679,24 +2720,34 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       RootPinEntry* pins = NEW_C_HEAP_ARRAY(RootPinEntry, pin_capacity, mtGC);
       int num_pins = 0;
       bool* root_guarded_regions = nullptr;
+      bool* root_backoff_regions = nullptr;
       if (dense_refill_after_root_guard && dense_deferred_candidates != nullptr) {
         root_guarded_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
         memset(root_guarded_regions, 0, num_regions * sizeof(bool));
+      }
+      if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+        root_backoff_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+        memset(root_backoff_regions, 0, num_regions * sizeof(bool));
       }
 
       class EvictionThreadRootPinClosure : public OopClosure {
         G1CollectedHeap* _g1h;
         bool*            _eviction_candidates;
         bool*            _root_guarded_regions;
+        bool*            _candidate_guarded_regions;
         uint             _num_regions;
         int              _regions_guarded;
         int              _roots_found;
 
       public:
         EvictionThreadRootPinClosure(G1CollectedHeap* g1h, bool* candidates,
-                                     bool* root_guarded_regions, uint num_regions)
+                                     bool* root_guarded_regions,
+                                     bool* candidate_guarded_regions,
+                                     uint num_regions)
           : _g1h(g1h), _eviction_candidates(candidates),
-            _root_guarded_regions(root_guarded_regions), _num_regions(num_regions),
+            _root_guarded_regions(root_guarded_regions),
+            _candidate_guarded_regions(candidate_guarded_regions),
+            _num_regions(num_regions),
             _regions_guarded(0), _roots_found(0) {}
 
         void do_oop(oop* p) {
@@ -2723,6 +2774,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
           if (_eviction_candidates[idx]) {
             _eviction_candidates[idx] = false;
+            if (_candidate_guarded_regions != nullptr) {
+              _candidate_guarded_regions[idx] = true;
+            }
             hr->clear_cold_destination();
             _regions_guarded++;
             _roots_found++;
@@ -2740,7 +2794,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       // words in this late post-evacuation eviction pass. Do not parse object
       // headers or relocate them here; conservatively keep their regions local.
       EvictionThreadRootPinClosure thread_pin_cl(_g1h, eviction_candidates,
-                                                 root_guarded_regions, num_regions);
+                                                 root_guarded_regions,
+                                                 root_backoff_regions, num_regions);
       Threads::oops_do(&thread_pin_cl, nullptr);
       if (thread_pin_cl.regions_guarded() > 0) {
         total_candidates -= thread_pin_cl.regions_guarded();
@@ -2750,7 +2805,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       if (!G1RemoteUseRootCatchRelocation) {
         EvictionThreadRootPinClosure root_pin_cl(_g1h, eviction_candidates,
-                                                 root_guarded_regions, num_regions);
+                                                 root_guarded_regions,
+                                                 root_backoff_regions, num_regions);
         JNIHandles::oops_do(&root_pin_cl);
         OopStorageSet::strong_oops_do(&root_pin_cl);
         for (auto id : EnumRange<OopStorageSet::WeakId>()) {
@@ -2805,6 +2861,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           uint idx = hr->hrm_index();
           if (idx < num_regions && eviction_candidates[idx]) {
             eviction_candidates[idx] = false;
+            if (root_guarded_regions != nullptr) {
+              root_guarded_regions[idx] = true;
+            }
+            if (root_backoff_regions != nullptr) {
+              root_backoff_regions[idx] = true;
+            }
             hr->clear_cold_destination();
             remote_anchor_pinned++;
           }
@@ -2820,6 +2882,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               HeapRegion* hr = _g1h->region_at_or_null(i);
               if (hr == nullptr) continue;
               eviction_candidates[i] = false;
+              if (root_guarded_regions != nullptr) {
+                root_guarded_regions[i] = true;
+              }
+              if (root_backoff_regions != nullptr) {
+                root_backoff_regions[i] = true;
+              }
               hr->clear_cold_destination();
               overflow_pinned++;
             }
@@ -2970,6 +3038,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             HeapRegion* hr = _g1h->region_at_or_null(i);
             if (hr == nullptr) continue;
             eviction_candidates[i] = false;
+            if (root_guarded_regions != nullptr) {
+              root_guarded_regions[i] = true;
+            }
+            if (root_backoff_regions != nullptr) {
+              root_backoff_regions[i] = true;
+            }
             hr->clear_cold_destination();
             regions_pinned++;
             overflow_pinned++;
@@ -3021,6 +3095,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               uint idx = pin_hr->hrm_index();
               if (idx < num_regions && eviction_candidates[idx]) {
                 eviction_candidates[idx] = false;
+                if (root_guarded_regions != nullptr) {
+                  root_guarded_regions[idx] = true;
+                }
+                if (root_backoff_regions != nullptr) {
+                  root_backoff_regions[idx] = true;
+                }
                 pin_hr->clear_cold_destination();
                 regions_pinned++;
                 total_candidates--;
@@ -3061,6 +3141,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               uint idx = pin_hr->hrm_index();
               if (idx < num_regions && eviction_candidates[idx]) {
                 eviction_candidates[idx] = false;
+                if (root_guarded_regions != nullptr) {
+                  root_guarded_regions[idx] = true;
+                }
+                if (root_backoff_regions != nullptr) {
+                  root_backoff_regions[idx] = true;
+                }
                 pin_hr->clear_cold_destination();
                 regions_pinned++;
                 total_candidates--;
@@ -3103,6 +3189,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             uint idx = hr->hrm_index();
             if (idx < num_regions && eviction_candidates[idx]) {
               eviction_candidates[idx] = false;
+              if (root_guarded_regions != nullptr) {
+                root_guarded_regions[idx] = true;
+              }
+              if (root_backoff_regions != nullptr) {
+                root_backoff_regions[idx] = true;
+              }
               regions_pinned++;
               total_candidates--;
               fallback_pinned++;
@@ -3169,6 +3261,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
       }
 
+      (void)backoff_remote_eviction_guarded_regions(
+          rmm, root_backoff_regions, num_regions, "root/remote-anchor guarded");
+
       // Clean up cold_destination/root_pinned flags from earlier scan
       for (uint i = 0; i < num_regions; i++) {
         HeapRegion* hr = _g1h->region_at_or_null(i);
@@ -3182,10 +3277,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       if (root_guarded_regions != nullptr) {
         FREE_C_HEAP_ARRAY(bool, root_guarded_regions);
       }
+      if (root_backoff_regions != nullptr) {
+        FREE_C_HEAP_ARRAY(bool, root_backoff_regions);
+      }
     }
 
     if (raw_stack_guarded_regions != nullptr) {
       FREE_C_HEAP_ARRAY(bool, raw_stack_guarded_regions);
+    }
+
+    if (raw_stack_backoff_regions != nullptr) {
+      FREE_C_HEAP_ARRAY(bool, raw_stack_backoff_regions);
     }
 
     if (dense_deferred_candidates != nullptr) {

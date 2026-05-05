@@ -392,7 +392,8 @@
                                                                             \
   product(uint, G1RemoteEvictionAbortBackoffGCCycles, 16, DIAGNOSTIC,       \
           "Number of GC cycles to skip a region after remote eviction "      \
-          "verification aborts with untagged heap refs. 0 disables the "     \
+          "verification aborts or stack/root/remote-anchor guards reject "   \
+          "a candidate. 0 disables the "                                    \
           "backoff.")                                                        \
           range(0, 10000)                                                    \
                                                                             \
