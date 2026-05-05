@@ -392,12 +392,12 @@
           "eviction Phase C may still tag refs during a bounded STW "         \
           "eviction attempt.")                                                \
                                                                             \
-  product(bool, G1RemoteTagObjArraySources, false, DIAGNOSTIC,               \
+  product(bool, G1RemoteTagObjArraySources, true, DIAGNOSTIC,                \
           "Allow remote eviction Phase C to tag references stored in object " \
-          "array elements. Disabled by default because some object-array "    \
+          "array elements when the target is a type array. Ordinary object "  \
+          "targets from object arrays remain untaggable because some "        \
           "load/null-check paths can observe the unresolved tagged handle "   \
-          "before the receiver is resolved. Unknown sources and non-oop "     \
-          "arrays remain untaggable.")                                        \
+          "before the receiver is resolved.")                                 \
                                                                             \
   product(bool, G1RemoteAllowTypeArrayEviction, false, DIAGNOSTIC,           \
           "Allow remote eviction of primitive arrays as whole objects. "       \

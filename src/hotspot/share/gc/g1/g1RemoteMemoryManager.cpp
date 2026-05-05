@@ -1596,10 +1596,14 @@ public:
     if (heap_source) {
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
       bool object_array_source = source_klass != nullptr && source_klass->is_objArray_klass();
+      Klass* target_klass = target->klass_or_null();
+      bool target_type_array = target_klass != nullptr && target_klass->is_typeArray_klass();
+      bool unsafe_obj_array_source =
+          object_array_source && (!G1RemoteTagObjArraySources || !target_type_array);
       bool unknown_source = _cur_obj == nullptr && !_allow_unknown_heap_source;
       bool untaggable_source = unknown_source ||
           (source_klass != nullptr && source_klass->is_array_klass() &&
-           (!object_array_source || !G1RemoteTagObjArraySources));
+           (!object_array_source || unsafe_obj_array_source));
       if (untaggable_source) {
         _untaggable++;
         if (_untaggable_reports_left > 0) {
@@ -2600,11 +2604,15 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
       bool source_array = source_klass != nullptr && source_klass->is_array_klass();
       bool source_obj_array = source_klass != nullptr && source_klass->is_objArray_klass();
+      Klass* target_klass = target->klass_or_null();
+      bool target_type_array = target_klass != nullptr && target_klass->is_typeArray_klass();
+      bool unsafe_obj_array_source =
+          source_obj_array && (!G1RemoteTagObjArraySources || !target_type_array);
       bool heap_source = src_hr != nullptr && _g1h->is_in((void*)p);
       bool untaggable_source =
           !heap_source ||
           source_klass == nullptr ||
-          (source_array && (!source_obj_array || !G1RemoteTagObjArraySources));
+          (source_array && (!source_obj_array || unsafe_obj_array_source));
 
       _missed++;
       if (src_hr != nullptr) {
