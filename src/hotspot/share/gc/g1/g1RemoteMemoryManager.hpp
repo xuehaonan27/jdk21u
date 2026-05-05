@@ -1227,10 +1227,18 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
   // not make a remote edge anchor invisible to root processing; stale anchors
   // are correctness-critical because fetch-time edge patching trusts them.
   //
-  // For each anchor (LOCAL + remote_refcount > 0), call cl->do_oop. If GC
-  // moves the object, update the primary Handle immediately. Do not rebuild the
-  // secondary address table here: this method is called from evacuation workers,
-  // and a full table rebuild serializes the whole worker gang.
+  // For each local remote root, call cl->do_oop. This includes:
+  //   - edge anchors (LOCAL + remote_refcount > 0), and
+  //   - fetched-back evicted objects (LOCAL + eviction_word_size > 0).
+  //
+  // A fetched primitive array can be referenced only through a tagged handle in
+  // a heap/root slot. If we miss that slot, treating the handle itself as a root
+  // is the conservative fallback that prevents GC from freeing the FCR object
+  // while Java can still resolve the handle.
+  //
+  // If GC moves the object, update the primary Handle immediately. Do not
+  // rebuild the secondary address table here: this method is called from
+  // evacuation workers, and a full table rebuild serializes the worker gang.
   class AnchorHandleClosure {
     G1RemoteMemoryManager* _rmm;
     OopClosureType* _cl;
@@ -1241,7 +1249,8 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
       : _rmm(rmm), _cl(cl), _stale_anchors(0) {}
 
     void do_handle(RemoteHandle* h) {
-      if (h == nullptr || h->remote_refcount() == 0) return;
+      if (h == nullptr) return;
+      if (h->remote_refcount() == 0 && h->eviction_word_size() == 0) return;
 
       uintptr_t sa = h->load_state_and_addr_acquire();
       if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) return;
