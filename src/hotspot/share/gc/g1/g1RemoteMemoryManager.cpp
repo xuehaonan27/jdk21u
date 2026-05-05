@@ -1601,8 +1601,11 @@ public:
       bool object_array_source = source_klass != nullptr && source_klass->is_objArray_klass();
       Klass* target_klass = target->klass_or_null();
       bool target_type_array = target_klass != nullptr && target_klass->is_typeArray_klass();
+      bool target_object = target_klass != nullptr && !target_klass->is_array_klass();
       bool unsafe_obj_array_source =
-          object_array_source && (!G1RemoteTagObjArraySources || !target_type_array);
+          object_array_source &&
+          ((!target_type_array || !G1RemoteTagObjArraySources) &&
+           (!target_object || !G1RemoteTagObjArrayObjectSources));
       bool unknown_source = _cur_obj == nullptr && !_allow_unknown_heap_source;
       bool untaggable_source = unknown_source ||
           (source_klass != nullptr && source_klass->is_array_klass() &&
@@ -2664,8 +2667,11 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       bool source_obj_array = source_klass != nullptr && source_klass->is_objArray_klass();
       Klass* target_klass = target->klass_or_null();
       bool target_type_array = target_klass != nullptr && target_klass->is_typeArray_klass();
+      bool target_object = target_klass != nullptr && !target_klass->is_array_klass();
       bool unsafe_obj_array_source =
-          source_obj_array && (!G1RemoteTagObjArraySources || !target_type_array);
+          source_obj_array &&
+          ((!target_type_array || !G1RemoteTagObjArraySources) &&
+           (!target_object || !G1RemoteTagObjArrayObjectSources));
       bool heap_source = src_hr != nullptr && _g1h->is_in((void*)p);
       bool untaggable_source =
           !heap_source ||

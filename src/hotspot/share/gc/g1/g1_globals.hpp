@@ -399,6 +399,12 @@
           "load/null-check paths can observe the unresolved tagged handle "   \
           "before the receiver is resolved.")                                 \
                                                                             \
+  product(bool, G1RemoteTagObjArrayObjectSources, false, DIAGNOSTIC,          \
+          "Allow remote eviction Phase C to tag references stored in object " \
+          "array elements when the target is an ordinary object. This is "     \
+          "disabled by default because every mutator and VM object-array "     \
+          "element load must resolve tagged handles before using the value.")  \
+                                                                            \
   product(bool, G1RemoteAbortOnPhaseCUntaggable, true, DIAGNOSTIC,           \
           "Abort remote eviction immediately after Phase C if tagging found " \
           "heap refs that cannot safely be tagged. Verification would only "  \
