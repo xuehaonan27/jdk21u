@@ -404,6 +404,12 @@
           "heap refs that cannot safely be tagged. Verification would only "  \
           "rediscover those refs and abort later.")                           \
                                                                             \
+  product(bool, G1RemoteUseRootCatchRelocation, false, DIAGNOSTIC,           \
+          "Allow remote eviction to copy root-held candidate objects to "     \
+          "fetch-cache regions before evicting their source regions. "        \
+          "Disabled by default because an eviction abort after this phase "   \
+          "would otherwise leave forwarding stubs in local old regions.")     \
+                                                                            \
   product(bool, G1RemoteAllowTypeArrayEviction, false, DIAGNOSTIC,           \
           "Allow remote eviction of primitive arrays as whole objects. "       \
           "Object arrays remain local unless covered by separate reference "   \

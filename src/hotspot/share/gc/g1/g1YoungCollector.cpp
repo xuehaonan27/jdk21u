@@ -2516,10 +2516,86 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                      thread_pin_cl.regions_guarded(), thread_pin_cl.roots_found());
       }
 
-      class EvictionRootCollectClosure : public OopClosure {
-        G1CollectedHeap* _g1h;
-        const bool*      _eviction_candidates;
-        uint             _num_regions;
+      if (!G1RemoteUseRootCatchRelocation) {
+        EvictionThreadRootPinClosure root_pin_cl(_g1h, eviction_candidates, num_regions);
+        JNIHandles::oops_do(&root_pin_cl);
+        OopStorageSet::strong_oops_do(&root_pin_cl);
+        for (auto id : EnumRange<OopStorageSet::WeakId>()) {
+          OopStorageSet::storage(id)->oops_do(&root_pin_cl);
+        }
+        {
+          CLDToOopClosure cld_cl(&root_pin_cl, ClassLoaderData::_claim_none);
+          ClassLoaderDataGraph::cld_do(&cld_cl);
+        }
+        {
+          CodeBlobToOopClosure code_cl(&root_pin_cl, false);
+          CodeCache::blobs_do(&code_cl);
+        }
+        _g1h->ref_processor_cm()->weak_oops_do(&root_pin_cl);
+
+        bool remote_anchor_overflow = false;
+        int remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
+            eviction_candidates, num_regions, nullptr, 0, &remote_anchor_overflow);
+        int remote_anchor_capacity = remote_anchor_seen;
+        uintptr_t* remote_anchor_addrs = nullptr;
+        if (remote_anchor_capacity > 0) {
+          remote_anchor_addrs = NEW_C_HEAP_ARRAY(uintptr_t, remote_anchor_capacity, mtGC);
+        }
+
+        remote_anchor_overflow = false;
+        remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
+            eviction_candidates, num_regions, remote_anchor_addrs,
+            remote_anchor_capacity, &remote_anchor_overflow);
+        int remote_anchor_stored = MIN2(remote_anchor_seen, remote_anchor_capacity);
+        int remote_anchor_pinned = 0;
+        for (int i = 0; i < remote_anchor_stored; i++) {
+          uintptr_t obj_addr = remote_anchor_addrs[i];
+          if (!is_aligned((address)obj_addr, HeapWordSize) ||
+              !_g1h->is_in_reserved((void*)obj_addr)) {
+            continue;
+          }
+          HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)obj_addr);
+          if (hr == nullptr) continue;
+          uint idx = hr->hrm_index();
+          if (idx < num_regions && eviction_candidates[idx]) {
+            eviction_candidates[idx] = false;
+            hr->clear_cold_destination();
+            remote_anchor_pinned++;
+          }
+        }
+        if (remote_anchor_addrs != nullptr) {
+          FREE_C_HEAP_ARRAY(uintptr_t, remote_anchor_addrs);
+        }
+
+        if (remote_anchor_seen > remote_anchor_stored || remote_anchor_overflow) {
+          int overflow_pinned = 0;
+          for (uint i = 0; i < num_regions; i++) {
+            if (eviction_candidates[i]) {
+              HeapRegion* hr = _g1h->region_at_or_null(i);
+              if (hr == nullptr) continue;
+              eviction_candidates[i] = false;
+              hr->clear_cold_destination();
+              overflow_pinned++;
+            }
+          }
+          remote_anchor_pinned += overflow_pinned;
+          log_warning(gc)("Root-catch disabled: remote-anchor overflow, pinned %d "
+                          "remaining candidate regions (anchors=%d stored=%d)",
+                          overflow_pinned, remote_anchor_seen, remote_anchor_stored);
+        }
+
+        int root_guarded = root_pin_cl.regions_guarded() + remote_anchor_pinned;
+        if (root_guarded > 0) {
+          total_candidates -= root_guarded;
+          log_info(gc)("Root-catch disabled: pinned %d candidate regions for "
+                       "%d non-thread roots and %d remote anchors",
+                       root_guarded, root_pin_cl.roots_found(), remote_anchor_seen);
+        }
+      } else {
+        class EvictionRootCollectClosure : public OopClosure {
+          G1CollectedHeap* _g1h;
+          const bool*      _eviction_candidates;
+          uint             _num_regions;
         RootPinEntry**   _pins;
         int&             _num_pins;
         int&             _pin_capacity;
@@ -2828,6 +2904,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         // regions. Update every LOCAL Handle that still points at one of
         // those forwarding stubs, including duplicate dormant anchors.
         rmm->fixup_all_local_handles();
+      }
       }
 
       // Clean up cold_destination/root_pinned flags from earlier scan
