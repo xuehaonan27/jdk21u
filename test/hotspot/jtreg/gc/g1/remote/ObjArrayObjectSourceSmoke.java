@@ -2,7 +2,7 @@
  * @test
  * @summary Stress object-array references to ordinary objects under remote eviction.
  * @requires vm.gc.G1
- * @run main/othervm -Xms512m -Xmx512m -XX:+UseG1GC -XX:+UnlockDiagnosticVMOptions -XX:+G1SimulateRemoteEviction -XX:LocalMemoryRatio=10 -XX:-G1RemoteUseCgroupPressure -XX:+G1TagRefSites -XX:+G1RemoteAllowDenseObjectEviction -XX:+G1RemoteUseFastPhaseC -XX:+G1RemoteUseFastPhaseCSourceHints -XX:+G1RemoteTagObjArrayObjectSources -XX:+G1RemoteRepairFastPhaseCMisses -XX:G1RemoteFastPhaseCRepairMissLimit=200000 -XX:-G1RemoteUseRootCatchRelocation -XX:-UseCompressedOops -XX:-UseCompressedClassPointers -Xshare:off ObjArrayObjectSourceSmoke
+ * @run main/othervm -Xms512m -Xmx512m -XX:+UseG1GC -XX:+UnlockDiagnosticVMOptions -XX:+G1SimulateRemoteEviction -XX:LocalMemoryRatio=10 -XX:-G1RemoteUseCgroupPressure -XX:+G1TagRefSites -XX:TieredStopAtLevel=1 -XX:+G1RemoteAllowDenseObjectEviction -XX:+G1RemoteUseFastPhaseC -XX:+G1RemoteUseFastPhaseCSourceHints -XX:+G1RemoteTagObjArrayObjectSources -XX:+G1RemoteRepairFastPhaseCMisses -XX:G1RemoteFastPhaseCRepairMissLimit=200000 -XX:-G1RemoteUseRootCatchRelocation -XX:-UseCompressedOops -XX:-UseCompressedClassPointers -Xshare:off ObjArrayObjectSourceSmoke
  */
 
 public class ObjArrayObjectSourceSmoke {
