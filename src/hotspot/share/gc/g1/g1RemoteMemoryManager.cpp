@@ -3553,6 +3553,7 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
 
 void G1RemoteMemoryManager::update_handles_for_full_gc() {
   int updated = 0;
+  int stale_killed = 0;
 
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
@@ -3561,14 +3562,24 @@ void G1RemoteMemoryManager::update_handles_for_full_gc() {
       HandleEntry* next = e->_next;
       RemoteHandle* h = e->_handle;
 
-      if (h != nullptr && h->is_local()) {
-        // Verify the object address is still in the heap before accessing.
-        // During Full GC, dead objects may have been reclaimed.
-        if (!_g1h->is_in((void*)e->_obj_addr)) {
+      if (h != nullptr) {
+        uintptr_t sa = h->load_state_and_addr_acquire();
+        if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
           e = next;
           continue;
         }
-        oop obj = cast_to_oop(e->_obj_addr);
+
+        // Full GC runs after remote eviction may leave LOCAL table entries
+        // pointing into evict-guarded or otherwise stale heap ranges.  Do not
+        // read the mark word until the common validator has ruled those out.
+        if (!validate_local_handle_addr(h, "FULL-GC-HANDLE",
+                                        &stale_killed, 16)) {
+          e = next;
+          continue;
+        }
+
+        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+        oop obj = cast_to_oop(addr);
         if (obj->is_forwarded()) {
           oop new_obj = obj->forwardee();
           uintptr_t new_addr = cast_from_oop<uintptr_t>(new_obj);
@@ -3613,8 +3624,9 @@ void G1RemoteMemoryManager::update_handles_for_full_gc() {
   }
   table_unlock();
 
-  if (updated > 0) {
-    log_info(gc)("Full GC handle update: %d handles rekeyed", updated);
+  if (updated > 0 || stale_killed > 0) {
+    log_info(gc)("Full GC handle update: %d handles rekeyed, %d stale handles killed",
+                 updated, stale_killed);
   }
 }
 
