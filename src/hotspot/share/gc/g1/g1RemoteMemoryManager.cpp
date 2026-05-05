@@ -1672,6 +1672,23 @@ static int remote_eviction_scan_region_objects(HeapRegion* hr,
                                                const G1CMBitMap* bitmap,
                                                const char* phase,
                                                ObjectClosure* cl) {
+  if (hr->is_continues_humongous()) {
+    return 0;
+  }
+
+  if (hr->is_starts_humongous()) {
+    oop obj = cast_to_oop(hr->bottom());
+    Klass* k = obj->klass_or_null_acquire();
+    if (!remote_eviction_valid_klass(k)) {
+      log_warning(gc)("%s humongous scan skipped: region %u invalid klass at "
+                      PTR_FORMAT,
+                      phase, hr->hrm_index(), p2i((void*)obj));
+      return 0;
+    }
+    cl->do_object(obj);
+    return 1;
+  }
+
   HeapWord* const pb = hr->parsable_bottom_acquire();
   HeapWord* const region_top = hr->top();
   HeapWord* const region_end = hr->end();
