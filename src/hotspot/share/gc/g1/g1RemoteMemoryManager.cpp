@@ -2371,10 +2371,54 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
   return total_tagged;
 }
 
+class G1RemoteRollbackDirtyCards : public StackObj {
+  G1CollectedHeap* _g1h;
+  G1CardTable* _ct;
+  G1DirtyCardQueueSet& _dcqs;
+  G1DirtyCardQueue _queue;
+  int _dirtied;
+
+public:
+  G1RemoteRollbackDirtyCards(G1CollectedHeap* g1h)
+    : _g1h(g1h),
+      _ct(g1h->card_table()),
+      _dcqs(G1BarrierSet::dirty_card_queue_set()),
+      _queue(&_dcqs),
+      _dirtied(0) {}
+
+  void dirty_field(oop* field_addr) {
+    if (field_addr == nullptr || !_g1h->is_in_reserved((void*)field_addr)) {
+      return;
+    }
+
+    HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)field_addr);
+    if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+      return;
+    }
+
+    CardTable::CardValue* card = _ct->byte_for((HeapWord*)field_addr);
+    if (*card == G1CardTable::g1_young_card_val() ||
+        *card == G1CardTable::dirty_card_val()) {
+      return;
+    }
+
+    *card = G1CardTable::dirty_card_val();
+    _dcqs.enqueue(_queue, card);
+    _dirtied++;
+  }
+
+  void flush() {
+    _dcqs.flush_queue(_queue);
+  }
+
+  int dirtied() const { return _dirtied; }
+};
+
 int G1RemoteMemoryManager::untag_recorded_local_refs() {
   int restored = 0;
   int removed = 0;
   int retained = 0;
+  G1RemoteRollbackDirtyCards dirty_cards(_g1h);
 
   for (int i = 0; i < _tagged_field_count; i++) {
     oop* field_addr = _tagged_fields[i]._field_addr;
@@ -2411,6 +2455,7 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
     if (state == REMOTE_HANDLE_LOCAL) {
       *(uintptr_t*)field_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      dirty_cards.dirty_field(field_addr);
       restored++;
       continue;
     }
@@ -2418,20 +2463,23 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
     _tagged_fields[retained++] = _tagged_fields[i];
   }
 
+  dirty_cards.flush();
   _tagged_field_count = retained;
-  if (restored > 0 || removed > 0) {
+  if (restored > 0 || removed > 0 || dirty_cards.dirtied() > 0) {
     log_info(gc)("Recorded untag cleanup: restored %d local refs, removed %d stale entries, "
-                 "%d remote-tag entries retained",
-                 restored, removed, retained);
+                 "%d remote-tag entries retained, dirtied %d cards",
+                 restored, removed, retained, dirty_cards.dirtied());
   }
   return restored;
 }
 
 int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_workers) {
   class UntagClosure : public BasicOopIterateClosure {
+    G1RemoteRollbackDirtyCards* _dirty_cards;
     int _untagged;
   public:
-    UntagClosure() : _untagged(0) {}
+    UntagClosure(G1RemoteRollbackDirtyCards* dirty_cards)
+      : _dirty_cards(dirty_cards), _untagged(0) {}
 
     virtual void do_oop(oop* p) {
       uintptr_t raw = *(uintptr_t*)p;
@@ -2445,6 +2493,9 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
       if (state == REMOTE_HANDLE_LOCAL) {
         uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
         *(uintptr_t*)p = addr;
+        if (_dirty_cards != nullptr) {
+          _dirty_cards->dirty_field(p);
+        }
         _untagged++;
       }
     }
@@ -2452,7 +2503,8 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
     int untagged() const { return _untagged; }
   };
 
-  UntagClosure cl;
+  G1RemoteRollbackDirtyCards dirty_cards(_g1h);
+  UntagClosure cl(&dirty_cards);
   for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
     HeapRegion* hr = _g1h->region_at_or_null(i);
     if (hr == nullptr) continue;
@@ -2471,8 +2523,10 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
     }
   }
 
-  if (cl.untagged() > 0) {
-    log_info(gc)("Untag cleanup: restored %d tagged refs to clean oops", cl.untagged());
+  dirty_cards.flush();
+  if (cl.untagged() > 0 || dirty_cards.dirtied() > 0) {
+    log_info(gc)("Untag cleanup: restored %d tagged refs to clean oops, dirtied %d cards",
+                 cl.untagged(), dirty_cards.dirtied());
   }
   return cl.untagged();
 }
