@@ -1467,7 +1467,9 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     bool can_evict_object =
         unlocked &&
         !G1CollectedHeap::is_obj_filler(obj) &&
-        (!is_array || (is_type_array && G1RemoteAllowTypeArrayEviction));
+        (!is_array ||
+         (is_type_array && G1RemoteAllowTypeArrayEviction) ||
+         (is_obj_array && G1RemoteAllowObjectArrayEviction));
     if (can_evict_object) {
       evictable_object_count++;
       evictable_words += word_size;
