@@ -3993,6 +3993,52 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                    finish_failed_regions, finish_failed_aborted, finish_workers,
                    G1RemoteParallelFinishEviction ? 1 : 0);
 
+      // Phase C may already have rewritten heap fields to tagged handles.
+      // If any candidate is removed after Phase C, mixing "restore these
+      // candidates" with "evict the rest" requires per-region tagged-field
+      // rollback. Until that exists, abort the whole attempt and restore all
+      // local tagged refs. Leaving tagged refs to local objects in ordinary
+      // object arrays is not a safe mutator-visible state.
+      if (finish_failed_regions > 0) {
+        int late_abort_regions = 0;
+        int late_abort_entries = 0;
+        for (uint i = 0; i < num_regions; i++) {
+          if (!eviction_candidates[i]) continue;
+
+          int start = region_start[i];
+          int rcount = region_count_arr[i];
+          for (int e = start; e < start + rcount; e++) {
+            if (entry_active[e]) {
+              rmm->abort_prepared_eviction(&entries[e]);
+              entry_active[e] = false;
+              late_abort_entries++;
+            }
+          }
+
+          HeapRegion* hr = _g1h->region_at_or_null(i);
+          if (hr != nullptr) {
+            hr->clear_cold_destination();
+          }
+          eviction_candidates[i] = false;
+          region_complete[i] = false;
+          region_count_arr[i] = 0;
+          late_abort_regions++;
+          if (total_candidates > 0) {
+            total_candidates--;
+          }
+        }
+
+        int restored = rmm->untag_recorded_local_refs();
+        if (restored < rmm->last_phase_c_tagged()) {
+          rmm->untag_all_heap_refs();
+        }
+        log_warning(gc)("Phase E finish failure guard: aborted %d remaining "
+                        "candidate regions (%d prepared entries) after %d "
+                        "regions failed finish; restored %d local tagged refs",
+                        late_abort_regions, late_abort_entries,
+                        finish_failed_regions, restored);
+      }
+
       // E1.8: Edge-table construction can create new dormant anchors for
       // outgoing references. Re-run the unprepared-handle guard after those
       // anchors are published and before any backend send or fillerization.
