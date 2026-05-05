@@ -34,6 +34,10 @@
 #include <signal.h>
 #include <pthread.h>
 
+#ifdef USE_LIBAPTH
+#include <apth.h>
+#endif
+
 #ifdef __linux__
   /* Also defined in net/linux_close.c */
   #define INTERRUPT_SIGNAL (SIGRTMAX - 2)
@@ -88,12 +92,10 @@ Java_sun_nio_ch_NativeThread_current0(JNIEnv *env, jclass cl)
      * fall through to the normal pthread_self() path.
      */
     {
-        extern void *apth_self(void);
-        extern int apth_get_thread_stats(void *, void *);
-        void *self = apth_self();
+        apth_t self = apth_self();
         if (self != NULL) {
-            struct { int dispatches; double cpu, wall; int thread_class, state; } st;
-            if (apth_get_thread_stats(self, &st) == 0 && st.thread_class != 3/*DEDICATED*/) {
+            struct apth_thread_stats st;
+            if (apth_get_thread_stats(self, &st) == 0 && st.thread_class != APTH_CLASS_DEDICATED) {
                 return (jlong)-2;
             }
         }
