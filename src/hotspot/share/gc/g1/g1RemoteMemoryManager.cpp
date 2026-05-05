@@ -1375,6 +1375,108 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
   return count;
 }
 
+int G1RemoteMemoryManager::mark_remote_anchor_regions_in_set(const bool* region_set,
+                                                             uint num_regions,
+                                                             bool* anchor_regions,
+                                                             int* anchors_seen) {
+  if (anchors_seen != nullptr) {
+    *anchors_seen = 0;
+  }
+  if (region_set == nullptr || anchor_regions == nullptr || num_regions == 0) {
+    return 0;
+  }
+
+  int marked_regions = 0;
+  int seen = 0;
+  int stale_handles = 0;
+
+  class RemoteAnchorMarkClosure {
+    G1RemoteMemoryManager* _rmm;
+    const bool* _region_set;
+    uint _num_regions;
+    bool* _anchor_regions;
+    int _marked_regions;
+    int _seen;
+    int _stale_handles;
+
+  public:
+    RemoteAnchorMarkClosure(G1RemoteMemoryManager* rmm,
+                            const bool* region_set,
+                            uint num_regions,
+                            bool* anchor_regions)
+      : _rmm(rmm), _region_set(region_set), _num_regions(num_regions),
+        _anchor_regions(anchor_regions), _marked_regions(0), _seen(0),
+        _stale_handles(0) {}
+
+    void do_handle(RemoteHandle* h) {
+      if (h == nullptr) return;
+      if (!h->is_local() || h->remote_refcount() == 0) return;
+
+      if (!_rmm->validate_local_handle_addr(h, "ANCHOR-MARK",
+                                            &_stale_handles, 8)) {
+        return;
+      }
+
+      uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+      if (addr == 0 || !_rmm->_g1h->is_in((void*)addr)) return;
+
+      HeapRegion* hr = _rmm->_g1h->heap_region_containing((void*)addr);
+      if (hr == nullptr) return;
+      uint ridx = hr->hrm_index();
+      if (ridx >= _num_regions || !_region_set[ridx]) return;
+
+      _seen++;
+      if (!_anchor_regions[ridx]) {
+        _anchor_regions[ridx] = true;
+        _marked_regions++;
+      }
+    }
+
+    int marked_regions() const { return _marked_regions; }
+    int seen() const { return _seen; }
+    int stale_handles() const { return _stale_handles; }
+  };
+
+  RemoteAnchorMarkClosure cl(this, region_set, num_regions, anchor_regions);
+  _handle_allocator.handles_do(&cl);
+  marked_regions = cl.marked_regions();
+  seen = cl.seen();
+  stale_handles = cl.stale_handles();
+
+  for (int i = 0; i < _cross_roots_count; i++) {
+    RemoteHandle* h = _cross_roots[i];
+    if (h == nullptr || !h->is_local()) continue;
+    if (!validate_local_handle_addr(h, "CROSS-ROOT-MARK",
+                                    &stale_handles, 8)) {
+      continue;
+    }
+
+    uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+    if (addr == 0 || !_g1h->is_in((void*)addr)) continue;
+
+    HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
+    if (hr == nullptr) continue;
+    uint ridx = hr->hrm_index();
+    if (ridx >= num_regions || !region_set[ridx]) continue;
+
+    seen++;
+    if (!anchor_regions[ridx]) {
+      anchor_regions[ridx] = true;
+      marked_regions++;
+    }
+  }
+
+  if (anchors_seen != nullptr) {
+    *anchors_seen = seen;
+  }
+  if (stale_handles > 8) {
+    log_warning(gc)("Remote anchor marking marked %d stale LOCAL handles DEAD "
+                    "(logged first 8)", stale_handles);
+  }
+
+  return marked_regions;
+}
+
 // ============================================================
 // Region-Granularity Eviction
 // ============================================================

@@ -1590,46 +1590,13 @@ static int mark_remote_anchor_regions_for_set(G1CollectedHeap* g1h,
     return 0;
   }
 
-  bool overflow = false;
-  int anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
-      region_set, num_regions, nullptr, 0, &overflow);
-  if (anchor_seen <= 0) {
-    return 0;
+  int anchor_seen = 0;
+  int marked = rmm->mark_remote_anchor_regions_in_set(
+      region_set, num_regions, guarded_regions, &anchor_seen);
+  if (marked > 0) {
+    log_debug(gc)("%s: remote-anchor guard marked %d regions from %d anchors",
+                  reason, marked, anchor_seen);
   }
-
-  uintptr_t* anchor_addrs = NEW_C_HEAP_ARRAY(uintptr_t, anchor_seen, mtGC);
-  overflow = false;
-  int anchor_seen_again = rmm->collect_remote_anchor_addrs_in_regions(
-      region_set, num_regions, anchor_addrs, anchor_seen, &overflow);
-  int anchor_stored = MIN2(anchor_seen_again, anchor_seen);
-  int marked = 0;
-
-  for (int i = 0; i < anchor_stored; i++) {
-    uintptr_t obj_addr = anchor_addrs[i];
-    if (!is_aligned((address)obj_addr, HeapWordSize) ||
-        !g1h->is_in_reserved((void*)obj_addr)) {
-      continue;
-    }
-    HeapRegion* hr = g1h->heap_region_containing_or_null((void*)obj_addr);
-    if (hr == nullptr) continue;
-    uint idx = hr->hrm_index();
-    if (idx < num_regions && !guarded_regions[idx]) {
-      guarded_regions[idx] = true;
-      marked++;
-    }
-  }
-
-  FREE_C_HEAP_ARRAY(uintptr_t, anchor_addrs);
-
-  if (overflow || anchor_seen_again > anchor_stored) {
-    if (overflow_out != nullptr) {
-      *overflow_out = true;
-    }
-    log_warning(gc)("%s: remote-anchor guard saw overflow while marking "
-                    "dense refill blockers (anchors=%d stored=%d)",
-                    reason, anchor_seen_again, anchor_stored);
-  }
-
   return marked;
 }
 
@@ -2835,31 +2802,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
 
-        bool remote_anchor_overflow = false;
-        int remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
-            eviction_candidates, num_regions, nullptr, 0, &remote_anchor_overflow);
-        int remote_anchor_capacity = remote_anchor_seen;
-        uintptr_t* remote_anchor_addrs = nullptr;
-        if (remote_anchor_capacity > 0) {
-          remote_anchor_addrs = NEW_C_HEAP_ARRAY(uintptr_t, remote_anchor_capacity, mtGC);
-        }
-
-        remote_anchor_overflow = false;
-        remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
-            eviction_candidates, num_regions, remote_anchor_addrs,
-            remote_anchor_capacity, &remote_anchor_overflow);
-        int remote_anchor_stored = MIN2(remote_anchor_seen, remote_anchor_capacity);
+        bool* remote_anchor_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+        memset(remote_anchor_regions, 0, num_regions * sizeof(bool));
+        int remote_anchor_seen = 0;
+        (void)rmm->mark_remote_anchor_regions_in_set(
+            eviction_candidates, num_regions, remote_anchor_regions,
+            &remote_anchor_seen);
         int remote_anchor_pinned = 0;
-        for (int i = 0; i < remote_anchor_stored; i++) {
-          uintptr_t obj_addr = remote_anchor_addrs[i];
-          if (!is_aligned((address)obj_addr, HeapWordSize) ||
-              !_g1h->is_in_reserved((void*)obj_addr)) {
-            continue;
-          }
-          HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)obj_addr);
-          if (hr == nullptr) continue;
-          uint idx = hr->hrm_index();
-          if (idx < num_regions && eviction_candidates[idx]) {
+        for (uint idx = 0; idx < num_regions; idx++) {
+          if (remote_anchor_regions[idx] && eviction_candidates[idx]) {
+            HeapRegion* hr = _g1h->region_at_or_null(idx);
+            if (hr == nullptr) continue;
             eviction_candidates[idx] = false;
             if (root_guarded_regions != nullptr) {
               root_guarded_regions[idx] = true;
@@ -2871,32 +2824,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             remote_anchor_pinned++;
           }
         }
-        if (remote_anchor_addrs != nullptr) {
-          FREE_C_HEAP_ARRAY(uintptr_t, remote_anchor_addrs);
-        }
-
-        if (remote_anchor_seen > remote_anchor_stored || remote_anchor_overflow) {
-          int overflow_pinned = 0;
-          for (uint i = 0; i < num_regions; i++) {
-            if (eviction_candidates[i]) {
-              HeapRegion* hr = _g1h->region_at_or_null(i);
-              if (hr == nullptr) continue;
-              eviction_candidates[i] = false;
-              if (root_guarded_regions != nullptr) {
-                root_guarded_regions[i] = true;
-              }
-              if (root_backoff_regions != nullptr) {
-                root_backoff_regions[i] = true;
-              }
-              hr->clear_cold_destination();
-              overflow_pinned++;
-            }
-          }
-          remote_anchor_pinned += overflow_pinned;
-          log_warning(gc)("Root-catch disabled: remote-anchor overflow, pinned %d "
-                          "remaining candidate regions (anchors=%d stored=%d)",
-                          overflow_pinned, remote_anchor_seen, remote_anchor_stored);
-        }
+        FREE_C_HEAP_ARRAY(bool, remote_anchor_regions);
 
         int root_guarded = root_pin_cl.regions_guarded() + remote_anchor_pinned;
         if (root_guarded > 0) {
