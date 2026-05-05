@@ -1349,6 +1349,12 @@ struct RegionColdnessSample {
   size_t unknown_words;
   size_t object_count;
   size_t object_words;
+  size_t evictable_object_count;
+  size_t evictable_words;
+  size_t array_count;
+  size_t obj_array_count;
+  size_t type_array_count;
+  size_t locked_count;
   bool dense_small_objects;
 
   RegionColdnessSample() :
@@ -1358,6 +1364,12 @@ struct RegionColdnessSample {
     unknown_words(0),
     object_count(0),
     object_words(0),
+    evictable_object_count(0),
+    evictable_words(0),
+    array_count(0),
+    obj_array_count(0),
+    type_array_count(0),
+    locked_count(0),
     dense_small_objects(false) {}
 };
 
@@ -1368,6 +1380,27 @@ static bool remote_old_region_meets_min_evict_used(HeapRegion* hr) {
   }
   size_t min_used = (HeapRegion::GrainBytes * (size_t)min_used_percent) / 100;
   return hr->used() >= min_used;
+}
+
+static bool region_sample_allows_dense_object_eviction(const RegionColdnessSample& sample) {
+  if (!G1RemoteDenseSkipUnevictableSamples) {
+    return true;
+  }
+  if (sample.object_count == 0 || sample.evictable_object_count == 0) {
+    return false;
+  }
+  if (sample.obj_array_count > 0) {
+    return false;
+  }
+  if (sample.type_array_count > 0 && !G1RemoteAllowTypeArrayEviction) {
+    return false;
+  }
+  if (sample.locked_count > 0) {
+    return false;
+  }
+
+  size_t unevictable_words = sample.object_words - sample.evictable_words;
+  return unevictable_words * 100 <= sample.object_words * 10;
 }
 
 static bool region_is_cold_by_epoch(HeapRegion* hr,
@@ -1385,6 +1418,12 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   size_t unknown_words = 0;
   size_t object_count = 0;
   size_t object_words = 0;
+  size_t evictable_object_count = 0;
+  size_t evictable_words = 0;
+  size_t array_count = 0;
+  size_t obj_array_count = 0;
+  size_t type_array_count = 0;
+  size_t locked_count = 0;
   size_t obj_index = 0;
 
   HeapWord* p = hr->bottom();
@@ -1403,6 +1442,33 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     object_count++;
     object_words += word_size;
 
+    Klass* klass = obj->klass_or_null();
+    markWord mw = obj->mark();
+    bool unlocked = mw.is_unlocked();
+    if (!unlocked) {
+      locked_count++;
+    }
+    bool is_array = klass != nullptr && klass->is_array_klass();
+    bool is_obj_array = klass != nullptr && klass->is_objArray_klass();
+    bool is_type_array = klass != nullptr && klass->is_typeArray_klass();
+    if (is_array) {
+      array_count++;
+      if (is_obj_array) {
+        obj_array_count++;
+      }
+      if (is_type_array) {
+        type_array_count++;
+      }
+    }
+    bool can_evict_object =
+        unlocked &&
+        !G1CollectedHeap::is_obj_filler(obj) &&
+        (!is_array || (is_type_array && G1RemoteAllowTypeArrayEviction));
+    if (can_evict_object) {
+      evictable_object_count++;
+      evictable_words += word_size;
+    }
+
     if (object_count >= dense_probe_object_count &&
         object_words < object_count * min_avg_object_words) {
       sample->sampled_words = sampled_words;
@@ -1411,6 +1477,12 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
       sample->unknown_words = unknown_words;
       sample->object_count = object_count;
       sample->object_words = object_words;
+      sample->evictable_object_count = evictable_object_count;
+      sample->evictable_words = evictable_words;
+      sample->array_count = array_count;
+      sample->obj_array_count = obj_array_count;
+      sample->type_array_count = type_array_count;
+      sample->locked_count = locked_count;
       sample->dense_small_objects = true;
       return false;
     }
@@ -1418,7 +1490,6 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     // Sample every 8th object to bound mark-word work while still scanning
     // object sizes correctly across the region.
     if ((obj_index++ & 0x7) == 0) {
-      markWord mw = obj->mark();
       sampled_words += word_size;
       if (!mw.is_unlocked() || mw.remote_epoch() == 0) {
         unknown_words += word_size;
@@ -1437,6 +1508,12 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   sample->unknown_words = unknown_words;
   sample->object_count = object_count;
   sample->object_words = object_words;
+  sample->evictable_object_count = evictable_object_count;
+  sample->evictable_words = evictable_words;
+  sample->array_count = array_count;
+  sample->obj_array_count = obj_array_count;
+  sample->type_array_count = type_array_count;
+  sample->locked_count = locked_count;
 
   if (object_count > 0) {
     // Object-granularity RDMA fetch makes densely packed tiny-object regions
@@ -2145,6 +2222,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_regions_dense_small = 0;
         int path2_regions_backoff_skipped = 0;
         int path2_regions_sparse_skipped = 0;
+        int path2_regions_unevictable_sample_skipped = 0;
         size_t path2_dense_small_bytes = 0;
         size_t path2_dense_small_objects = 0;
         int path2_dense_last_resort_candidates = 0;
@@ -2326,6 +2404,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (rmm != nullptr) {
               (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
             }
+            if (!region_sample_allows_dense_object_eviction(region_sample)) {
+              path2_regions_unevictable_sample_skipped++;
+              continue;
+            }
 
             hr->set_cold_destination();
             eviction_candidates[i] = true;
@@ -2346,6 +2428,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                          path2_dense_last_resort_objects,
                          eviction_tier,
                          G1RemoteDenseLastResortHighFirst ? "high-first" : "low-first");
+          }
+          if (path2_regions_unevictable_sample_skipped > 0) {
+            log_info(gc)("Path 2 dense last-resort skipped %d sampled regions "
+                         "with insufficient Phase-E-evictable payload",
+                         path2_regions_unevictable_sample_skipped);
           }
         }
 
@@ -2417,6 +2504,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
             if (!region_sample.dense_small_objects) continue;
           }
+          if (!region_sample_allows_dense_object_eviction(region_sample)) continue;
 
           hr->set_cold_destination();
           eviction_candidates[i] = true;
