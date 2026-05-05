@@ -33,6 +33,7 @@
 #include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/heapRegion.hpp"
+#include "runtime/atomic.hpp"
 #include "runtime/os.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
@@ -488,6 +489,256 @@ static oopDesc* finish_fetched_object(G1CollectedHeap* g1h,
 static const uint G1RemoteFetchBatchHardCap = 256;
 static volatile int g1_remote_fetch_batch_disabled = 0;
 
+struct RemotePrefetchCacheEntry {
+  RemoteHandle* handle;
+  size_t slot_id;
+  Klass* klass;
+  size_t word_size;
+  uint8_t* bytes;
+  size_t byte_size;
+  uint64_t stamp;
+};
+
+static const uint RemotePrefetchCacheSlots = 16384;
+static const uint RemotePrefetchCacheProbeLimit = 64;
+static const size_t RemotePrefetchCacheMaxBytes = 64 * M;
+static volatile int g1_remote_prefetch_cache_lock = 0;
+static RemotePrefetchCacheEntry* g1_remote_prefetch_cache = nullptr;
+static size_t g1_remote_prefetch_cache_bytes = 0;
+static uint64_t g1_remote_prefetch_cache_stamp = 0;
+static uint64_t g1_remote_prefetch_cache_hits = 0;
+static uint64_t g1_remote_prefetch_cache_stores = 0;
+static uint64_t g1_remote_prefetch_cache_evictions = 0;
+static uint64_t g1_remote_prefetch_cache_drops = 0;
+
+static void remote_prefetch_cache_lock() {
+  while (Atomic::cmpxchg(&g1_remote_prefetch_cache_lock, 0, 1) != 0) {
+    SpinPause();
+  }
+}
+
+static void remote_prefetch_cache_unlock() {
+  Atomic::release_store(&g1_remote_prefetch_cache_lock, 0);
+}
+
+static bool remote_prefetch_cache_ensure_locked() {
+  if (g1_remote_prefetch_cache != nullptr) {
+    return true;
+  }
+  g1_remote_prefetch_cache =
+      NEW_C_HEAP_ARRAY(RemotePrefetchCacheEntry, RemotePrefetchCacheSlots, mtGC);
+  if (g1_remote_prefetch_cache == nullptr) {
+    return false;
+  }
+  memset(g1_remote_prefetch_cache, 0,
+         sizeof(RemotePrefetchCacheEntry) * RemotePrefetchCacheSlots);
+  return true;
+}
+
+static void remote_prefetch_cache_free_entry_locked(uint idx) {
+  RemotePrefetchCacheEntry& e = g1_remote_prefetch_cache[idx];
+  if (e.bytes != nullptr) {
+    os::free(e.bytes);
+    e.bytes = nullptr;
+  }
+  if (g1_remote_prefetch_cache_bytes >= e.byte_size) {
+    g1_remote_prefetch_cache_bytes -= e.byte_size;
+  } else {
+    g1_remote_prefetch_cache_bytes = 0;
+  }
+  e.handle = nullptr;
+  e.slot_id = 0;
+  e.klass = nullptr;
+  e.word_size = 0;
+  e.byte_size = 0;
+  e.stamp = 0;
+}
+
+static uint remote_prefetch_cache_hash(RemoteHandle* h, size_t slot_id) {
+  uintptr_t x = (uintptr_t)h ^ (slot_id * 11400714819323198485ull);
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdull;
+  x ^= x >> 33;
+  return (uint)(x % RemotePrefetchCacheSlots);
+}
+
+static void remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
+                                        Klass* klass, size_t word_size,
+                                        const void* obj_bytes) {
+  if (h == nullptr || klass == nullptr || word_size == 0 || obj_bytes == nullptr) {
+    return;
+  }
+
+  size_t expected_ws = h->eviction_word_size();
+  if (word_size != expected_ws) {
+    return;
+  }
+
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE ||
+      (size_t)(sa & REMOTE_HANDLE_ADDR_MASK) != slot_id) {
+    return;
+  }
+
+  if (word_size > SIZE_MAX / HeapWordSize) {
+    return;
+  }
+  size_t byte_size = word_size * HeapWordSize;
+  if (byte_size == 0 || byte_size > RemotePrefetchCacheMaxBytes / 4) {
+    return;
+  }
+
+  uint8_t* copy = (uint8_t*)os::malloc(byte_size, mtGC);
+  if (copy == nullptr) {
+    return;
+  }
+  memcpy(copy, obj_bytes, byte_size);
+
+  remote_prefetch_cache_lock();
+  if (!remote_prefetch_cache_ensure_locked()) {
+    remote_prefetch_cache_unlock();
+    os::free(copy);
+    return;
+  }
+
+  uint insert_idx = RemotePrefetchCacheSlots;
+  uint oldest_idx = 0;
+  uint64_t oldest_stamp = UINT64_MAX;
+  uint start = remote_prefetch_cache_hash(h, slot_id);
+  for (uint probe = 0; probe < RemotePrefetchCacheProbeLimit; probe++) {
+    uint idx = (start + probe) % RemotePrefetchCacheSlots;
+    RemotePrefetchCacheEntry& e = g1_remote_prefetch_cache[idx];
+    if (e.handle == h && e.slot_id == slot_id) {
+      remote_prefetch_cache_free_entry_locked(idx);
+      insert_idx = idx;
+      break;
+    }
+    if (e.handle == nullptr) {
+      insert_idx = idx;
+      break;
+    }
+    if (e.stamp < oldest_stamp) {
+      oldest_stamp = e.stamp;
+      oldest_idx = idx;
+    }
+  }
+
+  if (insert_idx == RemotePrefetchCacheSlots) {
+    insert_idx = oldest_idx;
+    remote_prefetch_cache_free_entry_locked(insert_idx);
+    g1_remote_prefetch_cache_evictions++;
+  }
+
+  if (g1_remote_prefetch_cache_bytes + byte_size > RemotePrefetchCacheMaxBytes) {
+    g1_remote_prefetch_cache_drops++;
+    remote_prefetch_cache_unlock();
+    os::free(copy);
+    return;
+  }
+
+  RemotePrefetchCacheEntry& dst = g1_remote_prefetch_cache[insert_idx];
+  dst.handle = h;
+  dst.slot_id = slot_id;
+  dst.klass = klass;
+  dst.word_size = word_size;
+  dst.bytes = copy;
+  dst.byte_size = byte_size;
+  dst.stamp = ++g1_remote_prefetch_cache_stamp;
+  g1_remote_prefetch_cache_bytes += byte_size;
+  g1_remote_prefetch_cache_stores++;
+  remote_prefetch_cache_unlock();
+}
+
+static bool remote_prefetch_cache_take(RemoteHandle* h, size_t slot_id,
+                                       Klass** klass_out, size_t* word_size_out,
+                                       uint8_t** bytes_out) {
+  *klass_out = nullptr;
+  *word_size_out = 0;
+  *bytes_out = nullptr;
+  if (h == nullptr || g1_remote_prefetch_cache == nullptr) {
+    return false;
+  }
+
+  remote_prefetch_cache_lock();
+  if (g1_remote_prefetch_cache == nullptr) {
+    remote_prefetch_cache_unlock();
+    return false;
+  }
+
+  uint start = remote_prefetch_cache_hash(h, slot_id);
+  for (uint probe = 0; probe < RemotePrefetchCacheProbeLimit; probe++) {
+    uint idx = (start + probe) % RemotePrefetchCacheSlots;
+    RemotePrefetchCacheEntry& e = g1_remote_prefetch_cache[idx];
+    if (e.handle == nullptr) {
+      continue;
+    }
+    if (e.handle != h) {
+      continue;
+    }
+
+    bool match = e.slot_id == slot_id && e.word_size == h->eviction_word_size();
+    if (match) {
+      *klass_out = e.klass;
+      *word_size_out = e.word_size;
+      *bytes_out = e.bytes;
+      e.bytes = nullptr;
+      e.handle = nullptr;
+      e.slot_id = 0;
+      e.klass = nullptr;
+      e.word_size = 0;
+      if (g1_remote_prefetch_cache_bytes >= e.byte_size) {
+        g1_remote_prefetch_cache_bytes -= e.byte_size;
+      } else {
+        g1_remote_prefetch_cache_bytes = 0;
+      }
+      e.byte_size = 0;
+      e.stamp = 0;
+      g1_remote_prefetch_cache_hits++;
+      uint64_t hits = g1_remote_prefetch_cache_hits;
+      if (hits == 1 || (hits & (hits - 1)) == 0) {
+        log_info(gc)("Remote prefetch cache: hits=" UINT64_FORMAT
+                     " stores=" UINT64_FORMAT " evictions=" UINT64_FORMAT
+                     " drops=" UINT64_FORMAT " bytes=" SIZE_FORMAT,
+                     hits, g1_remote_prefetch_cache_stores,
+                     g1_remote_prefetch_cache_evictions,
+                     g1_remote_prefetch_cache_drops,
+                     g1_remote_prefetch_cache_bytes);
+      }
+      remote_prefetch_cache_unlock();
+      return true;
+    }
+
+    remote_prefetch_cache_free_entry_locked(idx);
+    g1_remote_prefetch_cache_drops++;
+    remote_prefetch_cache_unlock();
+    return false;
+  }
+
+  remote_prefetch_cache_unlock();
+  return false;
+}
+
+static void remote_prefetch_cache_drop(RemoteHandle* h, size_t slot_id) {
+  if (h == nullptr || g1_remote_prefetch_cache == nullptr) {
+    return;
+  }
+
+  remote_prefetch_cache_lock();
+  if (g1_remote_prefetch_cache != nullptr) {
+    uint start = remote_prefetch_cache_hash(h, slot_id);
+    for (uint probe = 0; probe < RemotePrefetchCacheProbeLimit; probe++) {
+      uint idx = (start + probe) % RemotePrefetchCacheSlots;
+      if (g1_remote_prefetch_cache[idx].handle == h &&
+          g1_remote_prefetch_cache[idx].slot_id == slot_id) {
+        remote_prefetch_cache_free_entry_locked(idx);
+        g1_remote_prefetch_cache_drops++;
+        break;
+      }
+    }
+  }
+  remote_prefetch_cache_unlock();
+}
+
 class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
   G1CollectedHeap* _g1h;
   G1RemoteMemoryManager* _rmm;
@@ -504,6 +755,7 @@ class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
   RemoteHandle* _publish_handles[G1RemoteFetchBatchHardCap];
   HeapWord* _publish_dests[G1RemoteFetchBatchHardCap];
   uintptr_t _publish_ids[G1RemoteFetchBatchHardCap];
+  size_t _publish_slots[G1RemoteFetchBatchHardCap];
   uint _publish_count;
 
 public:
@@ -525,11 +777,10 @@ public:
       return;
     }
 
-    // Speculative prefetch installs objects into FCR without a Java access
-    // that naturally roots them. Full GC can then trim the FCR region and leave
-    // a LOCAL handle pointing outside top. Until prefetch uses a non-heap byte
-    // cache or has precise lifetime tracking, only install the demanded object.
     if (!is_primary) {
+      remote_prefetch_cache_store(h, slot_id, klass, word_size, obj_bytes);
+      _prefetched++;
+      _prefetch_words += word_size;
       return;
     }
 
@@ -584,6 +835,7 @@ public:
     _publish_handles[_publish_count] = h;
     _publish_dests[_publish_count] = dest;
     _publish_ids[_publish_count] = (uintptr_t)h;
+    _publish_slots[_publish_count] = slot_id;
     _publish_count++;
 
     _installed++;
@@ -597,6 +849,9 @@ public:
 
   void publish(G1RemoteBackend* backend) {
     if (_publish_count == 0) return;
+    for (uint i = 0; i < _publish_count; i++) {
+      remote_prefetch_cache_drop(_publish_handles[i], _publish_slots[i]);
+    }
     backend->localize_batch(_publish_ids, _publish_count);
     _rmm->publish_local_handles(_publish_handles, _publish_dests, _publish_count);
   }
@@ -621,7 +876,8 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
-  uint max_objects = 1;
+  uint max_objects = MIN2((uint)G1RemoteFetchBatchObjects,
+                          G1RemoteFetchBatchHardCap);
   size_t max_response_bytes = G1RemoteFetchBatchBytes == 0 ?
       (size_t)RDMAMsgBufSize : MIN2((size_t)G1RemoteFetchBatchBytes, (size_t)RDMAMsgBufSize);
 
@@ -681,6 +937,37 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
   size_t word_size = h->eviction_word_size();
+  uintptr_t fetch_sa = h->load_state_and_addr_acquire();
+  size_t slot_id = (size_t)(fetch_sa & REMOTE_HANDLE_ADDR_MASK);
+
+  Klass* cached_klass = nullptr;
+  size_t cached_word_size = 0;
+  uint8_t* cached_bytes = nullptr;
+  if (remote_prefetch_cache_take(h, slot_id, &cached_klass,
+                                 &cached_word_size, &cached_bytes)) {
+    jlong fetch_start = os::elapsed_counter();
+    HeapWord* dest = rmm->allocate_in_fcr(cached_word_size);
+    if (dest == nullptr) {
+      os::free(cached_bytes);
+      h->cas_fetching_to_remote();
+      rmm->record_fetch_retry();
+      *out_retry = true;
+      return nullptr;
+    }
+
+    memcpy(dest, cached_bytes, cached_word_size * HeapWordSize);
+    os::free(cached_bytes);
+    oopDesc* result = finish_fetched_object(g1h, rmm, h, dest,
+                                            cached_klass, cached_word_size);
+    uintptr_t handle_id = (uintptr_t)h;
+    remote_prefetch_cache_drop(h, slot_id);
+    rmm->backend()->localize_batch(&handle_id, 1);
+    rmm->publish_local_handle(h, dest);
+
+    jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
+    rmm->record_fetch_result(cached_word_size, fetch_elapsed, true);
+    return result;
+  }
 
   if (G1RemoteFetchBatchObjects > 1 &&
       Atomic::load(&g1_remote_fetch_batch_disabled) == 0 &&
@@ -723,6 +1010,7 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
   oopDesc* result = finish_fetched_object(g1h, rmm, h, dest, fetched_klass, word_size);
 
   uintptr_t handle_id = (uintptr_t)h;
+  remote_prefetch_cache_drop(h, slot_id);
   rmm->backend()->localize_batch(&handle_id, 1);
 
   rmm->publish_local_handle(h, dest);
