@@ -53,7 +53,6 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _entry_chunks(nullptr), _entry_free_list(nullptr), _entry_chunk_top(ENTRY_CHUNK_CAPACITY),
     _table_lock(0), _local_handles_head(nullptr), _local_handle_count(0),
     _local_handle_lock(0), _alloc_lock(0),
-    _edge_table_lock(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
     _eviction_backoff_until_epoch(nullptr), _eviction_backoff_capacity(0),
@@ -84,6 +83,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   memset(_eviction_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
   memset((void*)_stripe_locks, 0, sizeof(_stripe_locks));
   memset(_edge_buckets, 0, sizeof(_edge_buckets));
+  memset((void*)_edge_bucket_locks, 0, sizeof(_edge_bucket_locks));
   memset(_hotness_stats, 0, sizeof(_hotness_stats));
   memset(_prev_hotness_stats, 0, sizeof(_prev_hotness_stats));
   memset(_sim_remote_slots, 0, sizeof(_sim_remote_slots));
