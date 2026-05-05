@@ -80,20 +80,46 @@ static inline bool g1_cm_mark_safe_local_oop(G1CollectedHeap* g1h,
   }
 
   HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
+  if (hr->is_humongous()) {
+    HeapRegion* start = hr->humongous_start_region();
+    if (start == nullptr ||
+        !start->is_starts_humongous() ||
+        start->is_free() ||
+        start->is_evict_guarded() ||
+        obj_addr != start->bottom()) {
+      return false;
+    }
+    if (start->obj_allocated_since_marking_start(obj)) {
+      return false;
+    }
+
+    Klass* k = obj->klass_or_null();
+    if (!g1_cm_valid_klass_for_mark(k)) {
+      return false;
+    }
+
+    size_t obj_size = obj->size_given_klass(k);
+    if (obj_size < (size_t)MinObjAlignment ||
+        !is_object_aligned(obj_size)) {
+      return false;
+    }
+
+    if (out_hr != nullptr) {
+      *out_hr = start;
+    }
+    if (out_size != nullptr) {
+      *out_size = obj_size;
+    }
+    return true;
+  }
+
   if (obj_addr < hr->bottom() || obj_addr >= hr->top()) {
     return false;
   }
   if (hr->obj_allocated_since_marking_start(obj)) {
     return false;
   }
-  if (hr->is_continues_humongous()) {
-    return false;
-  }
-  if (hr->is_starts_humongous()) {
-    if (obj_addr != hr->bottom()) {
-      return false;
-    }
-  } else if (hr->is_old()) {
+  if (hr->is_old()) {
     if (hr->block_start(obj_addr) != obj_addr) {
       return false;
     }
