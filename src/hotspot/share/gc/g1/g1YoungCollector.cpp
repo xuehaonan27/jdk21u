@@ -1354,6 +1354,8 @@ struct RegionColdnessSample {
   size_t array_count;
   size_t obj_array_count;
   size_t type_array_count;
+  size_t filler_count;
+  size_t filler_words;
   size_t locked_count;
   bool dense_small_objects;
 
@@ -1369,6 +1371,8 @@ struct RegionColdnessSample {
     array_count(0),
     obj_array_count(0),
     type_array_count(0),
+    filler_count(0),
+    filler_words(0),
     locked_count(0),
     dense_small_objects(false) {}
 };
@@ -1386,7 +1390,9 @@ static bool region_sample_allows_dense_object_eviction(const RegionColdnessSampl
   if (!G1RemoteDenseSkipUnevictableSamples) {
     return true;
   }
-  if (sample.object_count == 0 || sample.evictable_object_count == 0) {
+  size_t phase_e_object_count = sample.object_count - sample.filler_count;
+  size_t phase_e_object_words = sample.object_words - sample.filler_words;
+  if (phase_e_object_count == 0 || sample.evictable_object_count == 0) {
     return false;
   }
   if (sample.obj_array_count > 0 && !G1RemoteAllowObjectArrayEviction) {
@@ -1403,8 +1409,8 @@ static bool region_sample_allows_dense_object_eviction(const RegionColdnessSampl
   // the containing region may remain local. Any unevictable object would make
   // the region partial, so a stale raw reference to an evicted object could see
   // that filler instead of faulting on a guarded fully-evicted region.
-  return sample.evictable_object_count == sample.object_count &&
-         sample.evictable_words == sample.object_words;
+  return sample.evictable_object_count == phase_e_object_count &&
+         sample.evictable_words == phase_e_object_words;
 }
 
 static bool region_is_cold_by_epoch(HeapRegion* hr,
@@ -1427,6 +1433,8 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   size_t array_count = 0;
   size_t obj_array_count = 0;
   size_t type_array_count = 0;
+  size_t filler_count = 0;
+  size_t filler_words = 0;
   size_t locked_count = 0;
   size_t obj_index = 0;
 
@@ -1448,6 +1456,11 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
 
     Klass* klass = obj->klass_or_null();
     markWord mw = obj->mark();
+    bool is_filler = G1CollectedHeap::is_obj_filler(obj);
+    if (is_filler) {
+      filler_count++;
+      filler_words += word_size;
+    }
     bool unlocked = mw.is_unlocked();
     if (!unlocked) {
       locked_count++;
@@ -1466,7 +1479,7 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
     }
     bool can_evict_object =
         unlocked &&
-        !G1CollectedHeap::is_obj_filler(obj) &&
+        !is_filler &&
         (!is_array ||
          (is_type_array && G1RemoteAllowTypeArrayEviction) ||
          (is_obj_array && G1RemoteAllowObjectArrayEviction));
@@ -1490,6 +1503,8 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
         sample->array_count = array_count;
         sample->obj_array_count = obj_array_count;
         sample->type_array_count = type_array_count;
+        sample->filler_count = filler_count;
+        sample->filler_words = filler_words;
         sample->locked_count = locked_count;
         return false;
       }
@@ -1521,6 +1536,8 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   sample->array_count = array_count;
   sample->obj_array_count = obj_array_count;
   sample->type_array_count = type_array_count;
+  sample->filler_count = filler_count;
+  sample->filler_words = filler_words;
   sample->locked_count = locked_count;
 
   if (object_count > 0) {
@@ -2366,6 +2383,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t path2_dense_last_resort_objects = 0;
         const bool allow_dense_object_granularity_eviction =
           G1RemoteAllowDenseObjectEviction;
+        size_t dense_skip_objects = 0;
+        size_t dense_skip_evictable_objects = 0;
+        size_t dense_skip_obj_arrays = 0;
+        size_t dense_skip_type_arrays = 0;
+        size_t dense_skip_fillers = 0;
+        size_t dense_skip_locked = 0;
         bool unlimited = false;
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
         dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
@@ -2543,6 +2566,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             }
             if (!region_sample_allows_dense_object_eviction(region_sample)) {
               path2_regions_unevictable_sample_skipped++;
+              dense_skip_objects += region_sample.object_count;
+              dense_skip_evictable_objects += region_sample.evictable_object_count;
+              dense_skip_obj_arrays += region_sample.obj_array_count;
+              dense_skip_type_arrays += region_sample.type_array_count;
+              dense_skip_fillers += region_sample.filler_count;
+              dense_skip_locked += region_sample.locked_count;
               continue;
             }
 
@@ -2570,6 +2599,16 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             log_info(gc)("Path 2 dense last-resort skipped %d sampled regions "
                          "with insufficient Phase-E-evictable payload",
                          path2_regions_unevictable_sample_skipped);
+            log_info(gc)("Path 2 dense skip sample detail: objects=" SIZE_FORMAT
+                         " evictable=" SIZE_FORMAT " obj_arrays=" SIZE_FORMAT
+                         " type_arrays=" SIZE_FORMAT " fillers=" SIZE_FORMAT
+                         " locked=" SIZE_FORMAT,
+                         dense_skip_objects,
+                         dense_skip_evictable_objects,
+                         dense_skip_obj_arrays,
+                         dense_skip_type_arrays,
+                         dense_skip_fillers,
+                         dense_skip_locked);
           }
         }
 
@@ -3284,7 +3323,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           rmm->last_phase_c_untaggable() > 0) {
         abort_remote_eviction_candidates(
             _g1h, rmm, eviction_candidates, num_regions,
-            "refs from untaggable heap sources kept raw during Phase C",
+            "refs from untaggable heap/root sources kept raw during Phase C",
             rmm->last_phase_c_untaggable());
         total_candidates = 0;
       }

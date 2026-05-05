@@ -1613,7 +1613,23 @@ public:
     }
 
     bool heap_source = _g1h->is_in((void*)p);
-    if (heap_source) {
+    if (!heap_source) {
+      // Non-heap root slots (thread stacks, JNI handles, OopStorage, CLD
+      // handles) are not stable enough to keep in the persistent tagged-field
+      // side list. Let the normal Phase-C untaggable abort path keep the
+      // candidate region local instead of leaving a tagged root behind.
+      _untaggable++;
+      if (_untaggable_reports_left > 0) {
+        log_warning(gc)("Tagging: kept raw ref from non-heap root field="
+                        PTR_FORMAT " -> target=" PTR_FORMAT
+                        " in candidate region %u",
+                        p2i(p), p2i((void*)target), idx);
+        _untaggable_reports_left--;
+      }
+      return;
+    }
+
+    {
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
       bool object_array_source = source_klass != nullptr && source_klass->is_objArray_klass();
       Klass* target_klass = target->klass_or_null();
@@ -1931,13 +1947,13 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
 
   if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
     log_info(gc)("Full heap scan (%u workers): tagged %d refs, %d refs had no handle, "
-                 "%d refs from untaggable heap sources kept raw",
+                 "%d refs from untaggable sources kept raw",
                  (workers != nullptr ? num_workers : 1), total_tagged,
                  total_no_handle, total_untaggable);
   }
   if (total_untaggable > 0) {
     log_warning(gc)("Full heap scan: verifier will keep candidate regions local if "
-                    "array/unknown-source refs still point into them");
+                    "array/unknown/root refs still point into them");
   }
   record_phase_c_counts(total_tagged, total_no_handle, total_untaggable);
   return total_tagged;
@@ -2368,12 +2384,15 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
       continue;
     }
 
-    if (_g1h->is_in((void*)field_addr)) {
-      HeapRegion* field_hr = _g1h->heap_region_containing((HeapWord*)field_addr);
-      if (field_hr != nullptr && (field_hr->is_free() || field_hr->is_evict_guarded())) {
-        removed++;
-        continue;
-      }
+    if (!_g1h->is_in_reserved((void*)field_addr)) {
+      removed++;
+      continue;
+    }
+
+    HeapRegion* field_hr = _g1h->heap_region_containing((HeapWord*)field_addr);
+    if (field_hr != nullptr && (field_hr->is_free() || field_hr->is_evict_guarded())) {
+      removed++;
+      continue;
     }
 
     uintptr_t raw = *(uintptr_t*)field_addr;
@@ -3981,6 +4000,16 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
   for (int i = 0; i < _tagged_field_count; i++) {
     oop* field_addr = _tagged_fields[i]._field_addr;
     RemoteHandle* h = _tagged_fields[i]._handle;
+
+    if (field_addr == nullptr || h == nullptr) {
+      removed++;
+      continue;
+    }
+
+    if (!_g1h->is_in_reserved((void*)field_addr)) {
+      removed++;
+      continue;
+    }
 
     // field_addr may be in an evicted (mprotected) region — skip without reading
     HeapRegion* field_hr = _g1h->heap_region_containing((HeapWord*)field_addr);
