@@ -8,7 +8,7 @@
 public class ObjArrayObjectSourceSmoke {
     static final int SHARDS = 96;
     static final int PER_SHARD = 8192;
-    static final Object[][] ROOTS = new Object[SHARDS][];
+    static final Object[] ROOTS = new Object[SHARDS * PER_SHARD];
 
     static final class Box {
         final int value;
@@ -25,14 +25,12 @@ public class ObjArrayObjectSourceSmoke {
         long expected = 0;
         Box prev = null;
         for (int s = 0; s < SHARDS; s++) {
-            Object[] shard = new Object[PER_SHARD];
-            ROOTS[s] = shard;
             for (int i = 0; i < PER_SHARD; i++) {
                 int value = s * PER_SHARD + i;
                 Box box = new Box(value);
                 box.next = prev;
                 prev = box;
-                shard[i] = box;
+                ROOTS[value] = box;
                 expected += value;
             }
         }
@@ -52,14 +50,12 @@ public class ObjArrayObjectSourceSmoke {
 
     static long sum() {
         long total = 0;
-        for (Object[] shard : ROOTS) {
-            for (Object obj : shard) {
-                Box box = (Box) obj;
-                total += box.value;
-                if (box.next != null) {
-                    total += box.next.value & 1;
-                    total -= box.next.value & 1;
-                }
+        for (Object obj : ROOTS) {
+            Box box = (Box) obj;
+            total += box.value;
+            if (box.next != null) {
+                total += box.next.value & 1;
+                total -= box.next.value & 1;
             }
         }
         return total;
