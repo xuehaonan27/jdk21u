@@ -377,6 +377,12 @@
           "is diagnostic and remains guarded by normal root and verifier "   \
           "checks.")                                                        \
                                                                             \
+  product(bool, G1RemoteDenseRefillAfterRootGuard, true, DIAGNOSTIC,        \
+          "After root or remote-anchor guards remove dense last-resort "      \
+          "eviction candidates, refill the candidate set from other "         \
+          "deferred dense regions that were not seen on raw stacks, roots, "  \
+          "or remote anchors. This remains guarded by normal verification.")  \
+                                                                            \
   product(uint, G1RemoteMinOldRegionEvictUsedPercent, 0, DIAGNOSTIC,        \
           "Skip Path 2 pressure-eviction candidates whose old region used "   \
           "bytes are below this percentage of a G1 region. Sparse old "       \
