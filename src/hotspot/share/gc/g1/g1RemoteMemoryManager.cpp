@@ -283,7 +283,7 @@ void G1RemoteMemoryManager::record_fetch_result(size_t word_size,
   Atomic::add(&_fetch_words, (uint64_t)word_size);
   Atomic::add(&_fetch_elapsed_counter, (uint64_t)elapsed_counter);
 
-  const uint64_t progress_interval = 1024;
+  const uint64_t progress_interval = 64 * 1024;
   uint64_t fetch_success = Atomic::load(&_fetch_success);
   uint64_t next = Atomic::load(&_fetch_progress_next);
   while (fetch_success >= next) {

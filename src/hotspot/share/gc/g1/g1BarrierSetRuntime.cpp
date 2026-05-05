@@ -501,11 +501,9 @@ struct RemotePrefetchCacheEntry {
 
 static const uint RemotePrefetchCacheSlots = 16384;
 static const uint RemotePrefetchCacheProbeLimit = 64;
-static const size_t RemotePrefetchCacheMaxBytes = 64 * M;
 static volatile int g1_remote_prefetch_cache_lock = 0;
 static RemotePrefetchCacheEntry* g1_remote_prefetch_cache = nullptr;
 static size_t g1_remote_prefetch_cache_bytes = 0;
-static uint64_t g1_remote_prefetch_cache_stamp = 0;
 static uint64_t g1_remote_prefetch_cache_hits = 0;
 static uint64_t g1_remote_prefetch_cache_stores = 0;
 static uint64_t g1_remote_prefetch_cache_evictions = 0;
@@ -519,20 +517,6 @@ static void remote_prefetch_cache_lock() {
 
 static void remote_prefetch_cache_unlock() {
   Atomic::release_store(&g1_remote_prefetch_cache_lock, 0);
-}
-
-static bool remote_prefetch_cache_ensure_locked() {
-  if (g1_remote_prefetch_cache != nullptr) {
-    return true;
-  }
-  g1_remote_prefetch_cache =
-      NEW_C_HEAP_ARRAY(RemotePrefetchCacheEntry, RemotePrefetchCacheSlots, mtGC);
-  if (g1_remote_prefetch_cache == nullptr) {
-    return false;
-  }
-  memset(g1_remote_prefetch_cache, 0,
-         sizeof(RemotePrefetchCacheEntry) * RemotePrefetchCacheSlots);
-  return true;
 }
 
 static void remote_prefetch_cache_free_entry_locked(uint idx) {
@@ -560,93 +544,6 @@ static uint remote_prefetch_cache_hash(RemoteHandle* h, size_t slot_id) {
   x *= 0xff51afd7ed558ccdull;
   x ^= x >> 33;
   return (uint)(x % RemotePrefetchCacheSlots);
-}
-
-static void remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
-                                        Klass* klass, size_t word_size,
-                                        const void* obj_bytes) {
-  if (h == nullptr || klass == nullptr || word_size == 0 || obj_bytes == nullptr) {
-    return;
-  }
-
-  size_t expected_ws = h->eviction_word_size();
-  if (word_size != expected_ws) {
-    return;
-  }
-
-  uintptr_t sa = h->load_state_and_addr_acquire();
-  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE ||
-      (size_t)(sa & REMOTE_HANDLE_ADDR_MASK) != slot_id) {
-    return;
-  }
-
-  if (word_size > SIZE_MAX / HeapWordSize) {
-    return;
-  }
-  size_t byte_size = word_size * HeapWordSize;
-  if (byte_size == 0 || byte_size > RemotePrefetchCacheMaxBytes / 4) {
-    return;
-  }
-
-  uint8_t* copy = (uint8_t*)os::malloc(byte_size, mtGC);
-  if (copy == nullptr) {
-    return;
-  }
-  memcpy(copy, obj_bytes, byte_size);
-
-  remote_prefetch_cache_lock();
-  if (!remote_prefetch_cache_ensure_locked()) {
-    remote_prefetch_cache_unlock();
-    os::free(copy);
-    return;
-  }
-
-  uint insert_idx = RemotePrefetchCacheSlots;
-  uint oldest_idx = 0;
-  uint64_t oldest_stamp = UINT64_MAX;
-  uint start = remote_prefetch_cache_hash(h, slot_id);
-  for (uint probe = 0; probe < RemotePrefetchCacheProbeLimit; probe++) {
-    uint idx = (start + probe) % RemotePrefetchCacheSlots;
-    RemotePrefetchCacheEntry& e = g1_remote_prefetch_cache[idx];
-    if (e.handle == h && e.slot_id == slot_id) {
-      remote_prefetch_cache_free_entry_locked(idx);
-      insert_idx = idx;
-      break;
-    }
-    if (e.handle == nullptr) {
-      insert_idx = idx;
-      break;
-    }
-    if (e.stamp < oldest_stamp) {
-      oldest_stamp = e.stamp;
-      oldest_idx = idx;
-    }
-  }
-
-  if (insert_idx == RemotePrefetchCacheSlots) {
-    insert_idx = oldest_idx;
-    remote_prefetch_cache_free_entry_locked(insert_idx);
-    g1_remote_prefetch_cache_evictions++;
-  }
-
-  if (g1_remote_prefetch_cache_bytes + byte_size > RemotePrefetchCacheMaxBytes) {
-    g1_remote_prefetch_cache_drops++;
-    remote_prefetch_cache_unlock();
-    os::free(copy);
-    return;
-  }
-
-  RemotePrefetchCacheEntry& dst = g1_remote_prefetch_cache[insert_idx];
-  dst.handle = h;
-  dst.slot_id = slot_id;
-  dst.klass = klass;
-  dst.word_size = word_size;
-  dst.bytes = copy;
-  dst.byte_size = byte_size;
-  dst.stamp = ++g1_remote_prefetch_cache_stamp;
-  g1_remote_prefetch_cache_bytes += byte_size;
-  g1_remote_prefetch_cache_stores++;
-  remote_prefetch_cache_unlock();
 }
 
 static bool remote_prefetch_cache_take(RemoteHandle* h, size_t slot_id,
@@ -774,13 +671,6 @@ public:
 
     if (h == nullptr || klass == nullptr || word_size == 0 || obj_bytes == nullptr) {
       _failed++;
-      return;
-    }
-
-    if (!is_primary) {
-      remote_prefetch_cache_store(h, slot_id, klass, word_size, obj_bytes);
-      _prefetched++;
-      _prefetch_words += word_size;
       return;
     }
 
