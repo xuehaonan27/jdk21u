@@ -525,6 +525,14 @@ public:
       return;
     }
 
+    // Speculative prefetch installs objects into FCR without a Java access
+    // that naturally roots them. Full GC can then trim the FCR region and leave
+    // a LOCAL handle pointing outside top. Until prefetch uses a non-heap byte
+    // cache or has precise lifetime tracking, only install the demanded object.
+    if (!is_primary) {
+      return;
+    }
+
     if (_publish_count >= G1RemoteFetchBatchHardCap) {
       _failed++;
       return;
@@ -613,7 +621,7 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
-  uint max_objects = MIN2((uint)G1RemoteFetchBatchObjects, G1RemoteFetchBatchHardCap);
+  uint max_objects = 1;
   size_t max_response_bytes = G1RemoteFetchBatchBytes == 0 ?
       (size_t)RDMAMsgBufSize : MIN2((size_t)G1RemoteFetchBatchBytes, (size_t)RDMAMsgBufSize);
 
