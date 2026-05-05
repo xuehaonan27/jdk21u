@@ -1399,8 +1399,12 @@ static bool region_sample_allows_dense_object_eviction(const RegionColdnessSampl
     return false;
   }
 
-  size_t unevictable_words = sample.object_words - sample.evictable_words;
-  return unevictable_words * 100 <= sample.object_words * 10;
+  // Dense object-granularity eviction writes fillers for evicted objects while
+  // the containing region may remain local. Any unevictable object would make
+  // the region partial, so a stale raw reference to an evicted object could see
+  // that filler instead of faulting on a guarded fully-evicted region.
+  return sample.evictable_object_count == sample.object_count &&
+         sample.evictable_words == sample.object_words;
 }
 
 static bool region_is_cold_by_epoch(HeapRegion* hr,
@@ -1471,20 +1475,22 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
 
     if (object_count >= dense_probe_object_count &&
         object_words < object_count * min_avg_object_words) {
-      sample->sampled_words = sampled_words;
-      sample->cold_words = cold_words;
-      sample->hot_words = hot_words;
-      sample->unknown_words = unknown_words;
-      sample->object_count = object_count;
-      sample->object_words = object_words;
-      sample->evictable_object_count = evictable_object_count;
-      sample->evictable_words = evictable_words;
-      sample->array_count = array_count;
-      sample->obj_array_count = obj_array_count;
-      sample->type_array_count = type_array_count;
-      sample->locked_count = locked_count;
       sample->dense_small_objects = true;
-      return false;
+      if (guard_dense_small_objects) {
+        sample->sampled_words = sampled_words;
+        sample->cold_words = cold_words;
+        sample->hot_words = hot_words;
+        sample->unknown_words = unknown_words;
+        sample->object_count = object_count;
+        sample->object_words = object_words;
+        sample->evictable_object_count = evictable_object_count;
+        sample->evictable_words = evictable_words;
+        sample->array_count = array_count;
+        sample->obj_array_count = obj_array_count;
+        sample->type_array_count = type_array_count;
+        sample->locked_count = locked_count;
+        return false;
+      }
     }
 
     // Sample every 8th object to bound mark-word work while still scanning

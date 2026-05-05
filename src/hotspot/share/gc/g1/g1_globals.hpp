@@ -362,8 +362,8 @@
   product(bool, G1RemoteDenseSkipUnevictableSamples, true, DIAGNOSTIC,      \
           "When dense last-resort eviction is enabled, skip sampled old "     \
           "regions that contain object arrays, disabled primitive arrays, "   \
-          "locked objects, or too little object payload that Phase E can "    \
-          "actually evict.")                                                 \
+          "locked objects, or any object payload that Phase E cannot "        \
+          "evict completely.")                                               \
                                                                             \
   product(bool, G1RemoteSkipFillerOnCompleteEviction, false, DIAGNOSTIC,    \
           "Skip per-object filler writes when a candidate region has been "  \
