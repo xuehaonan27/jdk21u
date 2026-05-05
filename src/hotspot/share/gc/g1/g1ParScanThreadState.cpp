@@ -60,6 +60,10 @@
 #define MAYBE_INLINE_EVACUATION NOT_DEBUG(inline) DEBUG_ONLY(NOINLINE)
 
 static bool should_record_remote_ref_sites(G1CollectedHeap* g1h) {
+  if (!G1RemoteAllowPromotionRefSiteTags) {
+    return false;
+  }
+
   if (G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     return true;
   }
