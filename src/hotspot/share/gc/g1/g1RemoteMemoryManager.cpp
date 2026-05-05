@@ -60,6 +60,9 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _fast_phase_c_source_hint_capacity(0),
     _fast_phase_c_source_hint_count(0),
     _fast_phase_c_source_hint_lock(0),
+    _last_phase_c_tagged(0),
+    _last_phase_c_no_handle(0),
+    _last_phase_c_untaggable(0),
     _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
     _remote_roots_capacity(0),
     _cross_roots_count(0),
@@ -1916,6 +1919,7 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
     log_warning(gc)("Full heap scan: verifier will keep candidate regions local if "
                     "array/unknown-source refs still point into them");
   }
+  record_phase_c_counts(total_tagged, total_no_handle, total_untaggable);
   return total_tagged;
 }
 
@@ -2327,7 +2331,61 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     if (buf != nullptr) FREE_C_HEAP_ARRAY(TaggedFieldEntry, buf);
   }
 
+  record_phase_c_counts(total_tagged, total_no_handle, total_untaggable);
   return total_tagged;
+}
+
+int G1RemoteMemoryManager::untag_recorded_local_refs() {
+  int restored = 0;
+  int removed = 0;
+  int retained = 0;
+
+  for (int i = 0; i < _tagged_field_count; i++) {
+    oop* field_addr = _tagged_fields[i]._field_addr;
+    RemoteHandle* h = _tagged_fields[i]._handle;
+    if (field_addr == nullptr || h == nullptr) {
+      removed++;
+      continue;
+    }
+
+    if (_g1h->is_in((void*)field_addr)) {
+      HeapRegion* field_hr = _g1h->heap_region_containing((HeapWord*)field_addr);
+      if (field_hr != nullptr && (field_hr->is_free() || field_hr->is_evict_guarded())) {
+        removed++;
+        continue;
+      }
+    }
+
+    uintptr_t raw = *(uintptr_t*)field_addr;
+    if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) !=
+        (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+      removed++;
+      continue;
+    }
+
+    if ((RemoteHandle*)(raw & G1_OOP_ADDR_MASK) != h) {
+      removed++;
+      continue;
+    }
+
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    if (state == REMOTE_HANDLE_LOCAL) {
+      *(uintptr_t*)field_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      restored++;
+      continue;
+    }
+
+    _tagged_fields[retained++] = _tagged_fields[i];
+  }
+
+  _tagged_field_count = retained;
+  if (restored > 0 || removed > 0) {
+    log_info(gc)("Recorded untag cleanup: restored %d local refs, removed %d stale entries, "
+                 "%d remote-tag entries retained",
+                 restored, removed, retained);
+  }
+  return restored;
 }
 
 int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_workers) {

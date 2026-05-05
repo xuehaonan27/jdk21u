@@ -399,6 +399,11 @@
           "load/null-check paths can observe the unresolved tagged handle "   \
           "before the receiver is resolved.")                                 \
                                                                             \
+  product(bool, G1RemoteAbortOnPhaseCUntaggable, true, DIAGNOSTIC,           \
+          "Abort remote eviction immediately after Phase C if tagging found " \
+          "heap refs that cannot safely be tagged. Verification would only "  \
+          "rediscover those refs and abort later.")                           \
+                                                                            \
   product(bool, G1RemoteAllowTypeArrayEviction, false, DIAGNOSTIC,           \
           "Allow remote eviction of primitive arrays as whole objects. "       \
           "Object arrays remain local unless covered by separate reference "   \

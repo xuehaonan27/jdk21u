@@ -1464,6 +1464,42 @@ static bool region_is_cold_by_epoch(HeapRegion* hr,
   return enough_signal && mostly_cold && not_hot;
 }
 
+static int abort_remote_eviction_candidates(G1CollectedHeap* g1h,
+                                            G1RemoteMemoryManager* rmm,
+                                            bool* eviction_candidates,
+                                            uint num_regions,
+                                            const char* reason,
+                                            int refs) {
+  log_warning(gc)("Eviction ABORTED: %d %s", refs, reason);
+
+  int backoff_regions = 0;
+  for (uint i = 0; i < num_regions; i++) {
+    if (!eviction_candidates[i]) {
+      continue;
+    }
+    if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+      rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
+      backoff_regions++;
+    }
+    HeapRegion* hr = g1h->region_at_or_null(i);
+    if (hr != nullptr) {
+      hr->clear_cold_destination();
+    }
+    eviction_candidates[i] = false;
+  }
+
+  if (backoff_regions > 0) {
+    log_warning(gc)("Eviction backoff: skipping %d aborted candidate regions for %u GC cycles",
+                    backoff_regions, G1RemoteEvictionAbortBackoffGCCycles);
+  }
+
+  int restored = rmm->untag_recorded_local_refs();
+  if (restored < rmm->last_phase_c_tagged()) {
+    rmm->untag_all_heap_refs();
+  }
+  return backoff_regions;
+}
+
 #ifdef LINUX
 static bool read_jlong_from_file(const char* path, jlong* value) {
   FILE* fp = fopen(path, "r");
@@ -2932,13 +2968,24 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                      phase_c_ms, nworkers, tagged);
       }
 
+      if (total_candidates > 0 &&
+          G1RemoteAbortOnPhaseCUntaggable &&
+          rmm->last_phase_c_untaggable() > 0) {
+        abort_remote_eviction_candidates(
+            _g1h, rmm, eviction_candidates, num_regions,
+            "refs from untaggable heap sources kept raw during Phase C",
+            rmm->last_phase_c_untaggable());
+        total_candidates = 0;
+      }
+
       // ---- Phase C.1: Safety-net scan of newly-evacuated areas ----
       // Objects evacuated during this GC land above _pre_evac_tops[i] in
       // destination regions.  The general Phase C scan covers them via
       // sequential iteration above parsable_bottom, but truncation on
       // unexpected heap gaps can silently skip objects.  This targeted
       // pass re-scans only the newly-evacuated portion of each region.
-      if (_pre_evac_tops != nullptr &&
+      if (total_candidates > 0 &&
+          _pre_evac_tops != nullptr &&
           !(G1RemoteUseFastPhaseC &&
             G1RemoteVerifyEvictionRefs &&
             G1RemoteSkipFastPhaseCSafetyNetWhenVerifying)) {
@@ -2952,12 +2999,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         } else {
           log_info(gc)("Phase C.1 safety-net: %.1fms, 0 missed refs", phase_c1_ms);
         }
-      } else if (_pre_evac_tops != nullptr) {
+      } else if (total_candidates > 0 && _pre_evac_tops != nullptr) {
         log_info(gc)("Phase C.1 safety-net: skipped because Fast Phase C is verifier-backed");
       }
 
       // ---- Phase C.5: Verify no untagged refs remain ----
-      if (G1RemoteVerifyEvictionRefs) {
+      if (total_candidates > 0 && G1RemoteVerifyEvictionRefs) {
         Ticks phase_c5_start = Ticks::now();
         int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates,
                                                                   num_regions,
@@ -2965,27 +3012,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         double phase_c5_ms = (Ticks::now() - phase_c5_start).seconds() * 1000.0;
         log_info(gc)("Phase C.5 verify: %.1fms (%d missed heap refs)", phase_c5_ms, missed);
         if (missed > 0) {
-          log_warning(gc)("Eviction ABORTED: %d untagged HEAP refs found after tagging", missed);
-          int backoff_regions = 0;
-          for (uint i = 0; i < num_regions; i++) {
-            if (eviction_candidates[i]) {
-              if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
-                rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
-                backoff_regions++;
-              }
-              HeapRegion* hr = _g1h->region_at_or_null(i);
-              if (hr != nullptr) {
-                hr->clear_cold_destination();
-              }
-              eviction_candidates[i] = false;
-            }
-          }
-          if (backoff_regions > 0) {
-            log_warning(gc)("Eviction backoff: skipping %d aborted candidate regions for %u GC cycles",
-                            backoff_regions, G1RemoteEvictionAbortBackoffGCCycles);
-          }
+          abort_remote_eviction_candidates(
+              _g1h, rmm, eviction_candidates, num_regions,
+              "untagged HEAP refs found after tagging", missed);
           total_candidates = 0;
-          rmm->untag_all_heap_refs();
         }
       }
 

@@ -740,8 +740,16 @@ private:
   uint      _fast_phase_c_source_hint_capacity;
   uint      _fast_phase_c_source_hint_count;
   volatile int _fast_phase_c_source_hint_lock;
+  int       _last_phase_c_tagged;
+  int       _last_phase_c_no_handle;
+  int       _last_phase_c_untaggable;
   void ensure_eviction_backoff_capacity(uint num_regions);
   void ensure_fast_phase_c_source_hint_capacity(uint num_regions);
+  void record_phase_c_counts(int tagged, int no_handle, int untaggable) {
+    _last_phase_c_tagged = tagged;
+    _last_phase_c_no_handle = no_handle;
+    _last_phase_c_untaggable = untaggable;
+  }
   void fast_phase_c_source_hint_lock() {
     while (Atomic::cmpxchg(&_fast_phase_c_source_hint_lock, 0, 1) != 0) { /* spin */ }
   }
@@ -835,6 +843,9 @@ public:
 
   int tagged_field_count() const { return _tagged_field_count; }
   const TaggedFieldEntry* tagged_fields() const { return _tagged_fields; }
+  int last_phase_c_tagged() const { return _last_phase_c_tagged; }
+  int last_phase_c_no_handle() const { return _last_phase_c_no_handle; }
+  int last_phase_c_untaggable() const { return _last_phase_c_untaggable; }
 
   // Post-evacuation fixup: iterate tagged fields, update Handles whose
   // targets have been forwarded during evacuation. Lazily removes stale
@@ -1200,6 +1211,7 @@ public:
   // Untag all tagged oop fields in the heap. Called on eviction abort to
   // restore clean oops, preventing barrier gaps from causing crashes.
   int untag_all_heap_refs(WorkerThreads* workers = nullptr, uint num_workers = 0);
+  int untag_recorded_local_refs();
 
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
