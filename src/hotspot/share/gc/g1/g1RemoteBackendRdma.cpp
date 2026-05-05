@@ -779,6 +779,7 @@ size_t RDMAExecutorBackend::fetch_batch_around(uintptr_t handle_id, size_t slot_
   }
 
   io_lock();
+  if (!flush_localize_batch_locked()) { io_unlock(); return 0; }
 
   if (!rdma_post_recv()) { io_unlock(); return 0; }
 
