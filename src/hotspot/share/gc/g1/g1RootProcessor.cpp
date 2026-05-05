@@ -76,12 +76,19 @@ void G1RootProcessor::evacuate_roots(G1ParScanThreadState* pss, uint worker_id) 
   // CodeCache is already processed in java roots
   _process_strong_tasks.all_tasks_claimed(G1RP_PS_CodeCache_oops_do);
 
-  // Dormant anchor Handles: local objects referenced by remote objects.
-  // Must be treated as strong roots to prevent collection.
+  process_remote_roots(closures->strong_oops());
+}
+
+void G1RootProcessor::process_remote_roots(OopClosure* oops) {
+  // Local objects referenced only from evicted remote objects are still Java
+  // live. Young GC, Full GC strong roots, and Full GC all-roots must all scan
+  // these handles, otherwise fetch-time edge patching can observe stale LOCAL
+  // handles after compaction.
   if (_process_strong_tasks.try_claim_task(G1RP_PS_RemoteAnchors_oops_do)) {
     G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
     if (rmm != nullptr) {
-      rmm->oops_do_remote_anchors(closures->strong_oops());
+      rmm->oops_do_remote_anchors(oops);
+      rmm->oops_do_remote_cross_roots(oops);
     }
   }
 }
@@ -115,6 +122,7 @@ void G1RootProcessor::process_strong_roots(OopClosure* oops,
   // refProcessor is not needed since we are inside a safe point
   _process_strong_tasks.all_tasks_claimed(G1RP_PS_CodeCache_oops_do,
                                           G1RP_PS_refProcessor_oops_do);
+  process_remote_roots(oops);
 }
 
 // Adaptor to pass the closures to all the roots in the VM.
@@ -150,6 +158,7 @@ void G1RootProcessor::process_all_roots(OopClosure* oops,
 
   // refProcessor is not needed since we are inside a safe point
   _process_strong_tasks.all_tasks_claimed(G1RP_PS_refProcessor_oops_do);
+  process_remote_roots(oops);
 }
 
 void G1RootProcessor::process_java_roots(G1RootClosures* closures,

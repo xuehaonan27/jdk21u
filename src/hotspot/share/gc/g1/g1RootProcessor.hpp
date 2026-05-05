@@ -73,6 +73,8 @@ class G1RootProcessor : public StackObj {
                                 G1GCPhaseTimes* phase_times,
                                 uint worker_id);
 
+  void process_remote_roots(OopClosure* oops);
+
 public:
   G1RootProcessor(G1CollectedHeap* g1h, uint n_workers);
 
