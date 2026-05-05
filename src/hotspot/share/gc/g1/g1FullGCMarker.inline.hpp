@@ -78,7 +78,7 @@ template <class T> inline void G1FullGCMarker::mark_and_push(T* p) {
   oop obj = g1_resolved_load(p);
   if (obj != nullptr) {
     G1CollectedHeap* g1h = G1CollectedHeap::heap();
-    if (!g1_gc_resolved_oop_safe_for_scan(g1h, p, obj)) {
+    if (!g1_gc_resolve_oop_for_scan(g1h, p, &obj)) {
       return;
     }
     if (mark_object(obj)) {

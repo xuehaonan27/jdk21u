@@ -127,19 +127,33 @@ static inline bool g1_retag_stale_gc_slot_if_possible(G1CollectedHeap* g1h, T* p
 }
 
 template <class T>
-static inline bool g1_gc_resolved_oop_safe_for_scan(G1CollectedHeap* g1h, T* p, oop obj) {
+static inline bool g1_gc_resolve_oop_for_scan(G1CollectedHeap* g1h, T* p, oop* obj_addr) {
   if (!g1_remote_gc_scan_checks_enabled()) {
     return true;
   }
+  oop obj = *obj_addr;
   if (g1_gc_scan_region_contains_oop(g1h, obj)) {
     return true;
   }
 
   // A clean pre-eviction oop can survive in a dirty card/root slot. If the
-  // field is a writable heap slot, repair it back to a shared handle before
-  // skipping; otherwise just avoid dereferencing the protected/free address.
-  g1_retag_stale_gc_slot_if_possible(g1h, p, obj);
+  // field is a writable heap slot, repair it back to a shared handle and
+  // rescan that repaired edge in the same GC pass.  Full GC in particular has
+  // no later remembered-set pass that would rediscover an edge repaired here.
+  if (g1_retag_stale_gc_slot_if_possible(g1h, p, obj)) {
+    oop repaired = g1_resolved_load(p);
+    if (g1_gc_scan_region_contains_oop(g1h, repaired)) {
+      *obj_addr = repaired;
+      return true;
+    }
+  }
   return false;
+}
+
+template <class T>
+static inline bool g1_gc_resolved_oop_safe_for_scan(G1CollectedHeap* g1h, T* p, oop obj) {
+  oop resolved = obj;
+  return g1_gc_resolve_oop_for_scan(g1h, p, &resolved);
 }
 
 template <class T>
@@ -183,11 +197,11 @@ inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
-  // Phase 6: skip remote objects (resolved to non-heap slot_id)
-  if (!_g1h->is_in(obj)) {
+  if (!g1_gc_resolve_oop_for_scan(_g1h, p, &obj)) {
     return;
   }
-  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
   const G1HeapRegionAttr region_attr = _g1h->region_attr(obj);
@@ -214,11 +228,11 @@ inline void G1RootRegionScanClosure::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
-  // Phase 6: skip remote objects (resolved to non-heap slot_id)
-  if (!_g1h->is_in(obj)) {
+  if (!g1_gc_resolve_oop_for_scan(_g1h, p, &obj)) {
     return;
   }
-  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
   if (LocalMemoryRatio < 100 || G1TagRefSites ||
@@ -255,11 +269,11 @@ inline void G1ConcurrentRefineOopClosure::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
-  // Phase 6: skip remote objects (resolved to non-heap slot_id)
-  if (!_g1h->is_in(obj)) {
+  if (!g1_gc_resolve_oop_for_scan(_g1h, p, &obj)) {
     return;
   }
-  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
 
@@ -290,11 +304,11 @@ inline void G1ScanCardClosure::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
-  // Phase 6: skip remote objects (resolved to non-heap slot_id)
-  if (!_g1h->is_in(obj)) {
+  if (!g1_gc_resolve_oop_for_scan(_g1h, p, &obj)) {
     return;
   }
-  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
 
@@ -356,11 +370,11 @@ void G1ParCopyClosure<barrier, should_mark>::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
-  // Phase 6: skip remote objects (resolved to non-heap slot_id)
-  if (!_g1h->is_in(obj)) {
+  if (!g1_gc_resolve_oop_for_scan(_g1h, p, &obj)) {
     return;
   }
-  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
   assert(_worker_id == _par_scan_state->worker_id(), "sanity");
@@ -437,11 +451,11 @@ template <class T> void G1RebuildRemSetClosure::do_oop_work(T* p) {
   if (obj == nullptr) {
     return;
   }
-  // Phase 6: skip remote objects (resolved to non-heap slot_id)
-  if (!_g1h->is_in(obj)) {
+  if (!g1_gc_resolve_oop_for_scan(_g1h, p, &obj)) {
     return;
   }
-  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+  // Phase 6: skip remote objects (resolved to non-heap slot_id)
+  if (!_g1h->is_in(obj)) {
     return;
   }
 

@@ -231,11 +231,15 @@ void G1ParScanThreadState::do_oop_evac(T* p) {
   // Reference should not be null here as such are never pushed to the task queue.
   oop obj = g1_resolved_load<IS_NOT_NULL>(p);
 
-  // Null from resolve_oop_raw (REMOTE handle) or non-heap address: skip.
-  if (obj == nullptr || !_g1h->is_in(obj)) {
+  // Null from resolve_oop_raw (REMOTE handle): skip.
+  if (obj == nullptr) {
     return;
   }
-  if (!g1_gc_resolved_oop_safe_for_scan(_g1h, p, obj)) {
+  if (!g1_gc_resolve_oop_for_scan(_g1h, p, &obj)) {
+    return;
+  }
+  // Non-heap address after stale-slot repair: skip.
+  if (!_g1h->is_in(obj)) {
     return;
   }
 
