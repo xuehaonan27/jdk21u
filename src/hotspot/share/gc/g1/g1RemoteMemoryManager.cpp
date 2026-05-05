@@ -848,6 +848,7 @@ static volatile int _prep_fail_edge = 0;
 static volatile int _prep_fail_slot = 0;
 static volatile int _prep_success = 0;
 static volatile int _prep_success_type_array = 0;
+static volatile int _prep_success_obj_array = 0;
 static volatile int _prep_diag_logged = 0;
 
 bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAllocBuffer* hab,
@@ -870,21 +871,31 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
   }
 
   if (klass->is_array_klass()) {
-    if (!klass->is_typeArray_klass()) {
+    if (klass->is_typeArray_klass()) {
+      if (!G1RemoteAllowTypeArrayEviction) {
+        Atomic::add(&_prep_fail_array, 1);
+        if (Atomic::add(&_prep_fail_type_array_disabled, 1) <= 3 && !_prep_diag_logged) {
+          log_info(gc)("prepare_eviction: primitive array obj=" PTR_FORMAT
+                       " klass=%s kept local (G1RemoteAllowTypeArrayEviction=false)",
+                       p2i((void*)obj), klass->external_name());
+        }
+        return false;
+      }
+    } else if (klass->is_objArray_klass()) {
+      if (!G1RemoteAllowObjectArrayEviction) {
+        Atomic::add(&_prep_fail_array, 1);
+        if (Atomic::add(&_prep_fail_obj_array, 1) <= 3 && !_prep_diag_logged) {
+          log_info(gc)("prepare_eviction: object array obj=" PTR_FORMAT
+                       " klass=%s kept local (G1RemoteAllowObjectArrayEviction=false)",
+                       p2i((void*)obj), klass->external_name());
+        }
+        return false;
+      }
+    } else {
       Atomic::add(&_prep_fail_array, 1);
       if (Atomic::add(&_prep_fail_obj_array, 1) <= 3 && !_prep_diag_logged) {
-        log_info(gc)("prepare_eviction: object/unknown array obj=" PTR_FORMAT
+        log_info(gc)("prepare_eviction: unknown array obj=" PTR_FORMAT
                      " klass=%s kept local",
-                     p2i((void*)obj), klass->external_name());
-      }
-      return false;
-    }
-
-    if (!G1RemoteAllowTypeArrayEviction) {
-      Atomic::add(&_prep_fail_array, 1);
-      if (Atomic::add(&_prep_fail_type_array_disabled, 1) <= 3 && !_prep_diag_logged) {
-        log_info(gc)("prepare_eviction: primitive array obj=" PTR_FORMAT
-                     " klass=%s kept local (G1RemoteAllowTypeArrayEviction=false)",
                      p2i((void*)obj), klass->external_name());
       }
       return false;
@@ -965,6 +976,9 @@ bool G1RemoteMemoryManager::finish_prepared_eviction_edges(
   if (et == nullptr) {
     if (zero_edges) {
       Atomic::add(&_prep_success, 1);
+      if (entry->klass != nullptr && entry->klass->is_objArray_klass()) {
+        Atomic::add(&_prep_success_obj_array, 1);
+      }
       return true;
     }
     Atomic::add(&_prep_fail_edge, 1);
@@ -981,6 +995,9 @@ bool G1RemoteMemoryManager::finish_prepared_eviction_edges(
   }
 
   Atomic::add(&_prep_success, 1);
+  if (entry->klass != nullptr && entry->klass->is_objArray_klass()) {
+    Atomic::add(&_prep_success_obj_array, 1);
+  }
   return true;
 }
 
@@ -995,9 +1012,9 @@ bool G1RemoteMemoryManager::prepare_eviction(oop obj, RemoteHandleAllocBuffer* h
 void G1RemoteMemoryManager::log_prepare_eviction_stats() {
   if (_prep_fail_null + _prep_fail_locked + _prep_fail_array +
       _prep_fail_filler + _prep_fail_edge + _prep_fail_slot + _prep_success > 0) {
-    log_info(gc)("prepare_eviction stats: success=%d(type_array=%d) null=%d "
+    log_info(gc)("prepare_eviction stats: success=%d(type_array=%d obj_array=%d) null=%d "
                  "locked=%d array=%d(obj=%d type_disabled=%d) filler=%d edge=%d slot=%d",
-                 _prep_success, _prep_success_type_array,
+                 _prep_success, _prep_success_type_array, _prep_success_obj_array,
                  _prep_fail_null, _prep_fail_locked, _prep_fail_array,
                  _prep_fail_obj_array, _prep_fail_type_array_disabled,
                  _prep_fail_filler, _prep_fail_edge, _prep_fail_slot);
@@ -1006,7 +1023,7 @@ void G1RemoteMemoryManager::log_prepare_eviction_stats() {
   _prep_fail_null = _prep_fail_locked = _prep_fail_array =
       _prep_fail_obj_array = _prep_fail_type_array_disabled =
       _prep_fail_filler = _prep_fail_edge = _prep_fail_slot = _prep_success =
-      _prep_success_type_array = 0;
+      _prep_success_type_array = _prep_success_obj_array = 0;
   _prep_diag_logged = 0;
 }
 

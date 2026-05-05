@@ -1389,7 +1389,7 @@ static bool region_sample_allows_dense_object_eviction(const RegionColdnessSampl
   if (sample.object_count == 0 || sample.evictable_object_count == 0) {
     return false;
   }
-  if (sample.obj_array_count > 0) {
+  if (sample.obj_array_count > 0 && !G1RemoteAllowObjectArrayEviction) {
     return false;
   }
   if (sample.type_array_count > 0 && !G1RemoteAllowTypeArrayEviction) {
