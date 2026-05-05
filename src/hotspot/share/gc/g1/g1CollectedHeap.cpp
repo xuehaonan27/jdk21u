@@ -1352,6 +1352,13 @@ jint G1CollectedHeap::initialize_service_thread() {
 }
 
 HeapRegion* G1CollectedHeap::allocate_fcr_region() {
+  if (SafepointSynchronize::is_at_safepoint() &&
+      !Thread::current()->is_VM_thread() &&
+      !FreeList_lock->owned_by_self()) {
+    MutexLocker x(FreeList_lock, Mutex::_no_safepoint_check_flag);
+    return allocate_fcr_region();
+  }
+
   // Allocate a clean free region for Fetch Cache without expansion (safe outside
   // safepoint). Reusing evict-guarded regions as FCR hides stale clean oop
   // aliases: the stale address becomes readable again and can resolve to
