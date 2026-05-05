@@ -1003,8 +1003,8 @@ private:
   HeapRegion* _current_fcr;       // Current FCR region for fetch allocation
   volatile int _fcr_lock;         // Spinlock for FCR region creation
 
-  void fcr_lock()   { while (Atomic::cmpxchg(&_fcr_lock, 0, 1) != 0) { /* spin */ } }
-  void fcr_unlock() { Atomic::release_store(&_fcr_lock, 0); }
+  bool try_fcr_lock() { return Atomic::cmpxchg(&_fcr_lock, 0, 1) == 0; }
+  void fcr_unlock()   { Atomic::release_store(&_fcr_lock, 0); }
 
   // Allocate a new FCR region from the free region pool.
   // Must NOT be called from JRT_LEAF (needs Heap_lock).

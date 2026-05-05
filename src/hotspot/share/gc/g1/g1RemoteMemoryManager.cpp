@@ -31,6 +31,7 @@
 #include "runtime/jniHandles.hpp"
 #include "runtime/threads.hpp"
 #include "gc/shared/oopStorageSet.inline.hpp"
+#include "utilities/spinYield.hpp"
 #include "utilities/copy.hpp"
 #include "classfile/classLoaderDataGraph.hpp"
 #include "gc/shared/workerThread.hpp"
@@ -4342,10 +4343,23 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
   }
 
   // Current FCR full or doesn't exist. Allocate a new FCR region.
-  // Outside a safepoint this requires Heap_lock. During STW GC, the VMThread
-  // must not wait for Heap_lock because the owner may be a stopped JavaThread.
-  // No os::malloc fallback — all fetched objects go into proper G1 regions.
-  fcr_lock();
+  // This path is reachable from resolve_tagged_oop_no_safepoint(), a leaf
+  // runtime call that cannot block indefinitely while a VM handshake or
+  // safepoint is pending.  If either coordination lock is contended, report a
+  // retryable allocation failure to the fetch state machine instead of waiting.
+  const uint FCRLockSpinLimit = 256;
+  bool locked = false;
+  for (uint spins = 0; spins < FCRLockSpinLimit; spins++) {
+    if (try_fcr_lock()) {
+      locked = true;
+      break;
+    }
+    SpinPause();
+  }
+  if (!locked) {
+    return nullptr;
+  }
+
   if (_current_fcr != fcr) {
     fcr = _current_fcr;
     fcr_unlock();
@@ -4367,8 +4381,12 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
                  " old_fcr=" PTR_FORMAT, word_size, p2i(fcr));
     new_fcr = allocate_new_fcr_region();
   } else {
-    MutexLocker ml(Heap_lock);
+    if (!Heap_lock->try_lock()) {
+      fcr_unlock();
+      return nullptr;
+    }
     new_fcr = allocate_new_fcr_region();
+    Heap_lock->unlock();
   }
   if (new_fcr != nullptr) {
     _current_fcr = new_fcr;

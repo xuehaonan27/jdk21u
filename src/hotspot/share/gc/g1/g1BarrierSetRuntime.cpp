@@ -500,6 +500,7 @@ class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
   size_t _raced;
   size_t _failed;
   size_t _prefetch_words;
+  bool _primary_alloc_failed;
   RemoteHandle* _publish_handles[G1RemoteFetchBatchHardCap];
   HeapWord* _publish_dests[G1RemoteFetchBatchHardCap];
   uintptr_t _publish_ids[G1RemoteFetchBatchHardCap];
@@ -510,7 +511,8 @@ public:
                            RemoteHandle* primary, size_t primary_slot)
     : _g1h(g1h), _rmm(rmm), _primary(primary), _primary_result(nullptr),
       _primary_slot(primary_slot), _returned(0), _installed(0), _prefetched(0),
-      _raced(0), _failed(0), _prefetch_words(0), _publish_count(0) {}
+      _raced(0), _failed(0), _prefetch_words(0), _primary_alloc_failed(false),
+      _publish_count(0) {}
 
   void do_object(uintptr_t handle_id, size_t slot_id, Klass* klass,
                  size_t word_size, const void* obj_bytes) override {
@@ -556,7 +558,10 @@ public:
     HeapWord* dest = _rmm->allocate_in_fcr(word_size);
     if (dest == nullptr) {
       if (is_primary) {
-        guarantee(dest != nullptr, "FCR allocation failed for primary batch fetch");
+        h->cas_fetching_to_remote();
+        _primary_alloc_failed = true;
+        _failed++;
+        return;
       } else {
         h->cas_fetching_to_remote();
         _failed++;
@@ -589,6 +594,7 @@ public:
   }
 
   oopDesc* primary_result() const { return _primary_result; }
+  bool primary_alloc_failed() const { return _primary_alloc_failed; }
   size_t returned() const { return _returned; }
   size_t installed() const { return _installed; }
   size_t prefetched() const { return _prefetched; }
@@ -630,6 +636,13 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
     return installer.primary_result();
   }
 
+  if (installer.primary_alloc_failed()) {
+    h->cas_fetching_to_remote();
+    rmm->record_fetch_retry();
+    *out_retry = true;
+    return nullptr;
+  }
+
   Atomic::release_store(&g1_remote_fetch_batch_disabled, 1);
   log_warning(gc)("Batch fetch did not install primary object for handle " PTR_FORMAT
                   " slot=" SIZE_FORMAT " (returned=" SIZE_FORMAT
@@ -668,7 +681,12 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
   }
 
   HeapWord* dest = rmm->allocate_in_fcr(word_size);
-  guarantee(dest != nullptr, "FCR allocation failed for fetch");
+  if (dest == nullptr) {
+    h->cas_fetching_to_remote();
+    rmm->record_fetch_retry();
+    *out_retry = true;
+    return nullptr;
+  }
 
   // Zero-fill before fetch so any partial/wrong copy is detectable
   memset(dest, 0, word_size * HeapWordSize);
