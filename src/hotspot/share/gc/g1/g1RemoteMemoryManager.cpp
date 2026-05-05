@@ -3553,7 +3553,7 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
 
 void G1RemoteMemoryManager::update_handles_for_full_gc() {
   int updated = 0;
-  int stale_killed = 0;
+  int stale_skipped = 0;
 
   table_lock();
   for (size_t idx = 0; idx < TABLE_SIZE; idx++) {
@@ -3571,14 +3571,40 @@ void G1RemoteMemoryManager::update_handles_for_full_gc() {
 
         // Full GC runs after remote eviction may leave LOCAL table entries
         // pointing into evict-guarded or otherwise stale heap ranges.  Do not
-        // read the mark word until the common validator has ruled those out.
-        if (!validate_local_handle_addr(h, "FULL-GC-HANDLE",
-                                        &stale_killed, 16)) {
+        // read the mark word until the address is known safe.  This pass must
+        // not mark handles DEAD: tagged heap fields may still recover through
+        // duplicate/remote aliases during normal barrier resolution.
+        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+        HeapRegion* hr = nullptr;
+        bool safe_to_read = false;
+        if (addr != 0 && _g1h->is_in_reserved((void*)addr)) {
+          hr = _g1h->heap_region_containing_or_null((void*)addr);
+          if (hr != nullptr &&
+              !hr->is_evict_guarded() &&
+              !hr->is_free() &&
+              !hr->is_empty() &&
+              !hr->is_continues_humongous() &&
+              (HeapWord*)addr >= hr->bottom() &&
+              (HeapWord*)addr < hr->top() &&
+              _g1h->is_in((void*)addr)) {
+            oop candidate = cast_to_oop(addr);
+            Klass* k = candidate->klass_or_null_acquire();
+            if (remote_eviction_valid_klass(k) &&
+                !G1CollectedHeap::is_obj_filler(candidate)) {
+              size_t word_size = candidate->size_given_klass(k);
+              safe_to_read = word_size >= (size_t)MinObjAlignment &&
+                             is_object_aligned(word_size) &&
+                             word_size <= (size_t)(hr->top() - (HeapWord*)addr) &&
+                             word_size <= (size_t)(hr->end() - (HeapWord*)addr);
+            }
+          }
+        }
+        if (!safe_to_read) {
+          stale_skipped++;
           e = next;
           continue;
         }
 
-        uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
         oop obj = cast_to_oop(addr);
         if (obj->is_forwarded()) {
           oop new_obj = obj->forwardee();
@@ -3624,9 +3650,9 @@ void G1RemoteMemoryManager::update_handles_for_full_gc() {
   }
   table_unlock();
 
-  if (updated > 0 || stale_killed > 0) {
-    log_info(gc)("Full GC handle update: %d handles rekeyed, %d stale handles killed",
-                 updated, stale_killed);
+  if (updated > 0 || stale_skipped > 0) {
+    log_info(gc)("Full GC handle update: %d handles rekeyed, %d stale handles skipped",
+                 updated, stale_skipped);
   }
 }
 
