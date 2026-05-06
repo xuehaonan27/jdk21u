@@ -511,6 +511,7 @@ static uint64_t g1_remote_prefetch_cache_stores = 0;
 static uint64_t g1_remote_prefetch_cache_evictions = 0;
 static uint64_t g1_remote_prefetch_cache_drops = 0;
 static uint g1_remote_prefetch_cache_evict_cursor = 0;
+static uint g1_remote_fetch_batch_effective_logged = 0;
 
 static void remote_prefetch_cache_lock() {
   while (Atomic::cmpxchg(&g1_remote_prefetch_cache_lock, 0, 1) != 0) {
@@ -578,6 +579,56 @@ static uint remote_prefetch_cache_hash(RemoteHandle* h, size_t slot_id) {
   x *= 0xff51afd7ed558ccdull;
   x ^= x >> 33;
   return (uint)(x % RemotePrefetchCacheSlots);
+}
+
+static uint remote_fetch_effective_batch_objects(uint configured) {
+  if (configured <= 1) {
+    return configured;
+  }
+
+  uint bounded = MIN2(configured, G1RemoteFetchBatchHardCap);
+  uint effective = bounded;
+  uint64_t hits = 0;
+  uint64_t stores = 0;
+  uint64_t evictions = 0;
+  uint64_t drops = 0;
+  bool log_change = false;
+
+  remote_prefetch_cache_lock();
+  hits = g1_remote_prefetch_cache_hits;
+  stores = g1_remote_prefetch_cache_stores;
+  evictions = g1_remote_prefetch_cache_evictions;
+  drops = g1_remote_prefetch_cache_drops;
+
+  if (stores < 4096) {
+    effective = MIN2(bounded, 64u);
+  } else {
+    uint64_t attempts = hits + stores;
+    uint64_t hit_per_mille = attempts == 0 ? 0 : (hits * 1000) / attempts;
+    if (hit_per_mille < 20) {
+      effective = MIN2(bounded, 8u);
+    } else if (hit_per_mille < 50) {
+      effective = MIN2(bounded, 16u);
+    } else if (hit_per_mille < 150) {
+      effective = MIN2(bounded, 32u);
+    } else if (hit_per_mille < 300) {
+      effective = MIN2(bounded, 64u);
+    }
+  }
+
+  if (g1_remote_fetch_batch_effective_logged != effective) {
+    g1_remote_fetch_batch_effective_logged = effective;
+    log_change = true;
+  }
+  remote_prefetch_cache_unlock();
+
+  if (log_change) {
+    log_info(gc)("Remote batch fetch policy: configured=%u effective=%u "
+                 "cache_hits=" UINT64_FORMAT " stores=" UINT64_FORMAT
+                 " evictions=" UINT64_FORMAT " drops=" UINT64_FORMAT,
+                 configured, effective, hits, stores, evictions, drops);
+  }
+  return effective;
 }
 
 static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
@@ -910,8 +961,7 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
-  uint max_objects = MIN2((uint)G1RemoteFetchBatchObjects,
-                          G1RemoteFetchBatchHardCap);
+  uint max_objects = remote_fetch_effective_batch_objects((uint)G1RemoteFetchBatchObjects);
   size_t max_response_bytes = G1RemoteFetchBatchBytes == 0 ?
       (size_t)RDMAMsgBufSize : MIN2((size_t)G1RemoteFetchBatchBytes, (size_t)RDMAMsgBufSize);
 
