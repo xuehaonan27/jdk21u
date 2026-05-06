@@ -2504,6 +2504,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     uint dense_refill_region_cap = 0;
     int dense_pre_d_guarded = 0;
     int dense_pre_d_refilled = 0;
+    bool pre_d_raw_stack_guard_ran = false;
     int path1_candidates = 0;
     int path2_candidates = 0;
 
@@ -2927,6 +2928,83 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     int total_candidates = path1_candidates + path2_candidates;
 
+    // Root-catch relocation is disabled by default. In that mode, candidate
+    // regions that already have remote anchors cannot be evicted this cycle:
+    // a LOCAL anchored handle would keep a raw local address into the region.
+    // Filter them before deopt/raw-stack/Phase-C work. The later root guard
+    // still handles ordinary roots and any anchors introduced after this point.
+    if (total_candidates > 0 && !G1RemoteUseRootCatchRelocation) {
+      bool* early_anchor_candidate_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+      memset(early_anchor_candidate_regions, 0, num_regions * sizeof(bool));
+      bool* early_anchor_dense_regions = nullptr;
+      if (dense_deferred_candidates != nullptr) {
+        early_anchor_dense_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+        memset(early_anchor_dense_regions, 0, num_regions * sizeof(bool));
+      }
+
+      int early_anchor_seen = 0;
+      int early_dense_anchor_seen = 0;
+      int early_dense_anchor_regions = 0;
+      int early_anchor_regions = rmm->mark_remote_anchor_regions_in_set(
+          eviction_candidates, num_regions, early_anchor_candidate_regions,
+          &early_anchor_seen,
+          dense_deferred_candidates, early_anchor_dense_regions,
+          &early_dense_anchor_regions, &early_dense_anchor_seen);
+
+      int early_anchor_removed = 0;
+      for (uint i = 0; i < num_regions; i++) {
+        if (!early_anchor_candidate_regions[i] || !eviction_candidates[i]) {
+          continue;
+        }
+        eviction_candidates[i] = false;
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr != nullptr) {
+          hr->clear_cold_destination();
+        }
+        early_anchor_removed++;
+        if (total_candidates > 0) {
+          total_candidates--;
+        }
+      }
+
+      if (early_anchor_removed > 0) {
+        log_info(gc)("Pre-D remote-anchor guard: removed %d candidate regions "
+                     "with %d anchored handles before raw-stack/Phase-C work",
+                     early_anchor_removed, early_anchor_seen);
+        if (early_dense_anchor_regions > 0) {
+          log_info(gc)("Pre-D remote-anchor guard: marked %d dense refill "
+                       "regions guarded by %d anchored handles",
+                       early_dense_anchor_regions, early_dense_anchor_seen);
+        }
+
+        if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+          (void)backoff_remote_eviction_guarded_regions(
+              rmm, early_anchor_candidate_regions, num_regions,
+              "remote-anchor guarded");
+        }
+
+        if (dense_refill_after_root_guard &&
+            dense_deferred_candidates != nullptr &&
+            dense_refill_region_cap > 0) {
+          uint refill_budget =
+              MIN2((uint)early_anchor_removed, dense_refill_region_cap);
+          (void)refill_dense_eviction_candidates(
+              _g1h, rmm, eviction_candidates, dense_deferred_candidates,
+              nullptr, early_anchor_dense_regions, num_regions, refill_budget,
+              early_anchor_removed, "Pre-D remote-anchor",
+              &path2_candidates, &total_candidates);
+        }
+      } else if (early_anchor_regions > 0) {
+        log_debug(gc)("Pre-D remote-anchor guard: %d anchored candidate "
+                      "regions were already inactive", early_anchor_regions);
+      }
+
+      if (early_anchor_dense_regions != nullptr) {
+        FREE_C_HEAP_ARRAY(bool, early_anchor_dense_regions);
+      }
+      FREE_C_HEAP_ARRAY(bool, early_anchor_candidate_regions);
+    }
+
     if (G1DeoptimizeBeforeEviction && total_candidates > 0) {
       Ticks deopt_start = Ticks::now();
       DeoptimizationScope deopt_scope;
@@ -2957,6 +3035,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       int raw_guarded = guard_eviction_candidates_with_raw_stack(
           _g1h, eviction_candidates, num_regions, "Pre-D raw stack guard",
           raw_stack_guarded_regions, raw_stack_backoff_regions);
+      pre_d_raw_stack_guard_ran = true;
       if (raw_guarded > 0) {
         total_candidates -= raw_guarded;
         dense_pre_d_guarded += raw_guarded;
@@ -3764,6 +3843,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        guard_cl.regions_guarded(), guard_cl.roots_found());
         }
 
+        if (pre_d_raw_stack_guard_ran && !G1RemoteUseRootCatchRelocation) {
+          log_info(gc)("Pre-E raw stack guard: skipped because Pre-D already "
+                       "scanned stopped Java stacks and root-catch relocation "
+                       "is disabled");
+        } else {
         class PreEvictionRawStackGuardClosure : public ThreadClosure {
           G1CollectedHeap* _g1h;
           bool*            _eviction_candidates;
@@ -3866,6 +3950,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           log_info(gc)("Pre-E raw stack guard: scanned " SIZE_FORMAT
                        " words in %d Java threads, 0 candidate stack words",
                        raw_stack_cl.words_scanned(), raw_stack_cl.threads_scanned());
+        }
         }
       }
 
