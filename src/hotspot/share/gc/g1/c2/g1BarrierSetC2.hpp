@@ -31,6 +31,15 @@
 
 // G1 disaggregated-memory barrier_data bit for C2 load barrier.
 const uint8_t G1BarrierTag = 1;
+const uint8_t G1BarrierAccessHintShift = 1;
+
+inline uint8_t g1_barrier_data_with_access_hint(uint32_t access_hint) {
+  return (uint8_t)(G1BarrierTag | ((access_hint & 0x7f) << G1BarrierAccessHintShift));
+}
+
+inline uint32_t g1_access_hint_from_barrier_data(uint8_t barrier_data) {
+  return (uint32_t)(barrier_data >> G1BarrierAccessHintShift);
+}
 
 class MacroAssembler;
 class MachNode;
@@ -49,6 +58,7 @@ private:
   const MachNode* _node;
   Address         _ref_addr;
   Register        _ref;
+  uint32_t        _access_hint;
   Label           _entry;
   Label           _continuation;
 

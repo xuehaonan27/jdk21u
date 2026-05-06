@@ -27,6 +27,7 @@
 
 #include "c1/c1_CodeStubs.hpp"
 #include "c1/c1_Compilation.hpp"
+#include "gc/g1/g1BarrierSetRuntime.hpp"
 #include "gc/shared/c1/modRefBarrierSetC1.hpp"
 
 class G1PreBarrierStub: public CodeStub {
@@ -132,12 +133,14 @@ class G1TagResolveStub: public CodeStub {
   LIR_Opr _ref;       // result register (loaded oop / resolved oop)
   LIR_Opr _ref_addr;  // memory address to re-read from (ZGC pattern)
   LIR_Opr _tmp;       // temp register for complex addresses
+  uint32_t _access_hint;
 
  public:
-  G1TagResolveStub(LIRAccess& access, LIR_Opr ref)
+  G1TagResolveStub(LIRAccess& access, LIR_Opr ref, uint32_t access_hint)
     : _ref(ref),
       _ref_addr(access.resolved_addr()),
-      _tmp(LIR_OprFact::illegalOpr) {
+      _tmp(LIR_OprFact::illegalOpr),
+      _access_hint(access_hint) {
     assert(_ref->is_register(), "must be a register");
     assert(_ref_addr->is_address(), "must be an address");
 
@@ -154,6 +157,7 @@ class G1TagResolveStub: public CodeStub {
   LIR_Opr ref() const { return _ref; }
   LIR_Opr ref_addr() const { return _ref_addr; }
   LIR_Opr tmp() const { return _tmp; }
+  uint32_t access_hint() const { return _access_hint; }
   void set_ref(LIR_Opr ref) { _ref = ref; }
 
   virtual void emit_code(LIR_Assembler* e);

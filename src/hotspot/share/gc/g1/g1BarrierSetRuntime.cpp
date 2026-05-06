@@ -300,6 +300,12 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   return resolved;
 JRT_END
 
+JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop_with_hint(oopDesc* tagged,
+                                                                      uint32_t access_hint))
+  (void)access_hint;
+  return G1BarrierSetRuntime::resolve_tagged_oop(tagged);
+JRT_END
+
 // ============================================================
 // Shared fetch helpers — used by both safepoint-safe and
 // non-safepointing slow paths to avoid logic duplication.
@@ -1045,6 +1051,49 @@ static size_t remote_fetch_max_response_bytes() {
                                     (size_t)RDMAMsgBufSize);
 }
 
+static bool remote_fetch_hint_prefers_around(uint32_t access_hint) {
+  if (!G1RemoteUseCompilerFetchHints) {
+    return false;
+  }
+  return access_hint == G1RemoteAccessHintField ||
+         access_hint == G1RemoteAccessHintArray ||
+         access_hint == G1RemoteAccessHintInterpreter;
+}
+
+static void remote_apply_compiler_fetch_hint(uint32_t access_hint,
+                                             uint* max_objects,
+                                             uint* slot_window,
+                                             size_t* max_response_bytes) {
+  if (!G1RemoteUseCompilerFetchHints || max_objects == nullptr ||
+      slot_window == nullptr || max_response_bytes == nullptr ||
+      *max_objects <= 1) {
+    return;
+  }
+
+  switch (access_hint) {
+    case G1RemoteAccessHintArray:
+      *max_objects = MAX2(*max_objects, MIN2((uint)64, G1RemoteFetchBatchHardCap));
+      *slot_window = MAX2(*slot_window, (uint)1024);
+      break;
+    case G1RemoteAccessHintField:
+      *max_objects = MAX2(*max_objects, MIN2((uint)32, G1RemoteFetchBatchHardCap));
+      break;
+    case G1RemoteAccessHintInterpreter:
+      *max_objects = MAX2(*max_objects, MIN2((uint)16, G1RemoteFetchBatchHardCap));
+      break;
+    case G1RemoteAccessHintUnsafe:
+    case G1RemoteAccessHintAtomic:
+    case G1RemoteAccessHintUnknown:
+    default:
+      return;
+  }
+
+  *max_objects = MIN2(*max_objects, G1RemoteFetchBatchHardCap);
+  if (*max_response_bytes == 0) {
+    *max_response_bytes = remote_fetch_max_response_bytes();
+  }
+}
+
 static void remote_exact_fetch_combine_lock() {
   while (Atomic::cmpxchg(&g1_remote_exact_fetch_combine_lock, 0, 1) != 0) {
     SpinPause();
@@ -1351,7 +1400,9 @@ static bool fetch_and_install_exact_combined(RemoteHandle* h,
 }
 
 static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
-                                        bool* out_retry, uint max_objects) {
+                                        bool* out_retry, uint max_objects,
+                                        uint slot_window,
+                                        size_t max_response_bytes) {
   *out_retry = false;
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
@@ -1360,13 +1411,11 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
-  size_t max_response_bytes = remote_fetch_max_response_bytes();
-
   BatchFetchInstallClosure installer(g1h, rmm, h, slot_id);
   jlong fetch_start = os::elapsed_counter();
   size_t returned = backend->fetch_batch_around((uintptr_t)h, slot_id, max_objects,
-                                                G1RemoteFetchBatchSlotWindow,
-                                                max_response_bytes, &installer);
+                                                slot_window, max_response_bytes,
+                                                &installer);
   jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
 
   installer.publish(backend);
@@ -1413,7 +1462,8 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
 // Returns the local oop on success, nullptr on failure (Handle set to DEAD
 // after max retries, or set back to REMOTE for caller to retry).
 // *out_retry is set to true if the caller should re-enter the state machine.
-static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* out_retry) {
+static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
+                                  bool* out_retry, uint32_t access_hint) {
   *out_retry = false;
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
@@ -1450,9 +1500,12 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
     return result;
   }
 
+  bool prefer_around = remote_fetch_hint_prefers_around(access_hint);
+
   oopDesc* combined_result = nullptr;
   bool combined_retry = false;
-  if (fetch_and_install_exact_combined(h, &combined_retry, &combined_result)) {
+  if (!prefer_around &&
+      fetch_and_install_exact_combined(h, &combined_retry, &combined_result)) {
     if (combined_retry) {
       *out_retry = true;
       return nullptr;
@@ -1464,9 +1517,23 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
       Atomic::load(&g1_remote_fetch_batch_disabled) == 0 &&
       rmm->backend()->supports_batch_fetch()) {
     uint max_objects = remote_fetch_effective_batch_objects((uint)G1RemoteFetchBatchObjects);
+    uint slot_window = G1RemoteFetchBatchSlotWindow;
+    size_t max_response_bytes = remote_fetch_max_response_bytes();
+    remote_apply_compiler_fetch_hint(access_hint, &max_objects,
+                                     &slot_window, &max_response_bytes);
     if (max_objects > 1) {
-      return fetch_and_install_batch(h, fetch_attempts, out_retry, max_objects);
+      return fetch_and_install_batch(h, fetch_attempts, out_retry, max_objects,
+                                     slot_window, max_response_bytes);
     }
+  }
+
+  if (prefer_around &&
+      fetch_and_install_exact_combined(h, &combined_retry, &combined_result)) {
+    if (combined_retry) {
+      *out_retry = true;
+      return nullptr;
+    }
+    return combined_result;
   }
 
   HeapWord* dest = rmm->allocate_in_fcr(word_size);
@@ -1625,6 +1692,11 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
 // Blocking I/O (RDMA/TCP) adds at most ~50us to safepoint initiation.
 // ============================================================
 oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
+  return resolve_tagged_oop_no_safepoint_with_hint(tagged, G1RemoteAccessHintUnknown);
+}
+
+oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint(oopDesc* tagged,
+                                                                         uint32_t access_hint) {
   RemoteHandle* h = nullptr;
   oopDesc* fast = resolve_fast_checks(tagged, &h);
   if (h == nullptr) return fast;
@@ -1662,7 +1734,7 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
     if (state == REMOTE_HANDLE_REMOTE) {
       if (h->cas_remote_to_fetching()) {
         bool retry = false;
-        oopDesc* result = fetch_and_install(h, fetch_attempts, &retry);
+        oopDesc* result = fetch_and_install(h, fetch_attempts, &retry, access_hint);
         if (retry) continue;
         return result;
       }

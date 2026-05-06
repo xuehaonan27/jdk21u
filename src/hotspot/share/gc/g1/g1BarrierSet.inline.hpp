@@ -60,9 +60,11 @@ static inline bool g1_needs_remote_resolve(oop value) {
   return hr == nullptr || hr->is_free() || hr->is_evict_guarded();
 }
 
-static inline oop g1_resolve_remote_oop_if_needed(oop value) {
+static inline oop g1_resolve_remote_oop_if_needed(oop value,
+                                                  uint32_t access_hint = G1RemoteAccessHintUnknown) {
   if (g1_needs_remote_resolve(value)) {
-    return cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_slow((oopDesc*)value));
+    return cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint((oopDesc*)value,
+                                                                                      access_hint));
   }
   return value;
 }
@@ -167,7 +169,8 @@ oop_load_in_heap(T* addr) {
   // === Disaggregated Memory Load Barrier ===
   // Resolve tagged oops, and in remote mode also clean stale oops whose
   // old local region has since been evict-guarded.
-  value = g1_resolve_remote_oop_if_needed(value);
+  value = g1_resolve_remote_oop_if_needed(value,
+      (decorators & IS_ARRAY) != 0 ? G1RemoteAccessHintArray : G1RemoteAccessHintField);
 
   guarantee(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
             "oop_load_in_heap: barrier returned tagged value " PTR_FORMAT " from addr " PTR_FORMAT,
@@ -181,7 +184,7 @@ template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_load_in_heap_at(oop base, ptrdiff_t offset) {
   if (g1_needs_remote_resolve(base)) {
-    base = g1_resolve_remote_oop_if_needed(base);
+    base = g1_resolve_remote_oop_if_needed(base, G1RemoteAccessHintField);
     if (base == nullptr) {
       return nullptr;
     }
@@ -193,7 +196,8 @@ oop_load_in_heap_at(oop base, ptrdiff_t offset) {
             cast_from_oop<uintptr_t>(base), (intx)offset);
   oop value = ModRef::oop_load_in_heap_at(base, offset);
   // Resolve tagged oops and clean stale oops via the centralized runtime.
-  value = g1_resolve_remote_oop_if_needed(value);
+  value = g1_resolve_remote_oop_if_needed(value,
+      (decorators & IS_ARRAY) != 0 ? G1RemoteAccessHintArray : G1RemoteAccessHintField);
   assert(value == nullptr || (cast_from_oop<uintptr_t>(value) >> 47) == 0,
          "oop_load_in_heap_at: barrier returned tagged " PTR_FORMAT " base=" PTR_FORMAT " off=" INTX_FORMAT,
          cast_from_oop<uintptr_t>(value), cast_from_oop<uintptr_t>(base), (intx)offset);
@@ -284,16 +288,16 @@ template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap(T* addr, oop new_value) {
-  new_value = g1_resolve_remote_oop_if_needed(new_value);
+  new_value = g1_resolve_remote_oop_if_needed(new_value, G1RemoteAccessHintField);
   ModRef::oop_store_in_heap(addr, new_value);
 }
 
 template <DecoratorSet decorators, typename BarrierSetT>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
-  new_value = g1_resolve_remote_oop_if_needed(new_value);
+  new_value = g1_resolve_remote_oop_if_needed(new_value, G1RemoteAccessHintField);
   if (g1_needs_remote_resolve(base)) {
-    base = g1_resolve_remote_oop_if_needed(base);
+    base = g1_resolve_remote_oop_if_needed(base, G1RemoteAccessHintField);
     if (base == nullptr) {
       return;
     }
@@ -343,7 +347,7 @@ template <DecoratorSet decorators, typename BarrierSetT>
 inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_atomic_cmpxchg_in_heap_at(oop base, ptrdiff_t offset, oop compare_value, oop new_value) {
   if (g1_needs_remote_resolve(base)) {
-    base = g1_resolve_remote_oop_if_needed(base);
+    base = g1_resolve_remote_oop_if_needed(base, G1RemoteAccessHintAtomic);
     if (base == nullptr) {
       return nullptr;
     }

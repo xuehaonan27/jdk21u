@@ -184,5 +184,6 @@ void G1BarrierSet::on_thread_detach(Thread* thread) {
 // Routes through the non-safepointing slow path which uses the canonical
 // fetch_and_install() helper (with validation, localize_batch, etc.).
 oop resolve_oop_full(oop tagged) {
-  return cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint((oopDesc*)cast_from_oop<uintptr_t>(tagged)));
+  return cast_to_oop(G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint(
+      (oopDesc*)cast_from_oop<uintptr_t>(tagged), G1RemoteAccessHintUnknown));
 }

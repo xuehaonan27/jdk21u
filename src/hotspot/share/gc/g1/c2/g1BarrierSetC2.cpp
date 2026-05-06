@@ -50,7 +50,12 @@
 // ============================================================
 
 G1TagResolveStubC2::G1TagResolveStubC2(const MachNode* node, Address ref_addr, Register ref)
-  : _node(node), _ref_addr(ref_addr), _ref(ref), _entry(), _continuation() {}
+  : _node(node),
+    _ref_addr(ref_addr),
+    _ref(ref),
+    _access_hint(g1_access_hint_from_barrier_data(node->barrier_data())),
+    _entry(),
+    _continuation() {}
 
 Label* G1TagResolveStubC2::entry() {
   return Compile::current()->output()->in_scratch_emit_size() ? &_continuation : &_entry;
@@ -92,7 +97,8 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   if (_ref != c_rarg0) {
     masm.movptr(c_rarg0, _ref);
   }
-  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop)));
+  masm.movl(c_rarg1, _access_hint);
+  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_with_hint)));
   masm.testptr(rax, rax);
   masm.jcc(Assembler::negative, slow_path);
   masm.jmp(done);
@@ -102,7 +108,8 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   // push above; the slow-path call may clobber them freely.
   masm.bind(slow_path);
   masm.movptr(c_rarg0, rax);
-  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint)));
+  masm.movl(c_rarg1, _access_hint);
+  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint)));
   // Fall through to common exit.
 
   // === Common exit: resolved oop in rax ===
@@ -125,6 +132,19 @@ GrowableArray<G1TagResolveStubC2*>* G1BarrierSetC2State::stubs() { return _stubs
 
 static G1BarrierSetC2State* barrier_set_state() {
   return reinterpret_cast<G1BarrierSetC2State*>(Compile::current()->barrier_set_state());
+}
+
+static uint32_t g1_remote_access_hint_for_c2(DecoratorSet decorators, bool atomic = false) {
+  if (atomic) {
+    return G1RemoteAccessHintAtomic;
+  }
+  if ((decorators & C2_UNSAFE_ACCESS) != 0) {
+    return G1RemoteAccessHintUnsafe;
+  }
+  if ((decorators & IS_ARRAY) != 0) {
+    return G1RemoteAccessHintArray;
+  }
+  return G1RemoteAccessHintField;
 }
 
 const TypeFunc *G1BarrierSetC2::write_ref_field_pre_entry_Type() {
@@ -717,7 +737,8 @@ Node* G1BarrierSetC2::load_at_resolved(C2Access& access, const Type* val_type) c
   // oops, LoadN is 32-bit and bit 63 has no meaning.  The barrier is
   // only meaningful when -XX:-UseCompressedOops.
   if (!UseCompressedOops && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
-    access.set_barrier_data(G1BarrierTag);
+    access.set_barrier_data(g1_barrier_data_with_access_hint(
+        g1_remote_access_hint_for_c2(access.decorators())));
   }
 
   if (!need_read_barrier) {
@@ -1173,14 +1194,16 @@ int G1BarrierSetC2::estimate_stub_size() const {
 Node* G1BarrierSetC2::atomic_cmpxchg_val_at_resolved(C2AtomicParseAccess& access, Node* expected_val,
                                                        Node* new_val, const Type* val_type) const {
   if (!UseCompressedOops && access.is_oop() && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
-    access.set_barrier_data(G1BarrierTag);
+    access.set_barrier_data(g1_barrier_data_with_access_hint(
+        g1_remote_access_hint_for_c2(access.decorators(), true)));
   }
   return CardTableBarrierSetC2::atomic_cmpxchg_val_at_resolved(access, expected_val, new_val, val_type);
 }
 
 Node* G1BarrierSetC2::atomic_xchg_at_resolved(C2AtomicParseAccess& access, Node* new_val, const Type* val_type) const {
   if (!UseCompressedOops && access.is_oop() && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
-    access.set_barrier_data(G1BarrierTag);
+    access.set_barrier_data(g1_barrier_data_with_access_hint(
+        g1_remote_access_hint_for_c2(access.decorators(), true)));
   }
   return CardTableBarrierSetC2::atomic_xchg_at_resolved(access, new_val, val_type);
 }

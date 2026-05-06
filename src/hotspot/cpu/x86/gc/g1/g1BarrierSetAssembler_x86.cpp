@@ -118,6 +118,16 @@ void G1BarrierSetAssembler::gen_write_ref_array_post_barrier(MacroAssembler* mas
   __ pop_call_clobbered_registers(false /* save_fpu */);
 }
 
+static uint32_t g1_remote_access_hint_for_assembler(DecoratorSet decorators) {
+  if ((decorators & ON_UNKNOWN_OOP_REF) != 0) {
+    return G1RemoteAccessHintUnsafe;
+  }
+  if ((decorators & IS_ARRAY) != 0) {
+    return G1RemoteAccessHintArray;
+  }
+  return G1RemoteAccessHintField;
+}
+
 void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorators, BasicType type,
                                     Register dst, Address src, Register tmp1, Register tmp_thread) {
   bool on_oop = is_reference_type(type);
@@ -160,8 +170,9 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
     __ push(r8);  __ push(r9);  __ push(r10); __ push(r11);
     // 10 pushes total. Set up argument and call.
     if (dst != c_rarg0) __ mov(c_rarg0, dst);
+    __ movl(c_rarg1, g1_remote_access_hint_for_assembler(decorators));
     masm->MacroAssembler::call_VM_leaf_base(
-        CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), 1);
+        CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_with_hint), 2);
     // rax = resolved oop. Check if still tagged (REMOTE handle).
     {
       Label leaf_resolved;
@@ -170,8 +181,9 @@ void G1BarrierSetAssembler::load_at(MacroAssembler* masm, DecoratorSet decorator
       // Still tagged — REMOTE object needs fetch. Call non-safepointing
       // slow path (no thread transitions, so saved registers are safe).
       __ mov(c_rarg0, rax);
+      __ movl(c_rarg1, g1_remote_access_hint_for_assembler(decorators));
       masm->MacroAssembler::call_VM_leaf_base(
-          CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), 1);
+          CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint), 2);
       __ bind(leaf_resolved);
     }
     // rax = fully resolved oop. Stash in rbx (callee-saved, survives pops).
@@ -250,8 +262,10 @@ void G1BarrierSetAssembler::copy_load_at(MacroAssembler* masm, DecoratorSet deco
     __ push(rbx);
     __ push_call_clobbered_registers(false /* save_fpu */);
     if (dst != c_rarg0) __ mov(c_rarg0, dst);
+    __ movl(c_rarg1, g1_remote_access_hint_for_assembler(decorators));
     // Phase 1: Leaf call
-    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_with_hint),
+                    c_rarg0, c_rarg1);
     __ testptr(rax, rax);
     __ jcc(Assembler::negative, slow_path);
     __ jmp(resolved);
@@ -259,7 +273,9 @@ void G1BarrierSetAssembler::copy_load_at(MacroAssembler* masm, DecoratorSet deco
     // Use call_VM_leaf for automatic RSP alignment (push(rbx) + push_ccr
     // may leave RSP 8 mod 16 depending on caller alignment).
     __ bind(slow_path);
-    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+    __ movl(c_rarg1, g1_remote_access_hint_for_assembler(decorators));
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint),
+                    rax, c_rarg1);
     // Fall through to common exit.
     __ bind(resolved);
     __ movptr(rbx, rax);
@@ -583,8 +599,9 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_stub(LIR_Assembler* ce, G1Ta
     __ push(rax);
   }
 
-  // Pass tagged oop to the runtime blob via parameter area
+  // Pass tagged oop and access-shape hint to the runtime blob via parameter area.
   ce->store_parameter(ref, 0);
+  ce->store_parameter((jint)stub->access_hint(), 1);
   __ call(RuntimeAddress(bs->tag_resolve_c1_runtime_code_blob()->code_begin()));
 
   // Move result into ref register
@@ -774,9 +791,11 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_runtime_stub(StubAssembler* 
   __ push_call_clobbered_registers();
 
   __ load_parameter(0, c_rarg0);
+  __ load_parameter(1, c_rarg1);
 
   // Phase 1: leaf call
-  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), c_rarg0);
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_with_hint),
+                  c_rarg0, c_rarg1);
   __ testptr(rax, rax);
   __ jcc(Assembler::negative, slow_path);
   __ jmp(done);
@@ -784,7 +803,9 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_runtime_stub(StubAssembler* 
   // Phase 2: slow path — call-clobbered regs still saved on stack.
   // Use call_VM_leaf for automatic RSP alignment.
   __ bind(slow_path);
-  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+  __ load_parameter(1, c_rarg1);
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint),
+                  rax, c_rarg1);
   // Fall through to common exit.
 
   __ bind(done);

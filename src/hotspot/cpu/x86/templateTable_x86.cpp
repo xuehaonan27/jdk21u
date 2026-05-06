@@ -169,7 +169,8 @@ static void do_oop_load(InterpreterMacroAssembler* _masm,
   __ load_heap_oop(dst, src, rdx, rbx, decorators);
 }
 
-static void resolve_rax_if_tagged(InterpreterMacroAssembler* _masm) {
+static void resolve_rax_if_tagged(InterpreterMacroAssembler* _masm,
+                                  uint32_t access_hint = G1RemoteAccessHintInterpreter) {
 #if INCLUDE_G1GC
   if (!UseG1GC) {
     return;
@@ -179,11 +180,15 @@ static void resolve_rax_if_tagged(InterpreterMacroAssembler* _masm) {
 
   __ jcc(Assembler::positive, done);
 
-  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop), rax);
+  __ movl(c_rarg1, access_hint);
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_with_hint),
+                  rax, c_rarg1);
   __ testptr(rax, rax);
   __ jcc(Assembler::positive, done);
 
-  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+  __ movl(c_rarg1, access_hint);
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint),
+                  rax, c_rarg1);
   __ bind(done);
 #endif
 }
@@ -1161,7 +1166,9 @@ void TemplateTable::aastore() {
     Label value_resolved;
     __ testptr(rax, rax);
     __ jcc(Assembler::positive, value_resolved);
-    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint), rax);
+    __ movl(c_rarg1, G1RemoteAccessHintArray);
+    __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint),
+                    rax, c_rarg1);
     __ movptr(at_tos(), rax);
     __ movl(rcx, at_tos_p1());
     __ movptr(rdx, at_tos_p2());
@@ -3554,7 +3561,7 @@ void TemplateTable::fast_accessfield(TosState state) {
                                   ConstantPoolCacheEntry::f2_offset())));
 
   // rax: object
-  resolve_rax_if_tagged(_masm);
+  resolve_rax_if_tagged(_masm, G1RemoteAccessHintField);
   __ verify_oop(rax);
   __ null_check(rax);
   Address field(rax, rbx, Address::times_1);
@@ -4165,7 +4172,7 @@ void TemplateTable::anewarray() {
 
 void TemplateTable::arraylength() {
   transition(atos, itos);
-  resolve_rax_if_tagged(_masm);
+  resolve_rax_if_tagged(_masm, G1RemoteAccessHintArray);
   __ movl(rax, Address(rax, arrayOopDesc::length_offset_in_bytes()));
 }
 

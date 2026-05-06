@@ -549,6 +549,10 @@
           "message-buffer size. The effective cap never exceeds "           \
           "RDMAMsgBufSize.")                                                \
                                                                             \
+  product(bool, G1RemoteUseCompilerFetchHints, true, DIAGNOSTIC,             \
+          "Use interpreter/C1/C2 access-shape hints to choose remote "        \
+          "fetch-around policy before falling back to exact fetch.")          \
+                                                                            \
   product(uint, RDMACQDepth, 256, DIAGNOSTIC,                               \
           "Depth of RDMA completion queues.")                               \
                                                                             \

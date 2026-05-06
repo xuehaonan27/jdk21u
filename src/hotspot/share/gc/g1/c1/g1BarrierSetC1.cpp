@@ -58,6 +58,16 @@ void G1TagResolveStub::emit_code(LIR_Assembler* ce) {
   bs->generate_c1_tag_resolve_stub(ce, this);
 }
 
+static uint32_t g1_remote_access_hint_for_c1(DecoratorSet decorators) {
+  if ((decorators & ON_UNKNOWN_OOP_REF) != 0) {
+    return G1RemoteAccessHintUnsafe;
+  }
+  if ((decorators & IS_ARRAY) != 0) {
+    return G1RemoteAccessHintArray;
+  }
+  return G1RemoteAccessHintField;
+}
+
 // Fused load+barrier LIR op for disaggregated memory.
 //
 // Performs movptr(result, [addr]) + testptr(result, result) + conditional
@@ -255,7 +265,8 @@ void G1BarrierSetC1::load_at_resolved(LIRAccess& access, LIR_Opr result) {
   // For non-oop loads or CompressedOops, use the base class load (no barrier).
   if (access.is_oop() && !UseCompressedOops) {
     // Create stub for the out-of-line slow path (re-reads from addr + calls blob)
-    G1TagResolveStub* stub = new G1TagResolveStub(access, result);
+    G1TagResolveStub* stub = new G1TagResolveStub(access, result,
+                                                  g1_remote_access_hint_for_c1(decorators));
     // Emit fused load+barrier as a single LIR op.
     // This REPLACES the base class load — the fused op does the movptr itself.
     __ append(new LIR_OpG1FusedLoadBarrier(access.resolved_addr(), result, stub));

@@ -34,6 +34,15 @@
 class oopDesc;
 class JavaThread;
 
+enum G1RemoteAccessHint : uint32_t {
+  G1RemoteAccessHintUnknown     = 0,
+  G1RemoteAccessHintField       = 1,
+  G1RemoteAccessHintArray       = 2,
+  G1RemoteAccessHintUnsafe      = 3,
+  G1RemoteAccessHintAtomic      = 4,
+  G1RemoteAccessHintInterpreter = 5
+};
+
 class G1BarrierSetRuntime: public AllStatic {
 public:
   using CardValue = G1CardTable::CardValue;
@@ -58,6 +67,7 @@ public:
   //     a still-tagged result.
   // Leaf fast path: handles LOCAL + Unique. Returns tagged oop for REMOTE.
   static oopDesc* resolve_tagged_oop(oopDesc* tagged);
+  static oopDesc* resolve_tagged_oop_with_hint(oopDesc* tagged, uint32_t access_hint);
   // Safepoint-safe slow path: REMOTE fetch with ThreadInVMfromJava + ThreadBlockInVM.
   // Called from interpreter barrier (C++ inline) where the frame is GC-walkable.
   static oopDesc* resolve_tagged_oop_slow(oopDesc* tagged);
@@ -66,6 +76,7 @@ public:
   // The thread stays in _thread_in_Java; blocking I/O adds at most ~50us
   // to safepoint initiation, which is acceptable.
   static oopDesc* resolve_tagged_oop_no_safepoint(oopDesc* tagged);
+  static oopDesc* resolve_tagged_oop_no_safepoint_with_hint(oopDesc* tagged, uint32_t access_hint);
 };
 
 #endif // SHARE_GC_G1_G1BARRIERSETRUNTIME_HPP
