@@ -1453,6 +1453,67 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
   int count = 0;
   int stale_handles = 0;
 
+  if (_local_handle_region_heads != nullptr &&
+      _local_handle_region_counts != nullptr &&
+      _local_handle_region_capacity >= num_regions) {
+    for (uint idx = 0; idx < num_regions && idx < _local_handle_region_capacity; idx++) {
+      if (!region_set[idx]) continue;
+
+      RemoteHandle* cur = _local_handle_region_heads[idx];
+      while (cur != nullptr) {
+        RemoteHandle* next = cur->_region_next;
+        uintptr_t cur_sa = cur->load_state_and_addr_acquire();
+        if ((cur_sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL &&
+            cur->remote_refcount() > 0 &&
+            validate_local_handle_addr(cur, "ANCHOR-COLLECT-REGION",
+                                       &stale_handles, 8)) {
+          uintptr_t sa = cur->load_state_and_addr_acquire();
+          uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+          uint ridx = local_handle_region_index(addr);
+          if (ridx < num_regions && region_set[ridx]) {
+            if (count < max_addrs && addrs != nullptr) {
+              addrs[count] = addr;
+            } else if (overflow != nullptr) {
+              *overflow = true;
+            }
+            count++;
+          }
+        }
+        cur = next;
+      }
+    }
+
+    for (int i = 0; i < _cross_roots_count; i++) {
+      RemoteHandle* h = _cross_roots[i];
+      if (h == nullptr || !h->is_local()) continue;
+      if (!validate_local_handle_addr(h, "CROSS-ROOT-COLLECT",
+                                      &stale_handles, 8)) {
+        continue;
+      }
+
+      uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+      if (addr == 0 || !_g1h->is_in((void*)addr)) continue;
+
+      HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
+      if (hr == nullptr) continue;
+      uint ridx = hr->hrm_index();
+      if (ridx >= num_regions || !region_set[ridx]) continue;
+
+      if (count < max_addrs && addrs != nullptr) {
+        addrs[count] = addr;
+      } else if (overflow != nullptr) {
+        *overflow = true;
+      }
+      count++;
+    }
+
+    if (stale_handles > 8) {
+      log_warning(gc)("Remote anchor collection marked %d stale LOCAL handles DEAD "
+                      "(logged first 8)", stale_handles);
+    }
+    return count;
+  }
+
   class RemoteAnchorCollectClosure {
     G1RemoteMemoryManager* _rmm;
     const bool* _region_set;
@@ -1565,6 +1626,91 @@ int G1RemoteMemoryManager::mark_remote_anchor_regions_in_set(const bool* region_
   int marked2 = 0;
   int seen2 = 0;
   int stale_handles = 0;
+
+  if (_local_handle_region_heads != nullptr &&
+      _local_handle_region_counts != nullptr &&
+      _local_handle_region_capacity >= num_regions) {
+    for (uint idx = 0; idx < num_regions && idx < _local_handle_region_capacity; idx++) {
+      bool scan_region = region_set[idx] ||
+          (region_set2 != nullptr && region_set2[idx]);
+      if (!scan_region) continue;
+
+      RemoteHandle* cur = _local_handle_region_heads[idx];
+      while (cur != nullptr) {
+        RemoteHandle* next = cur->_region_next;
+        uintptr_t cur_sa = cur->load_state_and_addr_acquire();
+        if ((cur_sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL &&
+            cur->remote_refcount() > 0 &&
+            validate_local_handle_addr(cur, "ANCHOR-MARK-REGION",
+                                       &stale_handles, 8)) {
+          uintptr_t addr = cur->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+          uint ridx = local_handle_region_index(addr);
+          if (ridx < num_regions && region_set[ridx]) {
+            seen++;
+            if (!anchor_regions[ridx]) {
+              anchor_regions[ridx] = true;
+              marked_regions++;
+            }
+          }
+          if (region_set2 != nullptr && anchor_regions2 != nullptr &&
+              ridx < num_regions && region_set2[ridx]) {
+            seen2++;
+            if (!anchor_regions2[ridx]) {
+              anchor_regions2[ridx] = true;
+              marked2++;
+            }
+          }
+        }
+        cur = next;
+      }
+    }
+
+    for (int i = 0; i < _cross_roots_count; i++) {
+      RemoteHandle* h = _cross_roots[i];
+      if (h == nullptr || !h->is_local()) continue;
+      if (!validate_local_handle_addr(h, "CROSS-ROOT-MARK",
+                                      &stale_handles, 8)) {
+        continue;
+      }
+
+      uintptr_t addr = h->load_state_and_addr_acquire() & REMOTE_HANDLE_ADDR_MASK;
+      if (addr == 0 || !_g1h->is_in((void*)addr)) continue;
+
+      HeapRegion* hr = _g1h->heap_region_containing((void*)addr);
+      if (hr == nullptr) continue;
+      uint ridx = hr->hrm_index();
+      if (ridx < num_regions && region_set[ridx]) {
+        seen++;
+        if (!anchor_regions[ridx]) {
+          anchor_regions[ridx] = true;
+          marked_regions++;
+        }
+      }
+      if (region_set2 != nullptr && anchor_regions2 != nullptr &&
+          ridx < num_regions && region_set2[ridx]) {
+        seen2++;
+        if (!anchor_regions2[ridx]) {
+          anchor_regions2[ridx] = true;
+          marked2++;
+        }
+      }
+    }
+
+    if (anchors_seen != nullptr) {
+      *anchors_seen = seen;
+    }
+    if (marked_regions2 != nullptr) {
+      *marked_regions2 = marked2;
+    }
+    if (anchors_seen2 != nullptr) {
+      *anchors_seen2 = seen2;
+    }
+    if (stale_handles > 8) {
+      log_warning(gc)("Remote anchor marking marked %d stale LOCAL handles DEAD "
+                      "(logged first 8)", stale_handles);
+    }
+    return marked_regions;
+  }
 
   class RemoteAnchorMarkClosure {
     G1RemoteMemoryManager* _rmm;
