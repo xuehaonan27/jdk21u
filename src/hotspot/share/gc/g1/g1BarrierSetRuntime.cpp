@@ -499,7 +499,10 @@ struct RemotePrefetchCacheEntry {
   uint64_t stamp;
 };
 
-static const uint RemotePrefetchCacheSlots = 16384;
+// Spark and small-object workloads can prefetch many tiny objects: the byte
+// cap can still be almost empty while a small entry table churns. Keep enough
+// slots so the byte cap, not hash-table occupancy, is usually the limiter.
+static const uint RemotePrefetchCacheSlots = 131072;
 static const uint RemotePrefetchCacheProbeLimit = 64;
 static const size_t RemotePrefetchCacheMaxBytes = 64 * 1024 * 1024;
 static const size_t RemotePrefetchCacheMaxObjectBytes = 16 * 1024;
