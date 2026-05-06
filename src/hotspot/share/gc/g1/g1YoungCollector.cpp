@@ -672,6 +672,45 @@ class G1EvacuateRegionsTask : public G1EvacuateRegionsBaseTask {
   G1RootProcessor* _root_processor;
   bool _has_optional_evacuation_work;
 
+  size_t remote_local_handles_in_collection_set(G1RemoteMemoryManager* rmm) {
+    if (rmm == nullptr) {
+      return 0;
+    }
+    if (!rmm->has_local_handle_region_counts()) {
+      return SIZE_MAX;
+    }
+
+    class CountLocalHandlesInCSetClosure : public HeapRegionClosure {
+      G1RemoteMemoryManager* _rmm;
+      size_t _count;
+      bool _unknown;
+
+    public:
+      CountLocalHandlesInCSetClosure(G1RemoteMemoryManager* rmm)
+        : HeapRegionClosure(), _rmm(rmm), _count(0), _unknown(false) {}
+
+      virtual bool do_heap_region(HeapRegion* hr) {
+        size_t count = _rmm->local_handle_count_for_region(hr->hrm_index());
+        if (count == SIZE_MAX) {
+          _unknown = true;
+          return false;
+        }
+        _count += count;
+        return false;
+      }
+
+      size_t count() const { return _unknown ? SIZE_MAX : _count; }
+    };
+
+    G1CollectionSet* cset = _g1h->collection_set();
+    CountLocalHandlesInCSetClosure cl(rmm);
+    cset->iterate(&cl);
+    if (cl.count() != SIZE_MAX) {
+      cset->iterate_optional(&cl);
+    }
+    return cl.count();
+  }
+
   void scan_roots(G1ParScanThreadState* pss, uint worker_id) {
     _root_processor->evacuate_roots(pss, worker_id);
     _g1h->rem_set()->scan_heap_roots(pss, worker_id, G1GCPhaseTimes::ScanHR, G1GCPhaseTimes::ObjCopy, _has_optional_evacuation_work);
@@ -682,35 +721,41 @@ class G1EvacuateRegionsTask : public G1EvacuateRegionsBaseTask {
     if (worker_id == 0) {
       G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
       if (rmm != nullptr && rmm->tagged_field_count() > 0) {
-        int count = rmm->tagged_field_count();
-        const G1RemoteMemoryManager::TaggedFieldEntry* entries = rmm->tagged_fields();
-        int evacuated = 0;
-        for (int i = 0; i < count; i++) {
-          RemoteHandle* h = entries[i]._handle;
-          uintptr_t sa = h->load_state_and_addr_acquire();
-          uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-          if (state != REMOTE_HANDLE_LOCAL) continue;
+        size_t cset_local_handles = remote_local_handles_in_collection_set(rmm);
+        if (cset_local_handles == 0) {
+          log_info(gc)("Tagged field root scan SKIP: no LOCAL handles in collection set "
+                       "(tagged_entries=%d)", rmm->tagged_field_count());
+        } else {
+          int count = rmm->tagged_field_count();
+          const G1RemoteMemoryManager::TaggedFieldEntry* entries = rmm->tagged_fields();
+          int evacuated = 0;
+          for (int i = 0; i < count; i++) {
+            RemoteHandle* h = entries[i]._handle;
+            uintptr_t sa = h->load_state_and_addr_acquire();
+            uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+            if (state != REMOTE_HANDLE_LOCAL) continue;
 
-          oop target = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
-          if (target == nullptr || !_g1h->is_in(target)) continue;
+            oop target = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+            if (target == nullptr || !_g1h->is_in(target)) continue;
 
-          const G1HeapRegionAttr region_attr = _g1h->region_attr(target);
-          if (!region_attr.is_in_cset()) continue;
+            const G1HeapRegionAttr region_attr = _g1h->region_attr(target);
+            if (!region_attr.is_in_cset()) continue;
 
-          markWord m = target->mark();
-          oop forwardee;
-          if (m.is_marked()) {
-            forwardee = cast_to_oop(m.decode_pointer());
-          } else {
-            forwardee = pss->copy_to_survivor_space(region_attr, target, m);
+            markWord m = target->mark();
+            oop forwardee;
+            if (m.is_marked()) {
+              forwardee = cast_to_oop(m.decode_pointer());
+            } else {
+              forwardee = pss->copy_to_survivor_space(region_attr, target, m);
+            }
+            if (forwardee != nullptr) {
+              rmm->update_handle_for_evacuation(h, target, forwardee);
+              evacuated++;
+            }
           }
-          if (forwardee != nullptr) {
-            rmm->update_handle_for_evacuation(h, target, forwardee);
-            evacuated++;
+          if (evacuated > 0) {
+            log_info(gc)("Tagged field root scan: evacuated %d Handle targets from cset", evacuated);
           }
-        }
-        if (evacuated > 0) {
-          log_info(gc)("Tagged field root scan: evacuated %d Handle targets from cset", evacuated);
         }
       }
     }
@@ -2151,8 +2196,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        "cset_local_handles=%zu)",
                        tagged_count, cset_local_handles);
         }
-        if (tagged_count > 0) {
+        if (tagged_count > 0 &&
+            (cset_local_handles == SIZE_MAX || cset_local_handles > 0)) {
           tagged_updated = rmm->fixup_tagged_field_handles();
+        } else if (tagged_count > 0) {
+          log_info(gc)("Tagged field fixup SKIP: no LOCAL handles in collection set "
+                       "(tagged_entries=%d)", tagged_count);
         }
         if (cset_local_handles == SIZE_MAX || cset_local_handles > 0) {
           if (cset_local_handles == SIZE_MAX) {
