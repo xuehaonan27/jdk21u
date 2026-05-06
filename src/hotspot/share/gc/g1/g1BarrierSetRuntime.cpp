@@ -512,6 +512,7 @@ static uint64_t g1_remote_prefetch_cache_evictions = 0;
 static uint64_t g1_remote_prefetch_cache_drops = 0;
 static uint g1_remote_prefetch_cache_evict_cursor = 0;
 static uint g1_remote_fetch_batch_effective_logged = 0;
+static uint64_t g1_remote_fetch_batch_policy_log_next_stores = 0;
 
 static void remote_prefetch_cache_lock() {
   while (Atomic::cmpxchg(&g1_remote_prefetch_cache_lock, 0, 1) != 0) {
@@ -540,6 +541,19 @@ static void remote_prefetch_cache_free_entry_locked(uint idx) {
   e.word_size = 0;
   e.byte_size = 0;
   e.stamp = 0;
+}
+
+static void remote_prefetch_cache_clear_locked() {
+  if (g1_remote_prefetch_cache == nullptr) {
+    return;
+  }
+  for (uint i = 0; i < RemotePrefetchCacheSlots; i++) {
+    if (g1_remote_prefetch_cache[i].handle != nullptr) {
+      remote_prefetch_cache_free_entry_locked(i);
+    }
+  }
+  g1_remote_prefetch_cache_bytes = 0;
+  g1_remote_prefetch_cache_evict_cursor = 0;
 }
 
 static bool remote_prefetch_cache_ensure_locked() {
@@ -592,41 +606,76 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
   uint64_t stores = 0;
   uint64_t evictions = 0;
   uint64_t drops = 0;
+  uint64_t useful_per_mille = 0;
+  uint64_t evict_per_mille = 0;
   bool log_change = false;
+  bool disabled_by_policy = false;
 
   remote_prefetch_cache_lock();
   hits = g1_remote_prefetch_cache_hits;
   stores = g1_remote_prefetch_cache_stores;
   evictions = g1_remote_prefetch_cache_evictions;
   drops = g1_remote_prefetch_cache_drops;
+  useful_per_mille = stores == 0 ? 0 : (hits * 1000) / stores;
+  evict_per_mille = stores == 0 ? 0 : (evictions * 1000) / stores;
 
   if (stores < 4096) {
     effective = MIN2(bounded, 64u);
-  } else {
-    uint64_t attempts = hits + stores;
-    uint64_t hit_per_mille = attempts == 0 ? 0 : (hits * 1000) / attempts;
-    if (hit_per_mille < 20) {
+  } else if (stores < 64 * 1024) {
+    if (useful_per_mille < 50) {
       effective = MIN2(bounded, 8u);
-    } else if (hit_per_mille < 50) {
+    } else if (useful_per_mille < 150) {
       effective = MIN2(bounded, 16u);
-    } else if (hit_per_mille < 150) {
+    } else if (useful_per_mille < 300) {
       effective = MIN2(bounded, 32u);
-    } else if (hit_per_mille < 300) {
+    } else {
+      effective = MIN2(bounded, 64u);
+    }
+  } else {
+    if (useful_per_mille < 100 ||
+        (useful_per_mille < 200 && evict_per_mille > 750)) {
+      effective = 1;
+    } else if (useful_per_mille < 200) {
+      effective = MIN2(bounded, 4u);
+    } else if (useful_per_mille < 350) {
+      effective = MIN2(bounded, 8u);
+    } else if (useful_per_mille < 500) {
+      effective = MIN2(bounded, 16u);
+    } else if (useful_per_mille < 700) {
       effective = MIN2(bounded, 64u);
     }
   }
 
-  if (g1_remote_fetch_batch_effective_logged != effective) {
+  if (g1_remote_fetch_batch_effective_logged == 0 ||
+      stores >= g1_remote_fetch_batch_policy_log_next_stores) {
     g1_remote_fetch_batch_effective_logged = effective;
+    g1_remote_fetch_batch_policy_log_next_stores = stores + 64 * 1024;
     log_change = true;
+  }
+  if (effective == 1 && stores >= 64 * 1024 &&
+      Atomic::cmpxchg(&g1_remote_fetch_batch_disabled, 0, 1) == 0) {
+    remote_prefetch_cache_clear_locked();
+    disabled_by_policy = true;
   }
   remote_prefetch_cache_unlock();
 
   if (log_change) {
     log_info(gc)("Remote batch fetch policy: configured=%u effective=%u "
                  "cache_hits=" UINT64_FORMAT " stores=" UINT64_FORMAT
-                 " evictions=" UINT64_FORMAT " drops=" UINT64_FORMAT,
-                 configured, effective, hits, stores, evictions, drops);
+                 " evictions=" UINT64_FORMAT " drops=" UINT64_FORMAT
+                 " useful_per_mille=" UINT64_FORMAT
+                 " evict_per_mille=" UINT64_FORMAT,
+                 configured, effective, hits, stores, evictions, drops,
+                 useful_per_mille, evict_per_mille);
+  }
+  if (disabled_by_policy) {
+    log_info(gc)("Remote batch fetch disabled by storm breaker: "
+                 "cache_hits=" UINT64_FORMAT " stores=" UINT64_FORMAT
+                 " evictions=" UINT64_FORMAT " drops=" UINT64_FORMAT
+                 " useful_per_mille=" UINT64_FORMAT
+                 " evict_per_mille=" UINT64_FORMAT,
+                 hits, stores, evictions, drops,
+                 useful_per_mille, evict_per_mille);
   }
   return effective;
 }
@@ -634,6 +683,9 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
 static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
                                         Klass* klass, size_t word_size,
                                         const void* obj_bytes) {
+  if (Atomic::load(&g1_remote_fetch_batch_disabled) != 0) {
+    return false;
+  }
   if (h == nullptr || klass == nullptr || obj_bytes == nullptr || word_size == 0) {
     return false;
   }
@@ -748,12 +800,14 @@ static bool remote_prefetch_cache_take(RemoteHandle* h, size_t slot_id,
   *klass_out = nullptr;
   *word_size_out = 0;
   *bytes_out = nullptr;
-  if (h == nullptr || g1_remote_prefetch_cache == nullptr) {
+  if (h == nullptr || g1_remote_prefetch_cache == nullptr ||
+      g1_remote_prefetch_cache_bytes == 0) {
     return false;
   }
 
   remote_prefetch_cache_lock();
-  if (g1_remote_prefetch_cache == nullptr) {
+  if (g1_remote_prefetch_cache == nullptr ||
+      g1_remote_prefetch_cache_bytes == 0) {
     remote_prefetch_cache_unlock();
     return false;
   }
@@ -812,7 +866,8 @@ static bool remote_prefetch_cache_take(RemoteHandle* h, size_t slot_id,
 }
 
 static void remote_prefetch_cache_drop(RemoteHandle* h, size_t slot_id) {
-  if (h == nullptr || g1_remote_prefetch_cache == nullptr) {
+  if (h == nullptr || g1_remote_prefetch_cache == nullptr ||
+      g1_remote_prefetch_cache_bytes == 0) {
     return;
   }
 
@@ -952,7 +1007,7 @@ public:
 };
 
 static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
-                                        bool* out_retry) {
+                                        bool* out_retry, uint max_objects) {
   *out_retry = false;
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
@@ -961,7 +1016,6 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
-  uint max_objects = remote_fetch_effective_batch_objects((uint)G1RemoteFetchBatchObjects);
   size_t max_response_bytes = G1RemoteFetchBatchBytes == 0 ?
       (size_t)RDMAMsgBufSize : MIN2((size_t)G1RemoteFetchBatchBytes, (size_t)RDMAMsgBufSize);
 
@@ -1056,7 +1110,10 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
   if (G1RemoteFetchBatchObjects > 1 &&
       Atomic::load(&g1_remote_fetch_batch_disabled) == 0 &&
       rmm->backend()->supports_batch_fetch()) {
-    return fetch_and_install_batch(h, fetch_attempts, out_retry);
+    uint max_objects = remote_fetch_effective_batch_objects((uint)G1RemoteFetchBatchObjects);
+    if (max_objects > 1) {
+      return fetch_and_install_batch(h, fetch_attempts, out_retry, max_objects);
+    }
   }
 
   HeapWord* dest = rmm->allocate_in_fcr(word_size);
