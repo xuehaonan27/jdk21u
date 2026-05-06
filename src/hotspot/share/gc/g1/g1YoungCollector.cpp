@@ -2074,6 +2074,100 @@ static void trim_free_region_rss(G1CollectedHeap* g1h) {
   }
 }
 
+static size_t remote_local_capacity_bytes(G1CollectedHeap* g1h) {
+  if (g1h == nullptr || LocalMemoryRatio == 0) {
+    return 0;
+  }
+  return (g1h->max_capacity() * (size_t)LocalMemoryRatio) / 100;
+}
+
+static bool remote_cgroup_pressure_exceeds_trim_trigger(size_t local_capacity,
+                                                        size_t* usage,
+                                                        size_t* capacity,
+                                                        size_t* total_usage,
+                                                        size_t* cache_usage) {
+  size_t raw_usage = 0;
+  size_t raw_capacity = 0;
+  size_t raw_total_usage = 0;
+  size_t raw_cache_usage = 0;
+  if (!read_remote_cgroup_pressure(local_capacity,
+                                   &raw_usage,
+                                   &raw_capacity,
+                                   &raw_total_usage,
+                                   &raw_cache_usage)) {
+    return false;
+  }
+  if (usage != nullptr) {
+    *usage = raw_usage;
+  }
+  if (capacity != nullptr) {
+    *capacity = raw_capacity;
+  }
+  if (total_usage != nullptr) {
+    *total_usage = raw_total_usage;
+  }
+  if (cache_usage != nullptr) {
+    *cache_usage = raw_cache_usage;
+  }
+
+  const uint trigger_percent = G1RemoteTier2Percent;
+  return raw_capacity > 0 &&
+         raw_usage > ((raw_capacity * (size_t)trigger_percent) / 100);
+}
+
+static bool maybe_trim_free_region_rss_for_cgroup_pressure(G1CollectedHeap* g1h,
+                                                           const char* reason) {
+  if (!G1RemoteUseCgroupPressure || LocalMemoryRatio >= 100) {
+    return false;
+  }
+
+  size_t local_capacity = remote_local_capacity_bytes(g1h);
+  size_t usage = 0;
+  size_t capacity = 0;
+  size_t total_usage = 0;
+  size_t cache_usage = 0;
+  if (!remote_cgroup_pressure_exceeds_trim_trigger(local_capacity,
+                                                   &usage,
+                                                   &capacity,
+                                                   &total_usage,
+                                                   &cache_usage)) {
+    return false;
+  }
+
+  log_info(gc)("Remote RSS trim trigger (%s): cgroup_anon=" SIZE_FORMAT
+               "MB/" SIZE_FORMAT "MB %.1f%% exceeds T2 %u%% "
+               "(total=" SIZE_FORMAT "MB cache=" SIZE_FORMAT "MB)",
+               reason,
+               usage / M,
+               capacity / M,
+               capacity == 0 ? 0.0 : ((double)usage * 100.0) / (double)capacity,
+               G1RemoteTier2Percent,
+               total_usage / M,
+               cache_usage / M);
+  trim_free_region_rss(g1h);
+  return true;
+}
+
+static void trim_free_region_rss_after_gc(G1CollectedHeap* g1h) {
+  if (LocalMemoryRatio >= 100) {
+    return;
+  }
+  if (G1RemoteUseCgroupPressure) {
+    size_t local_capacity = remote_local_capacity_bytes(g1h);
+    if (local_capacity > 0 &&
+        !remote_cgroup_pressure_exceeds_trim_trigger(local_capacity,
+                                                     nullptr,
+                                                     nullptr,
+                                                     nullptr,
+                                                     nullptr)) {
+      log_debug(gc)("Remote RSS trim SKIP: cgroup anon pressure below T2 %u%%",
+                    G1RemoteTier2Percent);
+      return;
+    }
+  }
+  trim_free_region_rss(g1h);
+}
+
 static bool has_remote_heap_activity(G1RemoteMemoryManager* rmm) {
   if (rmm == nullptr) {
     return false;
@@ -2458,7 +2552,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
         local_used = _g1h->used();
-        size_t local_capacity = (heap_capacity * LocalMemoryRatio) / 100;
+        size_t local_capacity = remote_local_capacity_bytes(_g1h);
         // RDMA mode keeps large native side metadata (handles, edge tables,
         // tagged-field lists, staging buffers, Spark/JVM native state). In the
         // Spark lr=25 run, a 2G reserve still let the process reach the 5G
@@ -2474,6 +2568,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         bool has_cgroup_pressure =
           read_remote_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity,
                                       &cgroup_total_usage, &cgroup_cache_usage);
+        if (has_cgroup_pressure) {
+          double initial_cgroup_pressure =
+            (double)cgroup_usage / (double)cgroup_capacity;
+          if (initial_cgroup_pressure * 100.0 > (double)G1RemoteTier2Percent) {
+            maybe_trim_free_region_rss_for_cgroup_pressure(_g1h,
+                                                           "pre-eviction");
+            has_cgroup_pressure =
+              read_remote_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity,
+                                          &cgroup_total_usage, &cgroup_cache_usage);
+          }
+        }
 
         // Allocation rate lookahead: predict bytes allocated before next GC.
         // predict_alloc_rate_ms() returns bytes/ms; multiply by 2000ms lookahead.
@@ -5212,9 +5317,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
   _g1h->rebuild_free_region_list();
 
-  if (LocalMemoryRatio < 100) {
-    trim_free_region_rss(_g1h);
-  }
+  trim_free_region_rss_after_gc(_g1h);
 
   _g1h->record_obj_copy_mem_stats();
 
