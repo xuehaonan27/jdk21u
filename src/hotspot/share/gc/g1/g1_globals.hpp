@@ -307,9 +307,10 @@
           "regions and this path is only for controlled experiments.")      \
                                                                             \
   product(bool, G1RemoteUseCgroupPressure, false, DIAGNOSTIC,               \
-          "In LocalMemoryRatio mode, include cgroup memory usage in "        \
-          "tiered remote eviction pressure decisions. Disabled by default "  \
-          "to preserve the heap-only policy.")                              \
+          "In LocalMemoryRatio mode, include cgroup anon/RSS memory usage "  \
+          "in tiered remote eviction pressure decisions. File cache is "     \
+          "logged but excluded because object eviction cannot reclaim it. "  \
+          "Disabled by default to preserve the heap-only policy.")           \
                                                                             \
   product(uint, G1RemoteTier2Percent, 85, DIAGNOSTIC,                       \
           "Local/cgroup pressure percentage above which tier 2 remote "      \

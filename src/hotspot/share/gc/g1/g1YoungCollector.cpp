@@ -1724,6 +1724,34 @@ static bool read_jlong_from_file(const char* path, jlong* value) {
   return ok;
 }
 
+static bool read_jlong_key_from_file(const char* path, const char* key,
+                                     jlong* value) {
+  FILE* fp = fopen(path, "r");
+  if (fp == nullptr) {
+    return false;
+  }
+
+  char buf[256];
+  size_t key_len = strlen(key);
+  bool ok = false;
+  while (fgets(buf, sizeof(buf), fp) != nullptr) {
+    if (strncmp(buf, key, key_len) != 0 || buf[key_len] != ' ') {
+      continue;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    jlong parsed = strtoll(buf + key_len + 1, &end, 10);
+    if (errno == 0 && end != buf + key_len + 1 && parsed >= 0) {
+      *value = parsed;
+      ok = true;
+      break;
+    }
+  }
+  fclose(fp);
+  return ok;
+}
+
 static bool cgroup_controller_matches(const char* controllers, const char* name) {
   size_t name_len = strlen(name);
   const char* cursor = controllers;
@@ -1763,7 +1791,10 @@ static bool build_cgroup_file_path(char* out,
 static bool init_remote_cgroup_memory_paths(char* usage_path,
                                             size_t usage_path_len,
                                             char* limit_path,
-                                            size_t limit_path_len) {
+                                            size_t limit_path_len,
+                                            char* stat_path,
+                                            size_t stat_path_len,
+                                            bool* is_cgroup_v2) {
   FILE* fp = fopen("/proc/self/cgroup", "r");
   if (fp == nullptr) {
     return false;
@@ -1795,7 +1826,13 @@ static bool init_remote_cgroup_memory_paths(char* usage_path,
                                "memory.usage_in_bytes") &&
         build_cgroup_file_path(limit_path, limit_path_len,
                                "/sys/fs/cgroup/memory", cgroup_path,
-                               "memory.limit_in_bytes");
+                               "memory.limit_in_bytes") &&
+        build_cgroup_file_path(stat_path, stat_path_len,
+                               "/sys/fs/cgroup/memory", cgroup_path,
+                               "memory.stat");
+      if (found && is_cgroup_v2 != nullptr) {
+        *is_cgroup_v2 = false;
+      }
     } else if (strcmp(hierarchy, "0") == 0 && controllers[0] == '\0') {
       found =
         build_cgroup_file_path(usage_path, usage_path_len,
@@ -1803,7 +1840,13 @@ static bool init_remote_cgroup_memory_paths(char* usage_path,
                                "memory.current") &&
         build_cgroup_file_path(limit_path, limit_path_len,
                                "/sys/fs/cgroup", cgroup_path,
-                               "memory.max");
+                               "memory.max") &&
+        build_cgroup_file_path(stat_path, stat_path_len,
+                               "/sys/fs/cgroup", cgroup_path,
+                               "memory.stat");
+      if (found && is_cgroup_v2 != nullptr) {
+        *is_cgroup_v2 = true;
+      }
     }
   }
 
@@ -1811,15 +1854,20 @@ static bool init_remote_cgroup_memory_paths(char* usage_path,
   return found;
 }
 
-static bool read_remote_cgroup_files(jlong* raw_usage, jlong* raw_limit) {
+static bool read_remote_cgroup_files(jlong* raw_usage, jlong* raw_limit,
+                                     jlong* raw_anon, jlong* raw_cache) {
   static bool paths_initialized = false;
   static char usage_path[1024];
   static char limit_path[1024];
+  static char stat_path[1024];
+  static bool is_cgroup_v2 = false;
 
   if (!paths_initialized) {
     paths_initialized =
       init_remote_cgroup_memory_paths(usage_path, sizeof(usage_path),
-                                      limit_path, sizeof(limit_path));
+                                      limit_path, sizeof(limit_path),
+                                      stat_path, sizeof(stat_path),
+                                      &is_cgroup_v2);
     if (!paths_initialized) {
       // The Spark executor is moved into the cgexec memory cgroup shortly after
       // launch. Retry later instead of caching a startup-time root cgroup miss.
@@ -1827,14 +1875,20 @@ static bool read_remote_cgroup_files(jlong* raw_usage, jlong* raw_limit) {
     }
   }
 
+  const char* anon_key = is_cgroup_v2 ? "anon" : "rss";
+  const char* cache_key = is_cgroup_v2 ? "file" : "cache";
   return read_jlong_from_file(usage_path, raw_usage) &&
-         read_jlong_from_file(limit_path, raw_limit);
+         read_jlong_from_file(limit_path, raw_limit) &&
+         read_jlong_key_from_file(stat_path, anon_key, raw_anon) &&
+         read_jlong_key_from_file(stat_path, cache_key, raw_cache);
 }
 #endif
 
 static bool read_remote_cgroup_pressure(size_t local_capacity,
                                         size_t* usage,
-                                        size_t* capacity) {
+                                        size_t* capacity,
+                                        size_t* total_usage,
+                                        size_t* cache_usage) {
 #ifdef LINUX
   if (!G1RemoteUseCgroupPressure) {
     return false;
@@ -1842,10 +1896,12 @@ static bool read_remote_cgroup_pressure(size_t local_capacity,
 
   jlong raw_usage = 0;
   jlong raw_limit = 0;
-  if (!read_remote_cgroup_files(&raw_usage, &raw_limit)) {
+  jlong raw_anon = 0;
+  jlong raw_cache = 0;
+  if (!read_remote_cgroup_files(&raw_usage, &raw_limit, &raw_anon, &raw_cache)) {
     return false;
   }
-  if (raw_usage <= 0 || raw_limit <= 0 || local_capacity == 0) {
+  if (raw_usage <= 0 || raw_limit <= 0 || raw_anon < 0 || local_capacity == 0) {
     return false;
   }
 
@@ -1854,8 +1910,18 @@ static bool read_remote_cgroup_pressure(size_t local_capacity,
     return false;
   }
 
-  *usage = (size_t)raw_usage;
+  // Use anonymous/RSS memory as the eviction pressure signal. Total memcg
+  // usage includes file cache from Spark input scans; object eviction cannot
+  // free that cache, so using it causes repeated emergency evictions even when
+  // local heap RSS is below the heap budget.
+  *usage = (size_t)raw_anon;
   *capacity = pressure_capacity;
+  if (total_usage != nullptr) {
+    *total_usage = (size_t)raw_usage;
+  }
+  if (cache_usage != nullptr) {
+    *cache_usage = (size_t)raw_cache;
+  }
   return true;
 #else
   return false;
@@ -2354,8 +2420,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t heap_budget = local_capacity - native_reserve;
         size_t cgroup_usage = 0;
         size_t cgroup_capacity = 0;
+        size_t cgroup_total_usage = 0;
+        size_t cgroup_cache_usage = 0;
         bool has_cgroup_pressure =
-          read_remote_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity);
+          read_remote_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity,
+                                      &cgroup_total_usage, &cgroup_cache_usage);
 
         // Allocation rate lookahead: predict bytes allocated before next GC.
         // predict_alloc_rate_ms() returns bytes/ms; multiply by 2000ms lookahead.
@@ -2407,7 +2476,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB / heap_budget=" SIZE_FORMAT
                        "MB (local_cap=" SIZE_FORMAT "MB reserve=" SIZE_FORMAT "MB, %.1f%%), "
                        "alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, heap_effective=%.1f%%, "
-                       "cgroup=" SIZE_FORMAT "MB/" SIZE_FORMAT "MB %.1f%%, thresholds=T2:%u%%/T3:%u%%, "
+                       "cgroup_anon=" SIZE_FORMAT "MB/" SIZE_FORMAT "MB %.1f%% "
+                       "(total=" SIZE_FORMAT "MB cache=" SIZE_FORMAT "MB), "
+                       "thresholds=T2:%u%%/T3:%u%%, "
                        "effective=%.1f%%, target=%zu%%, batch_cap=" SIZE_FORMAT
                        "MB, evict_target=" SIZE_FORMAT "MB, dense_last_resort=%s",
                        eviction_tier, local_used / M, heap_budget / M,
@@ -2416,6 +2487,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        lookahead_alloc / M,
                        heap_pressure * 100.0,
                        cgroup_usage / M, cgroup_capacity / M, cgroup_pressure * 100.0,
+                       cgroup_total_usage / M, cgroup_cache_usage / M,
                        tier2_percent, tier3_percent,
                        pressure * 100.0,
                        target_low_percent,
