@@ -914,14 +914,47 @@ class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
   uintptr_t _publish_ids[G1RemoteFetchBatchHardCap];
   size_t _publish_slots[G1RemoteFetchBatchHardCap];
   uint _publish_count;
+  bool _eager_prefetch;
+
+  bool try_eager_install_prefetch(RemoteHandle* h, size_t slot_id, Klass* klass,
+                                  size_t word_size, const void* obj_bytes) {
+    if (!_eager_prefetch || _publish_count >= G1RemoteFetchBatchHardCap) {
+      return false;
+    }
+    if (!h->try_remote_to_fetching(slot_id)) {
+      return false;
+    }
+
+    HeapWord* dest = _rmm->allocate_in_fcr(word_size);
+    if (dest == nullptr) {
+      h->cas_fetching_to_remote();
+      return false;
+    }
+
+    memset(dest, 0, word_size * HeapWordSize);
+    memcpy(dest, obj_bytes, word_size * HeapWordSize);
+    finish_fetched_object(_g1h, _rmm, h, dest, klass, word_size);
+
+    _publish_handles[_publish_count] = h;
+    _publish_dests[_publish_count] = dest;
+    _publish_ids[_publish_count] = (uintptr_t)h;
+    _publish_slots[_publish_count] = slot_id;
+    _publish_count++;
+
+    _installed++;
+    _prefetched++;
+    _prefetch_words += word_size;
+    return true;
+  }
 
 public:
   BatchFetchInstallClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm,
-                           RemoteHandle* primary, size_t primary_slot)
+                           RemoteHandle* primary, size_t primary_slot,
+                           bool eager_prefetch)
     : _g1h(g1h), _rmm(rmm), _primary(primary), _primary_result(nullptr),
       _primary_slot(primary_slot), _returned(0), _installed(0), _prefetched(0),
       _raced(0), _failed(0), _prefetch_words(0), _primary_alloc_failed(false),
-      _publish_count(0) {}
+      _publish_count(0), _eager_prefetch(eager_prefetch) {}
 
   void do_object(uintptr_t handle_id, size_t slot_id, Klass* klass,
                  size_t word_size, const void* obj_bytes) override {
@@ -957,6 +990,9 @@ public:
         return;
       }
     } else {
+      if (try_eager_install_prefetch(h, slot_id, klass, word_size, obj_bytes)) {
+        return;
+      }
       if (remote_prefetch_cache_store(h, slot_id, klass, word_size, obj_bytes)) {
         _prefetched++;
         _prefetch_words += word_size;
@@ -1058,6 +1094,11 @@ static bool remote_fetch_hint_prefers_around(uint32_t access_hint) {
   return access_hint == G1RemoteAccessHintField ||
          access_hint == G1RemoteAccessHintArray ||
          access_hint == G1RemoteAccessHintInterpreter;
+}
+
+static bool remote_fetch_hint_eager_installs_prefetch(uint32_t access_hint) {
+  return G1RemoteEagerInstallPrefetch &&
+         remote_fetch_hint_prefers_around(access_hint);
 }
 
 static void remote_apply_compiler_fetch_hint(uint32_t access_hint,
@@ -1402,7 +1443,8 @@ static bool fetch_and_install_exact_combined(RemoteHandle* h,
 static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
                                         bool* out_retry, uint max_objects,
                                         uint slot_window,
-                                        size_t max_response_bytes) {
+                                        size_t max_response_bytes,
+                                        bool eager_prefetch) {
   *out_retry = false;
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
@@ -1411,7 +1453,7 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
-  BatchFetchInstallClosure installer(g1h, rmm, h, slot_id);
+  BatchFetchInstallClosure installer(g1h, rmm, h, slot_id, eager_prefetch);
   jlong fetch_start = os::elapsed_counter();
   size_t returned = backend->fetch_batch_around((uintptr_t)h, slot_id, max_objects,
                                                 slot_window, max_response_bytes,
@@ -1522,8 +1564,10 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
     remote_apply_compiler_fetch_hint(access_hint, &max_objects,
                                      &slot_window, &max_response_bytes);
     if (max_objects > 1) {
+      bool eager_prefetch = remote_fetch_hint_eager_installs_prefetch(access_hint);
       return fetch_and_install_batch(h, fetch_attempts, out_retry, max_objects,
-                                     slot_window, max_response_bytes);
+                                     slot_window, max_response_bytes,
+                                     eager_prefetch);
     }
   }
 

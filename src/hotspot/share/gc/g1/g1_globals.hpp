@@ -553,6 +553,12 @@
           "Use interpreter/C1/C2 access-shape hints to choose remote "        \
           "fetch-around policy before falling back to exact fetch.")          \
                                                                             \
+  product(bool, G1RemoteEagerInstallPrefetch, true, DIAGNOSTIC,              \
+          "For compiler-guided fetch-around misses, install bounded "         \
+          "non-primary batch results directly into FCR so later tagged "      \
+          "loads can resolve through LOCAL handles instead of re-entering "   \
+          "the remote fetch path.")                                           \
+                                                                            \
   product(uint, RDMACQDepth, 256, DIAGNOSTIC,                               \
           "Depth of RDMA completion queues.")                               \
                                                                             \
