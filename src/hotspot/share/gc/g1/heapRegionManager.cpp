@@ -155,9 +155,7 @@ HeapRegion* HeapRegionManager::allocate_free_region_skip_evict_guarded(uint requ
   uint skipped_guarded = 0;
   G1NUMA* numa = G1NUMA::numa();
 
-  FreeRegionListIterator it(&_free_list);
-  while (it.more_available()) {
-    HeapRegion* cur = it.get_next();
+  for (HeapRegion* cur = _free_list.tail(); cur != nullptr; cur = cur->prev()) {
     if (cur->is_evict_guarded()) {
       skipped_guarded++;
       continue;
@@ -172,9 +170,7 @@ HeapRegion* HeapRegionManager::allocate_free_region_skip_evict_guarded(uint requ
   }
 
   if (hr == nullptr && requested_node_index != G1NUMA::AnyNodeIndex && numa->is_enabled()) {
-    FreeRegionListIterator retry(&_free_list);
-    while (retry.more_available()) {
-      HeapRegion* cur = retry.get_next();
+    for (HeapRegion* cur = _free_list.tail(); cur != nullptr; cur = cur->prev()) {
       if (cur->is_evict_guarded()) {
         continue;
       }

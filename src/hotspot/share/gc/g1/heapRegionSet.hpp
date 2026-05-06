@@ -203,6 +203,8 @@ public:
 
   static void set_unrealistically_long_length(uint len);
 
+  HeapRegion* tail() const { return _tail; }
+
   // Add hr to the list. The region should not be a member of another set.
   // Assumes that the list is ordered and will preserve that order. The order
   // is determined by hrm_index.
