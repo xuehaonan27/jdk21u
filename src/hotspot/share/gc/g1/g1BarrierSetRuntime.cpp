@@ -1006,6 +1006,347 @@ public:
   size_t prefetch_words() const { return _prefetch_words; }
 };
 
+struct RemoteExactFetchRequest {
+  RemoteHandle* handle;
+  size_t slot_id;
+  size_t word_size;
+  volatile int done;
+  bool skipped;
+  bool retry;
+  bool installed;
+  oopDesc* result;
+};
+
+static const uint G1RemoteExactFetchCombineSpin = 4096;
+static volatile int g1_remote_exact_fetch_combine_lock = 0;
+static volatile int g1_remote_exact_fetch_combine_active = 0;
+static RemoteExactFetchRequest*
+    g1_remote_exact_fetch_combine_queue[G1RemoteFetchBatchHardCap];
+static uint g1_remote_exact_fetch_combine_count = 0;
+static volatile uint64_t g1_remote_exact_fetch_batches = 0;
+static volatile uint64_t g1_remote_exact_fetch_requests = 0;
+static volatile uint64_t g1_remote_exact_fetch_solo = 0;
+static volatile uint64_t g1_remote_exact_fetch_installed = 0;
+static volatile uint64_t g1_remote_exact_fetch_retries = 0;
+
+static uint remote_exact_fetch_limit() {
+  if (G1RemoteFetchBatchObjects <= 1) {
+    return 0;
+  }
+  return MIN2((uint)G1RemoteFetchBatchObjects, G1RemoteFetchBatchHardCap);
+}
+
+static size_t remote_fetch_max_response_bytes() {
+  return G1RemoteFetchBatchBytes == 0 ?
+      (size_t)RDMAMsgBufSize : MIN2((size_t)G1RemoteFetchBatchBytes,
+                                    (size_t)RDMAMsgBufSize);
+}
+
+static void remote_exact_fetch_combine_lock() {
+  while (Atomic::cmpxchg(&g1_remote_exact_fetch_combine_lock, 0, 1) != 0) {
+    SpinPause();
+  }
+}
+
+static void remote_exact_fetch_combine_unlock() {
+  Atomic::release_store(&g1_remote_exact_fetch_combine_lock, 0);
+}
+
+static void remote_exact_fetch_complete(RemoteExactFetchRequest* req) {
+  Atomic::release_store(&req->done, 1);
+}
+
+static bool remote_exact_fetch_enqueue(RemoteExactFetchRequest* req,
+                                       bool* became_leader) {
+  *became_leader = false;
+  uint limit = remote_exact_fetch_limit();
+  if (limit < 2) {
+    return false;
+  }
+
+  remote_exact_fetch_combine_lock();
+  if (g1_remote_exact_fetch_combine_count >= limit) {
+    remote_exact_fetch_combine_unlock();
+    return false;
+  }
+
+  g1_remote_exact_fetch_combine_queue[g1_remote_exact_fetch_combine_count++] = req;
+  if (Atomic::load(&g1_remote_exact_fetch_combine_active) == 0) {
+    Atomic::release_store(&g1_remote_exact_fetch_combine_active, 1);
+    *became_leader = true;
+  }
+  remote_exact_fetch_combine_unlock();
+  return true;
+}
+
+class ExactFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
+  G1CollectedHeap* _g1h;
+  G1RemoteMemoryManager* _rmm;
+  RemoteExactFetchRequest** _requests;
+  uint _count;
+  size_t _installed;
+  size_t _failed;
+  RemoteHandle* _publish_handles[G1RemoteFetchBatchHardCap];
+  HeapWord* _publish_dests[G1RemoteFetchBatchHardCap];
+  uintptr_t _publish_ids[G1RemoteFetchBatchHardCap];
+  size_t _publish_slots[G1RemoteFetchBatchHardCap];
+  uint _publish_count;
+
+  RemoteExactFetchRequest* find_request(RemoteHandle* h, size_t slot_id) {
+    for (uint i = 0; i < _count; i++) {
+      RemoteExactFetchRequest* req = _requests[i];
+      if (req->handle == h && req->slot_id == slot_id) {
+        return req;
+      }
+    }
+    return nullptr;
+  }
+
+public:
+  ExactFetchInstallClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm,
+                           RemoteExactFetchRequest** requests, uint count)
+    : _g1h(g1h), _rmm(rmm), _requests(requests), _count(count),
+      _installed(0), _failed(0), _publish_count(0) {}
+
+  void do_object(uintptr_t handle_id, size_t slot_id, Klass* klass,
+                 size_t word_size, const void* obj_bytes) override {
+    RemoteHandle* h = (RemoteHandle*)handle_id;
+    RemoteExactFetchRequest* req = find_request(h, slot_id);
+    if (req == nullptr || req->installed || h == nullptr ||
+        klass == nullptr || obj_bytes == nullptr || word_size == 0) {
+      _failed++;
+      return;
+    }
+
+    if (word_size != req->word_size || word_size != h->eviction_word_size()) {
+      req->retry = true;
+      _failed++;
+      log_warning(gc)("Exact fetch size MISMATCH: handle=" PTR_FORMAT
+                      " slot=" SIZE_FORMAT " expected=" SIZE_FORMAT
+                      "w got=" SIZE_FORMAT "w",
+                      p2i(h), slot_id, req->word_size, word_size);
+      return;
+    }
+
+    uintptr_t sa = h->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    size_t current_slot = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+    if (state != REMOTE_HANDLE_FETCHING || current_slot != slot_id) {
+      req->retry = true;
+      _failed++;
+      return;
+    }
+
+    if (_publish_count >= G1RemoteFetchBatchHardCap) {
+      req->retry = true;
+      _failed++;
+      return;
+    }
+
+    HeapWord* dest = _rmm->allocate_in_fcr(word_size);
+    if (dest == nullptr) {
+      h->cas_fetching_to_remote();
+      req->retry = true;
+      _failed++;
+      return;
+    }
+
+    memset(dest, 0, word_size * HeapWordSize);
+    memcpy(dest, obj_bytes, word_size * HeapWordSize);
+    oopDesc* installed = finish_fetched_object(_g1h, _rmm, h, dest, klass, word_size);
+
+    _publish_handles[_publish_count] = h;
+    _publish_dests[_publish_count] = dest;
+    _publish_ids[_publish_count] = (uintptr_t)h;
+    _publish_slots[_publish_count] = slot_id;
+    _publish_count++;
+
+    req->result = installed;
+    req->installed = true;
+    _installed++;
+  }
+
+  void publish(G1RemoteBackend* backend) {
+    if (_publish_count == 0) return;
+    for (uint i = 0; i < _publish_count; i++) {
+      remote_prefetch_cache_drop(_publish_handles[i], _publish_slots[i]);
+    }
+    backend->localize_batch(_publish_ids, _publish_count);
+    _rmm->publish_local_handles(_publish_handles, _publish_dests, _publish_count);
+  }
+
+  size_t installed() const { return _installed; }
+  size_t failed() const { return _failed; }
+};
+
+static void remote_exact_fetch_log_progress() {
+  uint64_t batches = Atomic::load(&g1_remote_exact_fetch_batches);
+  if (batches == 1 || (batches & (batches - 1)) == 0) {
+    log_info(gc)("Remote exact fetch combiner: batches=" UINT64_FORMAT
+                 " requests=" UINT64_FORMAT " installed=" UINT64_FORMAT
+                 " retries=" UINT64_FORMAT " solo=" UINT64_FORMAT,
+                 batches,
+                 Atomic::load(&g1_remote_exact_fetch_requests),
+                 Atomic::load(&g1_remote_exact_fetch_installed),
+                 Atomic::load(&g1_remote_exact_fetch_retries),
+                 Atomic::load(&g1_remote_exact_fetch_solo));
+  }
+}
+
+static void remote_exact_fetch_run_batch(RemoteExactFetchRequest** requests,
+                                         uint count,
+                                         G1CollectedHeap* g1h,
+                                         G1RemoteMemoryManager* rmm,
+                                         G1RemoteBackend* backend) {
+  uintptr_t handle_ids[G1RemoteFetchBatchHardCap];
+  size_t slot_ids[G1RemoteFetchBatchHardCap];
+  for (uint i = 0; i < count; i++) {
+    handle_ids[i] = (uintptr_t)requests[i]->handle;
+    slot_ids[i] = requests[i]->slot_id;
+  }
+
+  ExactFetchInstallClosure installer(g1h, rmm, requests, count);
+  jlong fetch_start = os::elapsed_counter();
+  size_t returned = backend->fetch_batch_exact(handle_ids, slot_ids, count,
+                                               remote_fetch_max_response_bytes(),
+                                               &installer);
+  jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
+
+  installer.publish(backend);
+  rmm->record_fetch_batch_result(count, returned, installer.installed(),
+                                 0, 0, installer.failed(), 0, fetch_elapsed);
+
+  size_t installed = 0;
+  size_t retries = 0;
+  for (uint i = 0; i < count; i++) {
+    RemoteExactFetchRequest* req = requests[i];
+    if (req->installed && req->result != nullptr) {
+      installed++;
+      rmm->record_fetch_result(req->word_size, fetch_elapsed, true);
+    } else {
+      req->retry = true;
+      req->handle->cas_fetching_to_remote();
+      retries++;
+    }
+    remote_exact_fetch_complete(req);
+  }
+
+  Atomic::add(&g1_remote_exact_fetch_batches, (uint64_t)1);
+  Atomic::add(&g1_remote_exact_fetch_requests, (uint64_t)count);
+  Atomic::add(&g1_remote_exact_fetch_installed, (uint64_t)installed);
+  Atomic::add(&g1_remote_exact_fetch_retries, (uint64_t)retries);
+  remote_exact_fetch_log_progress();
+}
+
+static void remote_exact_fetch_drain_leader(G1CollectedHeap* g1h,
+                                            G1RemoteMemoryManager* rmm,
+                                            G1RemoteBackend* backend) {
+  while (true) {
+    for (uint spin = 0; spin < G1RemoteExactFetchCombineSpin; spin++) {
+      SpinPause();
+    }
+
+    RemoteExactFetchRequest* requests[G1RemoteFetchBatchHardCap];
+    uint count = 0;
+    uint limit = remote_exact_fetch_limit();
+
+    remote_exact_fetch_combine_lock();
+    if (g1_remote_exact_fetch_combine_count == 0 || limit < 2) {
+      Atomic::release_store(&g1_remote_exact_fetch_combine_active, 0);
+      remote_exact_fetch_combine_unlock();
+      return;
+    }
+
+    count = MIN2(g1_remote_exact_fetch_combine_count, limit);
+    for (uint i = 0; i < count; i++) {
+      requests[i] = g1_remote_exact_fetch_combine_queue[i];
+    }
+    for (uint i = count; i < g1_remote_exact_fetch_combine_count; i++) {
+      g1_remote_exact_fetch_combine_queue[i - count] =
+          g1_remote_exact_fetch_combine_queue[i];
+    }
+    g1_remote_exact_fetch_combine_count -= count;
+    remote_exact_fetch_combine_unlock();
+
+    if (count <= 1) {
+      requests[0]->skipped = true;
+      remote_exact_fetch_complete(requests[0]);
+      Atomic::inc(&g1_remote_exact_fetch_solo);
+      continue;
+    }
+
+    remote_exact_fetch_run_batch(requests, count, g1h, rmm, backend);
+  }
+}
+
+static bool fetch_and_install_exact_combined(RemoteHandle* h,
+                                             bool* out_retry,
+                                             oopDesc** out_result) {
+  *out_retry = false;
+  *out_result = nullptr;
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+  G1RemoteBackend* backend = rmm->backend();
+  if (remote_exact_fetch_limit() < 2 || !backend->supports_exact_batch_fetch()) {
+    return false;
+  }
+
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_FETCHING) {
+    return false;
+  }
+
+  RemoteExactFetchRequest req;
+  req.handle = h;
+  req.slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+  req.word_size = h->eviction_word_size();
+  req.done = 0;
+  req.skipped = false;
+  req.retry = false;
+  req.installed = false;
+  req.result = nullptr;
+
+  bool became_leader = false;
+  if (!remote_exact_fetch_enqueue(&req, &became_leader)) {
+    return false;
+  }
+
+  if (became_leader) {
+    remote_exact_fetch_drain_leader(g1h, rmm, backend);
+  }
+
+  uint64_t spins = 0;
+  while (Atomic::load_acquire(&req.done) == 0) {
+    if (++spins == (1ULL << 24)) {
+      log_warning(gc)("Exact fetch combiner wait exceeded %llu spins for handle "
+                      PTR_FORMAT " slot=" SIZE_FORMAT,
+                      (unsigned long long)spins, p2i(h), req.slot_id);
+    }
+    SpinPause();
+  }
+
+  if (req.skipped) {
+    return false;
+  }
+
+  if (req.retry || req.result == nullptr) {
+    // Keep exact batching out of the correctness decision.  If the batch
+    // response omitted this request or allocation failed, try to reclaim the
+    // FETCHING ownership and let the existing single-object path handle the
+    // fetch/retry/dead-marking policy.
+    if (h->try_remote_to_fetching(req.slot_id)) {
+      return false;
+    }
+    rmm->record_fetch_retry();
+    *out_retry = true;
+    return true;
+  }
+
+  *out_result = req.result;
+  return true;
+}
+
 static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
                                         bool* out_retry, uint max_objects) {
   *out_retry = false;
@@ -1016,8 +1357,7 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
-  size_t max_response_bytes = G1RemoteFetchBatchBytes == 0 ?
-      (size_t)RDMAMsgBufSize : MIN2((size_t)G1RemoteFetchBatchBytes, (size_t)RDMAMsgBufSize);
+  size_t max_response_bytes = remote_fetch_max_response_bytes();
 
   BatchFetchInstallClosure installer(g1h, rmm, h, slot_id);
   jlong fetch_start = os::elapsed_counter();
@@ -1105,6 +1445,16 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts, bool* ou
     jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
     rmm->record_fetch_result(cached_word_size, fetch_elapsed, true);
     return result;
+  }
+
+  oopDesc* combined_result = nullptr;
+  bool combined_retry = false;
+  if (fetch_and_install_exact_combined(h, &combined_retry, &combined_result)) {
+    if (combined_retry) {
+      *out_retry = true;
+      return nullptr;
+    }
+    return combined_result;
   }
 
   if (G1RemoteFetchBatchObjects > 1 &&

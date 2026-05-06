@@ -46,6 +46,7 @@ static const uint32_t RE_CMD_REPORT_REMOTE_ROOTS_V2 = 0x13;
 static const uint32_t RE_CMD_TRACE_AND_REPORT       = 0x17;
 static const uint32_t RE_CMD_FETCH_AROUND           = 0x18;
 static const uint32_t RE_CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES = 0x1A;
+static const uint32_t RE_CMD_FETCH_EXACT            = 0x1C;
 static const uint32_t RE_RESP_TRACE_RESULT           = 0x86;
 static const uint32_t RE_RESP_BATCH_OBJECT_DATA      = 0x87;
 
@@ -848,6 +849,153 @@ size_t RDMAExecutorBackend::fetch_batch_around(uintptr_t handle_id, size_t slot_
 
     if ((size_t)word_size * HeapWordSize != byte_size || cursor + byte_size > end) {
       log_warning(gc)("RDMAExecutor: malformed batch fetch entry %u/%u "
+                      "(ws=%u bytes=%u remaining=" SIZE_FORMAT ")",
+                      i, num_objects, word_size, byte_size, (size_t)(end - cursor));
+      break;
+    }
+
+    cl->do_object(entry_handle, entry_slot, entry_klass, word_size, cursor);
+    cursor += byte_size;
+    fetched++;
+  }
+
+  os::free(stable);
+  _total_fetched += fetched;
+  return fetched;
+}
+
+bool RDMAExecutorBackend::supports_exact_batch_fetch() const {
+  return true;
+}
+
+size_t RDMAExecutorBackend::fetch_batch_exact(const uintptr_t* handle_ids,
+                                              const size_t* slot_ids,
+                                              size_t count,
+                                              size_t max_response_bytes,
+                                              FetchBatchClosure* cl) {
+  if (!_connected || cl == nullptr || handle_ids == nullptr ||
+      slot_ids == nullptr || count == 0) {
+    return 0;
+  }
+
+  if (max_response_bytes == 0 || max_response_bytes > RDMAMsgBufSize) {
+    max_response_bytes = RDMAMsgBufSize;
+  }
+  if (max_response_bytes < 24 + 32) {
+    return 0;
+  }
+
+  const size_t header_size = 32;
+  const size_t entry_size = 16;
+  size_t max_by_request = (RDMAMsgBufSize > header_size) ?
+      ((RDMAMsgBufSize - header_size) / entry_size) : 0;
+  size_t max_by_response = (max_response_bytes - 24) / 32;
+  size_t max_objects = MIN2(max_by_request, max_by_response);
+  if (count > max_objects) {
+    count = max_objects;
+  }
+  if (count == 0) {
+    return 0;
+  }
+
+  size_t msg_size = header_size + count * entry_size;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  if (msg == nullptr) {
+    return 0;
+  }
+
+  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_EXACT;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = 0;
+  *(uint32_t*)(msg + 16) = (uint32_t)count;
+  *(uint32_t*)(msg + 20) = 0;
+  *(uint64_t*)(msg + 24) = (uint64_t)max_response_bytes;
+  uint8_t* cursor = msg + header_size;
+  for (size_t i = 0; i < count; i++) {
+    *(uint64_t*)(cursor + 0) = (uint64_t)handle_ids[i];
+    *(uint64_t*)(cursor + 8) = (uint64_t)slot_ids[i];
+    cursor += entry_size;
+  }
+
+  io_lock();
+  if (!flush_localize_batch_locked()) {
+    io_unlock();
+    os::free(msg);
+    return 0;
+  }
+  *(uint64_t*)(msg + 8) = _seq_id++;
+
+  if (!rdma_post_recv()) {
+    io_unlock();
+    os::free(msg);
+    return 0;
+  }
+
+  if (!rdma_send_msg(msg, msg_size)) {
+    io_unlock();
+    os::free(msg);
+    return 0;
+  }
+  os::free(msg);
+
+  void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
+  struct ibv_wc wc;
+  if (!poll_cq_wait(_recv_cq, /*wr_id*/0, &wc)) {
+    io_unlock();
+    return 0;
+  }
+
+  uint8_t* resp = (uint8_t*)recv_buf;
+  size_t resp_len = wc.byte_len;
+  if (resp_len < 24) {
+    log_warning(gc)("RDMAExecutor: exact fetch response too short: " SIZE_FORMAT
+                    " bytes", resp_len);
+    io_unlock();
+    return 0;
+  }
+
+  if (*(uint32_t*)resp != RE_RESP_BATCH_OBJECT_DATA) {
+    io_unlock();
+    return 0;
+  }
+
+  uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+  if (resp_msg_len > resp_len || resp_msg_len > max_response_bytes) {
+    log_warning(gc)("RDMAExecutor: malformed exact fetch length: hdr=%u actual="
+                    SIZE_FORMAT " max=" SIZE_FORMAT,
+                    resp_msg_len, resp_len, max_response_bytes);
+    io_unlock();
+    return 0;
+  }
+
+  uint8_t* stable = (uint8_t*)os::malloc(resp_msg_len, mtGC);
+  if (stable == nullptr) {
+    io_unlock();
+    return 0;
+  }
+  memcpy(stable, resp, resp_msg_len);
+  io_unlock();
+
+  uint32_t num_objects = *(uint32_t*)(stable + 16);
+  cursor = stable + 24;
+  uint8_t* end = stable + resp_msg_len;
+  size_t fetched = 0;
+
+  for (uint32_t i = 0; i < num_objects; i++) {
+    if (cursor + 32 > end) {
+      log_warning(gc)("RDMAExecutor: truncated exact fetch entry header at %u/%u",
+                      i, num_objects);
+      break;
+    }
+    uintptr_t entry_handle = (uintptr_t)*(uint64_t*)(cursor + 0);
+    size_t entry_slot = (size_t)*(uint64_t*)(cursor + 8);
+    Klass* entry_klass = (Klass*)(uintptr_t)*(uint64_t*)(cursor + 16);
+    uint32_t word_size = *(uint32_t*)(cursor + 24);
+    uint32_t byte_size = *(uint32_t*)(cursor + 28);
+    cursor += 32;
+
+    if ((size_t)word_size * HeapWordSize != byte_size || cursor + byte_size > end) {
+      log_warning(gc)("RDMAExecutor: malformed exact fetch entry %u/%u "
                       "(ws=%u bytes=%u remaining=" SIZE_FORMAT ")",
                       i, num_objects, word_size, byte_size, (size_t)(end - cursor));
       break;

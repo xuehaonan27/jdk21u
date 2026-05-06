@@ -137,6 +137,21 @@ public:
     return 0;
   }
 
+  // Exact batch fetch: request only the handles/slots listed by the caller.
+  // This is used to coalesce independent mutator faults without speculative
+  // neighbor prefetch.
+  virtual bool supports_exact_batch_fetch() const {
+    return false;
+  }
+
+  virtual size_t fetch_batch_exact(const uintptr_t* handle_ids,
+                                   const size_t* slot_ids,
+                                   size_t count,
+                                   size_t max_response_bytes,
+                                   FetchBatchClosure* cl) {
+    return 0;
+  }
+
   // Notify executor that these handle_ids are now LOCAL (fetched back)
   virtual void localize_batch(const uintptr_t* handle_ids, size_t count) {
     // Default: no-op (SIM backend doesn't track handle state)

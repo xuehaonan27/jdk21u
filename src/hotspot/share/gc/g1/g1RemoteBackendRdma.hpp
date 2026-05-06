@@ -116,6 +116,12 @@ public:
                             uint max_objects, uint slot_window,
                             size_t max_response_bytes,
                             FetchBatchClosure* cl) override;
+  bool supports_exact_batch_fetch() const override;
+  size_t fetch_batch_exact(const uintptr_t* handle_ids,
+                           const size_t* slot_ids,
+                           size_t count,
+                           size_t max_response_bytes,
+                           FetchBatchClosure* cl) override;
   void trace_and_report(uintptr_t** out_dead_ids, size_t* out_num_dead,
                         size_t* out_bytes_freed,
                         uintptr_t** out_cross_src, uintptr_t** out_cross_tgt,
