@@ -2924,8 +2924,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 dense_deferred_candidates, num_regions,
                 dense_anchor_guarded_regions, &dense_anchor_guarded_handles);
             if (dense_anchor_guarded_count > 0) {
-              log_info(gc)("Path 2 dense anchor prefilter: skipping %d dense "
-                           "regions with %d anchored handles before budgeting",
+              log_info(gc)("Path 2 dense anchor prefilter: observed %d dense "
+                           "regions with %d anchored handles; allowing dense "
+                           "cascade and relying on late complete-region "
+                           "local-handle guards",
                            dense_anchor_guarded_count, dense_anchor_guarded_handles);
             }
           }
@@ -2934,10 +2936,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             uint i = G1RemoteDenseLastResortHighFirst ? (num_regions - 1 - scan) : scan;
             if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
             if (!dense_deferred_candidates[i]) continue;
-            if (dense_anchor_guarded_regions != nullptr &&
-                dense_anchor_guarded_regions[i]) {
-              continue;
-            }
 
             HeapRegion* hr = _g1h->region_at_or_null(i);
             if (hr == nullptr) continue;
@@ -3050,8 +3048,21 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           &early_dense_anchor_regions, &early_dense_anchor_seen);
 
       int early_anchor_removed = 0;
+      int early_dense_anchor_allowed = 0;
       for (uint i = 0; i < num_regions; i++) {
         if (!early_anchor_candidate_regions[i] || !eviction_candidates[i]) {
+          continue;
+        }
+        // A remote edge to a LOCAL object is not by itself a raw local root.
+        // If the whole dense region survives the exact metadata/local-handle
+        // guards below, finalization turns the target Handle REMOTE and the
+        // already-remote source object's edge table naturally becomes a
+        // remote-to-remote edge.  Treating such handles as hard pins made
+        // Spark dense regions unevictable and caused cgroup OOM even though
+        // the candidate objects themselves were complete.
+        if (dense_deferred_candidates != nullptr &&
+            dense_deferred_candidates[i]) {
+          early_dense_anchor_allowed++;
           continue;
         }
         eviction_candidates[i] = false;
@@ -3065,9 +3076,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
+      if (early_dense_anchor_allowed > 0) {
+        log_info(gc)("Pre-D remote-anchor guard: allowed %d dense candidate "
+                     "regions with local handles through cascade path; late "
+                     "guards will reject any incomplete or unprepared handles",
+                     early_dense_anchor_allowed);
+      }
+
       if (early_anchor_removed > 0) {
         log_info(gc)("Pre-D remote-anchor guard: removed %d candidate regions "
-                     "with %d anchored handles before raw-stack/Phase-C work",
+                     "before raw-stack/Phase-C work (%d anchored handles seen "
+                     "in candidate scan)",
                      early_anchor_removed, early_anchor_seen);
         if (early_dense_anchor_regions > 0) {
           log_info(gc)("Pre-D remote-anchor guard: marked %d dense refill "

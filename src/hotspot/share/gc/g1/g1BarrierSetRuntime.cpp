@@ -661,9 +661,37 @@ static bool remote_prefetch_budget_allows_eager_install() {
          RemotePrefetchPressureOverTarget;
 }
 
-static bool remote_prefetch_budget_allows_cache_store() {
-  return remote_prefetch_sample_pressure_level() <
-         RemotePrefetchPressureOverTier2;
+static size_t remote_prefetch_cache_cap_for_pressure(int pressure_level,
+                                                     bool spatial_hint) {
+  if (!spatial_hint) {
+    return RemotePrefetchCacheMaxBytes;
+  }
+  if (pressure_level >= RemotePrefetchPressureOverTier3) {
+    return 8 * M;
+  }
+  if (pressure_level >= RemotePrefetchPressureOverTier2) {
+    return 16 * M;
+  }
+  return RemotePrefetchCacheMaxBytes;
+}
+
+static bool remote_prefetch_budget_allows_cache_store(bool spatial_hint,
+                                                      size_t byte_size,
+                                                      size_t* cache_cap_out) {
+  int pressure_level = remote_prefetch_sample_pressure_level();
+  size_t cache_cap =
+      remote_prefetch_cache_cap_for_pressure(pressure_level, spatial_hint);
+  if (cache_cap_out != nullptr) {
+    *cache_cap_out = cache_cap;
+  }
+  if (pressure_level < RemotePrefetchPressureOverTier2) {
+    return true;
+  }
+  // Under cgroup pressure, keep only compiler/interpreter-guided spatial
+  // prefetches and bound their bytes tightly.  This avoids the old
+  // all-or-nothing policy where Spark array scans collapsed to one-object RDMA
+  // fetches exactly when latency hiding mattered most.
+  return spatial_hint && byte_size <= cache_cap;
 }
 
 static void remote_prefetch_cache_lock() {
@@ -747,12 +775,16 @@ static uint remote_prefetch_cache_hash(RemoteHandle* h, size_t slot_id) {
   return (uint)(x % RemotePrefetchCacheSlots);
 }
 
-static uint remote_fetch_effective_batch_objects(uint configured) {
+static bool remote_fetch_hint_prefers_around(uint32_t access_hint);
+
+static uint remote_fetch_effective_batch_objects(uint configured,
+                                                 uint32_t access_hint) {
   if (configured <= 1) {
     return configured;
   }
 
   int pressure_level = remote_prefetch_sample_pressure_level();
+  bool spatial_hint = remote_fetch_hint_prefers_around(access_hint);
   uint bounded = MIN2(configured, G1RemoteFetchBatchHardCap);
   uint effective = bounded;
   uint64_t hits = 0;
@@ -802,13 +834,32 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
   }
 
   if (pressure_level >= RemotePrefetchPressureOverTier2) {
-    if (effective > 1) {
+    if (spatial_hint) {
+      uint pressure_cap =
+          pressure_level >= RemotePrefetchPressureOverTier3 ? 16u : 32u;
+      effective = MIN2(effective, MIN2(bounded, pressure_cap));
+      if (effective < 2) {
+        effective = MIN2(bounded, 2u);
+      }
+      pressure_limited = true;
       pressure_suppressed =
         Atomic::add(&g1_remote_prefetch_batch_suppressed, (uint64_t)1);
-      pressure_limited = true;
+    } else {
+      if (effective > 1) {
+        pressure_suppressed =
+          Atomic::add(&g1_remote_prefetch_batch_suppressed, (uint64_t)1);
+        pressure_limited = true;
+      }
+      effective = 1;
     }
-    effective = 1;
-    if (g1_remote_prefetch_cache_bytes > 0) {
+    size_t pressure_cap =
+        remote_prefetch_cache_cap_for_pressure(pressure_level, spatial_hint);
+    while (g1_remote_prefetch_cache_bytes > pressure_cap) {
+      if (!remote_prefetch_cache_evict_one_locked()) {
+        break;
+      }
+    }
+    if (!spatial_hint && g1_remote_prefetch_cache_bytes > 0) {
       remote_prefetch_cache_clear_locked();
     }
   }
@@ -835,12 +886,13 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
                  " evictions=" UINT64_FORMAT " drops=" UINT64_FORMAT
                  " useful_per_mille=" UINT64_FORMAT
                  " evict_per_mille=" UINT64_FORMAT
-                 " pressure=%s action=%s suppress(batch=" UINT64_FORMAT
+                 " pressure=%s action=%s spatial=%d suppress(batch=" UINT64_FORMAT
                  " eager=" UINT64_FORMAT " cache=" UINT64_FORMAT ")",
                  configured, effective, hits, stores, evictions, drops,
                  useful_per_mille, evict_per_mille,
                  remote_prefetch_pressure_level_name(pressure_level),
                  remote_prefetch_pressure_action(pressure_level),
+                 spatial_hint ? 1 : 0,
                  Atomic::load(&g1_remote_prefetch_batch_suppressed),
                  Atomic::load(&g1_remote_prefetch_eager_suppressed),
                  Atomic::load(&g1_remote_prefetch_cache_suppressed));
@@ -859,12 +911,9 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
 
 static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
                                         Klass* klass, size_t word_size,
-                                        const void* obj_bytes) {
+                                        const void* obj_bytes,
+                                        bool spatial_hint) {
   if (Atomic::load(&g1_remote_fetch_batch_disabled) != 0) {
-    return false;
-  }
-  if (!remote_prefetch_budget_allows_cache_store()) {
-    Atomic::inc(&g1_remote_prefetch_cache_suppressed);
     return false;
   }
   if (h == nullptr || klass == nullptr || obj_bytes == nullptr || word_size == 0) {
@@ -876,6 +925,12 @@ static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
   size_t byte_size = word_size * HeapWordSize;
   if (byte_size > RemotePrefetchCacheMaxObjectBytes ||
       byte_size > RemotePrefetchCacheMaxBytes) {
+    return false;
+  }
+  size_t cache_cap = RemotePrefetchCacheMaxBytes;
+  if (!remote_prefetch_budget_allows_cache_store(spatial_hint, byte_size,
+                                                 &cache_cap)) {
+    Atomic::inc(&g1_remote_prefetch_cache_suppressed);
     return false;
   }
 
@@ -908,7 +963,7 @@ static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
     return false;
   }
 
-  while (g1_remote_prefetch_cache_bytes + byte_size > RemotePrefetchCacheMaxBytes) {
+  while (g1_remote_prefetch_cache_bytes + byte_size > cache_cap) {
     if (!remote_prefetch_cache_evict_one_locked()) {
       remote_prefetch_cache_unlock();
       os::free(bytes);
@@ -1087,6 +1142,7 @@ class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
   size_t _publish_slots[G1RemoteFetchBatchHardCap];
   uint _publish_count;
   bool _eager_prefetch;
+  bool _spatial_prefetch;
 
   bool try_eager_install_prefetch(RemoteHandle* h, size_t slot_id, Klass* klass,
                                   size_t word_size, const void* obj_bytes) {
@@ -1126,11 +1182,13 @@ class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
 public:
   BatchFetchInstallClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm,
                            RemoteHandle* primary, size_t primary_slot,
-                           bool eager_prefetch)
+                           bool eager_prefetch,
+                           bool spatial_prefetch)
     : _g1h(g1h), _rmm(rmm), _primary(primary), _primary_result(nullptr),
       _primary_slot(primary_slot), _returned(0), _installed(0), _prefetched(0),
       _raced(0), _failed(0), _prefetch_words(0), _primary_alloc_failed(false),
-      _publish_count(0), _eager_prefetch(eager_prefetch) {}
+      _publish_count(0), _eager_prefetch(eager_prefetch),
+      _spatial_prefetch(spatial_prefetch) {}
 
   void do_object(uintptr_t handle_id, size_t slot_id, Klass* klass,
                  size_t word_size, const void* obj_bytes) override {
@@ -1169,7 +1227,8 @@ public:
       if (try_eager_install_prefetch(h, slot_id, klass, word_size, obj_bytes)) {
         return;
       }
-      if (remote_prefetch_cache_store(h, slot_id, klass, word_size, obj_bytes)) {
+      if (remote_prefetch_cache_store(h, slot_id, klass, word_size, obj_bytes,
+                                      _spatial_prefetch)) {
         _prefetched++;
         _prefetch_words += word_size;
       } else {
@@ -1627,7 +1686,8 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
                                         bool* out_retry, uint max_objects,
                                         uint slot_window,
                                         size_t max_response_bytes,
-                                        bool eager_prefetch) {
+                                        bool eager_prefetch,
+                                        bool spatial_prefetch) {
   *out_retry = false;
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
@@ -1636,7 +1696,8 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   uintptr_t sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
-  BatchFetchInstallClosure installer(g1h, rmm, h, slot_id, eager_prefetch);
+  BatchFetchInstallClosure installer(g1h, rmm, h, slot_id, eager_prefetch,
+                                     spatial_prefetch);
   jlong fetch_start = os::elapsed_counter();
   size_t returned = backend->fetch_batch_around((uintptr_t)h, slot_id, max_objects,
                                                 slot_window, max_response_bytes,
@@ -1747,12 +1808,12 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
     size_t max_response_bytes = remote_fetch_max_response_bytes();
     remote_apply_compiler_fetch_hint(access_hint, &max_objects,
                                      &slot_window, &max_response_bytes);
-    max_objects = remote_fetch_effective_batch_objects(max_objects);
+    max_objects = remote_fetch_effective_batch_objects(max_objects, access_hint);
     if (max_objects > 1) {
       bool eager_prefetch = remote_fetch_hint_eager_installs_prefetch(access_hint);
       return fetch_and_install_batch(h, fetch_attempts, out_retry, max_objects,
                                      slot_window, max_response_bytes,
-                                     eager_prefetch);
+                                     eager_prefetch, prefer_around);
     }
   }
 
