@@ -42,8 +42,10 @@
 #include "logging/log.hpp"
 #include "logging/logStream.hpp"
 #include "memory/iterator.inline.hpp"
+#include "memory/metaspace.hpp"
 #include "oops/access.inline.hpp"
 #include "oops/compressedOops.inline.hpp"
+#include "oops/klass.hpp"
 #include "oops/oopsHierarchy.hpp"
 #include "oops/oop.inline.hpp"
 #include "runtime/prefetch.inline.hpp"
@@ -64,6 +66,19 @@ static inline bool g1_remote_gc_scan_checks_enabled() {
          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
 }
 
+static inline bool g1_gc_scan_valid_klass(Klass* k) {
+  if (k == nullptr) {
+    return false;
+  }
+  if (!is_aligned((address)k, sizeof(MetaWord))) {
+    return false;
+  }
+  if (!Metaspace::contains(k)) {
+    return false;
+  }
+  return k->is_klass();
+}
+
 static inline bool g1_gc_scan_region_contains_oop(G1CollectedHeap* g1h, oop obj) {
   if (obj == nullptr) {
     return false;
@@ -76,20 +91,57 @@ static inline bool g1_gc_scan_region_contains_oop(G1CollectedHeap* g1h, oop obj)
   }
 
   HeapRegion* hr = g1h->heap_region_containing_or_null((void*)addr);
-  if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+  if (hr == nullptr || hr->is_free() || hr->is_empty() || hr->is_evict_guarded()) {
     return false;
   }
 
   HeapWord* obj_addr = (HeapWord*)addr;
   if (hr->is_humongous()) {
     HeapRegion* start = hr->humongous_start_region();
-    return start != nullptr &&
-           !start->is_free() &&
-           !start->is_evict_guarded() &&
-           obj_addr == start->bottom();
+    if (start == nullptr ||
+        !start->is_starts_humongous() ||
+        start->is_free() ||
+        start->is_empty() ||
+        start->is_evict_guarded() ||
+        obj_addr != start->bottom()) {
+      return false;
+    }
+
+    Klass* k = obj->klass_or_null_acquire();
+    if (!g1_gc_scan_valid_klass(k) || G1CollectedHeap::is_obj_filler(obj)) {
+      return false;
+    }
+    Klass* size_k = obj->klass_or_null_acquire();
+    if (size_k != k) {
+      return false;
+    }
+    size_t obj_size = obj->size_given_klass(size_k);
+    return obj_size >= (size_t)MinObjAlignment && is_object_aligned(obj_size);
   }
 
-  return obj_addr >= hr->bottom() && obj_addr < hr->top();
+  if (obj_addr < hr->bottom() || obj_addr >= hr->top()) {
+    return false;
+  }
+
+  // Range membership alone is not enough for the remote path: stale dirty-card
+  // slots and dense direct references can otherwise let an implausible heap
+  // word be queued as an oop.  Do not use HeapRegion::block_start() here; the
+  // remote root validators avoid it too because the block-start path may parse
+  // speculative/interior payload before it can reject the address.
+  Klass* k = obj->klass_or_null_acquire();
+  if (!g1_gc_scan_valid_klass(k) || G1CollectedHeap::is_obj_filler(obj)) {
+    return false;
+  }
+  Klass* size_k = obj->klass_or_null_acquire();
+  if (size_k != k) {
+    return false;
+  }
+
+  size_t obj_size = obj->size_given_klass(size_k);
+  return obj_size >= (size_t)MinObjAlignment &&
+         is_object_aligned(obj_size) &&
+         obj_size <= (size_t)(hr->top() - obj_addr) &&
+         obj_size <= (size_t)(hr->end() - obj_addr);
 }
 
 template <class T>
