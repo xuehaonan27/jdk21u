@@ -59,28 +59,6 @@
 // Explicit NOINLINE to block ATTRIBUTE_FLATTENing.
 #define MAYBE_INLINE_EVACUATION NOT_DEBUG(inline) DEBUG_ONLY(NOINLINE)
 
-static bool should_record_remote_ref_sites(G1CollectedHeap* g1h) {
-  if (!G1RemoteAllowPromotionRefSiteTags) {
-    return false;
-  }
-
-  if (G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
-    return true;
-  }
-
-  if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
-    const size_t local_capacity = (g1h->max_capacity() * LocalMemoryRatio) / 100;
-    const size_t used = g1h->used();
-    // Do not start object/ref-site tagging during the proactive tier. Spark NB
-    // creates dense tiny-object regions where object-granularity eviction is
-    // both expensive and currently unsafe. Delay recording until high pressure;
-    // page/region-oriented eviction should handle dense spatial-locality cases.
-    return used >= (local_capacity * 75) / 100;
-  }
-
-  return false;
-}
-
 G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
                                            G1RedirtyCardsQueueSet* rdcqs,
                                            PreservedMarks* preserved_marks,
@@ -119,7 +97,7 @@ G1ParScanThreadState::G1ParScanThreadState(G1CollectedHeap* g1h,
     _rc_buffer(nullptr),
     _rc_buffer_size(0),
     _rc_buffer_capacity(0),
-    _record_remote_ref_sites(should_record_remote_ref_sites(g1h))
+    _record_remote_ref_sites(false)
 {
   // We allocate number of young gen regions in the collection set plus one
   // entries, since entry 0 keeps track of surviving bytes for non-young regions.
@@ -868,8 +846,9 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         // Determine if tagging is safe: skip arrays and JVM-internal types
         // that are accessed by non-barrier paths (arraycopy, MH dispatch).
         bool in_cold_region = dest->is_cold_destination() && !dest->is_root_pinned();
-        bool safe_to_tag = G1RemoteAllowPromotionRefSiteTags &&
-                            (G1TagRefSites || in_cold_region);
+        // Persistent promotion-time heap-slot tagging is disabled. Phase C still
+        // performs bounded STW tagging for explicit remote eviction attempts.
+        bool safe_to_tag = false;
         if (safe_to_tag) {
           Klass* k = obj->klass();
           if (k->is_array_klass()) {

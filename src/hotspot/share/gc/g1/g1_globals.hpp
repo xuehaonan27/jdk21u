@@ -361,22 +361,11 @@
           "is enabled.")                                                    \
           range(0, 1024)                                                    \
                                                                             \
-  product(bool, G1RemoteDenseLastResortHighFirst, false, DIAGNOSTIC,        \
-          "When dense small-object last-resort eviction is enabled, select " \
-          "dense old regions from high heap region indices first. This is "  \
-          "a diagnostic policy for graph-shaped workloads where newer old "  \
-          "regions often reference older old regions.")                     \
-                                                                            \
   product(bool, G1RemoteDenseSkipUnevictableSamples, true, DIAGNOSTIC,      \
           "When dense last-resort eviction is enabled, skip sampled old "     \
           "regions that contain object arrays, disabled primitive arrays, "   \
           "locked objects, or any object payload that Phase E cannot "        \
           "evict completely.")                                               \
-                                                                            \
-  product(bool, G1RemoteSkipFillerOnCompleteEviction, false, DIAGNOSTIC,    \
-          "Skip per-object filler writes when a candidate region has been "  \
-          "fully evicted and is about to be freed and guarded. Experimental "\
-          "fast path for dense object-granularity eviction.")                \
                                                                             \
   product(bool, G1RemoteDenseRefillAfterStackGuard, false, DIAGNOSTIC,      \
           "After the conservative Pre-D raw-stack guard removes dense "      \
@@ -416,14 +405,6 @@
           "are repeatedly fetched soon after eviction. The base is "          \
           "G1RemoteEvictionAbortBackoffGCCycles.")                          \
           range(0, 10000)                                                    \
-                                                                            \
-  product(bool, G1RemoteAllowPromotionRefSiteTags, false, DIAGNOSTIC,        \
-          "Allow ordinary promotion-time OOP classification to write "        \
-          "persistent tagged refs into heap fields. Disabled by default "     \
-          "because Spark-like array-heavy cached data can expose load paths " \
-          "that do not safely tolerate long-lived tagged refs. Remote "       \
-          "eviction Phase C may still tag refs during a bounded STW "         \
-          "eviction attempt.")                                                \
                                                                             \
   product(bool, G1RemoteMoleculeProfile, false, DIAGNOSTIC,                  \
           "Log-only MoleculeGC-inspired class-pattern profiling. Records "    \
@@ -469,12 +450,6 @@
           "Abort remote eviction immediately after Phase C if tagging found " \
           "heap refs that cannot safely be tagged. Verification would only "  \
           "rediscover those refs and abort later.")                           \
-                                                                            \
-  product(bool, G1RemoteUseRootCatchRelocation, false, DIAGNOSTIC,           \
-          "Allow remote eviction to copy root-held candidate objects to "     \
-          "fetch-cache regions before evicting their source regions. "        \
-          "Disabled by default because an eviction abort after this phase "   \
-          "would otherwise leave forwarding stubs in local old regions.")     \
                                                                             \
   product(bool, G1RemoteAllowTypeArrayEviction, false, DIAGNOSTIC,           \
           "Allow remote eviction of primitive arrays as whole objects. "       \

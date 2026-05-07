@@ -1082,164 +1082,6 @@ void G1YoungCollector::post_evacuate_cleanup_2(G1ParScanThreadStateSet* per_thre
   phase_times()->record_post_evacuate_cleanup_task_2_time((Ticks::now() - start).seconds() * 1000.0);
 }
 
-struct RootPinEntry {
-  oop*      root;
-  uintptr_t obj_addr;
-  bool      update_root;
-};
-static int rpe_cmp(const void* a, const void* b) {
-  uintptr_t aa = ((const RootPinEntry*)a)->obj_addr;
-  uintptr_t bb = ((const RootPinEntry*)b)->obj_addr;
-  return (aa < bb) ? -1 : (aa > bb) ? 1 : 0;
-}
-
-static bool remote_eviction_is_block_start(G1CollectedHeap* g1h,
-                                           uintptr_t obj_addr,
-                                           HeapRegion** region_out,
-                                           const char** reason_out) {
-  if (region_out != nullptr) {
-    *region_out = nullptr;
-  }
-  if (reason_out != nullptr) {
-    *reason_out = nullptr;
-  }
-
-  if (obj_addr == 0) {
-    if (reason_out != nullptr) *reason_out = "NULL";
-    return false;
-  }
-  if (!is_aligned((address)obj_addr, HeapWordSize)) {
-    if (reason_out != nullptr) *reason_out = "UNALIGNED";
-    return false;
-  }
-  if (!g1h->is_in_reserved((void*)obj_addr)) {
-    if (reason_out != nullptr) *reason_out = "NOT-IN-HEAP";
-    return false;
-  }
-
-  HeapRegion* hr = g1h->heap_region_containing_or_null((void*)obj_addr);
-  if (hr == nullptr) {
-    if (reason_out != nullptr) *reason_out = "NO-REGION";
-    return false;
-  }
-  if (region_out != nullptr) {
-    *region_out = hr;
-  }
-  if (hr->is_free()) {
-    if (reason_out != nullptr) *reason_out = "FREE";
-    return false;
-  }
-  if (hr->is_empty()) {
-    if (reason_out != nullptr) *reason_out = "EMPTY";
-    return false;
-  }
-  if (hr->is_continues_humongous()) {
-    if (reason_out != nullptr) *reason_out = "CONT-HUMONGOUS";
-    return false;
-  }
-
-  HeapWord* addr = (HeapWord*)obj_addr;
-  if (addr < hr->bottom() || addr >= hr->top()) {
-    if (reason_out != nullptr) *reason_out = "OUTSIDE-TOP";
-    return false;
-  }
-  // Do not call HeapRegion::block_start() for remote-eviction root
-  // validation. The G1 block-start path may parse from a speculative/interior
-  // address and dereference payload bits as a Klass before it can report that
-  // the address is not a block boundary. Root scanners are supposed to supply
-  // real oop starts; validate the header directly and reject implausible roots.
-  oop obj = cast_to_oop(addr);
-  Klass* k = obj->klass_or_null_acquire();
-  if (k == nullptr) {
-    if (reason_out != nullptr) *reason_out = "NULL-KLASS";
-    return false;
-  }
-  if (!Klass::is_valid(k)) {
-    if (reason_out != nullptr) *reason_out = "BAD-KLASS";
-    return false;
-  }
-  return true;
-}
-
-static bool remote_eviction_is_filler_klass(Klass* k) {
-  return k == Universe::fillerArrayKlassObj() ||
-         k == vmClasses::FillerObject_klass();
-}
-
-static bool remote_eviction_is_relocatable_object(G1CollectedHeap* g1h,
-                                                  uintptr_t obj_addr,
-                                                  HeapRegion** region_out,
-                                                  size_t* word_size_out,
-                                                  const char** reason_out) {
-  HeapRegion* hr = nullptr;
-  if (!remote_eviction_is_block_start(g1h, obj_addr, &hr, reason_out)) {
-    if (region_out != nullptr) *region_out = hr;
-    return false;
-  }
-
-  oop obj = cast_to_oop(obj_addr);
-  Klass* k = obj->klass_or_null_acquire();
-  if (k == nullptr) {
-    if (reason_out != nullptr) *reason_out = "NULL-KLASS";
-    if (region_out != nullptr) *region_out = hr;
-    return false;
-  }
-  if (!Klass::is_valid(k)) {
-    if (reason_out != nullptr) *reason_out = "BAD-KLASS";
-    if (region_out != nullptr) *region_out = hr;
-    return false;
-  }
-  if (remote_eviction_is_filler_klass(k)) {
-    if (reason_out != nullptr) *reason_out = "FILLER";
-    if (region_out != nullptr) *region_out = hr;
-    return false;
-  }
-
-  Klass* size_k = obj->klass_or_null_acquire();
-  if (size_k == nullptr) {
-    if (reason_out != nullptr) *reason_out = "NULL-KLASS-SIZE";
-    if (region_out != nullptr) *region_out = hr;
-    return false;
-  }
-  if (size_k != k) {
-    if (reason_out != nullptr) *reason_out = "KLASS-CHANGED";
-    if (region_out != nullptr) *region_out = hr;
-    return false;
-  }
-
-  size_t word_size = obj->size_given_klass(size_k);
-  if (word_size == 0 || (HeapWord*)obj_addr + word_size > hr->top()) {
-    if (reason_out != nullptr) *reason_out = "BAD-SIZE";
-    if (region_out != nullptr) *region_out = hr;
-    return false;
-  }
-
-  if (region_out != nullptr) *region_out = hr;
-  if (word_size_out != nullptr) *word_size_out = word_size;
-  return true;
-}
-
-static void dirty_root_catch_region(G1CollectedHeap* g1h, HeapRegion* root_catch, HeapWord* top) {
-  if (root_catch == nullptr || top == root_catch->bottom()) {
-    return;
-  }
-
-  root_catch->set_top(top);
-
-  G1CardTable* ct = g1h->card_table();
-  CardTable::CardValue* start_card = ct->byte_for(root_catch->bottom());
-  CardTable::CardValue* end_card   = ct->byte_for(top - 1) + 1;
-  memset(start_card, CardTable::dirty_card_val(), end_card - start_card);
-
-  // Raw card table dirtying alone is invisible to G1's remset processing.
-  G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
-  G1DirtyCardQueue tmp_queue(&dcqs);
-  for (CardTable::CardValue* card = start_card; card < end_card; card++) {
-    dcqs.enqueue(tmp_queue, card);
-  }
-  dcqs.flush_queue(tmp_queue);
-}
-
 static int guard_eviction_candidates_with_raw_stack(G1CollectedHeap* g1h,
                                                     bool* eviction_candidates,
                                                     uint num_regions,
@@ -1642,7 +1484,7 @@ static int refill_dense_eviction_candidates(G1CollectedHeap* g1h,
   size_t refill_objects = 0;
 
   for (uint scan = 0; scan < num_regions && (uint)refilled < refill_budget; scan++) {
-    uint i = G1RemoteDenseLastResortHighFirst ? (num_regions - 1 - scan) : scan;
+    uint i = scan;
     if (!dense_deferred_candidates[i]) continue;
     if (raw_stack_guarded_regions != nullptr && raw_stack_guarded_regions[i]) continue;
     if (root_guarded_regions != nullptr && root_guarded_regions[i]) continue;
@@ -1683,10 +1525,9 @@ static int refill_dense_eviction_candidates(G1CollectedHeap* g1h,
 
   if (refilled > 0) {
     log_info(gc)("%s dense refill: added %d replacement regions ("
-                 SIZE_FORMAT "MB, " SIZE_FORMAT " objs) after %d removals (%s)",
+                 SIZE_FORMAT "MB, " SIZE_FORMAT " objs) after %d removals",
                  reason, refilled, refill_bytes / M, refill_objects,
-                 removed_regions,
-                 G1RemoteDenseLastResortHighFirst ? "high-first" : "low-first");
+                 removed_regions);
   } else if (removed_regions > 0) {
     log_info(gc)("%s dense refill: no replacement regions found after %d removals",
                  reason, removed_regions);
@@ -2926,8 +2767,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           dense_last_resort_cap = MIN2(dense_last_resort_cap, remaining_target);
           dense_last_resort_cap = MIN2(dense_last_resort_cap, evict_batch_cap_bytes);
 
-          if (!G1RemoteUseRootCatchRelocation &&
-              dense_deferred_candidates != nullptr &&
+          if (dense_deferred_candidates != nullptr &&
               dense_last_resort_cap > 0 &&
               rmm != nullptr) {
             dense_anchor_guarded_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
@@ -2945,7 +2785,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
 
           for (uint scan = 0; scan < num_regions && dense_last_resort_cap > 0; scan++) {
-            uint i = G1RemoteDenseLastResortHighFirst ? (num_regions - 1 - scan) : scan;
+            uint i = scan;
             if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
             if (!dense_deferred_candidates[i]) continue;
 
@@ -2994,12 +2834,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
           if (path2_dense_last_resort_candidates > 0) {
             log_info(gc)("Path 2 dense last-resort selected %d regions ("
-                         SIZE_FORMAT "MB, " SIZE_FORMAT " objs) for T%d pressure (%s)",
+                         SIZE_FORMAT "MB, " SIZE_FORMAT " objs) for T%d pressure",
                          path2_dense_last_resort_candidates,
                          path2_dense_last_resort_bytes / M,
                          path2_dense_last_resort_objects,
-                         eviction_tier,
-                         G1RemoteDenseLastResortHighFirst ? "high-first" : "low-first");
+                         eviction_tier);
           }
           if (path2_regions_unevictable_sample_skipped > 0) {
             log_info(gc)("Path 2 dense last-resort skipped %d sampled regions "
@@ -3082,12 +2921,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
     }
 
-    // Root-catch relocation is disabled by default. In that mode, candidate
-    // regions that already have remote anchors cannot be evicted this cycle:
+    // Candidate regions that already have remote anchors cannot be evicted this
+    // cycle:
     // a LOCAL anchored handle would keep a raw local address into the region.
     // Filter them before deopt/raw-stack/Phase-C work. The later root guard
     // still handles ordinary roots and any anchors introduced after this point.
-    if (total_candidates > 0 && !G1RemoteUseRootCatchRelocation) {
+    if (total_candidates > 0) {
       bool* early_anchor_candidate_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
       memset(early_anchor_candidate_regions, 0, num_regions * sizeof(bool));
       bool* early_anchor_dense_regions = nullptr;
@@ -3191,11 +3030,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                    deopt_ms, total_candidates);
     }
 
-    // ---- Phase C.9: Raw stack guard before root-catch relocation ----
-    // Root-catch installs forwarding pointers in old candidate objects.
-    // If a later raw-stack guard keeps that region local, those forwarding
-    // stubs become mutator-visible. Guard stack-held regions before any
-    // relocation so kept-local regions remain untouched.
+    // ---- Phase C.9: Raw stack guard before root scans ----
+    // Stack slots may contain raw clean oops that are not described as roots at
+    // this safepoint. Keep those regions local before Phase C/E mutates any
+    // candidate state.
     if (total_candidates > 0) {
       if ((dense_refill_after_stack_guard || dense_refill_after_root_guard) &&
           dense_deferred_candidates != nullptr) {
@@ -3231,16 +3069,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     }
 
-    // ---- Phase D: Root-catch relocation ----
-    // Instead of pinning entire 16MB regions for a few root-referenced
-    // objects (often just a Double or small array), relocate root-pinned
-    // objects to a dedicated "root-catch" region. This allows eviction of
-    // regions that previously had 1-2 root refs blocking them.
+    // ---- Phase D: Root and remote-anchor guards ----
+    // Preserve correctness by pinning candidate regions that still have roots,
+    // stack words, or remote anchors to local addresses.
     if (total_candidates > 0) {
-      int pin_capacity = 131072;
-      int pin_grows = 0;
-      RootPinEntry* pins = NEW_C_HEAP_ARRAY(RootPinEntry, pin_capacity, mtGC);
-      int num_pins = 0;
       bool* root_guarded_regions = nullptr;
       bool* root_backoff_regions = nullptr;
       if (dense_refill_after_root_guard && dense_deferred_candidates != nullptr) {
@@ -3321,11 +3153,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       Threads::oops_do(&thread_pin_cl, nullptr);
       if (thread_pin_cl.regions_guarded() > 0) {
         total_candidates -= thread_pin_cl.regions_guarded();
-        log_info(gc)("Root-catch: pinned %d candidate regions for %d thread roots",
+        log_info(gc)("Root guard: pinned %d candidate regions for %d thread roots",
                      thread_pin_cl.regions_guarded(), thread_pin_cl.roots_found());
       }
 
-      if (!G1RemoteUseRootCatchRelocation) {
+      {
         EvictionThreadRootPinClosure root_pin_cl(_g1h, eviction_candidates,
                                                  root_guarded_regions,
                                                  root_backoff_regions, num_regions);
@@ -3354,7 +3186,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               nullptr, eviction_candidates, remote_anchor_regions, nullptr,
               &remote_anchor_seen);
           if (anchor_refill_blockers > 0) {
-            log_info(gc)("Root-catch disabled: marked %d dense refill regions "
+            log_info(gc)("Root guard: marked %d dense refill regions "
                          "guarded by remote anchors",
                          anchor_refill_blockers);
           }
@@ -3385,7 +3217,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int root_guarded = root_pin_cl.regions_guarded() + remote_anchor_pinned;
         if (root_guarded > 0) {
           total_candidates -= root_guarded;
-          log_info(gc)("Root-catch disabled: pinned %d candidate regions for "
+          log_info(gc)("Root guard: pinned %d candidate regions for "
                        "%d non-thread roots and %d remote anchors",
                        root_guarded, root_pin_cl.roots_found(), remote_anchor_seen);
         }
@@ -3405,344 +3237,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               refill_budget, removed_for_refill, "Root-guard",
               &path2_candidates, &total_candidates);
         }
-      } else {
-        class EvictionRootCollectClosure : public OopClosure {
-          G1CollectedHeap* _g1h;
-          const bool*      _eviction_candidates;
-          uint             _num_regions;
-        RootPinEntry**   _pins;
-        int&             _num_pins;
-        int&             _pin_capacity;
-        int&             _pin_grows;
-
-        void append(oop* root, uintptr_t obj_addr, bool update_root) {
-          if (_num_pins >= _pin_capacity) {
-            int new_capacity = _pin_capacity + MAX2(_pin_capacity / 2, 4096);
-            RootPinEntry* new_pins = NEW_C_HEAP_ARRAY(RootPinEntry, new_capacity, mtGC);
-            memcpy(new_pins, *_pins, _num_pins * sizeof(RootPinEntry));
-            FREE_C_HEAP_ARRAY(RootPinEntry, *_pins);
-            *_pins = new_pins;
-            _pin_capacity = new_capacity;
-            _pin_grows++;
-          }
-          (*_pins)[_num_pins] = {root, obj_addr, update_root};
-          _num_pins++;
-        }
-
-        bool is_valid_root_object(oop obj, HeapRegion** region_out = nullptr) {
-          size_t word_size = 0;
-          const char* reason = nullptr;
-          return remote_eviction_is_relocatable_object(
-              _g1h, cast_from_oop<uintptr_t>(obj), region_out, &word_size, &reason);
-        }
-
-      public:
-        EvictionRootCollectClosure(G1CollectedHeap* g1h, const bool* candidates,
-                                   uint num_regions, RootPinEntry** pins,
-                                   int& num_pins, int& pin_capacity, int& pin_grows)
-          : _g1h(g1h), _eviction_candidates(candidates), _num_regions(num_regions),
-            _pins(pins), _num_pins(num_pins), _pin_capacity(pin_capacity),
-            _pin_grows(pin_grows) {}
-        void do_oop(oop* p) {
-          oop obj = *p;
-          if (obj == nullptr) return;
-          uintptr_t raw = cast_from_oop<uintptr_t>(obj);
-          if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
-              (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
-          if ((raw & G1_OOP_TAG_MASK) != 0) {
-            obj = cast_to_oop(raw & G1_OOP_ADDR_MASK);
-          }
-          HeapRegion* hr = nullptr;
-          if (!is_valid_root_object(obj, &hr)) return;
-          uint idx = hr->hrm_index();
-          if (idx < _num_regions && _eviction_candidates[idx]) {
-            append(p, cast_from_oop<uintptr_t>(obj), true);
-          }
-        }
-        void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
-      };
-
-      EvictionRootCollectClosure collect_cl(_g1h, eviction_candidates, num_regions,
-                                            &pins, num_pins, pin_capacity, pin_grows);
-      JNIHandles::oops_do(&collect_cl);
-      OopStorageSet::strong_oops_do(&collect_cl);
-      for (auto id : EnumRange<OopStorageSet::WeakId>()) {
-        OopStorageSet::storage(id)->oops_do(&collect_cl);
-      }
-      {
-        CLDToOopClosure cld_cl(&collect_cl, ClassLoaderData::_claim_none);
-        ClassLoaderDataGraph::cld_do(&cld_cl);
-      }
-      {
-        CodeBlobToOopClosure code_cl(&collect_cl, false);
-        CodeCache::blobs_do(&code_cl);
-      }
-      _g1h->ref_processor_cm()->weak_oops_do(&collect_cl);
-
-      bool remote_anchor_overflow = false;
-      int remote_anchor_seen = 0;
-      uintptr_t* remote_anchor_addrs = nullptr;
-      remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
-          eviction_candidates, num_regions, nullptr, 0, &remote_anchor_overflow);
-
-      int remote_anchor_capacity = remote_anchor_seen;
-      if (remote_anchor_capacity > 0) {
-        remote_anchor_addrs = NEW_C_HEAP_ARRAY(uintptr_t, remote_anchor_capacity, mtGC);
-      }
-      remote_anchor_overflow = false;
-      remote_anchor_seen = rmm->collect_remote_anchor_addrs_in_regions(
-          eviction_candidates, num_regions, remote_anchor_addrs,
-          remote_anchor_capacity, &remote_anchor_overflow);
-      int remote_anchor_stored = MIN2(remote_anchor_seen, remote_anchor_capacity);
-      for (int i = 0; i < remote_anchor_stored; i++) {
-        if (num_pins >= pin_capacity) {
-          int new_capacity = pin_capacity + MAX2(pin_capacity / 2, 4096);
-          RootPinEntry* new_pins = NEW_C_HEAP_ARRAY(RootPinEntry, new_capacity, mtGC);
-          memcpy(new_pins, pins, num_pins * sizeof(RootPinEntry));
-          FREE_C_HEAP_ARRAY(RootPinEntry, pins);
-          pins = new_pins;
-          pin_capacity = new_capacity;
-          pin_grows++;
-        }
-        pins[num_pins] = {nullptr, remote_anchor_addrs[i], false};
-        num_pins++;
-      }
-      if (remote_anchor_addrs != nullptr) {
-        FREE_C_HEAP_ARRAY(uintptr_t, remote_anchor_addrs);
-      }
-      if (remote_anchor_seen > remote_anchor_stored) {
-        remote_anchor_overflow = true;
-      }
-
-      // Relocate collected root-pinned objects to a catch region
-      if (remote_anchor_overflow) {
-        int overflow_pinned = 0;
-        for (uint i = 0; i < num_regions; i++) {
-          if (eviction_candidates[i]) {
-            HeapRegion* hr = _g1h->region_at_or_null(i);
-            if (hr == nullptr) continue;
-            eviction_candidates[i] = false;
-            if (root_guarded_regions != nullptr) {
-              root_guarded_regions[i] = true;
-            }
-            if (root_backoff_regions != nullptr) {
-              root_backoff_regions[i] = true;
-            }
-            hr->clear_cold_destination();
-            regions_pinned++;
-            overflow_pinned++;
-          }
-        }
-        total_candidates -= overflow_pinned;
-        log_warning(gc)("Root-catch overflow: pinned %d candidate regions "
-                        "(pins=%d capacity=%d grows=%d remote-anchor=%d stored=%d)",
-                        overflow_pinned, num_pins, pin_capacity, pin_grows,
-                        remote_anchor_seen, remote_anchor_stored);
-      } else if (num_pins > 0) {
-        qsort(pins, num_pins, sizeof(RootPinEntry), rpe_cmp);
-
-        HeapRegion* root_catch = nullptr;
-        HeapWord* catch_top = nullptr;
-        uint first_root_catch_idx = (uint)-1;
-        int catch_regions = 0;
-        int relocated = 0;
-        int roots_updated = 0;
-        int fallback_pinned = 0;
-        size_t root_catch_words = 0;
-        bool catch_alloc_failed = false;
-
-        uintptr_t prev_addr = 0;
-        HeapWord* prev_new = nullptr;
-
-        for (int i = 0; i < num_pins; i++) {
-          uintptr_t obj_addr = pins[i].obj_addr;
-          oop* root_p = pins[i].root;
-          bool update_root = pins[i].update_root && root_p != nullptr;
-
-          if (obj_addr == prev_addr && prev_new != nullptr) {
-            // Duplicate root to same object. Remote-anchor pins have no root
-            // slot; their Handle was updated by the first relocation and any
-            // duplicates are handled by the forwarding fixup below.
-            if (update_root) {
-              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-              uintptr_t tags = raw & G1_OOP_TAG_MASK;
-              *root_p = cast_to_oop(tags | ((uintptr_t)prev_new & G1_OOP_ADDR_MASK));
-              roots_updated++;
-            }
-            continue;
-          }
-
-          HeapRegion* pin_hr = nullptr;
-          const char* invalid_reason = nullptr;
-          if (!remote_eviction_is_block_start(_g1h, obj_addr, &pin_hr, &invalid_reason)) {
-            if (pin_hr != nullptr) {
-              uint idx = pin_hr->hrm_index();
-              if (idx < num_regions && eviction_candidates[idx]) {
-                eviction_candidates[idx] = false;
-                if (root_guarded_regions != nullptr) {
-                  root_guarded_regions[idx] = true;
-                }
-                if (root_backoff_regions != nullptr) {
-                  root_backoff_regions[idx] = true;
-                }
-                pin_hr->clear_cold_destination();
-                regions_pinned++;
-                total_candidates--;
-                fallback_pinned++;
-              }
-            }
-            if (fallback_pinned <= 32) {
-              log_warning(gc)("Root-catch: skipped invalid pin addr=" PTR_FORMAT
-                              " reason=%s region=%u",
-                              obj_addr,
-                              invalid_reason == nullptr ? "?" : invalid_reason,
-                              pin_hr == nullptr ? 9999 : pin_hr->hrm_index());
-            }
-            prev_addr = obj_addr;
-            prev_new = nullptr;
-            continue;
-          }
-
-          oop obj = cast_to_oop(obj_addr);
-          if (obj->is_forwarded()) {
-            // Already relocated by an earlier entry; update root to forwardee.
-            oop fwd = obj->forwardee();
-            if (update_root) {
-              uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-              uintptr_t tags = raw & G1_OOP_TAG_MASK;
-              *root_p = cast_to_oop(tags | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK));
-              roots_updated++;
-            }
-            prev_addr = obj_addr;
-            prev_new = cast_from_oop<HeapWord*>(fwd);
-            continue;
-          }
-
-          size_t word_sz = 0;
-          if (!remote_eviction_is_relocatable_object(_g1h, obj_addr, &pin_hr,
-                                                     &word_sz, &invalid_reason)) {
-            if (pin_hr != nullptr) {
-              uint idx = pin_hr->hrm_index();
-              if (idx < num_regions && eviction_candidates[idx]) {
-                eviction_candidates[idx] = false;
-                if (root_guarded_regions != nullptr) {
-                  root_guarded_regions[idx] = true;
-                }
-                if (root_backoff_regions != nullptr) {
-                  root_backoff_regions[idx] = true;
-                }
-                pin_hr->clear_cold_destination();
-                regions_pinned++;
-                total_candidates--;
-                fallback_pinned++;
-              }
-            }
-            if (fallback_pinned <= 32) {
-              log_warning(gc)("Root-catch: pinned region for invalid object addr="
-                              PTR_FORMAT " reason=%s region=%u",
-                              obj_addr,
-                              invalid_reason == nullptr ? "?" : invalid_reason,
-                              pin_hr == nullptr ? 9999 : pin_hr->hrm_index());
-            }
-            prev_addr = obj_addr;
-            prev_new = nullptr;
-            continue;
-          }
-          if (root_catch == nullptr) {
-            root_catch = _g1h->allocate_fcr_region();
-            if (root_catch != nullptr) {
-              catch_top = root_catch->bottom();
-              if (first_root_catch_idx == (uint)-1) {
-                first_root_catch_idx = root_catch->hrm_index();
-              }
-              catch_regions++;
-            }
-          } else if (catch_top + word_sz > root_catch->end() &&
-                     catch_top != root_catch->bottom()) {
-            dirty_root_catch_region(_g1h, root_catch, catch_top);
-            root_catch = _g1h->allocate_fcr_region();
-            if (root_catch != nullptr) {
-              catch_top = root_catch->bottom();
-              catch_regions++;
-            }
-          }
-
-          if (root_catch == nullptr || catch_top + word_sz > root_catch->end()) {
-            catch_alloc_failed = true;
-            HeapRegion* hr = _g1h->heap_region_containing(obj);
-            uint idx = hr->hrm_index();
-            if (idx < num_regions && eviction_candidates[idx]) {
-              eviction_candidates[idx] = false;
-              if (root_guarded_regions != nullptr) {
-                root_guarded_regions[idx] = true;
-              }
-              if (root_backoff_regions != nullptr) {
-                root_backoff_regions[idx] = true;
-              }
-              regions_pinned++;
-              total_candidates--;
-              fallback_pinned++;
-            }
-            prev_addr = obj_addr;
-            prev_new = nullptr;
-            continue;
-          }
-
-          // Copy object to catch region.
-          Copy::aligned_disjoint_words((HeapWord*)obj_addr, catch_top, word_sz);
-          oop new_obj = cast_to_oop(catch_top);
-          root_catch->update_bot_for_obj(catch_top, word_sz);
-
-          // Install forwarding pointer in old location (Phase B/C/E check this).
-          obj->forward_to(new_obj);
-
-          // Update root (preserve tag bits).
-          if (update_root) {
-            uintptr_t raw = cast_from_oop<uintptr_t>(*root_p);
-            uintptr_t tags = raw & G1_OOP_TAG_MASK;
-            *root_p = cast_to_oop(tags | ((uintptr_t)catch_top & G1_OOP_ADDR_MASK));
-            roots_updated++;
-          }
-
-          // Rekey handle table (old_addr -> new_addr).
-          rmm->update_handle_for_evacuation(obj, new_obj);
-
-          prev_addr = obj_addr;
-          prev_new = catch_top;
-          catch_top += word_sz;
-          root_catch_words += word_sz;
-          relocated++;
-        }
-
-        if (root_catch != nullptr) {
-          if (catch_top == root_catch->bottom()) {
-            FreeRegionList tmp("tmp");
-            _g1h->free_region(root_catch, &tmp);
-          } else {
-            dirty_root_catch_region(_g1h, root_catch, catch_top);
-          }
-        }
-
-        if (relocated > 0 || fallback_pinned > 0 || catch_alloc_failed) {
-          uint log_first_idx = (first_root_catch_idx == (uint)-1) ? 0 : first_root_catch_idx;
-          log_info(gc)("Root-catch relocation: %d objects (%zuKB) relocated to %d catch regions "
-                       "(first=%u), %d roots updated, %d regions fallback-pinned, pins=%d "
-                       "capacity=%d grows=%d remote-anchor=%d",
-                       relocated, root_catch_words * HeapWordSize / K,
-                       catch_regions, log_first_idx, roots_updated,
-                       fallback_pinned, num_pins, pin_capacity, pin_grows,
-                       remote_anchor_seen);
-        }
-        if (catch_alloc_failed) {
-          log_warning(gc)("Root-catch: catch region allocation failed or object too large; "
-                          "fallback-pinned %d regions", fallback_pinned);
-        }
-
-        // Root-catch installs forwarding pointers in the old candidate
-        // regions. Update every LOCAL Handle that still points at one of
-        // those forwarding stubs, including duplicate dormant anchors.
-        rmm->fixup_all_local_handles();
-      }
       }
 
       (void)backoff_remote_eviction_guarded_regions(
@@ -3757,7 +3251,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           hr->clear_root_pinned();
         }
       }
-      FREE_C_HEAP_ARRAY(RootPinEntry, pins);
       if (root_guarded_regions != nullptr) {
         FREE_C_HEAP_ARRAY(bool, root_guarded_regions);
       }
@@ -3988,9 +3481,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
 
       // ---- Pre-E Safety Guard: remove candidate regions with dangling roots ----
-      // Root-catch should have relocated all root-referenced objects, but may
-      // miss some (catch region full, roots added during Phase B/C scanning).
-      // Any region with raw root oops MUST NOT be evicted — those roots bypass
+      // Any region with raw root oops MUST NOT be evicted: those roots bypass
       // the load barrier and would SIGSEGV on madvise'd pages.
       {
         class PreEvictionRootGuardClosure : public OopClosure {
@@ -4050,7 +3541,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        guard_cl.regions_guarded(), guard_cl.roots_found());
         }
 
-        if (pre_d_raw_stack_guard_ran && !G1RemoteUseRootCatchRelocation) {
+        if (pre_d_raw_stack_guard_ran) {
           log_info(gc)("Pre-E raw stack guard: skipped because Pre-D already "
                        "scanned stopped Java stacks and root-catch relocation "
                        "is disabled");

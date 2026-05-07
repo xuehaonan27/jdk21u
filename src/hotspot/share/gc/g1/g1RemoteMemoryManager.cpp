@@ -1739,9 +1739,7 @@ void G1RemoteMemoryManager::finalize_eviction(PreparedEviction* entry) {
   HeapRegion* hr = _g1h->heap_region_containing(entry->obj);
   if (hr != nullptr) {
     hr->set_has_classified_objects();
-    if (!G1RemoteSkipFillerOnCompleteEviction) {
-      hr->set_had_remote_eviction_fillers();
-    }
+    hr->set_had_remote_eviction_fillers();
   }
 
   CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(entry->obj), entry->word_size, false);
@@ -1770,13 +1768,7 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
 
   if (hr != nullptr) {
     hr->set_has_classified_objects();
-    if (!G1RemoteSkipFillerOnCompleteEviction) {
-      hr->set_had_remote_eviction_fillers();
-    }
-  }
-
-  if (G1RemoteSkipFillerOnCompleteEviction) {
-    return;
+    hr->set_had_remote_eviction_fillers();
   }
 
   for (int e = start; e < start + count; e++) {
@@ -2618,7 +2610,8 @@ public:
       return;
     }
 
-    // Root-catch relocated: object has forwarding pointer → redirect to new address
+    // Evacuation or an earlier guarded path installed a forwarding pointer.
+    // Redirect the reference to the current object address.
     if (target->is_forwarded()) {
       oop fwd = target->forwardee();
       uintptr_t tag_bits = raw & G1_OOP_TAG_MASK;
@@ -4670,7 +4663,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         return;
       }
 
-      // Root-catch relocated objects have forwarding pointers — OK
+      // Forwarded objects have already been redirected by the active GC path.
       if (target->is_forwarded()) return;
 
       HeapRegion* src_hr = (_cur_obj != nullptr && _g1h->is_in(_cur_obj))
