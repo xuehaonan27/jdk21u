@@ -245,6 +245,9 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
         }
         if (stale_raw) {
           G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+          if (rmm != nullptr && rmm->is_dense_segment_remote_addr(v)) {
+            return (oopDesc*)(G1_OOP_MANAGED_BIT | (v & G1_OOP_ADDR_MASK));
+          }
           RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(v);
           if (h != nullptr) {
             uintptr_t sa = h->load_state_and_addr_acquire();
@@ -297,6 +300,9 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   oopDesc* resolved = (oopDesc*)(v & G1_OOP_ADDR_MASK);
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  if (rmm != nullptr && rmm->is_dense_segment_remote_addr((uintptr_t)resolved)) {
+    return tagged;
+  }
   sample_touch_hotness(resolved, rmm);
   return resolved;
 JRT_END
@@ -1904,6 +1910,13 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
       }
       if (stale_clean) {
         G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+        if (rmm != nullptr && rmm->localize_dense_segment_for_addr(v)) {
+          log_debug(gc)("Resolved clean stale oop " PTR_FORMAT
+                        " from dense segment region %u",
+                        p2i((void*)v),
+                        hr == nullptr ? 9999 : hr->hrm_index());
+          return tagged;
+        }
         RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(v);
         if (h != nullptr) {
           uintptr_t sa = h->load_state_and_addr_acquire();
@@ -1937,6 +1950,14 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
     oopDesc* resolved = (oopDesc*)(v & G1_OOP_ADDR_MASK);
     G1CollectedHeap* g1h = G1CollectedHeap::heap();
     G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+    if (rmm != nullptr && rmm->is_dense_segment_remote_addr((uintptr_t)resolved)) {
+      if (!rmm->localize_dense_segment_for_addr((uintptr_t)resolved)) {
+        log_warning(gc)("resolve_fast_checks: dense segment fetch failed for "
+                        "direct oop " PTR_FORMAT,
+                        p2i(resolved));
+        return nullptr;
+      }
+    }
     sample_touch_hotness(resolved, rmm);
     return resolved;
   }

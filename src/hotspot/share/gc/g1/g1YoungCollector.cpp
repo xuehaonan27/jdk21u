@@ -1657,7 +1657,11 @@ static int refill_dense_eviction_candidates(G1CollectedHeap* g1h,
     RegionColdnessSample region_sample;
     (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
     if (!region_sample.dense_small_objects) continue;
-    if (!region_sample_allows_dense_object_eviction(region_sample)) continue;
+    if (rmm->dense_segments_enabled()) {
+      if (!rmm->can_evict_dense_segment_region(hr, nullptr)) continue;
+    } else if (!region_sample_allows_dense_object_eviction(region_sample)) {
+      continue;
+    }
 
     hr->set_cold_destination();
     eviction_candidates[i] = true;
@@ -2701,7 +2705,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        evict_target_bytes / M,
                        uncapped_evict_target_bytes / M,
                        cgroup_evict_target_bytes / M,
-                       G1RemoteAllowDenseObjectEviction ? "on" : "off");
+                       (G1RemoteAllowDenseObjectEviction ||
+                        (rmm != nullptr && rmm->dense_segments_enabled())) ? "on" : "off");
         }
       } else if (G1RemoteEvictionThreshold > 0) {
         // Legacy threshold mode: evict when total heap > threshold% of Xmx
@@ -2739,7 +2744,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t path2_dense_last_resort_bytes = 0;
         size_t path2_dense_last_resort_objects = 0;
         const bool allow_dense_object_granularity_eviction =
-          G1RemoteAllowDenseObjectEviction;
+          G1RemoteAllowDenseObjectEviction ||
+          (rmm != nullptr && rmm->dense_segments_enabled());
         size_t dense_skip_objects = 0;
         size_t dense_skip_evictable_objects = 0;
         size_t dense_skip_obj_arrays = 0;
@@ -2951,7 +2957,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (rmm != nullptr) {
               (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
             }
-            if (!region_sample_allows_dense_object_eviction(region_sample)) {
+            bool dense_region_ok = rmm != nullptr && rmm->dense_segments_enabled()
+                ? rmm->can_evict_dense_segment_region(hr, nullptr)
+                : region_sample_allows_dense_object_eviction(region_sample);
+            if (!dense_region_ok) {
               path2_regions_unevictable_sample_skipped++;
               dense_skip_objects += region_sample.object_count;
               dense_skip_evictable_objects += region_sample.evictable_object_count;
@@ -3739,7 +3748,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                    path1_candidates, path2_candidates, total_candidates, regions_pinned);
 
       // ---- Phase B: Ensure handles for all objects in candidate regions ----
-      {
+      if (rmm->dense_segments_enabled()) {
+        log_info(gc)("Phase B ensure handles: skipped for dense segment mode");
+      } else {
         Ticks phase_b_start = Ticks::now();
         uint nworkers = _g1h->workers()->active_workers();
 
@@ -4085,7 +4096,67 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
+      if (total_candidates > 0 && rmm->dense_segments_enabled()) {
+        Ticks dense_start = Ticks::now();
+        int dense_evicted_regions = 0;
+        int dense_skipped_regions = 0;
+        int dense_failed_regions = 0;
+        size_t dense_evicted_bytes = 0;
+
+        for (uint i = 0; i < num_regions; i++) {
+          if (!eviction_candidates[i]) continue;
+          HeapRegion* hr = _g1h->region_at_or_null(i);
+          if (hr == nullptr) {
+            eviction_candidates[i] = false;
+            dense_skipped_regions++;
+            continue;
+          }
+
+          const char* reason = nullptr;
+          size_t objects = 0;
+          if (!rmm->can_evict_dense_segment_region(hr, &reason, &objects)) {
+            eviction_candidates[i] = false;
+            hr->clear_cold_destination();
+            regions_kept_alive++;
+            dense_skipped_regions++;
+            log_debug(gc)("Dense segment kept region %u local: %s",
+                          hr->hrm_index(), reason != nullptr ? reason : "unknown");
+            continue;
+          }
+
+          size_t region_used = hr->used();
+          if (!rmm->evict_dense_segment_region(hr)) {
+            eviction_candidates[i] = false;
+            hr->clear_cold_destination();
+            regions_kept_alive++;
+            dense_failed_regions++;
+            continue;
+          }
+
+          total_evicted += (int)objects;
+          regions_evicted++;
+          dense_evicted_regions++;
+          dense_evicted_bytes += region_used;
+          total_freed_bytes += region_used;
+          rmm->invalidate_fcr_if_freed(hr);
+          hr->clear_cardtable();
+          _g1h->free_region(hr, &freed_list);
+          ::madvise((char*)hr->bottom(), HeapRegion::GrainBytes, MADV_DONTNEED);
+          os::guard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+          hr->set_evict_guarded();
+          freed_regions++;
+        }
+
+        total_candidates = 0;
+        double dense_ms = (Ticks::now() - dense_start).seconds() * 1000.0;
+        log_info(gc)("Dense segment Phase E: %.1fms (%d regions evicted, "
+                     "%d skipped, %d failed, " SIZE_FORMAT "KB)",
+                     dense_ms, dense_evicted_regions, dense_skipped_regions,
+                     dense_failed_regions, dense_evicted_bytes / K);
+      }
+
       // ---- Phase E: Evict non-pinned candidates (batched) ----
+      if (total_candidates > 0) {
       {
       Ticks phase_e_start = Ticks::now();
 

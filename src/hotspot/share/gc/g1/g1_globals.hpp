@@ -306,6 +306,13 @@
           "object-granularity fetch has poor economics for dense Spark "    \
           "regions and this path is only for controlled experiments.")      \
                                                                             \
+  product(bool, G1RemoteUseDenseSegments, false, DIAGNOSTIC,                \
+          "Evict complete dense old regions as contiguous remote segments "  \
+          "instead of per-object remote handles. Incoming heap refs are "    \
+          "tagged as direct managed oops and segment fetch restores the "    \
+          "same virtual address range in place. Experimental and disabled "  \
+          "by default.")                                                    \
+                                                                            \
   product(bool, G1RemoteUseCgroupPressure, false, DIAGNOSTIC,               \
           "In LocalMemoryRatio mode, include cgroup anon/RSS memory usage "  \
           "in tiered remote eviction pressure decisions. File cache is "     \

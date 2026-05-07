@@ -241,6 +241,10 @@ bool HeapRegionManager::is_free(HeapRegion* hr) const {
 }
 #endif
 
+void HeapRegionManager::remove_from_free_list(HeapRegion* hr) {
+  _free_list.remove_starting_at(hr, 1);
+}
+
 HeapRegion* HeapRegionManager::new_heap_region(uint hrm_index) {
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   HeapWord* bottom = g1h->bottom_addr_for_region(hrm_index);

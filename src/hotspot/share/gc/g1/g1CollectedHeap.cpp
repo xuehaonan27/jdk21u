@@ -2786,6 +2786,55 @@ void G1CollectedHeap::decrement_summary_bytes(size_t bytes) {
   decrease_used(bytes);
 }
 
+bool G1CollectedHeap::unquarantine_evict_guarded_region(HeapRegion* hr) {
+  if (hr == nullptr || !hr->is_free() || !hr->is_evict_guarded()) {
+    log_warning(gc)("Dense segment unquarantine rejected: region=" PTR_FORMAT
+                    " free=%d guarded=%d",
+                    p2i(hr), hr != nullptr && hr->is_free() ? 1 : 0,
+                    hr != nullptr && hr->is_evict_guarded() ? 1 : 0);
+    return false;
+  }
+
+  {
+    MutexLocker x(FreeList_lock, Mutex::_no_safepoint_check_flag);
+    _hrm.remove_from_free_list(hr);
+  }
+
+  if (!os::unguard_memory((char*)hr->bottom(), HeapRegion::GrainBytes)) {
+    log_warning(gc)("Dense segment restore: os::unguard_memory failed for "
+                    "region %u [" PTR_FORMAT ", " PTR_FORMAT ")",
+                    hr->hrm_index(), p2i(hr->bottom()), p2i(hr->end()));
+    MutexLocker x(FreeList_lock, Mutex::_no_safepoint_check_flag);
+    _hrm.insert_into_free_list(hr);
+    return false;
+  }
+
+  hr->clear_evict_guarded();
+  hr->clear_rss_trimmed_free();
+  hr->reset_pre_dummy_top();
+  return true;
+}
+
+void G1CollectedHeap::publish_restored_evict_guarded_region(HeapRegion* hr,
+                                                            size_t used_bytes) {
+  assert(hr != nullptr, "region required");
+  assert(hr->is_free(), "region should still be free while bytes are copied");
+  assert(!hr->is_evict_guarded(), "region should already be unguarded");
+  assert(used_bytes > 0 && used_bytes <= HeapRegion::GrainBytes,
+         "invalid dense segment size");
+  assert(is_aligned(used_bytes, HeapWordSize), "segment size must be word aligned");
+
+  hr->set_top(hr->bottom() + used_bytes / HeapWordSize);
+  hr->set_old();
+  hr->init_top_at_mark_start();
+
+  {
+    MutexLocker x(OldSets_lock, Mutex::_no_safepoint_check_flag);
+    old_set_add(hr);
+  }
+  increase_used(used_bytes);
+}
+
 void G1CollectedHeap::clear_eden() {
   _eden.clear();
 }

@@ -192,6 +192,10 @@ public:
   // Insert the given region into the free region list.
   inline void insert_into_free_list(HeapRegion* hr);
 
+  // Remove the given single region from the free region list. The caller is
+  // responsible for changing the region type/accounting afterwards.
+  void remove_from_free_list(HeapRegion* hr);
+
   // Rebuild the free region list from scratch.
   void rebuild_free_list(WorkerThreads* workers);
 

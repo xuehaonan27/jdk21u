@@ -65,6 +65,14 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _last_phase_c_tagged(0),
     _last_phase_c_no_handle(0),
     _last_phase_c_untaggable(0),
+    _dense_segments(nullptr),
+    _dense_segment_capacity(0),
+    _dense_segment_lock(0),
+    _dense_segment_next_id(1),
+    _dense_segment_evict_success(0),
+    _dense_segment_evict_failures(0),
+    _dense_segment_fetch_success(0),
+    _dense_segment_fetch_failures(0),
     _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
     _remote_roots_capacity(0),
     _cross_roots_count(0),
@@ -489,6 +497,10 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
   uint64_t fetch_prefetch_installed = Atomic::load(&_fetch_prefetch_installed);
   uint64_t fetch_prefetch_raced = Atomic::load(&_fetch_prefetch_raced);
   uint64_t fetch_prefetch_failed = Atomic::load(&_fetch_prefetch_failed);
+  uint64_t dense_evict_success = Atomic::load(&_dense_segment_evict_success);
+  uint64_t dense_evict_failures = Atomic::load(&_dense_segment_evict_failures);
+  uint64_t dense_fetch_success = Atomic::load(&_dense_segment_fetch_success);
+  uint64_t dense_fetch_failures = Atomic::load(&_dense_segment_fetch_failures);
 
   if (resolve_fast_local == 0 && resolve_fast_remote == 0 &&
       resolve_fast_fetching == 0 && resolve_fast_dead == 0 &&
@@ -498,7 +510,9 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
       fetch_wait_hard == 0 && fetch_wait_loops == 0 &&
       fetch_batch_requests == 0 && fetch_batch_returned == 0 &&
       fetch_batch_installed == 0 && fetch_prefetch_installed == 0 &&
-      fetch_prefetch_raced == 0 && fetch_prefetch_failed == 0) {
+      fetch_prefetch_raced == 0 && fetch_prefetch_failed == 0 &&
+      dense_evict_success == 0 && dense_evict_failures == 0 &&
+      dense_fetch_success == 0 && dense_fetch_failures == 0) {
     return;
   }
 
@@ -520,6 +534,9 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                " inst=" UINT64_FORMAT " pref=" UINT64_FORMAT
                " raced=" UINT64_FORMAT " fail=" UINT64_FORMAT
                " pref_bytes=" UINT64_FORMAT " total_ms=%.1f)"
+               " dense_segment(evict_ok=" UINT64_FORMAT
+               " evict_fail=" UINT64_FORMAT " fetch_ok=" UINT64_FORMAT
+               " fetch_fail=" UINT64_FORMAT ")"
                " waits(slow=" UINT64_FORMAT " no_safepoint=" UINT64_FORMAT
                " hard=" UINT64_FORMAT " loops=" UINT64_FORMAT ")",
                resolve_fast_local,
@@ -542,6 +559,10 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                fetch_prefetch_failed,
                fetch_prefetch_words * HeapWordSize,
                batch_ms,
+               dense_evict_success,
+               dense_evict_failures,
+               dense_fetch_success,
+               dense_fetch_failures,
                fetch_wait_slow,
                fetch_wait_no_safepoint,
                fetch_wait_hard,
@@ -662,6 +683,11 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     _fast_phase_c_source_hint_capacity = 0;
     _fast_phase_c_source_hint_count = 0;
   }
+  if (_dense_segments != nullptr) {
+    FREE_C_HEAP_ARRAY(DenseSegmentEntry, _dense_segments);
+    _dense_segments = nullptr;
+    _dense_segment_capacity = 0;
+  }
 
   // Free edge tables (chained hash)
   for (size_t i = 0; i < EDGE_TABLE_BUCKETS; i++) {
@@ -763,6 +789,344 @@ bool G1RemoteMemoryManager::remember_fast_phase_c_source_hint(uint region_idx) {
                G1RemoteFastPhaseCSourceHintMaxRegions);
   fast_phase_c_source_hint_unlock();
   return true;
+}
+
+bool G1RemoteMemoryManager::ensure_dense_segment_capacity(uint num_regions) {
+  if (num_regions <= _dense_segment_capacity) {
+    return true;
+  }
+  uint new_cap = MAX2(num_regions, _dense_segment_capacity * 2);
+  if (new_cap < 1024) {
+    new_cap = 1024;
+  }
+  DenseSegmentEntry* entries = NEW_C_HEAP_ARRAY(DenseSegmentEntry, new_cap, mtGC);
+  for (uint i = 0; i < new_cap; i++) {
+    entries[i].clear();
+  }
+  if (_dense_segments != nullptr) {
+    for (uint i = 0; i < _dense_segment_capacity; i++) {
+      entries[i] = _dense_segments[i];
+    }
+    FREE_C_HEAP_ARRAY(DenseSegmentEntry, _dense_segments);
+  }
+  _dense_segments = entries;
+  _dense_segment_capacity = new_cap;
+  return true;
+}
+
+bool G1RemoteMemoryManager::dense_segments_enabled() const {
+  return G1RemoteUseDenseSegments &&
+         _backend != nullptr &&
+         _backend->supports_segments();
+}
+
+bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
+                                                           const char** reason,
+                                                           size_t* object_count) {
+  if (reason != nullptr) *reason = "ok";
+  if (object_count != nullptr) *object_count = 0;
+  if (!dense_segments_enabled()) {
+    if (reason != nullptr) *reason = "disabled";
+    return false;
+  }
+  if (hr == nullptr || hr->is_free() || hr->is_empty() || hr->is_evict_guarded()) {
+    if (reason != nullptr) *reason = "bad-region-state";
+    return false;
+  }
+  if (!hr->is_old() || hr->is_humongous() || hr->is_continues_humongous() ||
+      hr->is_fetch_cache()) {
+    if (reason != nullptr) *reason = "unsupported-region-kind";
+    return false;
+  }
+  if (hr->used() == 0 || hr->used() > HeapRegion::GrainBytes) {
+    if (reason != nullptr) *reason = "invalid-used";
+    return false;
+  }
+
+  int local_handles = count_local_handles_in_region(hr, 0);
+  if (local_handles > 0) {
+    if (reason != nullptr) *reason = "local-handles";
+    return false;
+  }
+
+  size_t objects = 0;
+  HeapWord* p = hr->bottom();
+  HeapWord* region_end = hr->end();
+  while (p < hr->top()) {
+    if (p < hr->bottom() || p >= region_end) {
+      if (reason != nullptr) *reason = "parse-out-of-region";
+      return false;
+    }
+    oop obj = cast_to_oop(p);
+    if (obj->is_forwarded()) {
+      if (reason != nullptr) *reason = "forwarded";
+      return false;
+    }
+    Klass* k = obj->klass_or_null();
+    if (k == nullptr) {
+      if (reason != nullptr) *reason = "null-klass";
+      return false;
+    }
+    size_t sz = obj->size_given_klass(k);
+    if (sz == 0 || sz > (size_t)(region_end - p)) {
+      if (reason != nullptr) *reason = "bad-size";
+      return false;
+    }
+    if (!G1CollectedHeap::is_obj_filler(obj)) {
+      if (!k->is_typeArray_klass()) {
+        if (reason != nullptr) *reason = "contains-oop-fields";
+        return false;
+      }
+      objects++;
+    }
+    p += sz;
+  }
+  if (p != hr->top() || objects == 0) {
+    if (reason != nullptr) *reason = "empty-or-unparseable";
+    return false;
+  }
+  if (object_count != nullptr) *object_count = objects;
+  return true;
+}
+
+bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr, uint32_t flags) {
+  const char* reason = nullptr;
+  size_t objects = 0;
+  if (!can_evict_dense_segment_region(hr, &reason, &objects)) {
+    log_debug(gc)("Dense segment evict rejected: region=%u reason=%s",
+                  hr != nullptr ? hr->hrm_index() : (uint)-1,
+                  reason != nullptr ? reason : "unknown");
+    return false;
+  }
+  uint region_idx = hr->hrm_index();
+  if (!ensure_dense_segment_capacity(region_idx + 1)) {
+    Atomic::inc(&_dense_segment_evict_failures);
+    return false;
+  }
+
+  uint64_t segment_id = 0;
+  dense_segment_lock();
+  DenseSegmentEntry* entry = &_dense_segments[region_idx];
+  if (entry->state == DenseSegmentRemote || entry->state == DenseSegmentFetching) {
+    dense_segment_unlock();
+    Atomic::inc(&_dense_segment_evict_failures);
+    log_warning(gc)("Dense segment evict rejected: region=%u already has "
+                    "segment state=%u id=" UINT64_FORMAT,
+                    region_idx, entry->state, entry->segment_id);
+    return false;
+  }
+  segment_id = ((uint64_t)region_idx << 32) | (_dense_segment_next_id++);
+  dense_segment_unlock();
+
+  size_t byte_size = hr->used();
+  bool ok = _backend->evict_segment(segment_id, (uintptr_t)hr->bottom(),
+                                    hr->bottom(), byte_size, flags);
+  if (!ok) {
+    Atomic::inc(&_dense_segment_evict_failures);
+    return false;
+  }
+
+  dense_segment_lock();
+  entry = &_dense_segments[region_idx];
+  entry->segment_id = segment_id;
+  entry->base = (uintptr_t)hr->bottom();
+  entry->byte_size = byte_size;
+  entry->flags = flags;
+  Atomic::release_store(&entry->state, (uint32_t)DenseSegmentRemote);
+  dense_segment_unlock();
+
+  Atomic::inc(&_dense_segment_evict_success);
+  log_info(gc)("Dense segment evicted: region=%u segment=" UINT64_FORMAT
+               " objects=" SIZE_FORMAT " bytes=" SIZE_FORMAT
+               " [" PTR_FORMAT ", " PTR_FORMAT ")",
+               region_idx, segment_id, objects, byte_size,
+               p2i(hr->bottom()), p2i(hr->top()));
+  return true;
+}
+
+bool G1RemoteMemoryManager::is_dense_segment_remote_addr(uintptr_t addr) const {
+  if (!G1RemoteUseDenseSegments || _dense_segments == nullptr ||
+      _g1h == nullptr || !_g1h->is_in_reserved((void*)addr)) {
+    return false;
+  }
+  HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)addr);
+  if (hr == nullptr) {
+    return false;
+  }
+  uint idx = hr->hrm_index();
+  if (idx >= _dense_segment_capacity) {
+    return false;
+  }
+  const DenseSegmentEntry* entry = &_dense_segments[idx];
+  uint32_t state = entry->state;
+  return entry->segment_id != 0 &&
+         (state == DenseSegmentRemote || state == DenseSegmentFetching) &&
+         addr >= entry->base &&
+         addr < entry->base + entry->byte_size;
+}
+
+static bool rebuild_dense_segment_bot(HeapRegion* hr, size_t byte_size) {
+  HeapWord* p = hr->bottom();
+  HeapWord* top = hr->bottom() + byte_size / HeapWordSize;
+  HeapWord* region_end = hr->end();
+  while (p < top) {
+    oop obj = cast_to_oop(p);
+    Klass* k = obj->klass_or_null();
+    if (k == nullptr) {
+      log_warning(gc)("Dense segment restore: null klass at " PTR_FORMAT
+                      " in region %u", p2i(p), hr->hrm_index());
+      return false;
+    }
+    size_t sz = obj->size_given_klass(k);
+    if (sz == 0 || sz > (size_t)(region_end - p)) {
+      log_warning(gc)("Dense segment restore: bad object size " SIZE_FORMAT
+                      " at " PTR_FORMAT " in region %u",
+                      sz, p2i(p), hr->hrm_index());
+      return false;
+    }
+    hr->update_bot_for_obj(p, sz);
+    p += sz;
+  }
+  return p == top;
+}
+
+static void dirty_dense_segment_cards(G1CollectedHeap* g1h, HeapRegion* hr) {
+  if (g1h == nullptr || hr == nullptr || hr->bottom() >= hr->top()) {
+    return;
+  }
+  G1CardTable* ct = g1h->card_table();
+  CardTable::CardValue* start_card = ct->byte_for(hr->bottom());
+  CardTable::CardValue* end_card = ct->byte_for(hr->top() - 1) + 1;
+  memset(start_card, CardTable::dirty_card_val(), end_card - start_card);
+
+  G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
+  G1DirtyCardQueue tmp_queue(&dcqs);
+  for (CardTable::CardValue* card = start_card; card < end_card; card++) {
+    dcqs.enqueue(tmp_queue, card);
+  }
+  dcqs.flush_queue(tmp_queue);
+}
+
+bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
+  if (!G1RemoteUseDenseSegments || _dense_segments == nullptr ||
+      _g1h == nullptr || !_g1h->is_in_reserved((void*)addr)) {
+    return false;
+  }
+
+  HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)addr);
+  if (hr == nullptr) {
+    return false;
+  }
+  uint idx = hr->hrm_index();
+  if (idx >= _dense_segment_capacity) {
+    return false;
+  }
+
+  uint64_t segment_id = 0;
+  uintptr_t base = 0;
+  size_t byte_size = 0;
+  uint32_t flags = 0;
+  SpinYield yield;
+
+  while (true) {
+    dense_segment_lock();
+    DenseSegmentEntry* entry = &_dense_segments[idx];
+    uint32_t state = Atomic::load(&entry->state);
+    bool addr_in_segment = entry->segment_id != 0 &&
+                           addr >= entry->base &&
+                           addr < entry->base + entry->byte_size;
+    if (!addr_in_segment || state == DenseSegmentNone) {
+      dense_segment_unlock();
+      return false;
+    }
+    if (state == DenseSegmentLocal) {
+      dense_segment_unlock();
+      return true;
+    }
+    if (state == DenseSegmentRemote) {
+      segment_id = entry->segment_id;
+      base = entry->base;
+      byte_size = entry->byte_size;
+      flags = entry->flags;
+      Atomic::release_store(&entry->state, (uint32_t)DenseSegmentFetching);
+      dense_segment_unlock();
+      break;
+    }
+    dense_segment_unlock();
+    yield.wait();
+  }
+
+  void* buf = os::malloc(byte_size, mtGC);
+  if (buf == nullptr) {
+    dense_segment_lock();
+    DenseSegmentEntry* entry = &_dense_segments[idx];
+    if (entry->segment_id == segment_id &&
+        Atomic::load(&entry->state) == DenseSegmentFetching) {
+      Atomic::release_store(&entry->state, (uint32_t)DenseSegmentRemote);
+    }
+    dense_segment_unlock();
+    Atomic::inc(&_dense_segment_fetch_failures);
+    return false;
+  }
+
+  uintptr_t fetched_base = 0;
+  size_t fetched_bytes = 0;
+  uint32_t fetched_flags = 0;
+  bool ok = _backend != nullptr &&
+            _backend->fetch_segment(segment_id, &fetched_base, buf, byte_size,
+                                    &fetched_bytes, &fetched_flags);
+  if (ok && (fetched_base != base || fetched_bytes != byte_size ||
+             fetched_flags != flags)) {
+    log_warning(gc)("Dense segment fetch metadata mismatch: segment="
+                    UINT64_FORMAT " expected_base=" PTR_FORMAT
+                    " actual_base=" PTR_FORMAT " expected_bytes="
+                    SIZE_FORMAT " actual_bytes=" SIZE_FORMAT
+                    " expected_flags=%u actual_flags=%u",
+                    segment_id, p2i((void*)base), p2i((void*)fetched_base),
+                    byte_size, fetched_bytes, flags, fetched_flags);
+    ok = false;
+  }
+
+  if (ok) {
+    hr = _g1h->region_at_or_null(idx);
+    ok = hr != nullptr &&
+         _g1h->unquarantine_evict_guarded_region(hr);
+  }
+  if (ok) {
+    memcpy(hr->bottom(), buf, fetched_bytes);
+    bool parse_ok = rebuild_dense_segment_bot(hr, fetched_bytes);
+    guarantee(parse_ok, "Dense segment restore produced an unparseable region");
+  }
+  if (ok) {
+    _g1h->publish_restored_evict_guarded_region(hr, fetched_bytes);
+  }
+  if (ok) {
+    dirty_dense_segment_cards(_g1h, hr);
+    _backend->discard_segment(segment_id);
+  }
+
+  os::free(buf);
+
+  dense_segment_lock();
+  DenseSegmentEntry* entry = &_dense_segments[idx];
+  if (entry->segment_id == segment_id) {
+    Atomic::release_store(&entry->state,
+                          (uint32_t)(ok ? DenseSegmentLocal : DenseSegmentRemote));
+  }
+  dense_segment_unlock();
+
+  if (ok) {
+    Atomic::inc(&_dense_segment_fetch_success);
+    log_info(gc)("Dense segment localized: region=%u segment=" UINT64_FORMAT
+                 " bytes=" SIZE_FORMAT " addr=" PTR_FORMAT,
+                 idx, segment_id, fetched_bytes, p2i((void*)addr));
+  } else {
+    Atomic::inc(&_dense_segment_fetch_failures);
+    log_warning(gc)("Dense segment fetch failed: region=%u segment="
+                    UINT64_FORMAT " addr=" PTR_FORMAT,
+                    idx, segment_id, p2i((void*)addr));
+  }
+  return ok;
 }
 
 size_t G1RemoteMemoryManager::sim_remote_evict(oop obj, size_t word_size, Klass* klass) {
@@ -2143,6 +2507,14 @@ public:
       }
     }
 
+    if (_rmm->dense_segments_enabled() && target_klass != nullptr &&
+        target_klass->is_typeArray_klass()) {
+      *(uintptr_t*)p = G1_OOP_MANAGED_BIT |
+                       (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
+      _tagged++;
+      return;
+    }
+
     RemoteHandle* h = _rmm->handle_for(target);
     if (h != nullptr) {
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
@@ -3003,36 +3375,58 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
 
 int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_workers) {
   class UntagClosure : public BasicOopIterateClosure {
+    G1CollectedHeap* _g1h;
     G1RemoteRollbackDirtyCards* _dirty_cards;
     int _untagged;
   public:
-    UntagClosure(G1RemoteRollbackDirtyCards* dirty_cards)
-      : _dirty_cards(dirty_cards), _untagged(0) {}
+    UntagClosure(G1CollectedHeap* g1h, G1RemoteRollbackDirtyCards* dirty_cards)
+      : _g1h(g1h), _dirty_cards(dirty_cards), _untagged(0) {}
 
     virtual void do_oop(oop* p) {
       uintptr_t raw = *(uintptr_t*)p;
       if (raw == 0) return;
-      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) !=
-          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+      bool shared = (raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+                    (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT);
+      bool direct = (raw & G1_OOP_MANAGED_BIT) != 0 &&
+                    (raw & G1_OOP_INDIRECT_BIT) == 0;
+      if (!shared && !direct) return;
 
-      RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
-      uintptr_t sa = h->load_state_and_addr_acquire();
-      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-      if (state == REMOTE_HANDLE_LOCAL) {
+      if (shared) {
+        RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+        uintptr_t sa = h->load_state_and_addr_acquire();
+        uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+        if (state != REMOTE_HANDLE_LOCAL) return;
         uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
         *(uintptr_t*)p = addr;
         if (_dirty_cards != nullptr) {
           _dirty_cards->dirty_field(p);
         }
         _untagged++;
+        return;
       }
+
+      uintptr_t addr = raw & G1_OOP_ADDR_MASK;
+      if (!g1_remote_oop_is_aligned(addr) ||
+          _g1h == nullptr ||
+          !_g1h->is_in_reserved((void*)addr)) {
+        return;
+      }
+      HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)addr);
+      if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+        return;
+      }
+      *(uintptr_t*)p = addr;
+      if (_dirty_cards != nullptr) {
+        _dirty_cards->dirty_field(p);
+      }
+      _untagged++;
     }
     virtual void do_oop(narrowOop* p) { }
     int untagged() const { return _untagged; }
   };
 
   G1RemoteRollbackDirtyCards dirty_cards(_g1h);
-  UntagClosure cl(&dirty_cards);
+  UntagClosure cl(_g1h, &dirty_cards);
   for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
     HeapRegion* hr = _g1h->region_at_or_null(i);
     if (hr == nullptr) continue;
@@ -3295,6 +3689,9 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       // Shared oops (bits 63+62) already go through a Handle — OK.
       if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
           (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
+      bool dense_direct_ref = _rmm->dense_segments_enabled() &&
+                              (raw & G1_OOP_MANAGED_BIT) != 0 &&
+                              (raw & G1_OOP_INDIRECT_BIT) == 0;
 
       uintptr_t target_addr;
       if ((raw >> 63) != 0) {
@@ -3316,6 +3713,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       oop target = cast_to_oop((HeapWord*)target_addr);
       uint idx = target_hr->hrm_index();
       if (idx >= _num_regions || !_eviction_set[idx]) return;
+      if (dense_direct_ref) return;
 
       Klass* target_klass = nullptr;
       if (!remote_eviction_valid_local_oop(_g1h, target, target_hr, &target_klass)) {

@@ -762,8 +762,48 @@ private:
   int       _last_phase_c_tagged;
   int       _last_phase_c_no_handle;
   int       _last_phase_c_untaggable;
+
+  enum DenseSegmentState : uint32_t {
+    DenseSegmentNone     = 0,
+    DenseSegmentRemote   = 1,
+    DenseSegmentFetching = 2,
+    DenseSegmentLocal    = 3
+  };
+
+  struct DenseSegmentEntry {
+    uint64_t          segment_id;
+    uintptr_t         base;
+    size_t            byte_size;
+    uint32_t          flags;
+    volatile uint32_t state;
+
+    void clear() {
+      segment_id = 0;
+      base = 0;
+      byte_size = 0;
+      flags = 0;
+      state = DenseSegmentNone;
+    }
+  };
+
+  DenseSegmentEntry* _dense_segments;
+  uint               _dense_segment_capacity;
+  volatile int       _dense_segment_lock;
+  uint64_t           _dense_segment_next_id;
+  volatile uint64_t  _dense_segment_evict_success;
+  volatile uint64_t  _dense_segment_evict_failures;
+  volatile uint64_t  _dense_segment_fetch_success;
+  volatile uint64_t  _dense_segment_fetch_failures;
+
   void ensure_eviction_backoff_capacity(uint num_regions);
   void ensure_fast_phase_c_source_hint_capacity(uint num_regions);
+  bool ensure_dense_segment_capacity(uint num_regions);
+  void dense_segment_lock() {
+    while (Atomic::cmpxchg(&_dense_segment_lock, 0, 1) != 0) { /* spin */ }
+  }
+  void dense_segment_unlock() {
+    Atomic::release_store(&_dense_segment_lock, 0);
+  }
   void record_phase_c_counts(int tagged, int no_handle, int untaggable) {
     _last_phase_c_tagged = tagged;
     _last_phase_c_no_handle = no_handle;
@@ -1017,6 +1057,12 @@ public:
   bool is_fast_phase_c_source_hint(uint region_idx) const;
   bool remember_fast_phase_c_source_hint(uint region_idx);
   uint fast_phase_c_source_hint_count() const { return _fast_phase_c_source_hint_count; }
+  bool dense_segments_enabled() const;
+  bool can_evict_dense_segment_region(HeapRegion* hr, const char** reason,
+                                      size_t* object_count = nullptr);
+  bool evict_dense_segment_region(HeapRegion* hr, uint32_t flags = 0);
+  bool is_dense_segment_remote_addr(uintptr_t addr) const;
+  bool localize_dense_segment_for_addr(uintptr_t addr);
 
   // Determine eviction threshold: objects at or above this distance are cold.
   // Returns the distance threshold, or HOTNESS_LEVELS if nothing to evict.
