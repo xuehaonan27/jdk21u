@@ -497,6 +497,18 @@
           "pre-scan even when the boolean flag is enabled.")                  \
           range(0, 4096)                                                      \
                                                                             \
+  product(uint, G1RemoteObjArrayContainerPrescanCandidateWindow, 4, DIAGNOSTIC, \
+          "For each eviction candidate, scan old source regions within this "  \
+          "region distance before any blind fallback scan. 0 disables this "   \
+          "candidate-neighborhood pass.")                                      \
+          range(0, 128)                                                       \
+                                                                            \
+  product(uint, G1RemoteObjArrayContainerPrescanLowPrefixRegions, 0, DIAGNOSTIC, \
+          "Maximum low-index old source regions scanned as a blind fallback "  \
+          "after source hints and candidate-neighborhood scans. 0 disables "   \
+          "the blind fallback.")                                               \
+          range(0, 4096)                                                      \
+                                                                            \
   product(size_t, G1RemoteObjArrayContainerPrescanMaxElements, 1*M, DIAGNOSTIC, \
           "Maximum object-array elements inspected by "                       \
           "G1RemoteUseObjArrayContainerPrescan in one GC. 0 disables the "     \

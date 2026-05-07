@@ -3444,15 +3444,37 @@ int G1RemoteMemoryManager::prescan_old_objarray_sources_to_eviction_set(
 
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
   ObjArrayContainerPrescanClosure cl(this, _g1h, eviction_set, num_regions);
-  uint regions_scanned = 0;
+  bool* scanned_sources = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+  memset(scanned_sources, 0, num_regions * sizeof(bool));
 
-  auto scan_source_region = [&](uint i) -> bool {
+  uint candidate_regions = 0;
+  for (uint i = 0; i < num_regions; i++) {
+    if (eviction_set[i]) {
+      candidate_regions++;
+    }
+  }
+
+  uint regions_scanned = 0;
+  uint hint_regions_scanned = 0;
+  uint neighbor_regions_scanned = 0;
+  uint fallback_regions_scanned = 0;
+  bool region_limit_reached = false;
+
+  auto scan_source_region = [&](uint i, uint* pass_counter) -> bool {
     if (i >= num_regions) {
       return false;
     }
+    if (cl.limit_reached()) {
+      return true;
+    }
     if (regions_scanned >= G1RemoteObjArrayContainerPrescanMaxRegions) {
+      region_limit_reached = true;
+      return true;
+    }
+    if (scanned_sources[i]) {
       return false;
     }
+    scanned_sources[i] = true;
 
     HeapRegion* hr = _g1h->region_at_or_null(i);
     if (hr == nullptr) return false;
@@ -3460,11 +3482,18 @@ int G1RemoteMemoryManager::prescan_old_objarray_sources_to_eviction_set(
     if (hr->is_young() || hr->is_continues_humongous()) return false;
     if (eviction_set[i]) return false;
     if (!hr->is_old() && !hr->is_starts_humongous()) return false;
+    if (regions_scanned >= G1RemoteObjArrayContainerPrescanMaxRegions) {
+      region_limit_reached = true;
+      return false;
+    }
 
     cl.set_source_region(i);
     remote_eviction_scan_region_objects(hr, bitmap,
                                         "ObjArray container pre-scan", &cl);
     regions_scanned++;
+    if (pass_counter != nullptr) {
+      (*pass_counter)++;
+    }
     return cl.limit_reached();
   };
 
@@ -3472,33 +3501,73 @@ int G1RemoteMemoryManager::prescan_old_objarray_sources_to_eviction_set(
     if (!is_fast_phase_c_source_hint(i)) {
       continue;
     }
-    if (scan_source_region(i)) {
+    if (scan_source_region(i, &hint_regions_scanned)) {
       break;
     }
   }
 
-  if (!cl.limit_reached()) {
-    for (uint i = 0; i < num_regions; i++) {
-      if (is_fast_phase_c_source_hint(i)) {
+  uint window = G1RemoteObjArrayContainerPrescanCandidateWindow;
+  if (!cl.limit_reached() && !region_limit_reached && window > 0) {
+    for (uint candidate_idx = 0; candidate_idx < num_regions; candidate_idx++) {
+      if (!eviction_set[candidate_idx]) {
         continue;
       }
-      if (scan_source_region(i)) {
+
+      for (uint distance = 1; distance <= window; distance++) {
+        if (candidate_idx >= distance) {
+          if (scan_source_region(candidate_idx - distance,
+                                 &neighbor_regions_scanned)) {
+            break;
+          }
+        }
+
+        if (distance < num_regions - candidate_idx) {
+          uint upper_idx = candidate_idx + distance;
+          if (scan_source_region(upper_idx, &neighbor_regions_scanned)) {
+            break;
+          }
+        }
+      }
+
+      if (cl.limit_reached() || region_limit_reached) {
         break;
       }
     }
   }
 
-  if (regions_scanned > 0 || cl.removed_candidates() > 0) {
-    log_info(gc)("ObjArray container pre-scan: regions=%u arrays=%d elements="
-                 SIZE_FORMAT " candidate_hits=%d hints=%d unsafe=%d "
-                 "hint_failures=%d removed=%d limit=%s",
-                 regions_scanned, cl.arrays_scanned(), cl.elements_scanned(),
-                 cl.candidate_hits(), cl.source_hints(), cl.unsafe_hits(),
-                 cl.hint_failures(), cl.removed_candidates(),
-                 cl.limit_reached() ? "yes" : "no");
+  uint fallback_limit = MIN2(num_regions,
+                             G1RemoteObjArrayContainerPrescanLowPrefixRegions);
+  if (!cl.limit_reached() && !region_limit_reached && fallback_limit > 0) {
+    for (uint i = 0; i < fallback_limit; i++) {
+      if (is_fast_phase_c_source_hint(i)) {
+        continue;
+      }
+      if (scan_source_region(i, &fallback_regions_scanned)) {
+        break;
+      }
+    }
   }
 
-  return cl.removed_candidates();
+  if (candidate_regions > 0 || regions_scanned > 0 ||
+      cl.removed_candidates() > 0) {
+    log_info(gc)("ObjArray container pre-scan: candidates=%u regions=%u "
+                 "hint_regions=%u neighbor_regions=%u fallback_regions=%u "
+                 "arrays=%d elements=" SIZE_FORMAT " candidate_hits=%d "
+                 "hints=%d unsafe=%d hint_failures=%d removed=%d "
+                 "element_limit=%s region_limit=%s window=%u fallback_limit=%u",
+                 candidate_regions, regions_scanned, hint_regions_scanned,
+                 neighbor_regions_scanned, fallback_regions_scanned,
+                 cl.arrays_scanned(), cl.elements_scanned(),
+                 cl.candidate_hits(), cl.source_hints(), cl.unsafe_hits(),
+                 cl.hint_failures(), cl.removed_candidates(),
+                 cl.limit_reached() ? "yes" : "no",
+                 region_limit_reached ? "yes" : "no",
+                 window, fallback_limit);
+  }
+
+  int removed = cl.removed_candidates();
+  FREE_C_HEAP_ARRAY(bool, scanned_sources);
+  return removed;
 }
 
 class TagAllHeapRefsTask : public WorkerTask {
