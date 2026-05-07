@@ -1686,6 +1686,26 @@ static int refill_dense_eviction_candidates(G1CollectedHeap* g1h,
   return refilled;
 }
 
+static size_t sum_eviction_candidate_used_bytes(G1CollectedHeap* g1h,
+                                                const bool* eviction_candidates,
+                                                uint num_regions) {
+  if (g1h == nullptr || eviction_candidates == nullptr) {
+    return 0;
+  }
+
+  size_t used = 0;
+  for (uint i = 0; i < num_regions; i++) {
+    if (!eviction_candidates[i]) {
+      continue;
+    }
+    HeapRegion* hr = g1h->region_at_or_null(i);
+    if (hr != nullptr) {
+      used += hr->used();
+    }
+  }
+  return used;
+}
+
 static int abort_remote_eviction_candidates(G1CollectedHeap* g1h,
                                             G1RemoteMemoryManager* rmm,
                                             bool* eviction_candidates,
@@ -2515,6 +2535,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     bool pre_d_raw_stack_guard_ran = false;
     int path1_candidates = 0;
     int path2_candidates = 0;
+    size_t path2_requested_evict_bytes = 0;
 
     // Path 1: cold-destination regions from this evacuation (root-pinned already filtered)
     for (uint i = 0; i < num_regions; i++) {
@@ -2558,6 +2579,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       int eviction_tier = 0;
       size_t evict_target_bytes = 0;
       size_t evict_batch_cap_bytes = 0;
+      size_t uncapped_evict_target_bytes = 0;
+      size_t cgroup_evict_target_bytes = 0;
+      bool cgroup_expanded_batch_cap = false;
 
       if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
         local_used = _g1h->used();
@@ -2625,14 +2649,30 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           evict_target_bytes = (local_used > target_low) ? (local_used - target_low) : 0;
           if (has_cgroup_pressure) {
             size_t cgroup_target_low = (cgroup_capacity * target_low_percent) / 100;
-            size_t cgroup_evict_target =
+            cgroup_evict_target_bytes =
               (cgroup_usage > cgroup_target_low) ? (cgroup_usage - cgroup_target_low) : 0;
-            evict_target_bytes = MAX2(evict_target_bytes, cgroup_evict_target);
+            evict_target_bytes = MAX2(evict_target_bytes, cgroup_evict_target_bytes);
           }
+          uncapped_evict_target_bytes = evict_target_bytes;
           if (max_evict_regions > 0) {
+            bool cgroup_emergency =
+              has_cgroup_pressure &&
+              cgroup_evict_target_bytes > 0 &&
+              cgroup_pressure * 100.0 > (double)tier3_percent;
+            if (cgroup_emergency) {
+              size_t required_regions =
+                (cgroup_evict_target_bytes + HeapRegion::GrainBytes - 1) /
+                HeapRegion::GrainBytes;
+              required_regions = MIN2(required_regions, (size_t)num_regions);
+              if (required_regions > (size_t)max_evict_regions) {
+                max_evict_regions = (uint)required_regions;
+                cgroup_expanded_batch_cap = true;
+              }
+            }
             evict_batch_cap_bytes = HeapRegion::GrainBytes * (size_t)max_evict_regions;
             evict_target_bytes = MIN2(evict_target_bytes, evict_batch_cap_bytes);
           }
+          path2_requested_evict_bytes = evict_target_bytes;
         }
 
         if (eviction_tier > 0) {
@@ -2643,7 +2683,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        "(total=" SIZE_FORMAT "MB cache=" SIZE_FORMAT "MB), "
                        "thresholds=T2:%u%%/T3:%u%%, "
                        "effective=%.1f%%, target=%zu%%, batch_cap=" SIZE_FORMAT
-                       "MB, evict_target=" SIZE_FORMAT "MB, dense_last_resort=%s",
+                       "MB%s, evict_target=" SIZE_FORMAT "MB "
+                       "(uncapped=" SIZE_FORMAT "MB cgroup_need=" SIZE_FORMAT
+                       "MB), dense_last_resort=%s",
                        eviction_tier, local_used / M, heap_budget / M,
                        local_capacity / M, native_reserve / M, heap_pressure * 100.0,
                        alloc_rate_ms / 1024.0,
@@ -2655,7 +2697,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        pressure * 100.0,
                        target_low_percent,
                        evict_batch_cap_bytes / M,
+                       cgroup_expanded_batch_cap ? " cgroup-expanded" : "",
                        evict_target_bytes / M,
+                       uncapped_evict_target_bytes / M,
+                       cgroup_evict_target_bytes / M,
                        G1RemoteAllowDenseObjectEviction ? "on" : "off");
         }
       } else if (G1RemoteEvictionThreshold > 0) {
@@ -2701,6 +2746,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t dense_skip_type_arrays = 0;
         size_t dense_skip_fillers = 0;
         size_t dense_skip_locked = 0;
+        bool* dense_anchor_guarded_regions = nullptr;
+        int dense_anchor_guarded_count = 0;
+        int dense_anchor_guarded_handles = 0;
         bool unlimited = false;
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
         dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
@@ -2849,6 +2897,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (allow_dense_object_granularity_eviction &&
             eviction_tier >= 2 && path2_bytes < evict_target_bytes) {
           uint dense_region_cap = eviction_tier >= 3 ? G1RemoteDenseT3Regions : G1RemoteDenseT2Regions;
+          if (dense_region_cap > 0 &&
+              eviction_tier >= 3 &&
+              evict_batch_cap_bytes > 0) {
+            size_t batch_region_cap = evict_batch_cap_bytes / HeapRegion::GrainBytes;
+            batch_region_cap = MIN2(batch_region_cap, (size_t)num_regions);
+            if (batch_region_cap > (size_t)dense_region_cap) {
+              dense_region_cap = (uint)batch_region_cap;
+            }
+          }
           dense_refill_after_stack_guard = G1RemoteDenseRefillAfterStackGuard;
           dense_refill_after_root_guard = G1RemoteDenseRefillAfterRootGuard;
           dense_refill_region_cap = dense_region_cap;
@@ -2857,10 +2914,30 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           dense_last_resort_cap = MIN2(dense_last_resort_cap, remaining_target);
           dense_last_resort_cap = MIN2(dense_last_resort_cap, evict_batch_cap_bytes);
 
+          if (!G1RemoteUseRootCatchRelocation &&
+              dense_deferred_candidates != nullptr &&
+              dense_last_resort_cap > 0 &&
+              rmm != nullptr) {
+            dense_anchor_guarded_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+            memset(dense_anchor_guarded_regions, 0, num_regions * sizeof(bool));
+            dense_anchor_guarded_count = rmm->mark_remote_anchor_regions_in_set(
+                dense_deferred_candidates, num_regions,
+                dense_anchor_guarded_regions, &dense_anchor_guarded_handles);
+            if (dense_anchor_guarded_count > 0) {
+              log_info(gc)("Path 2 dense anchor prefilter: skipping %d dense "
+                           "regions with %d anchored handles before budgeting",
+                           dense_anchor_guarded_count, dense_anchor_guarded_handles);
+            }
+          }
+
           for (uint scan = 0; scan < num_regions && dense_last_resort_cap > 0; scan++) {
             uint i = G1RemoteDenseLastResortHighFirst ? (num_regions - 1 - scan) : scan;
             if (path2_dense_last_resort_bytes >= dense_last_resort_cap) break;
             if (!dense_deferred_candidates[i]) continue;
+            if (dense_anchor_guarded_regions != nullptr &&
+                dense_anchor_guarded_regions[i]) {
+              continue;
+            }
 
             HeapRegion* hr = _g1h->region_at_or_null(i);
             if (hr == nullptr) continue;
@@ -2929,6 +3006,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        SIZE_FORMAT "MB fallback=" SIZE_FORMAT "MB) for T%d eviction",
                        path2_candidates, path2_bytes / M, path2_cold_bytes / M,
                        path2_fallback_bytes / M, eviction_tier);
+        }
+
+        if (path2_requested_evict_bytes > 0 && path2_bytes < path2_requested_evict_bytes) {
+          log_info(gc)("Path 2 under target before guards: selected=" SIZE_FORMAT
+                       "MB target=" SIZE_FORMAT "MB deficit=" SIZE_FORMAT
+                       "MB (tier=%d)",
+                       path2_bytes / M, path2_requested_evict_bytes / M,
+                       (path2_requested_evict_bytes - path2_bytes) / M,
+                       eviction_tier);
+        }
+
+        if (dense_anchor_guarded_regions != nullptr) {
+          FREE_C_HEAP_ARRAY(bool, dense_anchor_guarded_regions);
         }
 
       }
@@ -3609,6 +3699,20 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     if (dense_deferred_candidates != nullptr) {
       FREE_C_HEAP_ARRAY(bool, dense_deferred_candidates);
+    }
+
+    if (path2_requested_evict_bytes > 0) {
+      size_t surviving_candidate_bytes =
+          sum_eviction_candidate_used_bytes(_g1h, eviction_candidates, num_regions);
+      if (surviving_candidate_bytes < path2_requested_evict_bytes) {
+        log_info(gc)("Remote eviction target underfilled after guards: surviving="
+                     SIZE_FORMAT "MB target=" SIZE_FORMAT "MB deficit="
+                     SIZE_FORMAT "MB candidates=%d",
+                     surviving_candidate_bytes / M,
+                     path2_requested_evict_bytes / M,
+                     (path2_requested_evict_bytes - surviving_candidate_bytes) / M,
+                     total_candidates);
+      }
     }
 
     if (total_candidates > 0) {
