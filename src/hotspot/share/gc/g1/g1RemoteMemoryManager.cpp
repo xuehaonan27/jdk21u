@@ -849,7 +849,66 @@ bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
     return false;
   }
 
+  class DenseSegmentClosedClosure : public OopClosure {
+    HeapWord* _bottom;
+    HeapWord* _top;
+    bool _closed;
+    const char* _reason;
+    size_t _refs;
+
+    void fail(const char* reason) {
+      if (_closed) {
+        _reason = reason;
+      }
+      _closed = false;
+    }
+
+    void do_raw_oop(uintptr_t raw) {
+      if (raw == 0 || !_closed) return;
+
+      uintptr_t target_addr = raw;
+      if ((raw & G1_OOP_TAG_MASK) != 0) {
+        if ((raw & G1_OOP_MANAGED_BIT) == 0 ||
+            (raw & G1_OOP_INDIRECT_BIT) != 0) {
+          fail("tagged-handle-ref");
+          return;
+        }
+        target_addr = raw & G1_OOP_ADDR_MASK;
+      }
+
+      if (!is_aligned((address)target_addr, HeapWordSize)) {
+        fail("unaligned-oop");
+        return;
+      }
+      HeapWord* target = (HeapWord*)target_addr;
+      if (target < _bottom || target >= _top) {
+        fail("outgoing-oop");
+        return;
+      }
+      _refs++;
+    }
+
+  public:
+    DenseSegmentClosedClosure(HeapWord* bottom, HeapWord* top)
+      : _bottom(bottom), _top(top), _closed(true), _reason("ok"), _refs(0) {}
+
+    void do_oop(oop* p) override {
+      do_raw_oop(*(uintptr_t*)p);
+    }
+
+    void do_oop(narrowOop* p) override {
+      if (*p != 0) {
+        fail("compressed-oop");
+      }
+    }
+
+    bool closed() const { return _closed; }
+    const char* reason() const { return _reason; }
+    size_t refs() const { return _refs; }
+  };
+
   size_t objects = 0;
+  DenseSegmentClosedClosure closed_cl(hr->bottom(), hr->top());
   HeapWord* p = hr->bottom();
   HeapWord* region_end = hr->end();
   while (p < hr->top()) {
@@ -867,6 +926,11 @@ bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
       if (reason != nullptr) *reason = "null-klass";
       return false;
     }
+    markWord mark = obj->mark();
+    if (!mark.is_unlocked()) {
+      if (reason != nullptr) *reason = "locked-mark";
+      return false;
+    }
     size_t sz = obj->size_given_klass(k);
     if (sz == 0 || sz > (size_t)(region_end - p)) {
       if (reason != nullptr) *reason = "bad-size";
@@ -874,8 +938,11 @@ bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
     }
     if (!G1CollectedHeap::is_obj_filler(obj)) {
       if (!k->is_typeArray_klass()) {
-        if (reason != nullptr) *reason = "contains-oop-fields";
-        return false;
+        obj->oop_iterate(&closed_cl);
+        if (!closed_cl.closed()) {
+          if (reason != nullptr) *reason = closed_cl.reason();
+          return false;
+        }
       }
       objects++;
     }
@@ -2507,8 +2574,7 @@ public:
       }
     }
 
-    if (_rmm->dense_segments_enabled() && target_klass != nullptr &&
-        target_klass->is_typeArray_klass()) {
+    if (_rmm->dense_segments_enabled() && target_klass != nullptr) {
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT |
                        (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
       _tagged++;
