@@ -1151,6 +1151,22 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
 
   if (ok) {
     hr = _g1h->region_at_or_null(idx);
+  }
+
+  bool unlock_heap_for_restore = false;
+  if (ok && !SafepointSynchronize::is_at_safepoint() &&
+      !Heap_lock->owned_by_self()) {
+    if (!Heap_lock->try_lock()) {
+      log_info(gc)("Dense segment fetch retry: Heap_lock busy before restore "
+                   "for region %u segment=" UINT64_FORMAT,
+                   idx, segment_id);
+      ok = false;
+    } else {
+      unlock_heap_for_restore = true;
+    }
+  }
+
+  if (ok) {
     ok = hr != nullptr &&
          _g1h->unquarantine_evict_guarded_region(hr);
   }
@@ -1160,7 +1176,10 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
     guarantee(parse_ok, "Dense segment restore produced an unparseable region");
   }
   if (ok) {
-    _g1h->publish_restored_evict_guarded_region(hr, fetched_bytes);
+    ok = _g1h->publish_restored_evict_guarded_region(hr, fetched_bytes);
+  }
+  if (unlock_heap_for_restore) {
+    Heap_lock->unlock();
   }
   if (ok) {
     dirty_dense_segment_cards(_g1h, hr);

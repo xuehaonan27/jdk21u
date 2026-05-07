@@ -2795,8 +2795,22 @@ bool G1CollectedHeap::unquarantine_evict_guarded_region(HeapRegion* hr) {
     return false;
   }
 
-  {
+  bool unlock_heap = false;
+  if (!SafepointSynchronize::is_at_safepoint() && !Heap_lock->owned_by_self()) {
+    if (!Heap_lock->try_lock()) {
+      log_info(gc)("Dense segment unquarantine retry: Heap_lock busy for "
+                   "region %u", hr->hrm_index());
+      return false;
+    }
+    unlock_heap = true;
+  }
+
+  if (SafepointSynchronize::is_at_safepoint() &&
+      !Thread::current()->is_VM_thread() &&
+      !FreeList_lock->owned_by_self()) {
     MutexLocker x(FreeList_lock, Mutex::_no_safepoint_check_flag);
+    _hrm.remove_from_free_list(hr);
+  } else {
     _hrm.remove_from_free_list(hr);
   }
 
@@ -2804,18 +2818,30 @@ bool G1CollectedHeap::unquarantine_evict_guarded_region(HeapRegion* hr) {
     log_warning(gc)("Dense segment restore: os::unguard_memory failed for "
                     "region %u [" PTR_FORMAT ", " PTR_FORMAT ")",
                     hr->hrm_index(), p2i(hr->bottom()), p2i(hr->end()));
-    MutexLocker x(FreeList_lock, Mutex::_no_safepoint_check_flag);
-    _hrm.insert_into_free_list(hr);
+    if (SafepointSynchronize::is_at_safepoint() &&
+        !Thread::current()->is_VM_thread() &&
+        !FreeList_lock->owned_by_self()) {
+      MutexLocker x(FreeList_lock, Mutex::_no_safepoint_check_flag);
+      _hrm.insert_into_free_list(hr);
+    } else {
+      _hrm.insert_into_free_list(hr);
+    }
+    if (unlock_heap) {
+      Heap_lock->unlock();
+    }
     return false;
   }
 
   hr->clear_evict_guarded();
   hr->clear_rss_trimmed_free();
   hr->reset_pre_dummy_top();
+  if (unlock_heap) {
+    Heap_lock->unlock();
+  }
   return true;
 }
 
-void G1CollectedHeap::publish_restored_evict_guarded_region(HeapRegion* hr,
+bool G1CollectedHeap::publish_restored_evict_guarded_region(HeapRegion* hr,
                                                             size_t used_bytes) {
   assert(hr != nullptr, "region required");
   assert(hr->is_free(), "region should still be free while bytes are copied");
@@ -2824,16 +2850,34 @@ void G1CollectedHeap::publish_restored_evict_guarded_region(HeapRegion* hr,
          "invalid dense segment size");
   assert(is_aligned(used_bytes, HeapWordSize), "segment size must be word aligned");
 
+  bool unlock_heap = false;
+  if (!SafepointSynchronize::is_at_safepoint() && !Heap_lock->owned_by_self()) {
+    if (!Heap_lock->try_lock()) {
+      log_info(gc)("Dense segment publish retry: Heap_lock busy for region %u",
+                   hr->hrm_index());
+      return false;
+    }
+    unlock_heap = true;
+  }
+
   hr->set_top(hr->bottom() + used_bytes / HeapWordSize);
   hr->set_old();
   hr->set_top_at_mark_start(hr->bottom());
   hr->reset_parsable_bottom();
 
-  {
+  if (SafepointSynchronize::is_at_safepoint() &&
+      !Thread::current()->is_VM_thread() &&
+      !OldSets_lock->owned_by_self()) {
     MutexLocker x(OldSets_lock, Mutex::_no_safepoint_check_flag);
+    old_set_add(hr);
+  } else {
     old_set_add(hr);
   }
   increase_used(used_bytes);
+  if (unlock_heap) {
+    Heap_lock->unlock();
+  }
+  return true;
 }
 
 void G1CollectedHeap::clear_eden() {
