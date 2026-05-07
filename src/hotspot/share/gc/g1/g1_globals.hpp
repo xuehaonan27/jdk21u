@@ -413,6 +413,33 @@
           "eviction Phase C may still tag refs during a bounded STW "         \
           "eviction attempt.")                                                \
                                                                             \
+  product(bool, G1RemoteMoleculeProfile, false, DIAGNOSTIC,                  \
+          "Log-only MoleculeGC-inspired class-pattern profiling. Records "    \
+          "old-generation copied-object class edges and sampled old-gen "     \
+          "reference overwrites. Does not change placement, tracing, "        \
+          "eviction, or load-barrier behavior.")                              \
+                                                                            \
+  product(uint, G1RemoteMoleculeProfileTableSize, 8192, DIAGNOSTIC,          \
+          "Fixed hash-table size for G1RemoteMoleculeProfile class and "      \
+          "class-edge counters.")                                             \
+          range(128, 1048576)                                                 \
+                                                                            \
+  product(uint, G1RemoteMoleculeProfileTopK, 12, DIAGNOSTIC,                 \
+          "Number of top class and class-edge entries to print per GC when "  \
+          "G1RemoteMoleculeProfile is enabled.")                              \
+          range(0, 64)                                                        \
+                                                                            \
+  product(uint, G1RemoteMoleculeProfileEdgeSampleLimit, 256, DIAGNOSTIC,     \
+          "Maximum object-reference edges sampled from one promoted/copied "  \
+          "old object for G1RemoteMoleculeProfile. Object arrays are "        \
+          "sampled evenly up to this limit.")                                 \
+          range(0, 65536)                                                     \
+                                                                            \
+  product(uint, G1RemoteMoleculeProfileMutationSampleRate, 1024, DIAGNOSTIC, \
+          "Sample one in N old-generation reference overwrites for "          \
+          "G1RemoteMoleculeProfile. 1 records every observed overwrite.")     \
+          range(1, 1048576)                                                   \
+                                                                            \
   product(bool, G1RemoteTagObjArraySources, true, DIAGNOSTIC,                \
           "Allow remote eviction Phase C to tag references stored in object " \
           "array elements when the target is a type array. Ordinary object "  \

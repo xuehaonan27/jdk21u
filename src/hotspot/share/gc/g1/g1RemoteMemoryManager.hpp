@@ -25,6 +25,7 @@
 
 class G1CollectedHeap;
 class HeapRegion;
+class Klass;
 class WorkerThreads;
 
 // ============================================================
@@ -215,9 +216,69 @@ private:
     _eviction_table[idx] = alias;
   }
 
+  // Log-only MoleculeGC-inspired class-pattern profiler.
+  struct MoleculeKlassProfileEntry {
+    Klass*   _klass;
+    uint64_t _old_copies;
+    uint64_t _old_copy_bytes;
+    uint64_t _out_edges;
+    uint64_t _mutation_overwrites;
+  };
+
+  struct MoleculeEdgeProfileEntry {
+    Klass*   _from;
+    Klass*   _to;
+    uint64_t _promotion_edges;
+    uint64_t _mutation_overwrites;
+    uint64_t _array_source_edges;
+  };
+
+  MoleculeKlassProfileEntry* _molecule_klass_profile;
+  MoleculeEdgeProfileEntry*  _molecule_edge_profile;
+  uint                       _molecule_profile_capacity;
+  volatile int               _molecule_profile_lock;
+  volatile uint64_t          _molecule_profile_old_copies;
+  volatile uint64_t          _molecule_profile_old_copy_bytes;
+  volatile uint64_t          _molecule_profile_promotion_edges;
+  volatile uint64_t          _molecule_profile_array_edges;
+  volatile uint64_t          _molecule_profile_mutation_probes;
+  volatile uint64_t          _molecule_profile_mutation_overwrites;
+  volatile uint64_t          _molecule_profile_dropped_klass;
+  volatile uint64_t          _molecule_profile_dropped_edges;
+
+  void molecule_profile_lock() {
+    while (Atomic::cmpxchg(&_molecule_profile_lock, 0, 1) != 0) { /* spin */ }
+  }
+  void molecule_profile_unlock() {
+    Atomic::release_store(&_molecule_profile_lock, 0);
+  }
+  bool molecule_profile_ready() const {
+    return _molecule_klass_profile != nullptr &&
+           _molecule_edge_profile != nullptr &&
+           _molecule_profile_capacity > 0;
+  }
+  size_t molecule_profile_klass_hash(Klass* klass) const;
+  size_t molecule_profile_edge_hash(Klass* from, Klass* to) const;
+  void record_molecule_profile_klass_locked(Klass* klass,
+                                            uint64_t old_copies,
+                                            uint64_t old_copy_bytes,
+                                            uint64_t out_edges,
+                                            uint64_t mutation_overwrites);
+  void record_molecule_profile_edge_locked(Klass* from,
+                                           Klass* to,
+                                           bool array_source,
+                                           bool mutation);
+
 public:
   G1RemoteMemoryManager(G1CollectedHeap* g1h);
   ~G1RemoteMemoryManager();
+
+  bool molecule_profile_enabled() const { return molecule_profile_ready(); }
+  void record_molecule_profile_edge(Klass* from, Klass* to,
+                                    bool array_source, bool mutation);
+  void record_molecule_profile_old_copy(oop obj, size_t word_size);
+  void record_molecule_profile_ref_overwrite(void* field, bool is_narrow);
+  void log_molecule_profile_summary();
 
   // Must be called AFTER G1CollectedHeap::initialize() has set up the heap
   // regions (_hrm.initialize, initialize_reserved_region). At that point

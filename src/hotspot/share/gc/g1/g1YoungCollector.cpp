@@ -5628,6 +5628,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                    rmm->backend()->total_evicted(), rmm->backend()->total_fetched());
     }
     rmm->log_remote_access_stats();
+    rmm->log_molecule_profile_summary();
     } // end else (not concurrent start)
   }
 

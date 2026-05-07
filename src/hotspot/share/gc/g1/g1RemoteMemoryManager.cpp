@@ -23,6 +23,7 @@
 #include "logging/log.hpp"
 #include "memory/metaspace.hpp"
 #include "oops/arrayOop.hpp"
+#include "oops/objArrayOop.inline.hpp"
 #include "oops/oop.inline.hpp"
 #include "runtime/os.hpp"
 #include "runtime/safepoint.hpp"
@@ -55,6 +56,18 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _local_handle_region_counts(nullptr), _local_handle_region_heads(nullptr),
     _local_handle_region_capacity(0),
     _local_handle_lock(0), _alloc_lock(0),
+    _molecule_klass_profile(nullptr),
+    _molecule_edge_profile(nullptr),
+    _molecule_profile_capacity(0),
+    _molecule_profile_lock(0),
+    _molecule_profile_old_copies(0),
+    _molecule_profile_old_copy_bytes(0),
+    _molecule_profile_promotion_edges(0),
+    _molecule_profile_array_edges(0),
+    _molecule_profile_mutation_probes(0),
+    _molecule_profile_mutation_overwrites(0),
+    _molecule_profile_dropped_klass(0),
+    _molecule_profile_dropped_edges(0),
     _sim_remote_next_slot(0), _sim_remote_evicted_count(0),
     _sim_remote_fetched_count(0), _gc_epoch(0),
     _eviction_backoff_until_epoch(nullptr), _eviction_backoff_capacity(0),
@@ -100,6 +113,17 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   memset(_hotness_stats, 0, sizeof(_hotness_stats));
   memset(_prev_hotness_stats, 0, sizeof(_prev_hotness_stats));
   memset(_sim_remote_slots, 0, sizeof(_sim_remote_slots));
+  if (G1RemoteMoleculeProfile && G1RemoteMoleculeProfileTableSize > 0) {
+    _molecule_profile_capacity = G1RemoteMoleculeProfileTableSize;
+    _molecule_klass_profile =
+        NEW_C_HEAP_ARRAY(MoleculeKlassProfileEntry, _molecule_profile_capacity, mtGC);
+    _molecule_edge_profile =
+        NEW_C_HEAP_ARRAY(MoleculeEdgeProfileEntry, _molecule_profile_capacity, mtGC);
+    memset(_molecule_klass_profile, 0,
+           _molecule_profile_capacity * sizeof(MoleculeKlassProfileEntry));
+    memset(_molecule_edge_profile, 0,
+           _molecule_profile_capacity * sizeof(MoleculeEdgeProfileEntry));
+  }
 
   // Create remote storage backend. A build can include the RDMA/TCP backend,
   // but normal local G1 runs must stay in-process unless the runtime flag
@@ -688,6 +712,15 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     _dense_segments = nullptr;
     _dense_segment_capacity = 0;
   }
+  if (_molecule_klass_profile != nullptr) {
+    FREE_C_HEAP_ARRAY(MoleculeKlassProfileEntry, _molecule_klass_profile);
+    _molecule_klass_profile = nullptr;
+  }
+  if (_molecule_edge_profile != nullptr) {
+    FREE_C_HEAP_ARRAY(MoleculeEdgeProfileEntry, _molecule_edge_profile);
+    _molecule_edge_profile = nullptr;
+  }
+  _molecule_profile_capacity = 0;
 
   // Free edge tables (chained hash)
   for (size_t i = 0; i < EDGE_TABLE_BUCKETS; i++) {
@@ -2676,6 +2709,404 @@ static bool remote_eviction_valid_local_oop(G1CollectedHeap* g1h,
     *klass_out = k;
   }
   return true;
+}
+
+size_t G1RemoteMemoryManager::molecule_profile_klass_hash(Klass* klass) const {
+  return ((uintptr_t)klass >> 4) % _molecule_profile_capacity;
+}
+
+size_t G1RemoteMemoryManager::molecule_profile_edge_hash(Klass* from,
+                                                         Klass* to) const {
+  uintptr_t h = ((uintptr_t)from >> 4) ^ (((uintptr_t)to >> 4) * 1103515245u);
+  return h % _molecule_profile_capacity;
+}
+
+void G1RemoteMemoryManager::record_molecule_profile_klass_locked(
+    Klass* klass,
+    uint64_t old_copies,
+    uint64_t old_copy_bytes,
+    uint64_t out_edges,
+    uint64_t mutation_overwrites) {
+  if (klass == nullptr || _molecule_klass_profile == nullptr ||
+      _molecule_profile_capacity == 0) {
+    return;
+  }
+
+  size_t idx = molecule_profile_klass_hash(klass);
+  for (uint probe = 0; probe < _molecule_profile_capacity; probe++) {
+    MoleculeKlassProfileEntry* e =
+        &_molecule_klass_profile[(idx + probe) % _molecule_profile_capacity];
+    if (e->_klass == nullptr) {
+      e->_klass = klass;
+    }
+    if (e->_klass == klass) {
+      e->_old_copies += old_copies;
+      e->_old_copy_bytes += old_copy_bytes;
+      e->_out_edges += out_edges;
+      e->_mutation_overwrites += mutation_overwrites;
+      return;
+    }
+  }
+  _molecule_profile_dropped_klass++;
+}
+
+void G1RemoteMemoryManager::record_molecule_profile_edge_locked(Klass* from,
+                                                                Klass* to,
+                                                                bool array_source,
+                                                                bool mutation) {
+  if (from == nullptr || to == nullptr || _molecule_edge_profile == nullptr ||
+      _molecule_profile_capacity == 0) {
+    return;
+  }
+
+  size_t idx = molecule_profile_edge_hash(from, to);
+  for (uint probe = 0; probe < _molecule_profile_capacity; probe++) {
+    MoleculeEdgeProfileEntry* e =
+        &_molecule_edge_profile[(idx + probe) % _molecule_profile_capacity];
+    if (e->_from == nullptr) {
+      e->_from = from;
+      e->_to = to;
+    }
+    if (e->_from == from && e->_to == to) {
+      if (mutation) {
+        e->_mutation_overwrites++;
+      } else {
+        e->_promotion_edges++;
+        if (array_source) {
+          e->_array_source_edges++;
+        }
+      }
+      return;
+    }
+  }
+  _molecule_profile_dropped_edges++;
+}
+
+static Klass* molecule_profile_klass_for_raw(G1CollectedHeap* g1h,
+                                             uintptr_t raw) {
+  if (g1h == nullptr || raw == 0) {
+    return nullptr;
+  }
+  if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+      (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+    return nullptr;
+  }
+
+  uintptr_t addr = (raw & G1_OOP_TAG_MASK) != 0 ? (raw & G1_OOP_ADDR_MASK) : raw;
+  if (!is_aligned((address)addr, HeapWordSize) ||
+      !g1h->is_in_reserved((void*)addr)) {
+    return nullptr;
+  }
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null((void*)addr);
+  Klass* klass = nullptr;
+  if (!remote_eviction_valid_local_oop(g1h, cast_to_oop((HeapWord*)addr),
+                                       hr, &klass)) {
+    return nullptr;
+  }
+  return klass;
+}
+
+void G1RemoteMemoryManager::record_molecule_profile_edge(Klass* from,
+                                                         Klass* to,
+                                                         bool array_source,
+                                                         bool mutation) {
+  if (!molecule_profile_ready() || from == nullptr || to == nullptr) {
+    return;
+  }
+
+  molecule_profile_lock();
+  if (mutation) {
+    _molecule_profile_mutation_overwrites++;
+    record_molecule_profile_klass_locked(from, 0, 0, 0, 1);
+  } else {
+    _molecule_profile_promotion_edges++;
+    if (array_source) {
+      _molecule_profile_array_edges++;
+    }
+    record_molecule_profile_klass_locked(from, 0, 0, 1, 0);
+  }
+  record_molecule_profile_edge_locked(from, to, array_source, mutation);
+  molecule_profile_unlock();
+}
+
+void G1RemoteMemoryManager::record_molecule_profile_old_copy(oop obj,
+                                                             size_t word_size) {
+  if (!molecule_profile_ready() || obj == nullptr) {
+    return;
+  }
+
+  Klass* from = obj->klass_or_null_acquire();
+  if (!remote_eviction_valid_klass(from) || G1CollectedHeap::is_obj_filler(obj)) {
+    return;
+  }
+
+  molecule_profile_lock();
+  _molecule_profile_old_copies++;
+  _molecule_profile_old_copy_bytes += (uint64_t)word_size * HeapWordSize;
+  record_molecule_profile_klass_locked(from, 1,
+                                       (uint64_t)word_size * HeapWordSize,
+                                       0, 0);
+  molecule_profile_unlock();
+
+  if (from->is_typeArray_klass() || G1RemoteMoleculeProfileEdgeSampleLimit == 0) {
+    return;
+  }
+
+  class RecordEdgeClosure : public BasicOopIterateClosure {
+    G1RemoteMemoryManager* _rmm;
+    G1CollectedHeap*       _g1h;
+    Klass*                 _from;
+    uint                   _remaining;
+  public:
+    RecordEdgeClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
+                      Klass* from, uint limit)
+      : _rmm(rmm), _g1h(g1h), _from(from), _remaining(limit) {}
+
+    void do_oop(oop* p) override {
+      if (_remaining == 0) {
+        return;
+      }
+      Klass* to = molecule_profile_klass_for_raw(_g1h, *(uintptr_t*)p);
+      if (to == nullptr) {
+        return;
+      }
+      _remaining--;
+      _rmm->record_molecule_profile_edge(_from, to, false, false);
+    }
+
+    void do_oop(narrowOop* p) override {
+      // Spark/RDMA experiments run with UseCompressedOops=false. Keep the
+      // profiler conservative for other configurations.
+    }
+  };
+
+  if (from->is_objArray_klass()) {
+    if (UseCompressedOops) {
+      return;
+    }
+    objArrayOop array = objArrayOop(obj);
+    int len = array->length();
+    if (len <= 0) {
+      return;
+    }
+    uint limit = MIN2((uint)len, G1RemoteMoleculeProfileEdgeSampleLimit);
+    int step = MAX2(1, len / (int)limit);
+    uint sampled = 0;
+    for (int i = 0; i < len && sampled < limit; i += step) {
+      address slot_addr = cast_from_oop<address>(array) +
+                          objArrayOopDesc::base_offset_in_bytes() +
+                          (size_t)i * sizeof(oop);
+      Klass* to = molecule_profile_klass_for_raw(_g1h, *(uintptr_t*)slot_addr);
+      if (to == nullptr) {
+        continue;
+      }
+      sampled++;
+      record_molecule_profile_edge(from, to, true, false);
+    }
+    return;
+  }
+
+  RecordEdgeClosure cl(this, _g1h, from, G1RemoteMoleculeProfileEdgeSampleLimit);
+  obj->oop_iterate(&cl);
+}
+
+void G1RemoteMemoryManager::record_molecule_profile_ref_overwrite(void* field,
+                                                                  bool is_narrow) {
+  if (!molecule_profile_ready() || field == nullptr || is_narrow) {
+    return;
+  }
+
+  uint64_t probe = Atomic::add(&_molecule_profile_mutation_probes, (uint64_t)1);
+  if (G1RemoteMoleculeProfileMutationSampleRate > 1 &&
+      (probe % G1RemoteMoleculeProfileMutationSampleRate) != 0) {
+    return;
+  }
+
+  if (!_g1h->is_in_reserved(field)) {
+    return;
+  }
+  HeapRegion* src_hr = _g1h->heap_region_containing_or_null(field);
+  if (src_hr == nullptr || !src_hr->is_old() || src_hr->is_free() ||
+      src_hr->is_empty() || src_hr->is_evict_guarded()) {
+    return;
+  }
+
+  HeapWord* src_start = src_hr->block_start(field);
+  if (src_start == nullptr || src_start < src_hr->bottom() ||
+      src_start >= src_hr->top()) {
+    return;
+  }
+
+  Klass* from = nullptr;
+  oop src_obj = cast_to_oop(src_start);
+  if (!remote_eviction_valid_local_oop(_g1h, src_obj, src_hr, &from)) {
+    return;
+  }
+
+  uintptr_t raw = *(uintptr_t*)field;
+  Klass* to = molecule_profile_klass_for_raw(_g1h, raw);
+  if (to == nullptr) {
+    return;
+  }
+
+  record_molecule_profile_edge(from, to, false, true);
+}
+
+static const char* molecule_profile_klass_name(Klass* klass) {
+  return remote_eviction_valid_klass(klass) ? klass->external_name() : "?";
+}
+
+void G1RemoteMemoryManager::log_molecule_profile_summary() {
+  if (!molecule_profile_ready()) {
+    return;
+  }
+
+  molecule_profile_lock();
+  uint64_t old_copies = _molecule_profile_old_copies;
+  uint64_t promotion_edges = _molecule_profile_promotion_edges;
+  uint64_t mutation_overwrites = _molecule_profile_mutation_overwrites;
+  uint64_t mutation_probes = Atomic::load(&_molecule_profile_mutation_probes);
+  if (old_copies == 0 && promotion_edges == 0 && mutation_overwrites == 0) {
+    molecule_profile_unlock();
+    return;
+  }
+
+  log_info(gc)("Molecule profile: old_copies=" UINT64_FORMAT
+               " old_copy_bytes=" UINT64_FORMAT
+               " promotion_edges=" UINT64_FORMAT
+               " array_edges=" UINT64_FORMAT
+               " mutation_samples=" UINT64_FORMAT "/" UINT64_FORMAT
+               " dropped(klass=" UINT64_FORMAT " edge=" UINT64_FORMAT ")"
+               " table=%u",
+               old_copies,
+               _molecule_profile_old_copy_bytes,
+               promotion_edges,
+               _molecule_profile_array_edges,
+               mutation_overwrites,
+               mutation_probes,
+               _molecule_profile_dropped_klass,
+               _molecule_profile_dropped_edges,
+               _molecule_profile_capacity);
+
+  uint top_k = MIN2(G1RemoteMoleculeProfileTopK, (uint)64);
+  uint selected[64];
+  for (uint i = 0; i < 64; i++) {
+    selected[i] = UINT_MAX;
+  }
+
+  for (uint rank = 0; rank < top_k; rank++) {
+    uint best = UINT_MAX;
+    uint64_t best_bytes = 0;
+    for (uint i = 0; i < _molecule_profile_capacity; i++) {
+      if (_molecule_klass_profile[i]._klass == nullptr) {
+        continue;
+      }
+      bool used = false;
+      for (uint s = 0; s < rank; s++) {
+        if (selected[s] == i) {
+          used = true;
+          break;
+        }
+      }
+      if (used) {
+        continue;
+      }
+      if (_molecule_klass_profile[i]._old_copy_bytes > best_bytes) {
+        best = i;
+        best_bytes = _molecule_klass_profile[i]._old_copy_bytes;
+      }
+    }
+    if (best == UINT_MAX || best_bytes == 0) {
+      break;
+    }
+    selected[rank] = best;
+    MoleculeKlassProfileEntry* e = &_molecule_klass_profile[best];
+    log_info(gc)("Molecule profile klass top_bytes[%u]: klass=%s copies="
+                 UINT64_FORMAT " bytes=" UINT64_FORMAT " out_edges="
+                 UINT64_FORMAT " mutations=" UINT64_FORMAT,
+                 rank + 1, molecule_profile_klass_name(e->_klass),
+                 e->_old_copies, e->_old_copy_bytes, e->_out_edges,
+                 e->_mutation_overwrites);
+  }
+
+  for (uint i = 0; i < 64; i++) {
+    selected[i] = UINT_MAX;
+  }
+  for (uint rank = 0; rank < top_k; rank++) {
+    uint best = UINT_MAX;
+    uint64_t best_edges = 0;
+    for (uint i = 0; i < _molecule_profile_capacity; i++) {
+      if (_molecule_edge_profile[i]._from == nullptr) {
+        continue;
+      }
+      bool used = false;
+      for (uint s = 0; s < rank; s++) {
+        if (selected[s] == i) {
+          used = true;
+          break;
+        }
+      }
+      if (used) {
+        continue;
+      }
+      if (_molecule_edge_profile[i]._promotion_edges > best_edges) {
+        best = i;
+        best_edges = _molecule_edge_profile[i]._promotion_edges;
+      }
+    }
+    if (best == UINT_MAX || best_edges == 0) {
+      break;
+    }
+    selected[rank] = best;
+    MoleculeEdgeProfileEntry* e = &_molecule_edge_profile[best];
+    log_info(gc)("Molecule profile edge top_promoted[%u]: from=%s to=%s "
+                 "edges=" UINT64_FORMAT " array_edges=" UINT64_FORMAT
+                 " mutations=" UINT64_FORMAT,
+                 rank + 1, molecule_profile_klass_name(e->_from),
+                 molecule_profile_klass_name(e->_to),
+                 e->_promotion_edges, e->_array_source_edges,
+                 e->_mutation_overwrites);
+  }
+
+  for (uint i = 0; i < 64; i++) {
+    selected[i] = UINT_MAX;
+  }
+  for (uint rank = 0; rank < top_k; rank++) {
+    uint best = UINT_MAX;
+    uint64_t best_mutations = 0;
+    for (uint i = 0; i < _molecule_profile_capacity; i++) {
+      if (_molecule_edge_profile[i]._from == nullptr) {
+        continue;
+      }
+      bool used = false;
+      for (uint s = 0; s < rank; s++) {
+        if (selected[s] == i) {
+          used = true;
+          break;
+        }
+      }
+      if (used) {
+        continue;
+      }
+      if (_molecule_edge_profile[i]._mutation_overwrites > best_mutations) {
+        best = i;
+        best_mutations = _molecule_edge_profile[i]._mutation_overwrites;
+      }
+    }
+    if (best == UINT_MAX || best_mutations == 0) {
+      break;
+    }
+    selected[rank] = best;
+    MoleculeEdgeProfileEntry* e = &_molecule_edge_profile[best];
+    log_info(gc)("Molecule profile edge top_mutated[%u]: from=%s to=%s "
+                 "mutations=" UINT64_FORMAT " promoted_edges=" UINT64_FORMAT,
+                 rank + 1, molecule_profile_klass_name(e->_from),
+                 molecule_profile_klass_name(e->_to),
+                 e->_mutation_overwrites, e->_promotion_edges);
+  }
+
+  molecule_profile_unlock();
 }
 
 static bool remote_eviction_parse_obj(HeapRegion* hr, HeapWord* p,

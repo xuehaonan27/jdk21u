@@ -125,6 +125,16 @@ inline void G1BarrierSet::write_ref_field_pre(T* field) {
     return;
   }
 
+  if (G1RemoteMoleculeProfile) {
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    G1RemoteMemoryManager* rmm =
+        g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+    if (rmm != nullptr && rmm->molecule_profile_enabled()) {
+      rmm->record_molecule_profile_ref_overwrite(
+          (void*)field, sizeof(T) == sizeof(narrowOop));
+    }
+  }
+
   enqueue(field);
 }
 

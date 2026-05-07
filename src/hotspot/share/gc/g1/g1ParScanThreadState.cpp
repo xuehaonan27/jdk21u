@@ -677,6 +677,9 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
       _age_table.add(age, word_sz);
     } else {
       update_bot_after_copying(obj, word_sz);
+      if (_g1h->remote_memory_manager()->molecule_profile_enabled()) {
+        _g1h->remote_memory_manager()->record_molecule_profile_old_copy(obj, word_sz);
+      }
     }
 
     // Most objects are not arrays, so do one array check rather than
