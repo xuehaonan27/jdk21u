@@ -761,6 +761,7 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
   bool log_change = false;
   bool disabled_by_policy = false;
   bool pressure_limited = false;
+  uint64_t pressure_suppressed = 0;
 
   remote_prefetch_cache_lock();
   hits = g1_remote_prefetch_cache_hits;
@@ -799,7 +800,8 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
 
   if (pressure_level >= RemotePrefetchPressureOverTier2) {
     if (effective > 1) {
-      Atomic::inc(&g1_remote_prefetch_batch_suppressed);
+      pressure_suppressed =
+        Atomic::add(&g1_remote_prefetch_batch_suppressed, (uint64_t)1);
       pressure_limited = true;
     }
     effective = 1;
@@ -810,7 +812,9 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
 
   if (g1_remote_fetch_batch_effective_logged == 0 ||
       stores >= g1_remote_fetch_batch_policy_log_next_stores ||
-      pressure_limited) {
+      (pressure_limited &&
+       (pressure_suppressed == 1 ||
+        (pressure_suppressed & (pressure_suppressed - 1)) == 0))) {
     g1_remote_fetch_batch_effective_logged = effective;
     g1_remote_fetch_batch_policy_log_next_stores = stores + 64 * 1024;
     log_change = true;
