@@ -122,6 +122,14 @@ public:
                            size_t count,
                            size_t max_response_bytes,
                            FetchBatchClosure* cl) override;
+  bool supports_segments() const override;
+  bool evict_segment(uint64_t segment_id, uintptr_t vaddr_base,
+                     const void* bytes, size_t byte_size,
+                     uint32_t flags) override;
+  bool fetch_segment(uint64_t segment_id, uintptr_t* out_vaddr_base,
+                     void* dest, size_t byte_capacity,
+                     size_t* out_byte_size, uint32_t* out_flags) override;
+  void discard_segment(uint64_t segment_id) override;
   void trace_and_report(uintptr_t** out_dead_ids, size_t* out_num_dead,
                         size_t* out_bytes_freed,
                         uintptr_t** out_cross_src, uintptr_t** out_cross_tgt,

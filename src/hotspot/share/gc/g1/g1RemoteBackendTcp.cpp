@@ -36,7 +36,12 @@ static const uint32_t RE_CMD_EVICT_WITH_EDGES       = 0x12;
 static const uint32_t RE_CMD_REPORT_REMOTE_ROOTS_V2 = 0x13;
 static const uint32_t RE_RESP_COLLECTION_RESULT = 0x84;
 static const uint32_t RE_CMD_TRACE_AND_REPORT      = 0x17;
+static const uint32_t RE_CMD_EVICT_SEGMENT         = 0x1D;
+static const uint32_t RE_CMD_FETCH_SEGMENT         = 0x1E;
+static const uint32_t RE_CMD_DISCARD_SEGMENT       = 0x1F;
 static const uint32_t RE_RESP_TRACE_RESULT          = 0x86;
+static const uint32_t RE_RESP_SEGMENT_DATA          = 0x88;
+static const size_t   RE_MAX_MSG_SIZE              = 16 * 1024 * 1024;
 
 TCPExecutorBackend::TCPExecutorBackend()
   : _fd(-1), _connected(false), _seq_id(0),
@@ -184,6 +189,180 @@ void TCPExecutorBackend::shutdown() {
     _fd = -1;
     _connected = false;
   }
+}
+
+bool TCPExecutorBackend::supports_segments() const {
+  return true;
+}
+
+bool TCPExecutorBackend::evict_segment(uint64_t segment_id, uintptr_t vaddr_base,
+                                       const void* bytes, size_t byte_size,
+                                       uint32_t flags) {
+  if (!_connected || segment_id == 0 || bytes == nullptr || byte_size == 0) {
+    return false;
+  }
+
+  const size_t header_size = 48;
+  if (byte_size > RE_MAX_MSG_SIZE - header_size ||
+      byte_size > (size_t)UINT32_MAX - header_size) {
+    log_warning(gc)("TCPExecutor: segment evict too large: segment="
+                    UINT64_FORMAT " bytes=" SIZE_FORMAT,
+                    segment_id, byte_size);
+    return false;
+  }
+
+  size_t msg_size = header_size + byte_size;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  if (msg == nullptr) {
+    return false;
+  }
+
+  *(uint32_t*)(msg + 0) = RE_CMD_EVICT_SEGMENT;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = 0;
+  *(uint64_t*)(msg + 16) = segment_id;
+  *(uint64_t*)(msg + 24) = (uint64_t)vaddr_base;
+  *(uint64_t*)(msg + 32) = (uint64_t)byte_size;
+  *(uint32_t*)(msg + 40) = flags;
+  *(uint32_t*)(msg + 44) = 0;
+  memcpy(msg + header_size, bytes, byte_size);
+
+  io_lock();
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  bool sent = send_msg(msg, msg_size);
+  os::free(msg);
+  if (!sent) {
+    io_unlock();
+    return false;
+  }
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  bool ok = recv_msg(resp, sizeof(resp), &resp_len) &&
+            resp_len >= 16 && *(uint32_t*)resp == RE_RESP_OK;
+  io_unlock();
+  return ok;
+}
+
+bool TCPExecutorBackend::fetch_segment(uint64_t segment_id,
+                                       uintptr_t* out_vaddr_base,
+                                       void* dest,
+                                       size_t byte_capacity,
+                                       size_t* out_byte_size,
+                                       uint32_t* out_flags) {
+  if (!_connected || segment_id == 0 || dest == nullptr || byte_capacity == 0) {
+    return false;
+  }
+
+  const size_t header_size = 48;
+  size_t max_response_bytes = MIN2(RE_MAX_MSG_SIZE, byte_capacity + header_size);
+  if (max_response_bytes < byte_capacity) {
+    max_response_bytes = RE_MAX_MSG_SIZE;
+  }
+
+  io_lock();
+
+  uint8_t msg[32];
+  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_SEGMENT;
+  *(uint32_t*)(msg + 4) = sizeof(msg);
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = segment_id;
+  *(uint64_t*)(msg + 24) = (uint64_t)max_response_bytes;
+  if (!send_msg(msg, sizeof(msg))) {
+    io_unlock();
+    return false;
+  }
+
+  uint32_t net_len = 0;
+  if (!recv_all(&net_len, 4)) {
+    io_unlock();
+    return false;
+  }
+
+  if (net_len > RE_MAX_MSG_SIZE) {
+    uint8_t drain[4096];
+    size_t remaining = net_len;
+    while (remaining > 0) {
+      size_t chunk = MIN2(remaining, sizeof(drain));
+      if (!recv_all(drain, chunk)) {
+        break;
+      }
+      remaining -= chunk;
+    }
+    io_unlock();
+    return false;
+  }
+
+  uint8_t* resp = (uint8_t*)os::malloc(net_len, mtGC);
+  if (resp == nullptr) {
+    io_unlock();
+    return false;
+  }
+  if (!recv_all(resp, net_len)) {
+    os::free(resp);
+    io_unlock();
+    return false;
+  }
+
+  io_unlock();
+
+  if (net_len < header_size || *(uint32_t*)resp != RE_RESP_SEGMENT_DATA) {
+    os::free(resp);
+    return false;
+  }
+
+  uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+  uint64_t resp_segment_id = *(uint64_t*)(resp + 16);
+  uintptr_t resp_vaddr_base = (uintptr_t)*(uint64_t*)(resp + 24);
+  size_t resp_byte_size = (size_t)*(uint64_t*)(resp + 32);
+  uint32_t resp_flags = *(uint32_t*)(resp + 40);
+
+  if (resp_msg_len > net_len || resp_msg_len > max_response_bytes ||
+      resp_msg_len < header_size || resp_segment_id != segment_id ||
+      resp_byte_size > byte_capacity ||
+      resp_byte_size > resp_msg_len - header_size) {
+    log_warning(gc)("TCPExecutor: malformed segment fetch response: segment="
+                    UINT64_FORMAT " hdr_len=%u actual=%u bytes="
+                    SIZE_FORMAT " cap=" SIZE_FORMAT,
+                    segment_id, resp_msg_len, net_len, resp_byte_size,
+                    byte_capacity);
+    os::free(resp);
+    return false;
+  }
+
+  memcpy(dest, resp + header_size, resp_byte_size);
+  if (out_vaddr_base != nullptr) {
+    *out_vaddr_base = resp_vaddr_base;
+  }
+  if (out_byte_size != nullptr) {
+    *out_byte_size = resp_byte_size;
+  }
+  if (out_flags != nullptr) {
+    *out_flags = resp_flags;
+  }
+  os::free(resp);
+  return true;
+}
+
+void TCPExecutorBackend::discard_segment(uint64_t segment_id) {
+  if (!_connected || segment_id == 0) {
+    return;
+  }
+
+  io_lock();
+
+  uint8_t msg[24];
+  *(uint32_t*)(msg + 0) = RE_CMD_DISCARD_SEGMENT;
+  *(uint32_t*)(msg + 4) = sizeof(msg);
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = segment_id;
+  send_msg(msg, sizeof(msg));
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  recv_msg(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 // ================================================================

@@ -63,6 +63,15 @@ public:
 
   void shutdown() override;
 
+  bool supports_segments() const override;
+  bool evict_segment(uint64_t segment_id, uintptr_t vaddr_base,
+                     const void* bytes, size_t byte_size,
+                     uint32_t flags) override;
+  bool fetch_segment(uint64_t segment_id, uintptr_t* out_vaddr_base,
+                     void* dest, size_t byte_capacity,
+                     size_t* out_byte_size, uint32_t* out_flags) override;
+  void discard_segment(uint64_t segment_id) override;
+
   // V2 Protocol overrides
   size_t evict_with_edges(const void* obj_bytes, size_t word_size,
                           Klass* klass, uintptr_t handle_id,

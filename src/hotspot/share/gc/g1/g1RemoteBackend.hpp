@@ -152,6 +152,29 @@ public:
     return 0;
   }
 
+  // Dense contiguous heap segment operations. These support an adaptive
+  // chunk-granularity mode where the JVM preserves virtual address identity
+  // and fetches a complete segment instead of reconstructing per-object handles.
+  virtual bool supports_segments() const {
+    return false;
+  }
+
+  virtual bool evict_segment(uint64_t segment_id, uintptr_t vaddr_base,
+                             const void* bytes, size_t byte_size,
+                             uint32_t flags) {
+    return false;
+  }
+
+  virtual bool fetch_segment(uint64_t segment_id, uintptr_t* out_vaddr_base,
+                             void* dest, size_t byte_capacity,
+                             size_t* out_byte_size, uint32_t* out_flags) {
+    return false;
+  }
+
+  virtual void discard_segment(uint64_t segment_id) {
+    // Default: no-op
+  }
+
   // Notify executor that these handle_ids are now LOCAL (fetched back)
   virtual void localize_batch(const uintptr_t* handle_ids, size_t count) {
     // Default: no-op (SIM backend doesn't track handle state)

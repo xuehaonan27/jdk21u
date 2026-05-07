@@ -47,8 +47,12 @@ static const uint32_t RE_CMD_TRACE_AND_REPORT       = 0x17;
 static const uint32_t RE_CMD_FETCH_AROUND           = 0x18;
 static const uint32_t RE_CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES = 0x1A;
 static const uint32_t RE_CMD_FETCH_EXACT            = 0x1C;
+static const uint32_t RE_CMD_EVICT_SEGMENT          = 0x1D;
+static const uint32_t RE_CMD_FETCH_SEGMENT          = 0x1E;
+static const uint32_t RE_CMD_DISCARD_SEGMENT        = 0x1F;
 static const uint32_t RE_RESP_TRACE_RESULT           = 0x86;
 static const uint32_t RE_RESP_BATCH_OBJECT_DATA      = 0x87;
+static const uint32_t RE_RESP_SEGMENT_DATA           = 0x88;
 
 // RDMA parameters are set via JVM flags (g1_globals.hpp):
 //   -XX:RDMAMsgBufSize=65536    (SEND/RECV buffer, default 64K)
@@ -1009,6 +1013,188 @@ size_t RDMAExecutorBackend::fetch_batch_exact(const uintptr_t* handle_ids,
   os::free(stable);
   _total_fetched += fetched;
   return fetched;
+}
+
+bool RDMAExecutorBackend::supports_segments() const {
+  return true;
+}
+
+bool RDMAExecutorBackend::evict_segment(uint64_t segment_id, uintptr_t vaddr_base,
+                                        const void* bytes, size_t byte_size,
+                                        uint32_t flags) {
+  if (!_connected || segment_id == 0 || bytes == nullptr || byte_size == 0) {
+    return false;
+  }
+
+  const size_t header_size = 48;
+  if (RDMAMsgBufSize <= header_size ||
+      byte_size > RDMAMsgBufSize - header_size ||
+      byte_size > (size_t)UINT32_MAX - header_size) {
+    log_warning(gc)("RDMAExecutor: segment evict too large for control path: "
+                    "segment=" UINT64_FORMAT " bytes=" SIZE_FORMAT
+                    " msg_buf=" SIZE_FORMAT,
+                    segment_id, byte_size, (size_t)RDMAMsgBufSize);
+    return false;
+  }
+
+  size_t msg_size = header_size + byte_size;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  if (msg == nullptr) {
+    return false;
+  }
+
+  *(uint32_t*)(msg + 0) = RE_CMD_EVICT_SEGMENT;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = 0;
+  *(uint64_t*)(msg + 16) = segment_id;
+  *(uint64_t*)(msg + 24) = (uint64_t)vaddr_base;
+  *(uint64_t*)(msg + 32) = (uint64_t)byte_size;
+  *(uint32_t*)(msg + 40) = flags;
+  *(uint32_t*)(msg + 44) = 0;
+  memcpy(msg + header_size, bytes, byte_size);
+
+  io_lock();
+  if (!flush_localize_batch_locked()) {
+    io_unlock();
+    os::free(msg);
+    return false;
+  }
+  *(uint64_t*)(msg + 8) = _seq_id++;
+
+  if (!rdma_post_recv()) {
+    io_unlock();
+    os::free(msg);
+    return false;
+  }
+  if (!rdma_send_msg(msg, msg_size)) {
+    io_unlock();
+    os::free(msg);
+    return false;
+  }
+  os::free(msg);
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  bool ok = rdma_wait_recv(resp, sizeof(resp), &resp_len) &&
+            resp_len >= 16 && *(uint32_t*)resp == RE_RESP_OK;
+  io_unlock();
+  return ok;
+}
+
+bool RDMAExecutorBackend::fetch_segment(uint64_t segment_id,
+                                        uintptr_t* out_vaddr_base,
+                                        void* dest,
+                                        size_t byte_capacity,
+                                        size_t* out_byte_size,
+                                        uint32_t* out_flags) {
+  if (!_connected || segment_id == 0 || dest == nullptr || byte_capacity == 0) {
+    return false;
+  }
+
+  const size_t header_size = 48;
+  size_t max_response_bytes = byte_capacity + header_size;
+  if (max_response_bytes < byte_capacity || max_response_bytes > RDMAMsgBufSize) {
+    max_response_bytes = RDMAMsgBufSize;
+  }
+
+  io_lock();
+  if (!flush_localize_batch_locked()) {
+    io_unlock();
+    return false;
+  }
+
+  if (!rdma_post_recv()) {
+    io_unlock();
+    return false;
+  }
+
+  uint8_t msg[32];
+  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_SEGMENT;
+  *(uint32_t*)(msg + 4) = sizeof(msg);
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = segment_id;
+  *(uint64_t*)(msg + 24) = (uint64_t)max_response_bytes;
+  if (!rdma_send_msg(msg, sizeof(msg))) {
+    io_unlock();
+    return false;
+  }
+
+  void* recv_buf = (char*)_local_mr->addr + RDMAMsgBufSize;
+  struct ibv_wc wc;
+  if (!poll_cq_wait(_recv_cq, /*wr_id*/0, &wc)) {
+    io_unlock();
+    return false;
+  }
+
+  uint8_t* resp = (uint8_t*)recv_buf;
+  size_t resp_len = wc.byte_len;
+  if (resp_len < header_size || *(uint32_t*)resp != RE_RESP_SEGMENT_DATA) {
+    io_unlock();
+    return false;
+  }
+
+  uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+  uint64_t resp_segment_id = *(uint64_t*)(resp + 16);
+  uintptr_t resp_vaddr_base = (uintptr_t)*(uint64_t*)(resp + 24);
+  size_t resp_byte_size = (size_t)*(uint64_t*)(resp + 32);
+  uint32_t resp_flags = *(uint32_t*)(resp + 40);
+
+  if (resp_msg_len > resp_len || resp_msg_len > max_response_bytes ||
+      resp_msg_len < header_size || resp_segment_id != segment_id ||
+      resp_byte_size > byte_capacity ||
+      resp_byte_size > resp_msg_len - header_size) {
+    log_warning(gc)("RDMAExecutor: malformed segment fetch response: "
+                    "segment=" UINT64_FORMAT " hdr_len=%u actual="
+                    SIZE_FORMAT " bytes=" SIZE_FORMAT " cap=" SIZE_FORMAT,
+                    segment_id, resp_msg_len, resp_len, resp_byte_size,
+                    byte_capacity);
+    io_unlock();
+    return false;
+  }
+
+  memcpy(dest, resp + header_size, resp_byte_size);
+  io_unlock();
+
+  if (out_vaddr_base != nullptr) {
+    *out_vaddr_base = resp_vaddr_base;
+  }
+  if (out_byte_size != nullptr) {
+    *out_byte_size = resp_byte_size;
+  }
+  if (out_flags != nullptr) {
+    *out_flags = resp_flags;
+  }
+  return true;
+}
+
+void RDMAExecutorBackend::discard_segment(uint64_t segment_id) {
+  if (!_connected || segment_id == 0) {
+    return;
+  }
+
+  io_lock();
+  if (!flush_localize_batch_locked()) {
+    io_unlock();
+    return;
+  }
+
+  if (!rdma_post_recv()) {
+    io_unlock();
+    return;
+  }
+
+  uint8_t msg[24];
+  *(uint32_t*)(msg + 0) = RE_CMD_DISCARD_SEGMENT;
+  *(uint32_t*)(msg + 4) = sizeof(msg);
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = segment_id;
+  rdma_send_msg(msg, sizeof(msg));
+
+  uint8_t resp[64];
+  size_t resp_len = 0;
+  rdma_wait_recv(resp, sizeof(resp), &resp_len);
+
+  io_unlock();
 }
 
 void RDMAExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_roots) {
