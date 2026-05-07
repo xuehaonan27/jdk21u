@@ -4697,17 +4697,27 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         if (untaggable_source) {
           _repair_untaggable++;
         } else {
-          RemoteHandle* h = _rmm->handle_for(target);
-          if (h != nullptr) {
+          if (_rmm->dense_segments_enabled() && target_klass != nullptr) {
             if (can_repair_next()) {
-              *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
-              local_buf_add(p, h);
+              *(uintptr_t*)p = G1_OOP_MANAGED_BIT |
+                               (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
               _repaired++;
             } else {
               _repair_limit_skipped++;
             }
           } else {
-            _repair_no_handle++;
+            RemoteHandle* h = _rmm->handle_for(target);
+            if (h != nullptr) {
+              if (can_repair_next()) {
+                *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+                local_buf_add(p, h);
+                _repaired++;
+              } else {
+                _repair_limit_skipped++;
+              }
+            } else {
+              _repair_no_handle++;
+            }
           }
         }
       }
