@@ -730,7 +730,9 @@ class G1EvacuateRegionsTask : public G1EvacuateRegionsBaseTask {
           const G1RemoteMemoryManager::TaggedFieldEntry* entries = rmm->tagged_fields();
           int evacuated = 0;
           for (int i = 0; i < count; i++) {
+            if (!entries[i].is_handle()) continue;
             RemoteHandle* h = entries[i]._handle;
+            if (h == nullptr) continue;
             uintptr_t sa = h->load_state_and_addr_acquire();
             uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
             if (state != REMOTE_HANDLE_LOCAL) continue;
@@ -3652,6 +3654,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
+      if (total_candidates == 0 && rmm->dense_segments_enabled()) {
+        rmm->cleanup_recorded_direct_refs_after_dense_phase();
+      }
+
       if (total_candidates > 0 && rmm->dense_segments_enabled()) {
         Ticks dense_start = Ticks::now();
         int dense_evicted_regions = 0;
@@ -3709,6 +3715,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                      "%d skipped, %d failed, " SIZE_FORMAT "KB)",
                      dense_ms, dense_evicted_regions, dense_skipped_regions,
                      dense_failed_regions, dense_evicted_bytes / K);
+        rmm->cleanup_recorded_direct_refs_after_dense_phase();
       }
 
       // ---- Phase E: Evict non-pinned candidates (batched) ----

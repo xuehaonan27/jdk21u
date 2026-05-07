@@ -708,6 +708,13 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     _fast_phase_c_source_hint_count = 0;
   }
   if (_dense_segments != nullptr) {
+    for (uint i = 0; i < _dense_segment_capacity; i++) {
+      if (_dense_segments[i].edges != nullptr) {
+        FREE_C_HEAP_ARRAY(DenseSegmentEdge, _dense_segments[i].edges);
+        _dense_segments[i].edges = nullptr;
+        _dense_segments[i].edge_count = 0;
+      }
+    }
     FREE_C_HEAP_ARRAY(DenseSegmentEntry, _dense_segments);
     _dense_segments = nullptr;
     _dense_segment_capacity = 0;
@@ -871,58 +878,303 @@ bool G1RemoteMemoryManager::dense_segments_enabled() const {
          _backend->supports_segments();
 }
 
-class DenseSegmentClosedClosure : public BasicOopIterateClosure {
-  HeapWord* _bottom;
-  HeapWord* _top;
-  bool _closed;
-  const char* _reason;
-
-  void fail(const char* reason) {
-    if (_closed) {
-      _reason = reason;
+void G1RemoteMemoryManager::release_dense_segment_edges(DenseSegmentEdge* edges,
+                                                        uint32_t count) {
+  if (edges == nullptr) {
+    return;
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    if (edges[i].kind == DenseSegmentEdgeHandle &&
+        edges[i].target_handle != nullptr) {
+      edges[i].target_handle->decrement_remote_refcount();
     }
-    _closed = false;
+  }
+  FREE_C_HEAP_ARRAY(DenseSegmentEdge, edges);
+}
+
+bool G1RemoteMemoryManager::scan_dense_segment_region(HeapRegion* hr,
+                                                      bool build_edges,
+                                                      DenseSegmentEdge** out_edges,
+                                                      uint32_t* out_edge_count,
+                                                      size_t* out_object_count,
+                                                      const char** reason) {
+  if (out_edges != nullptr) {
+    *out_edges = nullptr;
+  }
+  if (out_edge_count != nullptr) {
+    *out_edge_count = 0;
+  }
+  if (out_object_count != nullptr) {
+    *out_object_count = 0;
+  }
+  if (reason != nullptr) {
+    *reason = "ok";
   }
 
-  void do_raw_oop(uintptr_t raw) {
-    if (raw == 0 || !_closed) return;
+  if (hr == nullptr || hr->is_free() || hr->is_empty() || hr->is_evict_guarded()) {
+    if (reason != nullptr) *reason = "bad-region-state";
+    return false;
+  }
 
-    uintptr_t target_addr = raw;
-    if ((raw & G1_OOP_TAG_MASK) != 0) {
-      if ((raw & G1_OOP_MANAGED_BIT) == 0 ||
-          (raw & G1_OOP_INDIRECT_BIT) != 0) {
-        fail("tagged-handle-ref");
+  class DenseSegmentBoundaryClosure : public BasicOopIterateClosure {
+    G1RemoteMemoryManager* _rmm;
+    G1CollectedHeap*       _g1h;
+    HeapWord*              _bottom;
+    HeapWord*              _top;
+    bool                   _build_edges;
+    RemoteHandleAllocBuffer _hab;
+    DenseSegmentEdge*      _edges;
+    uint32_t               _edge_count;
+    uint32_t               _edge_capacity;
+    bool                   _ok;
+    const char*            _reason;
+
+    void fail(const char* reason) {
+      if (_ok) {
+        _reason = reason;
+      }
+      _ok = false;
+    }
+
+    bool ensure_capacity() {
+      if (_edge_count < _edge_capacity) {
+        return true;
+      }
+      if (_edge_count == UINT32_MAX) {
+        fail("too-many-boundary-edges");
+        return false;
+      }
+      uint32_t new_cap = _edge_capacity == 0 ? 128 : _edge_capacity * 2;
+      if (new_cap < _edge_capacity) {
+        fail("too-many-boundary-edges");
+        return false;
+      }
+      DenseSegmentEdge* next =
+          NEW_C_HEAP_ARRAY(DenseSegmentEdge, new_cap, mtGC);
+      if (_edges != nullptr) {
+        memcpy(next, _edges, sizeof(DenseSegmentEdge) * _edge_count);
+        FREE_C_HEAP_ARRAY(DenseSegmentEdge, _edges);
+      }
+      _edges = next;
+      _edge_capacity = new_cap;
+      return true;
+    }
+
+    void add_handle_edge(oop* field, RemoteHandle* h) {
+      if (!_ok || h == nullptr) {
         return;
       }
-      target_addr = raw & G1_OOP_ADDR_MASK;
+      if (_build_edges && !ensure_capacity()) {
+        return;
+      }
+      uint32_t offset = (uint32_t)((uintptr_t)field - (uintptr_t)_bottom);
+      if (_build_edges) {
+        _edges[_edge_count].field_offset = offset;
+        _edges[_edge_count].kind = DenseSegmentEdgeHandle;
+        _edges[_edge_count].target_handle = h;
+        _edges[_edge_count].target_addr = 0;
+        h->increment_remote_refcount();
+      }
+      _edge_count++;
     }
 
-    if (!is_aligned((address)target_addr, HeapWordSize)) {
-      fail("unaligned-oop");
-      return;
+    void add_direct_edge(oop* field, uintptr_t target_addr) {
+      if (!_ok) {
+        return;
+      }
+      if (_build_edges && !ensure_capacity()) {
+        return;
+      }
+      uint32_t offset = (uint32_t)((uintptr_t)field - (uintptr_t)_bottom);
+      if (_build_edges) {
+        _edges[_edge_count].field_offset = offset;
+        _edges[_edge_count].kind = DenseSegmentEdgeDirect;
+        _edges[_edge_count].target_handle = nullptr;
+        _edges[_edge_count].target_addr = target_addr & G1_OOP_ADDR_MASK;
+      }
+      _edge_count++;
     }
-    HeapWord* target = (HeapWord*)target_addr;
-    if (target < _bottom || target >= _top) {
-      fail("outgoing-oop");
-      return;
+
+    bool valid_local_target(uintptr_t target_addr, oop* field) {
+      if (!is_aligned((address)target_addr, HeapWordSize)) {
+        fail("unaligned-oop");
+        return false;
+      }
+
+      HeapWord* target_word = (HeapWord*)target_addr;
+      if (target_word >= _bottom && target_word < _top) {
+        return true;
+      }
+
+      if (_rmm->is_dense_segment_remote_addr(target_addr)) {
+        add_direct_edge(field, target_addr);
+        return true;
+      }
+
+      if (!_g1h->is_in_reserved((void*)target_addr) ||
+          !_g1h->is_in((void*)target_addr)) {
+        fail("outgoing-not-live");
+        return false;
+      }
+
+      HeapRegion* target_hr = _g1h->heap_region_containing_or_null((void*)target_addr);
+      if (target_hr == nullptr || target_hr->is_free() || target_hr->is_empty() ||
+          target_hr->is_evict_guarded() || target_hr->is_continues_humongous()) {
+        fail("bad-outgoing-region");
+        return false;
+      }
+
+      oop target = cast_to_oop(target_word);
+      Klass* k = target->klass_or_null();
+      if (k == nullptr || G1CollectedHeap::is_obj_filler(target)) {
+        fail("bad-outgoing-klass");
+        return false;
+      }
+      size_t sz = target->size_given_klass(k);
+      if (sz == 0 ||
+          sz > (size_t)(target_hr->top() - target_word) ||
+          sz > (size_t)(target_hr->end() - target_word)) {
+        fail("bad-outgoing-size");
+        return false;
+      }
+
+      if (_build_edges) {
+        RemoteHandle* h = _rmm->ensure_dormant_anchor_for(target, &_hab);
+        add_handle_edge(field, h);
+      } else {
+        _edge_count++;
+      }
+      return true;
     }
+
+  public:
+    DenseSegmentBoundaryClosure(G1RemoteMemoryManager* rmm,
+                                G1CollectedHeap* g1h,
+                                HeapWord* bottom,
+                                HeapWord* top,
+                                bool build_edges)
+      : _rmm(rmm), _g1h(g1h), _bottom(bottom), _top(top),
+        _build_edges(build_edges), _hab(),
+        _edges(nullptr), _edge_count(0), _edge_capacity(0),
+        _ok(true), _reason("ok") {}
+
+    ~DenseSegmentBoundaryClosure() {
+      if (_edges != nullptr) {
+        _rmm->release_dense_segment_edges(_edges, _edge_count);
+      }
+    }
+
+    void do_oop(oop* p) override {
+      if (!_ok) {
+        return;
+      }
+      uintptr_t raw = *(uintptr_t*)p;
+      if (raw == 0) {
+        return;
+      }
+
+      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+        RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+        uintptr_t sa = h->load_state_and_addr_acquire();
+        uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+        if (state == REMOTE_HANDLE_LOCAL) {
+          uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+          HeapWord* target = (HeapWord*)addr;
+          if (target >= _bottom && target < _top) {
+            fail("internal-handle-ref");
+            return;
+          }
+        }
+        add_handle_edge(p, h);
+        return;
+      }
+
+      uintptr_t target_addr = raw;
+      if ((raw & G1_OOP_TAG_MASK) != 0) {
+        if ((raw & G1_OOP_MANAGED_BIT) == 0) {
+          fail("unknown-tagged-ref");
+          return;
+        }
+        target_addr = raw & G1_OOP_ADDR_MASK;
+      }
+      valid_local_target(target_addr, p);
+    }
+
+    void do_oop(narrowOop* p) override {
+      // Dense-segment Spark experiments run with UseCompressedOops=false.
+    }
+
+    bool ok() const { return _ok; }
+    const char* reason() const { return _reason; }
+    uint32_t edge_count() const { return _edge_count; }
+
+    DenseSegmentEdge* release_edges() {
+      DenseSegmentEdge* result = _edges;
+      _edges = nullptr;
+      _edge_capacity = 0;
+      return result;
+    }
+  };
+
+  DenseSegmentBoundaryClosure boundary_cl(this, _g1h, hr->bottom(), hr->top(),
+                                          build_edges);
+  size_t objects = 0;
+  HeapWord* p = hr->bottom();
+  HeapWord* region_end = hr->end();
+  while (p < hr->top()) {
+    if (p < hr->bottom() || p >= region_end) {
+      if (reason != nullptr) *reason = "parse-out-of-region";
+      return false;
+    }
+    oop obj = cast_to_oop(p);
+    if (obj->is_forwarded()) {
+      if (reason != nullptr) *reason = "forwarded";
+      return false;
+    }
+    Klass* k = obj->klass_or_null();
+    if (k == nullptr) {
+      if (reason != nullptr) *reason = "null-klass";
+      return false;
+    }
+    markWord mark = obj->mark();
+    if (!mark.is_unlocked()) {
+      if (reason != nullptr) *reason = "locked-mark";
+      return false;
+    }
+    size_t sz = obj->size_given_klass(k);
+    if (sz == 0 || sz > (size_t)(region_end - p)) {
+      if (reason != nullptr) *reason = "bad-size";
+      return false;
+    }
+    if (!G1CollectedHeap::is_obj_filler(obj)) {
+      if (!k->is_typeArray_klass()) {
+        obj->oop_iterate(&boundary_cl);
+        if (!boundary_cl.ok()) {
+          if (reason != nullptr) *reason = boundary_cl.reason();
+          return false;
+        }
+      }
+      objects++;
+    }
+    p += sz;
+  }
+  if (p != hr->top() || objects == 0) {
+    if (reason != nullptr) *reason = "empty-or-unparseable";
+    return false;
   }
 
-public:
-  DenseSegmentClosedClosure(HeapWord* bottom, HeapWord* top)
-    : _bottom(bottom), _top(top), _closed(true), _reason("ok") {}
-
-  void do_oop(oop* p) override {
-    do_raw_oop(*(uintptr_t*)p);
+  if (out_object_count != nullptr) {
+    *out_object_count = objects;
   }
-
-  void do_oop(narrowOop* p) override {
-    // Dense-segment Spark experiments run with UseCompressedOops=false.
+  if (out_edge_count != nullptr) {
+    *out_edge_count = boundary_cl.edge_count();
   }
-
-  bool closed() const { return _closed; }
-  const char* reason() const { return _reason; }
-};
+  if (build_edges && out_edges != nullptr) {
+    *out_edges = boundary_cl.release_edges();
+  }
+  return true;
+}
 
 bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
                                                            const char** reason,
@@ -954,48 +1206,7 @@ bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
   }
 
   size_t objects = 0;
-  DenseSegmentClosedClosure closed_cl(hr->bottom(), hr->top());
-  HeapWord* p = hr->bottom();
-  HeapWord* region_end = hr->end();
-  while (p < hr->top()) {
-    if (p < hr->bottom() || p >= region_end) {
-      if (reason != nullptr) *reason = "parse-out-of-region";
-      return false;
-    }
-    oop obj = cast_to_oop(p);
-    if (obj->is_forwarded()) {
-      if (reason != nullptr) *reason = "forwarded";
-      return false;
-    }
-    Klass* k = obj->klass_or_null();
-    if (k == nullptr) {
-      if (reason != nullptr) *reason = "null-klass";
-      return false;
-    }
-    markWord mark = obj->mark();
-    if (!mark.is_unlocked()) {
-      if (reason != nullptr) *reason = "locked-mark";
-      return false;
-    }
-    size_t sz = obj->size_given_klass(k);
-    if (sz == 0 || sz > (size_t)(region_end - p)) {
-      if (reason != nullptr) *reason = "bad-size";
-      return false;
-    }
-    if (!G1CollectedHeap::is_obj_filler(obj)) {
-      if (!k->is_typeArray_klass()) {
-        obj->oop_iterate(&closed_cl);
-        if (!closed_cl.closed()) {
-          if (reason != nullptr) *reason = closed_cl.reason();
-          return false;
-        }
-      }
-      objects++;
-    }
-    p += sz;
-  }
-  if (p != hr->top() || objects == 0) {
-    if (reason != nullptr) *reason = "empty-or-unparseable";
+  if (!scan_dense_segment_region(hr, false, nullptr, nullptr, &objects, reason)) {
     return false;
   }
   if (object_count != nullptr) *object_count = objects;
@@ -1031,10 +1242,23 @@ bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr, uint32_t 
   segment_id = ((uint64_t)region_idx << 32) | (_dense_segment_next_id++);
   dense_segment_unlock();
 
+  DenseSegmentEdge* edges = nullptr;
+  uint32_t edge_count = 0;
+  if (!scan_dense_segment_region(hr, true, &edges, &edge_count,
+                                 &objects, &reason)) {
+    release_dense_segment_edges(edges, edge_count);
+    Atomic::inc(&_dense_segment_evict_failures);
+    log_warning(gc)("Dense segment evict rejected during boundary build: "
+                    "region=%u reason=%s",
+                    region_idx, reason != nullptr ? reason : "unknown");
+    return false;
+  }
+
   size_t byte_size = hr->used();
   bool ok = _backend->evict_segment(segment_id, (uintptr_t)hr->bottom(),
                                     hr->bottom(), byte_size, flags);
   if (!ok) {
+    release_dense_segment_edges(edges, edge_count);
     Atomic::inc(&_dense_segment_evict_failures);
     return false;
   }
@@ -1044,6 +1268,11 @@ bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr, uint32_t 
   entry->segment_id = segment_id;
   entry->base = (uintptr_t)hr->bottom();
   entry->byte_size = byte_size;
+  if (entry->edges != nullptr) {
+    FREE_C_HEAP_ARRAY(DenseSegmentEdge, entry->edges);
+  }
+  entry->edges = edges;
+  entry->edge_count = edge_count;
   entry->flags = flags;
   entry->last_evict_epoch = _gc_epoch;
   Atomic::release_store(&entry->state, (uint32_t)DenseSegmentRemote);
@@ -1051,9 +1280,9 @@ bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr, uint32_t 
 
   Atomic::inc(&_dense_segment_evict_success);
   log_info(gc)("Dense segment evicted: region=%u segment=" UINT64_FORMAT
-               " objects=" SIZE_FORMAT " bytes=" SIZE_FORMAT
+               " objects=" SIZE_FORMAT " boundary_edges=%u bytes=" SIZE_FORMAT
                " [" PTR_FORMAT ", " PTR_FORMAT ")",
-               region_idx, segment_id, objects, byte_size,
+               region_idx, segment_id, objects, edge_count, byte_size,
                p2i(hr->bottom()), p2i(hr->top()));
   return true;
 }
@@ -1119,6 +1348,85 @@ static void dirty_dense_segment_cards(G1CollectedHeap* g1h, HeapRegion* hr) {
     dcqs.enqueue(tmp_queue, card);
   }
   dcqs.flush_queue(tmp_queue);
+}
+
+void G1RemoteMemoryManager::patch_dense_segment_boundary_edges(DenseSegmentEntry* entry,
+                                                               HeapRegion* hr) {
+  if (entry == nullptr || hr == nullptr || entry->edges == nullptr ||
+      entry->edge_count == 0) {
+    return;
+  }
+
+  DenseSegmentEdge* edges = entry->edges;
+  uint32_t count = entry->edge_count;
+  entry->edges = nullptr;
+  entry->edge_count = 0;
+
+  bool cm_active = concurrent_marking_active();
+  int clean = 0;
+  int shared = 0;
+  int direct = 0;
+  int nulled = 0;
+  int invalid = 0;
+
+  uintptr_t base = (uintptr_t)hr->bottom();
+  for (uint32_t i = 0; i < count; i++) {
+    DenseSegmentEdge* edge = &edges[i];
+    if ((size_t)edge->field_offset + sizeof(uintptr_t) > entry->byte_size) {
+      invalid++;
+      continue;
+    }
+
+    uintptr_t* field = (uintptr_t*)(base + edge->field_offset);
+    if (edge->kind == DenseSegmentEdgeDirect) {
+      *field = G1_OOP_MANAGED_BIT | (edge->target_addr & G1_OOP_ADDR_MASK);
+      direct++;
+      continue;
+    }
+
+    RemoteHandle* target = edge->target_handle;
+    if (target == nullptr) {
+      *field = 0;
+      nulled++;
+      continue;
+    }
+
+    uintptr_t sa = target->load_state_and_addr_acquire();
+    uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+    if (state == REMOTE_HANDLE_LOCAL) {
+      int stale = 0;
+      uintptr_t target_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+      if (validate_local_handle_addr(target, "DENSE-SEGMENT-PATCH", &stale, 8)) {
+        *field = target_addr;
+        clean++;
+      } else {
+        *field = 0;
+        nulled++;
+      }
+      if (cm_active) {
+        defer_refcount_decrement(target);
+      } else {
+        target->decrement_remote_refcount();
+      }
+    } else if (state == REMOTE_HANDLE_DEAD) {
+      *field = 0;
+      nulled++;
+      if (cm_active) {
+        defer_refcount_decrement(target);
+      } else {
+        target->decrement_remote_refcount();
+      }
+    } else {
+      *field = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)target;
+      shared++;
+    }
+  }
+
+  FREE_C_HEAP_ARRAY(DenseSegmentEdge, edges);
+
+  log_info(gc)("Dense segment boundary patch: region=%u edges=%u clean=%d "
+               "shared=%d direct=%d nulled=%d invalid=%d",
+               hr->hrm_index(), count, clean, shared, direct, nulled, invalid);
 }
 
 bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
@@ -1236,6 +1544,7 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
     Heap_lock->unlock();
   }
   if (ok) {
+    patch_dense_segment_boundary_edges(&_dense_segments[idx], hr);
     dirty_dense_segment_cards(_g1h, hr);
     _backend->discard_segment(segment_id);
   }
@@ -2541,7 +2850,7 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
   int               _local_count;
   int               _local_capacity;
 
-  void local_buf_add(oop* field_addr, RemoteHandle* h) {
+  void local_buf_add_entry(const TaggedFieldEntry& entry) {
     if (_local_count >= _local_capacity) {
       int new_cap = (_local_capacity == 0) ? 4096 : _local_capacity * 2;
       TaggedFieldEntry* nb = NEW_C_HEAP_ARRAY(TaggedFieldEntry, new_cap, mtGC);
@@ -2552,9 +2861,25 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
       _local_buf = nb;
       _local_capacity = new_cap;
     }
-    _local_buf[_local_count]._field_addr = field_addr;
-    _local_buf[_local_count]._handle = h;
-    _local_count++;
+    _local_buf[_local_count++] = entry;
+  }
+
+  void local_buf_add(oop* field_addr, RemoteHandle* h) {
+    TaggedFieldEntry entry;
+    entry._field_addr = field_addr;
+    entry._handle = h;
+    entry._tagged_raw = 0;
+    entry._kind = G1RemoteMemoryManager::TaggedFieldHandle;
+    local_buf_add_entry(entry);
+  }
+
+  void local_buf_add_direct(oop* field_addr, uintptr_t tagged_raw) {
+    TaggedFieldEntry entry;
+    entry._field_addr = field_addr;
+    entry._handle = nullptr;
+    entry._tagged_raw = tagged_raw;
+    entry._kind = G1RemoteMemoryManager::TaggedFieldDirect;
+    local_buf_add_entry(entry);
   }
 
 public:
@@ -2670,8 +2995,10 @@ public:
     }
 
     if (_rmm->dense_segments_enabled() && target_klass != nullptr) {
-      *(uintptr_t*)p = G1_OOP_MANAGED_BIT |
-                       (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
+      uintptr_t tagged_raw = G1_OOP_MANAGED_BIT |
+                             (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
+      *(uintptr_t*)p = tagged_raw;
+      local_buf_add_direct(p, tagged_raw);
       _tagged++;
       return;
     }
@@ -3730,8 +4057,7 @@ public:
   void flush_to_rmm() {
     for (uint i = 0; i < _num_workers; i++) {
       for (int j = 0; j < _worker_counts[i]; j++) {
-        _rmm->add_tagged_field(_worker_bufs[i][j]._field_addr,
-                               _worker_bufs[i][j]._handle);
+        _rmm->add_tagged_field_entry(_worker_bufs[i][j]);
       }
     }
   }
@@ -3766,7 +4092,7 @@ int G1RemoteMemoryManager::tag_all_heap_refs_to_eviction_set(
       scan_region_for_eviction_tags(hr, &cl, bitmap);
     }
     for (int j = 0; j < cl.local_count(); j++) {
-      add_tagged_field(cl.local_buf()[j]._field_addr, cl.local_buf()[j]._handle);
+      add_tagged_field_entry(cl.local_buf()[j]);
     }
     total_tagged = cl.tagged();
     total_no_handle = cl.no_handle();
@@ -3830,7 +4156,7 @@ int G1RemoteMemoryManager::tag_evacuated_area_refs_to_eviction_set(
   int total_tagged = cl.tagged();
   if (total_tagged > 0 || cl.untaggable() > 0) {
     for (int j = 0; j < cl.local_count(); j++) {
-      add_tagged_field(cl.local_buf()[j]._field_addr, cl.local_buf()[j]._handle);
+      add_tagged_field_entry(cl.local_buf()[j]);
     }
     log_warning(gc)("Phase C.1: re-scanned %d regions, tagged %d missed refs "
                     "(%d no handle, %d untaggable)",
@@ -4037,8 +4363,7 @@ public:
   void flush_to_rmm() {
     for (uint i = 0; i < _num_workers; i++) {
       for (int j = 0; j < _worker_counts[i]; j++) {
-        _rmm->add_tagged_field(_worker_bufs[i][j]._field_addr,
-                               _worker_bufs[i][j]._handle);
+        _rmm->add_tagged_field_entry(_worker_bufs[i][j]);
       }
     }
   }
@@ -4141,7 +4466,7 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     }
 
     for (int j = 0; j < cl.local_count(); j++) {
-      add_tagged_field(cl.local_buf()[j]._field_addr, cl.local_buf()[j]._handle);
+      add_tagged_field_entry(cl.local_buf()[j]);
     }
     total_tagged = cl.tagged();
     total_no_handle = cl.no_handle();
@@ -4178,7 +4503,7 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     }
 
     for (int j = 0; j < root_cl.local_count(); j++) {
-      add_tagged_field(root_cl.local_buf()[j]._field_addr, root_cl.local_buf()[j]._handle);
+      add_tagged_field_entry(root_cl.local_buf()[j]);
     }
 
     int root_tagged = root_cl.tagged();
@@ -4244,14 +4569,14 @@ public:
 
 int G1RemoteMemoryManager::untag_recorded_local_refs() {
   int restored = 0;
+  int direct_restored = 0;
   int removed = 0;
   int retained = 0;
   G1RemoteRollbackDirtyCards dirty_cards(_g1h);
 
   for (int i = 0; i < _tagged_field_count; i++) {
     oop* field_addr = _tagged_fields[i]._field_addr;
-    RemoteHandle* h = _tagged_fields[i]._handle;
-    if (field_addr == nullptr || h == nullptr) {
+    if (field_addr == nullptr) {
       removed++;
       continue;
     }
@@ -4268,6 +4593,34 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
     }
 
     uintptr_t raw = *(uintptr_t*)field_addr;
+    if (_tagged_fields[i].is_direct()) {
+      bool direct = (raw & G1_OOP_MANAGED_BIT) != 0 &&
+                    (raw & G1_OOP_INDIRECT_BIT) == 0;
+      if (!direct ||
+          (_tagged_fields[i]._tagged_raw != 0 &&
+           raw != _tagged_fields[i]._tagged_raw)) {
+        removed++;
+        continue;
+      }
+      uintptr_t addr = raw & G1_OOP_ADDR_MASK;
+      if (!g1_remote_oop_is_aligned(addr) ||
+          !_g1h->is_in_reserved((void*)addr)) {
+        removed++;
+        continue;
+      }
+      *(uintptr_t*)field_addr = addr;
+      dirty_cards.dirty_field(field_addr);
+      restored++;
+      direct_restored++;
+      continue;
+    }
+
+    RemoteHandle* h = _tagged_fields[i]._handle;
+    if (h == nullptr) {
+      removed++;
+      continue;
+    }
+
     if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) !=
         (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
       removed++;
@@ -4294,9 +4647,76 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
   dirty_cards.flush();
   _tagged_field_count = retained;
   if (restored > 0 || removed > 0 || dirty_cards.dirtied() > 0) {
-    log_info(gc)("Recorded untag cleanup: restored %d local refs, removed %d stale entries, "
-                 "%d remote-tag entries retained, dirtied %d cards",
-                 restored, removed, retained, dirty_cards.dirtied());
+    log_info(gc)("Recorded untag cleanup: restored %d local refs (%d direct), "
+                 "removed %d stale entries, %d remote-tag entries retained, "
+                 "dirtied %d cards",
+                 restored, direct_restored, removed, retained,
+                 dirty_cards.dirtied());
+  }
+  return restored;
+}
+
+int G1RemoteMemoryManager::cleanup_recorded_direct_refs_after_dense_phase() {
+  int restored = 0;
+  int dropped_remote = 0;
+  int removed = 0;
+  int retained = 0;
+  G1RemoteRollbackDirtyCards dirty_cards(_g1h);
+
+  for (int i = 0; i < _tagged_field_count; i++) {
+    TaggedFieldEntry entry = _tagged_fields[i];
+    if (!entry.is_direct()) {
+      _tagged_fields[retained++] = entry;
+      continue;
+    }
+
+    oop* field_addr = entry._field_addr;
+    if (field_addr == nullptr || !_g1h->is_in_reserved((void*)field_addr)) {
+      removed++;
+      continue;
+    }
+
+    HeapRegion* field_hr = _g1h->heap_region_containing((HeapWord*)field_addr);
+    if (field_hr != nullptr && (field_hr->is_free() || field_hr->is_evict_guarded())) {
+      removed++;
+      continue;
+    }
+
+    uintptr_t raw = *(uintptr_t*)field_addr;
+    bool direct = (raw & G1_OOP_MANAGED_BIT) != 0 &&
+                  (raw & G1_OOP_INDIRECT_BIT) == 0;
+    if (!direct || (entry._tagged_raw != 0 && raw != entry._tagged_raw)) {
+      removed++;
+      continue;
+    }
+
+    uintptr_t addr = raw & G1_OOP_ADDR_MASK;
+    if (!g1_remote_oop_is_aligned(addr) ||
+        !_g1h->is_in_reserved((void*)addr)) {
+      removed++;
+      continue;
+    }
+
+    HeapRegion* target_hr = _g1h->heap_region_containing_or_null((void*)addr);
+    if (is_dense_segment_remote_addr(addr) ||
+        (target_hr != nullptr && target_hr->is_evict_guarded())) {
+      dropped_remote++;
+      continue;
+    }
+
+    *(uintptr_t*)field_addr = addr;
+    dirty_cards.dirty_field(field_addr);
+    restored++;
+  }
+
+  dirty_cards.flush();
+  _tagged_field_count = retained;
+  if (restored > 0 || dropped_remote > 0 || removed > 0 || dirty_cards.dirtied() > 0) {
+    log_info(gc)("Dense direct tagged-field cleanup: restored %d local refs, "
+                 "dropped %d remote direct refs, removed %d stale entries, "
+                 "%d handle-tag entries retained, dirtied %d cards",
+                 restored, dropped_remote, removed, retained,
+                 dirty_cards.dirtied());
   }
   return restored;
 }
@@ -4355,22 +4775,20 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
 
   G1RemoteRollbackDirtyCards dirty_cards(_g1h);
   UntagClosure cl(_g1h, &dirty_cards);
+  class UntagObjectClosure {
+    UntagClosure* _cl;
+  public:
+    UntagObjectClosure(UntagClosure* cl) : _cl(cl) {}
+    void do_object(oop obj) {
+      obj->oop_iterate(_cl);
+    }
+  } obj_cl(&cl);
+  const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
   for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
     HeapRegion* hr = _g1h->region_at_or_null(i);
     if (hr == nullptr) continue;
     if (hr->is_empty() || hr->is_free()) continue;
-    HeapWord* p = hr->bottom();
-    HeapWord* region_end = hr->end();
-    while (p < hr->top()) {
-      if (p < hr->bottom() || p >= region_end) break;
-      oop obj = cast_to_oop(p);
-      Klass* k = obj->klass_or_null();
-      if (k == nullptr) break;
-      size_t sz = obj->size();
-      if (sz == 0 || sz > (size_t)(region_end - p)) break;
-      obj->oop_iterate(&cl);
-      p += sz;
-    }
+    remote_eviction_scan_region_objects(hr, bitmap, "Untag", &obj_cl);
   }
 
   dirty_cards.flush();
@@ -4426,7 +4844,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     int                    _local_count;
     int                    _local_capacity;
 
-    void local_buf_add(oop* field_addr, RemoteHandle* h) {
+    void local_buf_add_entry(const TaggedFieldEntry& entry) {
       if (_local_count >= _local_capacity) {
         int new_cap = (_local_capacity == 0) ? 256 : _local_capacity * 2;
         TaggedFieldEntry* nb = NEW_C_HEAP_ARRAY(TaggedFieldEntry, new_cap, mtGC);
@@ -4437,9 +4855,25 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         _local_buf = nb;
         _local_capacity = new_cap;
       }
-      _local_buf[_local_count]._field_addr = field_addr;
-      _local_buf[_local_count]._handle = h;
-      _local_count++;
+      _local_buf[_local_count++] = entry;
+    }
+
+    void local_buf_add(oop* field_addr, RemoteHandle* h) {
+      TaggedFieldEntry entry;
+      entry._field_addr = field_addr;
+      entry._handle = h;
+      entry._tagged_raw = 0;
+      entry._kind = G1RemoteMemoryManager::TaggedFieldHandle;
+      local_buf_add_entry(entry);
+    }
+
+    void local_buf_add_direct(oop* field_addr, uintptr_t tagged_raw) {
+      TaggedFieldEntry entry;
+      entry._field_addr = field_addr;
+      entry._handle = nullptr;
+      entry._tagged_raw = tagged_raw;
+      entry._kind = G1RemoteMemoryManager::TaggedFieldDirect;
+      local_buf_add_entry(entry);
     }
 
     static bool take_budget(volatile int* budget) {
@@ -4739,8 +5173,10 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         } else {
           if (_rmm->dense_segments_enabled() && target_klass != nullptr) {
             if (can_repair_next()) {
-              *(uintptr_t*)p = G1_OOP_MANAGED_BIT |
-                               (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
+              uintptr_t tagged_raw = G1_OOP_MANAGED_BIT |
+                                     (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
+              *(uintptr_t*)p = tagged_raw;
+              local_buf_add_direct(p, tagged_raw);
               _repaired++;
             } else {
               _repair_limit_skipped++;
@@ -4814,7 +5250,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
     void flush_repaired_fields() {
       for (int i = 0; i < _local_count; i++) {
-        _rmm->add_tagged_field(_local_buf[i]._field_addr, _local_buf[i]._handle);
+        _rmm->add_tagged_field_entry(_local_buf[i]);
       }
     }
 
@@ -6024,6 +6460,11 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
   for (int i = 0; i < _tagged_field_count; i++) {
     oop* field_addr = _tagged_fields[i]._field_addr;
     RemoteHandle* h = _tagged_fields[i]._handle;
+
+    if (_tagged_fields[i].is_direct()) {
+      removed++;
+      continue;
+    }
 
     if (field_addr == nullptr || h == nullptr) {
       removed++;

@@ -831,10 +831,24 @@ private:
     DenseSegmentLocal    = 3
   };
 
+  enum DenseSegmentEdgeKind : uint8_t {
+    DenseSegmentEdgeHandle = 0,
+    DenseSegmentEdgeDirect = 1
+  };
+
+  struct DenseSegmentEdge {
+    uint32_t     field_offset;
+    uint8_t      kind;
+    RemoteHandle* target_handle;
+    uintptr_t    target_addr;
+  };
+
   struct DenseSegmentEntry {
     uint64_t          segment_id;
     uintptr_t         base;
     size_t            byte_size;
+    DenseSegmentEdge* edges;
+    uint32_t          edge_count;
     uint32_t          flags;
     uint32_t          last_evict_epoch;
     uint32_t          last_fetch_epoch;
@@ -846,6 +860,8 @@ private:
       segment_id = 0;
       base = 0;
       byte_size = 0;
+      edges = nullptr;
+      edge_count = 0;
       flags = 0;
       last_evict_epoch = 0;
       last_fetch_epoch = 0;
@@ -867,6 +883,15 @@ private:
   void ensure_eviction_backoff_capacity(uint num_regions);
   void ensure_fast_phase_c_source_hint_capacity(uint num_regions);
   bool ensure_dense_segment_capacity(uint num_regions);
+  void release_dense_segment_edges(DenseSegmentEdge* edges, uint32_t count);
+  bool scan_dense_segment_region(HeapRegion* hr,
+                                 bool build_edges,
+                                 DenseSegmentEdge** out_edges,
+                                 uint32_t* out_edge_count,
+                                 size_t* out_object_count,
+                                 const char** reason);
+  void patch_dense_segment_boundary_edges(DenseSegmentEntry* entry,
+                                          HeapRegion* hr);
   void dense_segment_lock() {
     while (Atomic::cmpxchg(&_dense_segment_lock, 0, 1) != 0) { /* spin */ }
   }
@@ -943,9 +968,19 @@ public:
   // This avoids polluting G1's card/remset system with tagged oops, which
   // break refinement (Handle can transition REMOTE→LOCAL without any heap
   // field write, so cards can't track the indirection).
+  enum TaggedFieldKind : uint8_t {
+    TaggedFieldHandle = 0,
+    TaggedFieldDirect = 1
+  };
+
   struct TaggedFieldEntry {
     oop*          _field_addr;
     RemoteHandle* _handle;
+    uintptr_t     _tagged_raw;
+    uint8_t       _kind;
+
+    bool is_handle() const { return _kind == TaggedFieldHandle; }
+    bool is_direct() const { return _kind == TaggedFieldDirect; }
   };
 private:
   TaggedFieldEntry* _tagged_fields;
@@ -953,7 +988,7 @@ private:
   int _tagged_field_capacity;
 
 public:
-  void add_tagged_field(oop* field_addr, RemoteHandle* h) {
+  void add_tagged_field_entry(const TaggedFieldEntry& entry) {
     if (_tagged_field_count >= _tagged_field_capacity) {
       int new_cap = (_tagged_field_capacity == 0) ? 4096 : _tagged_field_capacity * 2;
       TaggedFieldEntry* new_buf = NEW_C_HEAP_ARRAY(TaggedFieldEntry, new_cap, mtGC);
@@ -964,9 +999,25 @@ public:
       _tagged_fields = new_buf;
       _tagged_field_capacity = new_cap;
     }
-    _tagged_fields[_tagged_field_count]._field_addr = field_addr;
-    _tagged_fields[_tagged_field_count]._handle = h;
-    _tagged_field_count++;
+    _tagged_fields[_tagged_field_count++] = entry;
+  }
+
+  void add_tagged_field(oop* field_addr, RemoteHandle* h) {
+    TaggedFieldEntry entry;
+    entry._field_addr = field_addr;
+    entry._handle = h;
+    entry._tagged_raw = 0;
+    entry._kind = TaggedFieldHandle;
+    add_tagged_field_entry(entry);
+  }
+
+  void add_direct_tagged_field(oop* field_addr, uintptr_t tagged_raw) {
+    TaggedFieldEntry entry;
+    entry._field_addr = field_addr;
+    entry._handle = nullptr;
+    entry._tagged_raw = tagged_raw;
+    entry._kind = TaggedFieldDirect;
+    add_tagged_field_entry(entry);
   }
 
   int tagged_field_count() const { return _tagged_field_count; }
@@ -1363,6 +1414,7 @@ public:
   // restore clean oops, preventing barrier gaps from causing crashes.
   int untag_all_heap_refs(WorkerThreads* workers = nullptr, uint num_workers = 0);
   int untag_recorded_local_refs();
+  int cleanup_recorded_direct_refs_after_dense_phase();
 
   // Patch fetched object's oop fields using sidecar edge table.
   // Called AFTER fetch_remote_object copies bytes, BEFORE set_local_release().
