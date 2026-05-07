@@ -5537,6 +5537,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
       }
     }
+    }
 
     // Post-eviction diagnostic: verify no root oops point into freed regions.
     // Uses eviction_candidates boolean array (independent of region state).
