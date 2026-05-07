@@ -1197,6 +1197,14 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
   dense_segment_unlock();
 
   if (ok) {
+    if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+      // A mutator fetch means this dense region is hot enough to keep local for
+      // a few GC epochs; otherwise pressure selection can immediately evict it
+      // again and create a fetch/evict storm.
+      dense_segment_lock();
+      backoff_eviction_region(idx, G1RemoteEvictionAbortBackoffGCCycles);
+      dense_segment_unlock();
+    }
     Atomic::inc(&_dense_segment_fetch_success);
     log_info(gc)("Dense segment localized: region=%u segment=" UINT64_FORMAT
                  " bytes=" SIZE_FORMAT " addr=" PTR_FORMAT,
