@@ -57,7 +57,21 @@ static inline bool g1_needs_remote_resolve(oop value) {
   if (g1h == nullptr || !g1h->is_in_reserved((void*)v)) return false;
 
   HeapRegion* hr = g1h->heap_region_containing_or_null((void*)v);
-  return hr == nullptr || hr->is_free() || hr->is_evict_guarded();
+  if (hr == nullptr || hr->is_free() || hr->is_evict_guarded() ||
+      !g1h->is_in((void*)v)) {
+    return true;
+  }
+
+  // An evicted region can be returned to normal heap service before every
+  // stale clean oop has been converted to a shared handle. Only regions that
+  // have actually held eviction fillers need the heavier klass/filler check.
+  if (!hr->had_remote_eviction_fillers()) {
+    return false;
+  }
+
+  oop obj = cast_to_oop((HeapWord*)v);
+  Klass* k = obj->klass_or_null();
+  return k == nullptr || G1CollectedHeap::is_obj_filler(obj);
 }
 
 static inline oop g1_resolve_remote_oop_if_needed(oop value,

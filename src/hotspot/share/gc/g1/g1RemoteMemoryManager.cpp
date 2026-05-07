@@ -1206,6 +1206,9 @@ void G1RemoteMemoryManager::finalize_eviction(PreparedEviction* entry) {
   HeapRegion* hr = _g1h->heap_region_containing(entry->obj);
   if (hr != nullptr) {
     hr->set_has_classified_objects();
+    if (!G1RemoteSkipFillerOnCompleteEviction) {
+      hr->set_had_remote_eviction_fillers();
+    }
   }
 
   CollectedHeap::fill_with_object(cast_from_oop<HeapWord*>(entry->obj), entry->word_size, false);
@@ -1234,6 +1237,9 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
 
   if (hr != nullptr) {
     hr->set_has_classified_objects();
+    if (!G1RemoteSkipFillerOnCompleteEviction) {
+      hr->set_had_remote_eviction_fillers();
+    }
   }
 
   if (G1RemoteSkipFillerOnCompleteEviction) {
@@ -3071,6 +3077,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     int                    _repair_no_handle;
     int                    _repair_untaggable;
     int                    _repair_limit_skipped;
+    int                    _stale_alias_repaired;
+    int                    _stale_alias_no_handle;
     int                    _heap_source;
     int                    _root_source;
     int                    _candidate_source;
@@ -3157,6 +3165,60 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
              !hr->is_continues_humongous();
     }
 
+    const char* stale_reason(uintptr_t addr, HeapRegion* hr) const {
+      if (hr == nullptr) return "NO-HR";
+      if (hr->is_free()) return "FREE";
+      if (hr->is_evict_guarded()) return "GUARDED";
+      if (!_g1h->is_in((void*)addr)) return "OUTSIDE-LIVE";
+
+      oop obj = cast_to_oop((HeapWord*)addr);
+      Klass* k = obj->klass_or_null();
+      if (k == nullptr) return "NULL-KLASS";
+      if (G1CollectedHeap::is_obj_filler(obj)) return "FILLER";
+      return nullptr;
+    }
+
+    bool repair_stale_alias(oop* p, uintptr_t addr, HeapRegion* hr,
+                            const char* reason) {
+      if (_cur_obj == nullptr || !_g1h->is_in((void*)p)) {
+        return false;
+      }
+
+      RemoteHandle* h = _rmm->handle_for_stale_eviction_addr(addr);
+      if (h == nullptr) {
+        _stale_alias_no_handle++;
+        if (_stale_alias_no_handle <= 20) {
+          log_warning(gc)("VERIFY stale-alias: no handle for stale field="
+                          PTR_FORMAT " raw=" PTR_FORMAT " reason=%s region=%u "
+                          "src_obj=" PTR_FORMAT,
+                          p2i(p), p2i((void*)addr), reason,
+                          hr == nullptr ? 9999 : hr->hrm_index(),
+                          p2i((void*)_cur_obj));
+        }
+        return false;
+      }
+
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+      if (state == REMOTE_HANDLE_DEAD) {
+        _stale_alias_no_handle++;
+        return false;
+      }
+
+      *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+      local_buf_add(p, h);
+      _stale_alias_repaired++;
+      if (_stale_alias_repaired <= 20) {
+        log_warning(gc)("VERIFY stale-alias: repaired field=" PTR_FORMAT
+                        " raw=" PTR_FORMAT " reason=%s region=%u -> handle="
+                        PTR_FORMAT " state=0x%lx src_obj=" PTR_FORMAT,
+                        p2i(p), p2i((void*)addr), reason,
+                        hr == nullptr ? 9999 : hr->hrm_index(),
+                        p2i(h), (unsigned long)state, p2i((void*)_cur_obj));
+      }
+      return true;
+    }
+
     void log_top_regions(const char* phase, const char* kind, const int* counts) const {
       const int limit = 8;
       uint selected[limit];
@@ -3201,6 +3263,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         _repair(repair), _repair_limit(repair_limit),
         _missed(0), _repaired(0), _repair_no_handle(0),
         _repair_untaggable(0), _repair_limit_skipped(0),
+        _stale_alias_repaired(0), _stale_alias_no_handle(0),
         _heap_source(0), _root_source(0),
         _candidate_source(0), _young_source(0), _destination_source(0),
         _direct_scanned_source(0), _dirty_card_source(0), _clean_old_source(0),
@@ -3233,15 +3296,24 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
           (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
 
-      oop target;
+      uintptr_t target_addr;
       if ((raw >> 63) != 0) {
-        target = cast_to_oop(raw & G1_OOP_ADDR_MASK);
+        target_addr = raw & G1_OOP_ADDR_MASK;
       } else {
-        target = cast_to_oop(raw);
+        target_addr = raw;
       }
-      if (!_g1h->is_in(target)) return;
+      if (!is_aligned((address)target_addr, HeapWordSize)) return;
+      if (!_g1h->is_in_reserved((void*)target_addr)) return;
 
-      HeapRegion* target_hr = _g1h->heap_region_containing(target);
+      HeapRegion* target_hr =
+          _g1h->heap_region_containing_or_null((void*)target_addr);
+      const char* stale = stale_reason(target_addr, target_hr);
+      if (stale != nullptr) {
+        repair_stale_alias(p, target_addr, target_hr, stale);
+        return;
+      }
+
+      oop target = cast_to_oop((HeapWord*)target_addr);
       uint idx = target_hr->hrm_index();
       if (idx >= _num_regions || !_eviction_set[idx]) return;
 
@@ -3379,6 +3451,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       _repair_no_handle += other._repair_no_handle;
       _repair_untaggable += other._repair_untaggable;
       _repair_limit_skipped += other._repair_limit_skipped;
+      _stale_alias_repaired += other._stale_alias_repaired;
+      _stale_alias_no_handle += other._stale_alias_no_handle;
       _heap_source += other._heap_source;
       _root_source += other._root_source;
       _candidate_source += other._candidate_source;
@@ -3406,6 +3480,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
     int missed() const { return _missed; }
     int repaired() const { return _repaired; }
+    int stale_alias_repaired() const { return _stale_alias_repaired; }
+    int stale_alias_no_handle() const { return _stale_alias_no_handle; }
     int unrepaired() const {
       int unrepaired_count = _missed - _repaired;
       return unrepaired_count > 0 ? unrepaired_count : 0;
@@ -3426,6 +3502,10 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
                         "no_handle=%d untaggable=%d limit_skipped=%d limit=%u",
                         phase, _repaired, unrepaired(), _repair_no_handle,
                         _repair_untaggable, _repair_limit_skipped, _repair_limit);
+      }
+      if (_stale_alias_repaired > 0 || _stale_alias_no_handle > 0) {
+        log_warning(gc)("VERIFY stale-alias (%s): repaired=%d no_handle=%d",
+                        phase, _stale_alias_repaired, _stale_alias_no_handle);
       }
       log_top_regions(phase, "src", _src_region_counts);
       log_top_regions(phase, "target", _target_region_counts);

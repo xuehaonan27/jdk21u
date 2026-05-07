@@ -1640,7 +1640,23 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
     G1CollectedHeap* g1h = G1CollectedHeap::heap();
     if (g1h != nullptr && g1h->is_in_reserved((void*)v)) {
       HeapRegion* hr = g1h->heap_region_containing_or_null((void*)v);
-      if (hr == nullptr || hr->is_free() || hr->is_evict_guarded()) {
+      bool stale_clean = hr == nullptr || hr->is_free() || hr->is_evict_guarded() ||
+                         !g1h->is_in((void*)v);
+      const char* stale_kind =
+          hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" :
+          (hr->is_free() ? "FREE" : "STALE"));
+      if (!stale_clean) {
+        oop obj = cast_to_oop((HeapWord*)v);
+        Klass* k = obj->klass_or_null();
+        if (k == nullptr) {
+          stale_clean = true;
+          stale_kind = "NULL-KLASS";
+        } else if (G1CollectedHeap::is_obj_filler(obj)) {
+          stale_clean = true;
+          stale_kind = "FILLER";
+        }
+      }
+      if (stale_clean) {
         G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
         RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(v);
         if (h != nullptr) {
@@ -1655,7 +1671,7 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
                           " from %s region %u via handle " PTR_FORMAT
                           " state=0x%lx",
                           p2i((void*)v),
-                          hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                          stale_kind,
                           hr == nullptr ? 9999 : hr->hrm_index(),
                           p2i(h), (unsigned long)state);
             return nullptr;
@@ -1664,7 +1680,7 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
         log_warning(gc)("Clean oop " PTR_FORMAT
                         " points into %s region %u but has no live remote handle",
                         p2i((void*)v),
-                        hr == nullptr ? "NO-HR" : (hr->is_evict_guarded() ? "GUARDED" : "FREE"),
+                        stale_kind,
                         hr == nullptr ? 9999 : hr->hrm_index());
         return nullptr;
       }

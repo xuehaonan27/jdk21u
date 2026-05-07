@@ -267,6 +267,11 @@ private:
   // Set to true when any object in the region gets classified.
   // Cleared on hr_clear() (region freed/recycled).
   bool _has_classified_objects;
+  // Persistent history bit: this region has held remote-eviction fillers.
+  // Unlike _has_classified_objects this intentionally survives hr_clear(),
+  // because stale clean oops may outlive region recycling and later point at
+  // old filler bytes inside an active region.
+  bool _had_remote_eviction_fillers;
 
   void report_region_type_change(G1HeapRegionTraceType::Type to);
 
@@ -583,6 +588,8 @@ public:
   // This is a fast-negative for write barrier: no classified objects → skip mark word check.
   bool has_classified_objects() const { return _has_classified_objects; }
   void set_has_classified_objects()   { _has_classified_objects = true; }
+  bool had_remote_eviction_fillers() const { return _had_remote_eviction_fillers; }
+  void set_had_remote_eviction_fillers()   { _had_remote_eviction_fillers = true; }
 
   // Cold destination flag: set when this region is used as a cold-old
   // allocation destination during GC. Objects in cold regions are eviction
