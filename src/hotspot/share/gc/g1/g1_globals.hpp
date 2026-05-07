@@ -485,6 +485,29 @@
           "misses and scan those regions in later eviction attempts. This "    \
           "turns repeated verifier repairs into bounded steady-state scans.")  \
                                                                             \
+  product(bool, G1RemoteUseObjArrayContainerPrescan, false, DIAGNOSTIC,       \
+          "Before Fast Phase C, boundedly scan old object-array container "    \
+          "regions for raw refs into eviction candidates. Safe sources are "   \
+          "seeded as current source hints; unsafe dense candidates are "       \
+          "removed before verifier-backed eviction work is wasted.")           \
+                                                                            \
+  product(uint, G1RemoteObjArrayContainerPrescanMaxRegions, 256, DIAGNOSTIC,  \
+          "Maximum old source regions scanned by "                            \
+          "G1RemoteUseObjArrayContainerPrescan in one GC. 0 disables the "     \
+          "pre-scan even when the boolean flag is enabled.")                  \
+          range(0, 4096)                                                      \
+                                                                            \
+  product(size_t, G1RemoteObjArrayContainerPrescanMaxElements, 1*M, DIAGNOSTIC, \
+          "Maximum object-array elements inspected by "                       \
+          "G1RemoteUseObjArrayContainerPrescan in one GC. 0 disables the "     \
+          "element cap.")                                                     \
+          range(0, 1024*M)                                                    \
+                                                                            \
+  product(bool, G1RemoteObjArrayContainerPrescanBackoffUnsafe, true, DIAGNOSTIC, \
+          "When object-array container pre-scan finds raw inbound refs that "  \
+          "cannot be represented by current Phase C tagging rules, remove "   \
+          "and back off the target candidate region for this GC.")             \
+                                                                            \
   product(uint, G1RemoteFastPhaseCSourceHintMaxRegions, 64, DIAGNOSTIC,       \
           "Maximum number of clean old source regions remembered by "          \
           "G1RemoteUseFastPhaseCSourceHints.")                                \

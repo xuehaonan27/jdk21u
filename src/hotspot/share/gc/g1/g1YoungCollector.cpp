@@ -3876,37 +3876,53 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
-      // ---- Phase C: Tag refs to eviction candidates ----
-      // The default full scan is O(entire_heap) but conservative.  The fast
-      // scanner is a diagnostic/capability path guarded by verification: it
-      // scans candidates, young regions, newly evacuated ranges, roots, and
-      // candidate remembered sets.  If verification finds a miss, eviction
-      // aborts and tagged refs are restored.
-      {
-        Ticks phase_c_start = Ticks::now();
-        uint nworkers = _g1h->workers()->active_workers();
-        int tagged = G1RemoteUseFastPhaseC
-          ? rmm->tag_refs_to_eviction_set_fast(eviction_candidates,
-                                               num_regions,
-                                               _pre_evac_tops,
-                                               _g1h->workers(), nworkers)
-          : rmm->tag_all_heap_refs_to_eviction_set(eviction_candidates,
-                                                   num_regions,
-                                                   _g1h->workers(), nworkers);
-        double phase_c_ms = (Ticks::now() - phase_c_start).seconds() * 1000.0;
-        log_info(gc)("Phase C %s scan: %.1fms (%u workers, %d tagged)",
-                     G1RemoteUseFastPhaseC ? "fast" : "full",
-                     phase_c_ms, nworkers, tagged);
+      if (total_candidates > 0 &&
+          G1RemoteUseFastPhaseC &&
+          G1RemoteUseObjArrayContainerPrescan) {
+        Ticks prescan_start = Ticks::now();
+        int removed = rmm->prescan_old_objarray_sources_to_eviction_set(
+            eviction_candidates, num_regions);
+        double prescan_ms = (Ticks::now() - prescan_start).seconds() * 1000.0;
+        if (removed > 0) {
+          total_candidates = MAX2(0, total_candidates - removed);
+        }
+        log_info(gc)("Phase C objArray container pre-scan: %.1fms "
+                     "(%d candidates removed, %d surviving)",
+                     prescan_ms, removed, total_candidates);
       }
 
-      if (total_candidates > 0 &&
-          G1RemoteAbortOnPhaseCUntaggable &&
-          rmm->last_phase_c_untaggable() > 0) {
-        abort_remote_eviction_candidates(
-            _g1h, rmm, eviction_candidates, num_regions,
-            "refs from untaggable heap/root sources kept raw during Phase C",
-            rmm->last_phase_c_untaggable());
-        total_candidates = 0;
+      if (total_candidates > 0) {
+        // ---- Phase C: Tag refs to eviction candidates ----
+        // The default full scan is O(entire_heap) but conservative.  The fast
+        // scanner is a diagnostic/capability path guarded by verification: it
+        // scans candidates, young regions, newly evacuated ranges, roots, and
+        // candidate remembered sets.  If verification finds a miss, eviction
+        // aborts and tagged refs are restored.
+        {
+          Ticks phase_c_start = Ticks::now();
+          uint nworkers = _g1h->workers()->active_workers();
+          int tagged = G1RemoteUseFastPhaseC
+            ? rmm->tag_refs_to_eviction_set_fast(eviction_candidates,
+                                                 num_regions,
+                                                 _pre_evac_tops,
+                                                 _g1h->workers(), nworkers)
+            : rmm->tag_all_heap_refs_to_eviction_set(eviction_candidates,
+                                                     num_regions,
+                                                     _g1h->workers(), nworkers);
+          double phase_c_ms = (Ticks::now() - phase_c_start).seconds() * 1000.0;
+          log_info(gc)("Phase C %s scan: %.1fms (%u workers, %d tagged)",
+                       G1RemoteUseFastPhaseC ? "fast" : "full",
+                       phase_c_ms, nworkers, tagged);
+        }
+
+        if (G1RemoteAbortOnPhaseCUntaggable &&
+            rmm->last_phase_c_untaggable() > 0) {
+          abort_remote_eviction_candidates(
+              _g1h, rmm, eviction_candidates, num_regions,
+              "refs from untaggable heap/root sources kept raw during Phase C",
+              rmm->last_phase_c_untaggable());
+          total_candidates = 0;
+        }
       }
 
       // ---- Phase C.1: Safety-net scan of newly-evacuated areas ----

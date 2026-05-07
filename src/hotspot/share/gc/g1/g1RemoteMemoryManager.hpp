@@ -1342,6 +1342,12 @@ public:
                                     HeapWord* const* pre_evac_tops,
                                     WorkerThreads* workers = nullptr, uint num_workers = 0);
 
+  // Bounded semantic pre-scan for old object-array containers. Mutates
+  // eviction_set by removing dense candidates whose inbound object-array refs
+  // cannot be represented by the current Phase C tagging rules.
+  int prescan_old_objarray_sources_to_eviction_set(bool* eviction_set,
+                                                   uint num_regions);
+
   int verify_no_untagged_refs_to_eviction_set(const bool* eviction_set, uint num_regions,
                                               HeapWord* const* pre_evac_tops = nullptr);
 
