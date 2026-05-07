@@ -1658,7 +1658,12 @@ static int refill_dense_eviction_candidates(G1CollectedHeap* g1h,
     (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
     if (!region_sample.dense_small_objects) continue;
     if (rmm->dense_segments_enabled()) {
-      if (!rmm->can_evict_dense_segment_region(hr, nullptr)) continue;
+      if (!rmm->can_evict_dense_segment_region(hr, nullptr)) {
+        if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+          rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
+        }
+        continue;
+      }
     } else if (!region_sample_allows_dense_object_eviction(region_sample)) {
       continue;
     }
@@ -2738,6 +2743,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_regions_backoff_skipped = 0;
         int path2_regions_sparse_skipped = 0;
         int path2_regions_unevictable_sample_skipped = 0;
+        int path2_regions_dense_incompatible_backoff = 0;
         size_t path2_dense_small_bytes = 0;
         size_t path2_dense_small_objects = 0;
         int path2_dense_last_resort_candidates = 0;
@@ -2962,6 +2968,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 : region_sample_allows_dense_object_eviction(region_sample);
             if (!dense_region_ok) {
               path2_regions_unevictable_sample_skipped++;
+              if (rmm != nullptr && G1RemoteEvictionAbortBackoffGCCycles > 0) {
+                rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
+                path2_regions_dense_incompatible_backoff++;
+              }
               dense_skip_objects += region_sample.object_count;
               dense_skip_evictable_objects += region_sample.evictable_object_count;
               dense_skip_obj_arrays += region_sample.obj_array_count;
@@ -2993,8 +3003,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
           if (path2_regions_unevictable_sample_skipped > 0) {
             log_info(gc)("Path 2 dense last-resort skipped %d sampled regions "
-                         "with insufficient Phase-E-evictable payload",
-                         path2_regions_unevictable_sample_skipped);
+                         "with insufficient Phase-E-evictable payload "
+                         "(%d backed off for %u GC cycles)",
+                         path2_regions_unevictable_sample_skipped,
+                         path2_regions_dense_incompatible_backoff,
+                         G1RemoteEvictionAbortBackoffGCCycles);
             log_info(gc)("Path 2 dense skip sample detail: objects=" SIZE_FORMAT
                          " evictable=" SIZE_FORMAT " obj_arrays=" SIZE_FORMAT
                          " type_arrays=" SIZE_FORMAT " fillers=" SIZE_FORMAT
@@ -3036,6 +3049,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     if (total_candidates > 0 && rmm->dense_segments_enabled()) {
       int dense_prefilter_removed = 0;
       int dense_prefilter_kept = 0;
+      int dense_prefilter_backoff = 0;
       for (uint i = 0; i < num_regions; i++) {
         if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at_or_null(i);
@@ -3045,6 +3059,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           eviction_candidates[i] = false;
           if (hr != nullptr) {
             hr->clear_cold_destination();
+            if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+              rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
+              dense_prefilter_backoff++;
+            }
           }
           dense_prefilter_removed++;
           if (total_candidates > 0) {
@@ -3056,8 +3074,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
       if (dense_prefilter_removed > 0 || dense_prefilter_kept > 0) {
         log_info(gc)("Dense segment prefilter: kept %d compatible regions, "
-                     "removed %d non-segment candidates before Phase B/C",
-                     dense_prefilter_kept, dense_prefilter_removed);
+                     "removed %d non-segment candidates before Phase B/C "
+                     "(%d backed off for %u GC cycles)",
+                     dense_prefilter_kept, dense_prefilter_removed,
+                     dense_prefilter_backoff,
+                     G1RemoteEvictionAbortBackoffGCCycles);
       }
     }
 
