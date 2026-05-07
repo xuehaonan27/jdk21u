@@ -50,9 +50,12 @@ static const uint32_t RE_CMD_FETCH_EXACT            = 0x1C;
 static const uint32_t RE_CMD_EVICT_SEGMENT          = 0x1D;
 static const uint32_t RE_CMD_FETCH_SEGMENT          = 0x1E;
 static const uint32_t RE_CMD_DISCARD_SEGMENT        = 0x1F;
+static const uint32_t RE_CMD_EVICT_SEGMENT_STAGED   = 0x20;
+static const uint32_t RE_CMD_FETCH_SEGMENT_STAGED   = 0x21;
 static const uint32_t RE_RESP_TRACE_RESULT           = 0x86;
 static const uint32_t RE_RESP_BATCH_OBJECT_DATA      = 0x87;
 static const uint32_t RE_RESP_SEGMENT_DATA           = 0x88;
+static const uint32_t RE_RESP_SEGMENT_STAGED         = 0x89;
 
 // RDMA parameters are set via JVM flags (g1_globals.hpp):
 //   -XX:RDMAMsgBufSize=65536    (SEND/RECV buffer, default 64K)
@@ -279,8 +282,10 @@ bool RDMAExecutorBackend::exchange_qp_info() {
   local_info.lid = port_attr.lid;
   local_info.active_mtu = (uint8_t)port_attr.active_mtu;
   memcpy(local_info.gid, &gid, 16);
+  // Expose only the data staging subrange to the executor for server->client
+  // staged fetches. The SEND/RECV ranges live before this address.
   local_info.rkey = _local_mr->rkey;
-  local_info.base_addr = (uint64_t)_local_mr->addr;
+  local_info.base_addr = (uint64_t)_local_mr->addr + 2 * RDMAMsgBufSize;
   local_info.arena_size = RDMADataBufSize;
 
   // Exchange via TCP
@@ -1028,12 +1033,56 @@ bool RDMAExecutorBackend::evict_segment(uint64_t segment_id, uintptr_t vaddr_bas
 
   const size_t header_size = 48;
   if (RDMAMsgBufSize <= header_size ||
-      byte_size > RDMAMsgBufSize - header_size ||
-      byte_size > (size_t)UINT32_MAX - header_size) {
-    log_warning(gc)("RDMAExecutor: segment evict too large for control path: "
-                    "segment=" UINT64_FORMAT " bytes=" SIZE_FORMAT
-                    " msg_buf=" SIZE_FORMAT,
-                    segment_id, byte_size, (size_t)RDMAMsgBufSize);
+      byte_size > RDMAMsgBufSize - header_size) {
+    const uint64_t remote_data_offset = 0;
+    if (byte_size > max_staged_batch_data_size() ||
+        remote_data_offset > _remote_arena_size ||
+        byte_size > _remote_arena_size - remote_data_offset) {
+      log_warning(gc)("RDMAExecutor: segment evict too large for staged path: "
+                      "segment=" UINT64_FORMAT " bytes=" SIZE_FORMAT
+                      " data_buf=" SIZE_FORMAT " remote_arena=" SIZE_FORMAT,
+                      segment_id, byte_size, max_staged_batch_data_size(),
+                      _remote_arena_size);
+      return false;
+    }
+
+    io_lock();
+    if (!flush_localize_batch_locked()) {
+      io_unlock();
+      return false;
+    }
+    if (!rdma_write(remote_data_offset, bytes, byte_size)) {
+      io_unlock();
+      return false;
+    }
+    if (!rdma_post_recv()) {
+      io_unlock();
+      return false;
+    }
+
+    uint8_t msg[56];
+    *(uint32_t*)(msg + 0) = RE_CMD_EVICT_SEGMENT_STAGED;
+    *(uint32_t*)(msg + 4) = sizeof(msg);
+    *(uint64_t*)(msg + 8) = _seq_id++;
+    *(uint64_t*)(msg + 16) = segment_id;
+    *(uint64_t*)(msg + 24) = (uint64_t)vaddr_base;
+    *(uint64_t*)(msg + 32) = (uint64_t)byte_size;
+    *(uint32_t*)(msg + 40) = flags;
+    *(uint32_t*)(msg + 44) = 0;
+    *(uint64_t*)(msg + 48) = remote_data_offset;
+    if (!rdma_send_msg(msg, sizeof(msg))) {
+      io_unlock();
+      return false;
+    }
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    bool ok = rdma_wait_recv(resp, sizeof(resp), &resp_len) &&
+              resp_len >= 16 && *(uint32_t*)resp == RE_RESP_OK;
+    io_unlock();
+    return ok;
+  }
+  if (byte_size > (size_t)UINT32_MAX - header_size) {
     return false;
   }
 
@@ -1094,7 +1143,82 @@ bool RDMAExecutorBackend::fetch_segment(uint64_t segment_id,
   const size_t header_size = 48;
   size_t max_response_bytes = byte_capacity + header_size;
   if (max_response_bytes < byte_capacity || max_response_bytes > RDMAMsgBufSize) {
-    max_response_bytes = RDMAMsgBufSize;
+    const uint64_t remote_data_offset = 0;
+    if (byte_capacity > max_staged_batch_data_size() ||
+        remote_data_offset > _remote_arena_size ||
+        byte_capacity > _remote_arena_size - remote_data_offset) {
+      log_warning(gc)("RDMAExecutor: segment fetch capacity too large for staged path: "
+                      "segment=" UINT64_FORMAT " cap=" SIZE_FORMAT
+                      " data_buf=" SIZE_FORMAT " remote_arena=" SIZE_FORMAT,
+                      segment_id, byte_capacity, max_staged_batch_data_size(),
+                      _remote_arena_size);
+      return false;
+    }
+
+    io_lock();
+    if (!flush_localize_batch_locked()) {
+      io_unlock();
+      return false;
+    }
+    if (!rdma_post_recv()) {
+      io_unlock();
+      return false;
+    }
+
+    uint8_t msg[40];
+    *(uint32_t*)(msg + 0) = RE_CMD_FETCH_SEGMENT_STAGED;
+    *(uint32_t*)(msg + 4) = sizeof(msg);
+    *(uint64_t*)(msg + 8) = _seq_id++;
+    *(uint64_t*)(msg + 16) = segment_id;
+    *(uint64_t*)(msg + 24) = remote_data_offset;
+    *(uint64_t*)(msg + 32) = (uint64_t)byte_capacity;
+    if (!rdma_send_msg(msg, sizeof(msg))) {
+      io_unlock();
+      return false;
+    }
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    if (!rdma_wait_recv(resp, sizeof(resp), &resp_len)) {
+      io_unlock();
+      return false;
+    }
+    if (resp_len < header_size || *(uint32_t*)resp != RE_RESP_SEGMENT_STAGED) {
+      io_unlock();
+      return false;
+    }
+
+    uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+    uint64_t resp_segment_id = *(uint64_t*)(resp + 16);
+    uintptr_t resp_vaddr_base = (uintptr_t)*(uint64_t*)(resp + 24);
+    size_t resp_byte_size = (size_t)*(uint64_t*)(resp + 32);
+    uint32_t resp_flags = *(uint32_t*)(resp + 40);
+    if (resp_msg_len < header_size || resp_msg_len > resp_len ||
+        resp_segment_id != segment_id || resp_byte_size > byte_capacity ||
+        resp_byte_size > max_staged_batch_data_size()) {
+      log_warning(gc)("RDMAExecutor: malformed staged segment fetch response: "
+                      "segment=" UINT64_FORMAT " hdr_len=%u actual="
+                      SIZE_FORMAT " bytes=" SIZE_FORMAT " cap=" SIZE_FORMAT,
+                      segment_id, resp_msg_len, resp_len, resp_byte_size,
+                      byte_capacity);
+      io_unlock();
+      return false;
+    }
+
+    void* data_buf = (char*)_local_mr->addr + 2 * RDMAMsgBufSize;
+    memcpy(dest, data_buf, resp_byte_size);
+    io_unlock();
+
+    if (out_vaddr_base != nullptr) {
+      *out_vaddr_base = resp_vaddr_base;
+    }
+    if (out_byte_size != nullptr) {
+      *out_byte_size = resp_byte_size;
+    }
+    if (out_flags != nullptr) {
+      *out_flags = resp_flags;
+    }
+    return true;
   }
 
   io_lock();

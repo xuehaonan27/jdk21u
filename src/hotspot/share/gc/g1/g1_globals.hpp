@@ -527,7 +527,7 @@
   product(uint, RemoteExecutorPort, 18515, DIAGNOSTIC,                      \
           "TCP port of the remote executor process.")                       \
                                                                             \
-  product(size_t, RDMADataBufSize, 4*M, DIAGNOSTIC,                         \
+  product(size_t, RDMADataBufSize, 64*M, DIAGNOSTIC,                        \
           "Size of the RDMA data staging buffer in bytes. Used for "        \
           "RDMA WRITE (eviction) and RDMA READ (fetch). Larger values "     \
           "allow bigger objects but require more locked memory "             \
