@@ -486,10 +486,11 @@
           "turns repeated verifier repairs into bounded steady-state scans.")  \
                                                                             \
   product(bool, G1RemoteUseObjArrayContainerPrescan, false, DIAGNOSTIC,       \
-          "Before Fast Phase C, boundedly scan old object-array container "    \
-          "regions for raw refs into eviction candidates. Safe sources are "   \
-          "seeded as current source hints; unsafe dense candidates are "       \
-          "removed before verifier-backed eviction work is wasted.")           \
+          "Before Fast Phase C, boundedly scan old source regions near "       \
+          "eviction candidates for raw refs into those candidates. Safe "      \
+          "sources are seeded as current source hints; unsafe dense "          \
+          "candidates are removed before verifier-backed eviction work is "    \
+          "wasted.")                                                           \
                                                                             \
   product(uint, G1RemoteObjArrayContainerPrescanMaxRegions, 256, DIAGNOSTIC,  \
           "Maximum old source regions scanned by "                            \
@@ -497,11 +498,17 @@
           "pre-scan even when the boolean flag is enabled.")                  \
           range(0, 4096)                                                      \
                                                                             \
-  product(uint, G1RemoteObjArrayContainerPrescanCandidateWindow, 4, DIAGNOSTIC, \
+  product(uint, G1RemoteObjArrayContainerPrescanCandidateWindow, 8, DIAGNOSTIC, \
           "For each eviction candidate, scan old source regions within this "  \
           "region distance before any blind fallback scan. 0 disables this "   \
           "candidate-neighborhood pass.")                                      \
           range(0, 128)                                                       \
+                                                                            \
+  product(bool, G1RemoteObjArrayContainerPrescanScanSourceHints, false, DIAGNOSTIC, \
+          "Also pre-scan already-learned Fast Phase C source hint regions. "   \
+          "Disabled by default because Fast Phase C scans those regions "      \
+          "directly; enabling this is mainly useful for diagnosing unsafe "    \
+          "object-array sources before Phase C.")                              \
                                                                             \
   product(uint, G1RemoteObjArrayContainerPrescanLowPrefixRegions, 0, DIAGNOSTIC, \
           "Maximum low-index old source regions scanned as a blind fallback "  \

@@ -3259,14 +3259,18 @@ static void scan_region_for_eviction_tags(HeapRegion* hr, EvictionSetTagClosure*
   remote_eviction_scan_region_objects(hr, bitmap, "Phase C", &obj_cl);
 }
 
-class ObjArrayContainerPrescanClosure {
+class ObjArrayContainerPrescanClosure : public BasicOopIterateClosure {
   G1RemoteMemoryManager* _rmm;
   G1CollectedHeap*       _g1h;
   bool*                  _eviction_set;
   uint                   _num_regions;
   uint                   _src_idx;
+  oop                    _cur_obj;
+  Klass*                 _cur_source_klass;
   int                    _arrays_scanned;
+  int                    _objects_scanned;
   size_t                 _elements_scanned;
+  size_t                 _field_refs_scanned;
   int                    _candidate_hits;
   int                    _source_hints;
   int                    _unsafe_hits;
@@ -3296,13 +3300,108 @@ class ObjArrayContainerPrescanClosure {
 
     if (_reports_left > 0) {
       log_info(gc)("ObjArray container pre-scan: removed candidate region %u "
-                   "reason=%s src_region=%u array=" PTR_FORMAT
+                   "reason=%s src_region=%u src_obj=" PTR_FORMAT
+                   "src_klass=%s array=" PTR_FORMAT
                    " target=" PTR_FORMAT " target_klass=%s",
-                   idx, reason, _src_idx, p2i((void*)array), p2i((void*)target),
+                   idx, reason, _src_idx, p2i((void*)_cur_obj),
+                   _cur_source_klass != nullptr ? _cur_source_klass->external_name() : "?",
+                   p2i((void*)array), p2i((void*)target),
                    target_klass != nullptr ? target_klass->external_name() : "?");
       _reports_left--;
     }
     return true;
+  }
+
+  void scan_oop_slot(oop* slot, objArrayOop array) {
+    if (_limit_reached || slot == nullptr) {
+      return;
+    }
+    if (element_budget_exhausted()) {
+      _limit_reached = true;
+      return;
+    }
+    _elements_scanned++;
+    if (array == nullptr) {
+      _field_refs_scanned++;
+    }
+
+    uintptr_t raw = *(uintptr_t*)slot;
+    if (raw == 0) {
+      return;
+    }
+
+    if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
+        (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
+      return;
+    }
+    if ((raw & G1_OOP_MANAGED_BIT) != 0) {
+      return;
+    }
+
+    uintptr_t target_addr = raw;
+    if (!is_aligned((address)target_addr, HeapWordSize)) {
+      return;
+    }
+    if (!_g1h->is_in((void*)target_addr)) {
+      return;
+    }
+
+    HeapRegion* target_hr =
+        _g1h->heap_region_containing_or_null((void*)target_addr);
+    if (target_hr == nullptr) {
+      return;
+    }
+    uint target_idx = target_hr->hrm_index();
+    if (target_idx >= _num_regions || !_eviction_set[target_idx]) {
+      return;
+    }
+
+    oop target = cast_to_oop((HeapWord*)target_addr);
+    Klass* target_klass = nullptr;
+    if (!remote_eviction_valid_local_oop(_g1h, target, target_hr, &target_klass)) {
+      return;
+    }
+    if (target->is_forwarded()) {
+      return;
+    }
+
+    _candidate_hits++;
+
+    bool source_obj_array =
+        _cur_source_klass != nullptr && _cur_source_klass->is_objArray_klass();
+    bool source_non_array =
+        _cur_source_klass != nullptr && !_cur_source_klass->is_array_klass();
+    bool target_type_array =
+        target_klass != nullptr && target_klass->is_typeArray_klass();
+    bool target_object =
+        target_klass != nullptr && !target_klass->is_array_klass();
+    bool taggable =
+        source_non_array ||
+        (source_obj_array &&
+         ((target_type_array && G1RemoteTagObjArraySources) ||
+          (target_object && G1RemoteTagObjArrayObjectSources)));
+
+    if (taggable) {
+      bool already_hint = _rmm->is_fast_phase_c_source_hint(_src_idx);
+      bool remembered = _rmm->remember_fast_phase_c_source_hint(_src_idx);
+      if (remembered) {
+        if (!already_hint) {
+          _source_hints++;
+        }
+      } else {
+        _hint_failures++;
+        if (G1RemoteObjArrayContainerPrescanBackoffUnsafe) {
+          remove_candidate(target_idx, "source-hint-limit", array, target,
+                           target_klass);
+        }
+      }
+    } else {
+      _unsafe_hits++;
+      if (G1RemoteObjArrayContainerPrescanBackoffUnsafe) {
+        remove_candidate(target_idx, "unsafe-source", array, target,
+                         target_klass);
+      }
+    }
   }
 
 public:
@@ -3311,8 +3410,9 @@ public:
                                   bool* eviction_set,
                                   uint num_regions)
     : _rmm(rmm), _g1h(g1h), _eviction_set(eviction_set),
-      _num_regions(num_regions), _src_idx((uint)-1),
-      _arrays_scanned(0), _elements_scanned(0), _candidate_hits(0),
+      _num_regions(num_regions), _src_idx((uint)-1), _cur_obj(nullptr),
+      _cur_source_klass(nullptr), _arrays_scanned(0), _objects_scanned(0),
+      _elements_scanned(0), _field_refs_scanned(0), _candidate_hits(0),
       _source_hints(0), _unsafe_hits(0), _hint_failures(0),
       _removed_candidates(0), _reports_left(12), _limit_reached(false) {}
 
@@ -3325,13 +3425,27 @@ public:
 
     Klass* source_klass = obj->klass_or_null_acquire();
     if (!remote_eviction_valid_klass(source_klass) ||
-        !source_klass->is_objArray_klass()) {
+        (source_klass->is_array_klass() &&
+         !source_klass->is_objArray_klass())) {
+      return;
+    }
+
+    _cur_obj = obj;
+    _cur_source_klass = source_klass;
+    _objects_scanned++;
+
+    if (!source_klass->is_objArray_klass()) {
+      obj->oop_iterate(this);
+      _cur_obj = nullptr;
+      _cur_source_klass = nullptr;
       return;
     }
 
     objArrayOop array = objArrayOop(obj);
     int len = array->length();
     if (len <= 0) {
+      _cur_obj = nullptr;
+      _cur_source_klass = nullptr;
       return;
     }
     _arrays_scanned++;
@@ -3339,90 +3453,26 @@ public:
     for (int i = 0; i < len; i++) {
       if (element_budget_exhausted()) {
         _limit_reached = true;
-        return;
+        break;
       }
-      _elements_scanned++;
 
       address slot_addr = cast_from_oop<address>(array) +
                           objArrayOopDesc::base_offset_in_bytes() +
                           (size_t)i * sizeof(oop);
-      uintptr_t raw = *(uintptr_t*)slot_addr;
-      if (raw == 0) {
-        continue;
-      }
-
-      if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
-          (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
-        continue;
-      }
-      if ((raw & G1_OOP_MANAGED_BIT) != 0) {
-        continue;
-      }
-
-      uintptr_t target_addr = raw;
-      if (!is_aligned((address)target_addr, HeapWordSize)) {
-        continue;
-      }
-      if (!_g1h->is_in((void*)target_addr)) {
-        continue;
-      }
-
-      HeapRegion* target_hr =
-          _g1h->heap_region_containing_or_null((void*)target_addr);
-      if (target_hr == nullptr) {
-        continue;
-      }
-      uint target_idx = target_hr->hrm_index();
-      if (target_idx >= _num_regions || !_eviction_set[target_idx]) {
-        continue;
-      }
-
-      oop target = cast_to_oop((HeapWord*)target_addr);
-      Klass* target_klass = nullptr;
-      if (!remote_eviction_valid_local_oop(_g1h, target, target_hr, &target_klass)) {
-        continue;
-      }
-      if (target->is_forwarded()) {
-        continue;
-      }
-
-      _candidate_hits++;
-
-      bool target_type_array =
-          target_klass != nullptr && target_klass->is_typeArray_klass();
-      bool target_object =
-          target_klass != nullptr && !target_klass->is_array_klass();
-      bool taggable =
-          (target_type_array && G1RemoteTagObjArraySources) ||
-          (target_object && G1RemoteTagObjArrayObjectSources);
-
-      if (taggable) {
-        bool already_hint = _rmm->is_fast_phase_c_source_hint(_src_idx);
-        bool remembered = _rmm->remember_fast_phase_c_source_hint(_src_idx);
-        if (remembered) {
-          if (!already_hint) {
-            _source_hints++;
-          }
-        } else {
-          _hint_failures++;
-          if (G1RemoteObjArrayContainerPrescanBackoffUnsafe) {
-            remove_candidate(target_idx, "source-hint-limit", array, target,
-                             target_klass);
-          }
-        }
-      } else {
-        _unsafe_hits++;
-        if (G1RemoteObjArrayContainerPrescanBackoffUnsafe) {
-          remove_candidate(target_idx, "unsafe-objarray-source", array, target,
-                           target_klass);
-        }
-      }
+      scan_oop_slot((oop*)slot_addr, array);
     }
+    _cur_obj = nullptr;
+    _cur_source_klass = nullptr;
   }
+
+  virtual void do_oop(oop* p) { scan_oop_slot(p, nullptr); }
+  virtual void do_oop(narrowOop* p) { /* UseCompressedOops=false */ }
 
   bool limit_reached() const { return _limit_reached; }
   int arrays_scanned() const { return _arrays_scanned; }
+  int objects_scanned() const { return _objects_scanned; }
   size_t elements_scanned() const { return _elements_scanned; }
+  size_t field_refs_scanned() const { return _field_refs_scanned; }
   int candidate_hits() const { return _candidate_hits; }
   int source_hints() const { return _source_hints; }
   int unsafe_hits() const { return _unsafe_hits; }
@@ -3475,6 +3525,10 @@ int G1RemoteMemoryManager::prescan_old_objarray_sources_to_eviction_set(
       return false;
     }
     scanned_sources[i] = true;
+    if (!G1RemoteObjArrayContainerPrescanScanSourceHints &&
+        is_fast_phase_c_source_hint(i)) {
+      return false;
+    }
 
     HeapRegion* hr = _g1h->region_at_or_null(i);
     if (hr == nullptr) return false;
@@ -3497,12 +3551,14 @@ int G1RemoteMemoryManager::prescan_old_objarray_sources_to_eviction_set(
     return cl.limit_reached();
   };
 
-  for (uint i = 0; i < num_regions; i++) {
-    if (!is_fast_phase_c_source_hint(i)) {
-      continue;
-    }
-    if (scan_source_region(i, &hint_regions_scanned)) {
-      break;
+  if (G1RemoteObjArrayContainerPrescanScanSourceHints) {
+    for (uint i = 0; i < num_regions; i++) {
+      if (!is_fast_phase_c_source_hint(i)) {
+        continue;
+      }
+      if (scan_source_region(i, &hint_regions_scanned)) {
+        break;
+      }
     }
   }
 
@@ -3552,12 +3608,14 @@ int G1RemoteMemoryManager::prescan_old_objarray_sources_to_eviction_set(
       cl.removed_candidates() > 0) {
     log_info(gc)("ObjArray container pre-scan: candidates=%u regions=%u "
                  "hint_regions=%u neighbor_regions=%u fallback_regions=%u "
-                 "arrays=%d elements=" SIZE_FORMAT " candidate_hits=%d "
+                 "objects=%d arrays=%d refs=" SIZE_FORMAT
+                 " obj_fields=" SIZE_FORMAT " candidate_hits=%d "
                  "hints=%d unsafe=%d hint_failures=%d removed=%d "
                  "element_limit=%s region_limit=%s window=%u fallback_limit=%u",
                  candidate_regions, regions_scanned, hint_regions_scanned,
                  neighbor_regions_scanned, fallback_regions_scanned,
-                 cl.arrays_scanned(), cl.elements_scanned(),
+                 cl.objects_scanned(), cl.arrays_scanned(),
+                 cl.elements_scanned(), cl.field_refs_scanned(),
                  cl.candidate_hits(), cl.source_hints(), cl.unsafe_hits(),
                  cl.hint_failures(), cl.removed_candidates(),
                  cl.limit_reached() ? "yes" : "no",
