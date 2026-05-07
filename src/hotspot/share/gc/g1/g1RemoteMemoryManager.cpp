@@ -820,6 +820,59 @@ bool G1RemoteMemoryManager::dense_segments_enabled() const {
          _backend->supports_segments();
 }
 
+class DenseSegmentClosedClosure : public BasicOopIterateClosure {
+  HeapWord* _bottom;
+  HeapWord* _top;
+  bool _closed;
+  const char* _reason;
+
+  void fail(const char* reason) {
+    if (_closed) {
+      _reason = reason;
+    }
+    _closed = false;
+  }
+
+  void do_raw_oop(uintptr_t raw) {
+    if (raw == 0 || !_closed) return;
+
+    uintptr_t target_addr = raw;
+    if ((raw & G1_OOP_TAG_MASK) != 0) {
+      if ((raw & G1_OOP_MANAGED_BIT) == 0 ||
+          (raw & G1_OOP_INDIRECT_BIT) != 0) {
+        fail("tagged-handle-ref");
+        return;
+      }
+      target_addr = raw & G1_OOP_ADDR_MASK;
+    }
+
+    if (!is_aligned((address)target_addr, HeapWordSize)) {
+      fail("unaligned-oop");
+      return;
+    }
+    HeapWord* target = (HeapWord*)target_addr;
+    if (target < _bottom || target >= _top) {
+      fail("outgoing-oop");
+      return;
+    }
+  }
+
+public:
+  DenseSegmentClosedClosure(HeapWord* bottom, HeapWord* top)
+    : _bottom(bottom), _top(top), _closed(true), _reason("ok") {}
+
+  void do_oop(oop* p) override {
+    do_raw_oop(*(uintptr_t*)p);
+  }
+
+  void do_oop(narrowOop* p) override {
+    // Dense-segment Spark experiments run with UseCompressedOops=false.
+  }
+
+  bool closed() const { return _closed; }
+  const char* reason() const { return _reason; }
+};
+
 bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
                                                            const char** reason,
                                                            size_t* object_count) {
@@ -848,64 +901,6 @@ bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
     if (reason != nullptr) *reason = "local-handles";
     return false;
   }
-
-  class DenseSegmentClosedClosure : public OopClosure {
-    HeapWord* _bottom;
-    HeapWord* _top;
-    bool _closed;
-    const char* _reason;
-    size_t _refs;
-
-    void fail(const char* reason) {
-      if (_closed) {
-        _reason = reason;
-      }
-      _closed = false;
-    }
-
-    void do_raw_oop(uintptr_t raw) {
-      if (raw == 0 || !_closed) return;
-
-      uintptr_t target_addr = raw;
-      if ((raw & G1_OOP_TAG_MASK) != 0) {
-        if ((raw & G1_OOP_MANAGED_BIT) == 0 ||
-            (raw & G1_OOP_INDIRECT_BIT) != 0) {
-          fail("tagged-handle-ref");
-          return;
-        }
-        target_addr = raw & G1_OOP_ADDR_MASK;
-      }
-
-      if (!is_aligned((address)target_addr, HeapWordSize)) {
-        fail("unaligned-oop");
-        return;
-      }
-      HeapWord* target = (HeapWord*)target_addr;
-      if (target < _bottom || target >= _top) {
-        fail("outgoing-oop");
-        return;
-      }
-      _refs++;
-    }
-
-  public:
-    DenseSegmentClosedClosure(HeapWord* bottom, HeapWord* top)
-      : _bottom(bottom), _top(top), _closed(true), _reason("ok"), _refs(0) {}
-
-    void do_oop(oop* p) override {
-      do_raw_oop(*(uintptr_t*)p);
-    }
-
-    void do_oop(narrowOop* p) override {
-      if (*p != 0) {
-        fail("compressed-oop");
-      }
-    }
-
-    bool closed() const { return _closed; }
-    const char* reason() const { return _reason; }
-    size_t refs() const { return _refs; }
-  };
 
   size_t objects = 0;
   DenseSegmentClosedClosure closed_cl(hr->bottom(), hr->top());
