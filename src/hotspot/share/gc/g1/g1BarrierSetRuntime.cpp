@@ -32,6 +32,7 @@
 #include "gc/g1/g1RemoteBackend.hpp"
 #include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
+#include "gc/g1/g1YoungCollector.hpp"
 #include "gc/g1/heapRegion.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/os.hpp"
@@ -522,6 +523,145 @@ static uint64_t g1_remote_prefetch_cache_drops = 0;
 static uint g1_remote_prefetch_cache_evict_cursor = 0;
 static uint g1_remote_fetch_batch_effective_logged = 0;
 static uint64_t g1_remote_fetch_batch_policy_log_next_stores = 0;
+static volatile uint64_t g1_remote_prefetch_pressure_checks = 0;
+static volatile int g1_remote_prefetch_pressure_lock = 0;
+static volatile int g1_remote_prefetch_pressure_has_sample = 0;
+static volatile int g1_remote_prefetch_pressure_level = 0;
+static volatile int g1_remote_prefetch_pressure_logged_level = -1;
+static volatile uint64_t g1_remote_prefetch_eager_suppressed = 0;
+static volatile uint64_t g1_remote_prefetch_batch_suppressed = 0;
+static volatile uint64_t g1_remote_prefetch_cache_suppressed = 0;
+
+enum RemotePrefetchPressureLevel {
+  RemotePrefetchPressureOk = 0,
+  RemotePrefetchPressureOverTarget = 1,
+  RemotePrefetchPressureOverTier2 = 2,
+  RemotePrefetchPressureOverTier3 = 3
+};
+
+static const uint64_t RemotePrefetchPressureSamplePeriod = 1024;
+
+static const char* remote_prefetch_pressure_level_name(int level) {
+  switch (level) {
+    case RemotePrefetchPressureOverTier3:
+      return "over-tier3";
+    case RemotePrefetchPressureOverTier2:
+      return "over-tier2";
+    case RemotePrefetchPressureOverTarget:
+      return "over-target";
+    default:
+      return "ok";
+  }
+}
+
+static const char* remote_prefetch_pressure_action(int level) {
+  if (level >= RemotePrefetchPressureOverTier2) {
+    return "demand-only";
+  }
+  if (level >= RemotePrefetchPressureOverTarget) {
+    return "cache-only";
+  }
+  return "eager-allowed";
+}
+
+static bool remote_prefetch_read_cgroup_pressure(size_t* usage,
+                                                 size_t* capacity,
+                                                 size_t* total_usage,
+                                                 size_t* cache_usage) {
+  if (!G1RemoteUseCgroupPressure || LocalMemoryRatio >= 100) {
+    return false;
+  }
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  if (g1h == nullptr || LocalMemoryRatio == 0) {
+    return false;
+  }
+
+  size_t local_capacity = (g1h->max_capacity() * (size_t)LocalMemoryRatio) / 100;
+  if (local_capacity == 0) {
+    return false;
+  }
+
+  return g1_remote_read_cgroup_pressure(local_capacity, usage, capacity,
+                                        total_usage, cache_usage);
+}
+
+static int remote_prefetch_sample_pressure_level() {
+  if (!G1RemoteUseCgroupPressure || LocalMemoryRatio >= 100) {
+    return RemotePrefetchPressureOk;
+  }
+
+  uint64_t check = Atomic::add(&g1_remote_prefetch_pressure_checks,
+                               (uint64_t)1);
+  if (Atomic::load(&g1_remote_prefetch_pressure_has_sample) != 0 &&
+      (check % RemotePrefetchPressureSamplePeriod) != 1) {
+    return Atomic::load(&g1_remote_prefetch_pressure_level);
+  }
+
+  if (Atomic::cmpxchg(&g1_remote_prefetch_pressure_lock, 0, 1) != 0) {
+    return Atomic::load(&g1_remote_prefetch_pressure_level);
+  }
+
+  size_t usage = 0;
+  size_t capacity = 0;
+  size_t total_usage = 0;
+  size_t cache_usage = 0;
+  bool has_pressure =
+    remote_prefetch_read_cgroup_pressure(&usage, &capacity,
+                                         &total_usage, &cache_usage);
+  if (!has_pressure) {
+    Atomic::release_store(&g1_remote_prefetch_pressure_has_sample, 1);
+    Atomic::release_store(&g1_remote_prefetch_pressure_lock, 0);
+    return Atomic::load(&g1_remote_prefetch_pressure_level);
+  }
+
+  int level = RemotePrefetchPressureOk;
+  if (capacity > 0) {
+    size_t pct = (usage * 100) / capacity;
+    if (pct >= (size_t)G1RemoteTier3Percent) {
+      level = RemotePrefetchPressureOverTier3;
+    } else if (pct >= (size_t)G1RemoteTier2Percent) {
+      level = RemotePrefetchPressureOverTier2;
+    } else if (pct >= (size_t)G1RemoteTier2TargetPercent) {
+      level = RemotePrefetchPressureOverTarget;
+    }
+  }
+
+  Atomic::release_store(&g1_remote_prefetch_pressure_level, level);
+  Atomic::release_store(&g1_remote_prefetch_pressure_has_sample, 1);
+
+  if (Atomic::load(&g1_remote_prefetch_pressure_logged_level) != level) {
+    Atomic::release_store(&g1_remote_prefetch_pressure_logged_level, level);
+    log_info(gc)("Remote prefetch pressure policy: level=%s action=%s "
+                 "cgroup_anon=" SIZE_FORMAT "MB/" SIZE_FORMAT
+                 "MB %.1f%% total=" SIZE_FORMAT "MB cache=" SIZE_FORMAT
+                 "MB target=%u%% T2=%u%% T3=%u%%",
+                 remote_prefetch_pressure_level_name(level),
+                 remote_prefetch_pressure_action(level),
+                 usage / M,
+                 capacity / M,
+                 capacity == 0 ? 0.0 :
+                   ((double)usage * 100.0) / (double)capacity,
+                 total_usage / M,
+                 cache_usage / M,
+                 G1RemoteTier2TargetPercent,
+                 G1RemoteTier2Percent,
+                 G1RemoteTier3Percent);
+  }
+
+  Atomic::release_store(&g1_remote_prefetch_pressure_lock, 0);
+  return level;
+}
+
+static bool remote_prefetch_budget_allows_eager_install() {
+  return remote_prefetch_sample_pressure_level() <
+         RemotePrefetchPressureOverTarget;
+}
+
+static bool remote_prefetch_budget_allows_cache_store() {
+  return remote_prefetch_sample_pressure_level() <
+         RemotePrefetchPressureOverTier2;
+}
 
 static void remote_prefetch_cache_lock() {
   while (Atomic::cmpxchg(&g1_remote_prefetch_cache_lock, 0, 1) != 0) {
@@ -609,6 +749,7 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
     return configured;
   }
 
+  int pressure_level = remote_prefetch_sample_pressure_level();
   uint bounded = MIN2(configured, G1RemoteFetchBatchHardCap);
   uint effective = bounded;
   uint64_t hits = 0;
@@ -619,6 +760,7 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
   uint64_t evict_per_mille = 0;
   bool log_change = false;
   bool disabled_by_policy = false;
+  bool pressure_limited = false;
 
   remote_prefetch_cache_lock();
   hits = g1_remote_prefetch_cache_hits;
@@ -655,13 +797,25 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
     }
   }
 
+  if (pressure_level >= RemotePrefetchPressureOverTier2) {
+    if (effective > 1) {
+      Atomic::inc(&g1_remote_prefetch_batch_suppressed);
+      pressure_limited = true;
+    }
+    effective = 1;
+    if (g1_remote_prefetch_cache_bytes > 0) {
+      remote_prefetch_cache_clear_locked();
+    }
+  }
+
   if (g1_remote_fetch_batch_effective_logged == 0 ||
-      stores >= g1_remote_fetch_batch_policy_log_next_stores) {
+      stores >= g1_remote_fetch_batch_policy_log_next_stores ||
+      pressure_limited) {
     g1_remote_fetch_batch_effective_logged = effective;
     g1_remote_fetch_batch_policy_log_next_stores = stores + 64 * 1024;
     log_change = true;
   }
-  if (effective == 1 && stores >= 64 * 1024 &&
+  if (!pressure_limited && effective == 1 && stores >= 64 * 1024 &&
       Atomic::cmpxchg(&g1_remote_fetch_batch_disabled, 0, 1) == 0) {
     remote_prefetch_cache_clear_locked();
     disabled_by_policy = true;
@@ -673,9 +827,16 @@ static uint remote_fetch_effective_batch_objects(uint configured) {
                  "cache_hits=" UINT64_FORMAT " stores=" UINT64_FORMAT
                  " evictions=" UINT64_FORMAT " drops=" UINT64_FORMAT
                  " useful_per_mille=" UINT64_FORMAT
-                 " evict_per_mille=" UINT64_FORMAT,
+                 " evict_per_mille=" UINT64_FORMAT
+                 " pressure=%s action=%s suppress(batch=" UINT64_FORMAT
+                 " eager=" UINT64_FORMAT " cache=" UINT64_FORMAT ")",
                  configured, effective, hits, stores, evictions, drops,
-                 useful_per_mille, evict_per_mille);
+                 useful_per_mille, evict_per_mille,
+                 remote_prefetch_pressure_level_name(pressure_level),
+                 remote_prefetch_pressure_action(pressure_level),
+                 Atomic::load(&g1_remote_prefetch_batch_suppressed),
+                 Atomic::load(&g1_remote_prefetch_eager_suppressed),
+                 Atomic::load(&g1_remote_prefetch_cache_suppressed));
   }
   if (disabled_by_policy) {
     log_info(gc)("Remote batch fetch disabled by storm breaker: "
@@ -693,6 +854,10 @@ static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
                                         Klass* klass, size_t word_size,
                                         const void* obj_bytes) {
   if (Atomic::load(&g1_remote_fetch_batch_disabled) != 0) {
+    return false;
+  }
+  if (!remote_prefetch_budget_allows_cache_store()) {
+    Atomic::inc(&g1_remote_prefetch_cache_suppressed);
     return false;
   }
   if (h == nullptr || klass == nullptr || obj_bytes == nullptr || word_size == 0) {
@@ -921,6 +1086,10 @@ class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
     if (!_eager_prefetch || _publish_count >= G1RemoteFetchBatchHardCap) {
       return false;
     }
+    if (!remote_prefetch_budget_allows_eager_install()) {
+      Atomic::inc(&g1_remote_prefetch_eager_suppressed);
+      return false;
+    }
     if (!h->try_remote_to_fetching(slot_id)) {
       return false;
     }
@@ -1097,8 +1266,15 @@ static bool remote_fetch_hint_prefers_around(uint32_t access_hint) {
 }
 
 static bool remote_fetch_hint_eager_installs_prefetch(uint32_t access_hint) {
-  return G1RemoteEagerInstallPrefetch &&
-         remote_fetch_hint_prefers_around(access_hint);
+  if (!G1RemoteEagerInstallPrefetch ||
+      !remote_fetch_hint_prefers_around(access_hint)) {
+    return false;
+  }
+  if (!remote_prefetch_budget_allows_eager_install()) {
+    Atomic::inc(&g1_remote_prefetch_eager_suppressed);
+    return false;
+  }
+  return true;
 }
 
 static void remote_apply_compiler_fetch_hint(uint32_t access_hint,
@@ -1558,11 +1734,13 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
   if (G1RemoteFetchBatchObjects > 1 &&
       Atomic::load(&g1_remote_fetch_batch_disabled) == 0 &&
       rmm->backend()->supports_batch_fetch()) {
-    uint max_objects = remote_fetch_effective_batch_objects((uint)G1RemoteFetchBatchObjects);
+    uint max_objects = MIN2((uint)G1RemoteFetchBatchObjects,
+                            G1RemoteFetchBatchHardCap);
     uint slot_window = G1RemoteFetchBatchSlotWindow;
     size_t max_response_bytes = remote_fetch_max_response_bytes();
     remote_apply_compiler_fetch_hint(access_hint, &max_objects,
                                      &slot_window, &max_response_bytes);
+    max_objects = remote_fetch_effective_batch_objects(max_objects);
     if (max_objects > 1) {
       bool eager_prefetch = remote_fetch_hint_eager_installs_prefetch(access_hint);
       return fetch_and_install_batch(h, fetch_attempts, out_retry, max_objects,

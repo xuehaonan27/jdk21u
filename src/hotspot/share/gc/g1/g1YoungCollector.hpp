@@ -55,6 +55,12 @@ class WorkerThreads;
 
 class outputStream;
 
+bool g1_remote_read_cgroup_pressure(size_t local_capacity,
+                                    size_t* usage,
+                                    size_t* capacity,
+                                    size_t* total_usage,
+                                    size_t* cache_usage);
+
 class G1YoungCollector {
   friend class G1YoungGCNotifyPauseMark;
   friend class G1YoungGCTraceTime;

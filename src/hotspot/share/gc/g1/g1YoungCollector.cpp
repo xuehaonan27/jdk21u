@@ -1901,19 +1901,27 @@ static bool init_remote_cgroup_memory_paths(char* usage_path,
 
 static bool read_remote_cgroup_files(jlong* raw_usage, jlong* raw_limit,
                                      jlong* raw_anon, jlong* raw_cache) {
-  static bool paths_initialized = false;
+  static volatile int paths_initialized = 0;
+  static volatile int paths_init_lock = 0;
   static char usage_path[1024];
   static char limit_path[1024];
   static char stat_path[1024];
   static bool is_cgroup_v2 = false;
 
-  if (!paths_initialized) {
-    paths_initialized =
+  if (Atomic::load(&paths_initialized) == 0) {
+    if (Atomic::cmpxchg(&paths_init_lock, 0, 1) != 0) {
+      return false;
+    }
+    bool initialized =
       init_remote_cgroup_memory_paths(usage_path, sizeof(usage_path),
                                       limit_path, sizeof(limit_path),
                                       stat_path, sizeof(stat_path),
                                       &is_cgroup_v2);
-    if (!paths_initialized) {
+    if (initialized) {
+      Atomic::release_store(&paths_initialized, 1);
+    }
+    Atomic::release_store(&paths_init_lock, 0);
+    if (!initialized) {
       // The Spark executor is moved into the cgexec memory cgroup shortly after
       // launch. Retry later instead of caching a startup-time root cgroup miss.
       return false;
@@ -1929,11 +1937,11 @@ static bool read_remote_cgroup_files(jlong* raw_usage, jlong* raw_limit,
 }
 #endif
 
-static bool read_remote_cgroup_pressure(size_t local_capacity,
-                                        size_t* usage,
-                                        size_t* capacity,
-                                        size_t* total_usage,
-                                        size_t* cache_usage) {
+bool g1_remote_read_cgroup_pressure(size_t local_capacity,
+                                    size_t* usage,
+                                    size_t* capacity,
+                                    size_t* total_usage,
+                                    size_t* cache_usage) {
 #ifdef LINUX
   if (!G1RemoteUseCgroupPressure) {
     return false;
@@ -2090,11 +2098,11 @@ static bool remote_cgroup_pressure_exceeds_trim_trigger(size_t local_capacity,
   size_t raw_capacity = 0;
   size_t raw_total_usage = 0;
   size_t raw_cache_usage = 0;
-  if (!read_remote_cgroup_pressure(local_capacity,
-                                   &raw_usage,
-                                   &raw_capacity,
-                                   &raw_total_usage,
-                                   &raw_cache_usage)) {
+  if (!g1_remote_read_cgroup_pressure(local_capacity,
+                                      &raw_usage,
+                                      &raw_capacity,
+                                      &raw_total_usage,
+                                      &raw_cache_usage)) {
     return false;
   }
   if (usage != nullptr) {
@@ -2567,8 +2575,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         size_t cgroup_total_usage = 0;
         size_t cgroup_cache_usage = 0;
         bool has_cgroup_pressure =
-          read_remote_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity,
-                                      &cgroup_total_usage, &cgroup_cache_usage);
+          g1_remote_read_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity,
+                                         &cgroup_total_usage, &cgroup_cache_usage);
         if (has_cgroup_pressure) {
           double initial_cgroup_pressure =
             (double)cgroup_usage / (double)cgroup_capacity;
@@ -2576,8 +2584,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             maybe_trim_free_region_rss_for_cgroup_pressure(_g1h,
                                                            "pre-eviction");
             has_cgroup_pressure =
-              read_remote_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity,
-                                          &cgroup_total_usage, &cgroup_cache_usage);
+              g1_remote_read_cgroup_pressure(local_capacity, &cgroup_usage, &cgroup_capacity,
+                                             &cgroup_total_usage, &cgroup_cache_usage);
           }
         }
 
