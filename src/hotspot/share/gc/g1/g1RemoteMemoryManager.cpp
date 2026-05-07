@@ -3790,6 +3790,10 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       if (!is_aligned((address)target_addr, HeapWordSize)) return;
       if (!_g1h->is_in_reserved((void*)target_addr)) return;
 
+      if (dense_direct_ref && _rmm->is_dense_segment_remote_addr(target_addr)) {
+        return;
+      }
+
       HeapRegion* target_hr =
           _g1h->heap_region_containing_or_null((void*)target_addr);
       const char* stale = stale_reason(target_addr, target_hr);
@@ -4180,6 +4184,9 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
       if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
           (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) return;
 
+      bool dense_direct_ref =
+          (raw & G1_OOP_MANAGED_BIT) != 0 &&
+          (raw & G1_OOP_INDIRECT_BIT) == 0;
       oop target;
       if ((raw >> 63) != 0) {
         target = cast_to_oop(raw & G1_OOP_ADDR_MASK);
@@ -4220,6 +4227,13 @@ int G1RemoteMemoryManager::verify_no_stale_refs_to_freed_regions() {
 
       HeapRegion* hr = _g1h->heap_region_containing_or_null(target);
       const char* stale_reason = nullptr;
+
+      G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+      if (dense_direct_ref &&
+          rmm != nullptr &&
+          rmm->is_dense_segment_remote_addr((uintptr_t)target)) {
+        return;
+      }
 
       if (hr == nullptr) {
         stale_reason = "NO-HR";
