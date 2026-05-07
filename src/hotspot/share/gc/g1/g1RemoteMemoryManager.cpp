@@ -773,6 +773,24 @@ void G1RemoteMemoryManager::backoff_eviction_region(uint region_idx, uint gc_cyc
   }
 }
 
+static uint dense_fetch_backoff_cycles_for_shift(uint16_t shift) {
+  uint base = G1RemoteEvictionAbortBackoffGCCycles;
+  uint max_cycles = G1RemoteDenseFetchBackoffMaxGCCycles;
+  if (base == 0 || max_cycles == 0) {
+    return 0;
+  }
+
+  uint cycles = MIN2(base, max_cycles);
+  for (uint16_t i = 0; i < shift && cycles < max_cycles; i++) {
+    if (cycles > max_cycles / 2) {
+      cycles = max_cycles;
+      break;
+    }
+    cycles *= 2;
+  }
+  return MIN2(cycles, max_cycles);
+}
+
 void G1RemoteMemoryManager::ensure_fast_phase_c_source_hint_capacity(uint num_regions) {
   if (num_regions <= _fast_phase_c_source_hint_capacity) {
     return;
@@ -1027,6 +1045,7 @@ bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr, uint32_t 
   entry->base = (uintptr_t)hr->bottom();
   entry->byte_size = byte_size;
   entry->flags = flags;
+  entry->last_evict_epoch = _gc_epoch;
   Atomic::release_store(&entry->state, (uint32_t)DenseSegmentRemote);
   dense_segment_unlock();
 
@@ -1121,6 +1140,7 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
   uintptr_t base = 0;
   size_t byte_size = 0;
   uint32_t flags = 0;
+  uint32_t last_evict_epoch = 0;
   SpinYield yield;
 
   while (true) {
@@ -1143,6 +1163,7 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
       base = entry->base;
       byte_size = entry->byte_size;
       flags = entry->flags;
+      last_evict_epoch = entry->last_evict_epoch;
       Atomic::release_store(&entry->state, (uint32_t)DenseSegmentFetching);
       dense_segment_unlock();
       break;
@@ -1221,27 +1242,53 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
 
   os::free(buf);
 
+  uint32_t fetch_age = _gc_epoch - last_evict_epoch;
+  uint16_t fetch_backoff_shift = 0;
+  uint16_t fetch_churn_count = 0;
+  uint backoff_cycles = 0;
+  bool churn_fetch = false;
   dense_segment_lock();
   DenseSegmentEntry* entry = &_dense_segments[idx];
   if (entry->segment_id == segment_id) {
+    if (ok) {
+      fetch_age = _gc_epoch - entry->last_evict_epoch;
+      churn_fetch = G1RemoteDenseFetchBackoffChurnWindowGCCycles > 0 &&
+                    fetch_age <= G1RemoteDenseFetchBackoffChurnWindowGCCycles;
+      if (churn_fetch) {
+        if (entry->fetch_backoff_shift < 15) {
+          entry->fetch_backoff_shift++;
+        }
+        if (entry->fetch_churn_count < UINT16_MAX) {
+          entry->fetch_churn_count++;
+        }
+      } else {
+        if (entry->fetch_backoff_shift > 0) {
+          entry->fetch_backoff_shift--;
+        }
+        if (entry->fetch_churn_count > 0) {
+          entry->fetch_churn_count--;
+        }
+      }
+      entry->last_fetch_epoch = _gc_epoch;
+      fetch_backoff_shift = entry->fetch_backoff_shift;
+      fetch_churn_count = entry->fetch_churn_count;
+      backoff_cycles = dense_fetch_backoff_cycles_for_shift(fetch_backoff_shift);
+      backoff_eviction_region(idx, backoff_cycles);
+    }
     Atomic::release_store(&entry->state,
                           (uint32_t)(ok ? DenseSegmentLocal : DenseSegmentRemote));
   }
   dense_segment_unlock();
 
   if (ok) {
-    if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
-      // A mutator fetch means this dense region is hot enough to keep local for
-      // a few GC epochs; otherwise pressure selection can immediately evict it
-      // again and create a fetch/evict storm.
-      dense_segment_lock();
-      backoff_eviction_region(idx, G1RemoteEvictionAbortBackoffGCCycles);
-      dense_segment_unlock();
-    }
     Atomic::inc(&_dense_segment_fetch_success);
     log_info(gc)("Dense segment localized: region=%u segment=" UINT64_FORMAT
-                 " bytes=" SIZE_FORMAT " addr=" PTR_FORMAT,
-                 idx, segment_id, fetched_bytes, p2i((void*)addr));
+                 " bytes=" SIZE_FORMAT " addr=" PTR_FORMAT
+                 " fetch_age=%u churn=%s churn_count=%u backoff_shift=%u"
+                 " backoff_cycles=%u",
+                 idx, segment_id, fetched_bytes, p2i((void*)addr),
+                 fetch_age, churn_fetch ? "yes" : "no",
+                 fetch_churn_count, fetch_backoff_shift, backoff_cycles);
   } else {
     Atomic::inc(&_dense_segment_fetch_failures);
     log_warning(gc)("Dense segment fetch failed: region=%u segment="

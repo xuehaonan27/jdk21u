@@ -405,6 +405,18 @@
           "backoff.")                                                        \
           range(0, 10000)                                                    \
                                                                             \
+  product(uint, G1RemoteDenseFetchBackoffChurnWindowGCCycles, 32, DIAGNOSTIC, \
+          "A dense segment fetch within this many GC cycles after eviction "  \
+          "is treated as eviction/fetch churn and increases that region's "   \
+          "adaptive eviction backoff. 0 disables churn growth.")              \
+          range(0, 10000)                                                    \
+                                                                            \
+  product(uint, G1RemoteDenseFetchBackoffMaxGCCycles, 256, DIAGNOSTIC,       \
+          "Maximum adaptive backoff, in GC cycles, for dense regions that "   \
+          "are repeatedly fetched soon after eviction. The base is "          \
+          "G1RemoteEvictionAbortBackoffGCCycles.")                          \
+          range(0, 10000)                                                    \
+                                                                            \
   product(bool, G1RemoteAllowPromotionRefSiteTags, false, DIAGNOSTIC,        \
           "Allow ordinary promotion-time OOP classification to write "        \
           "persistent tagged refs into heap fields. Disabled by default "     \

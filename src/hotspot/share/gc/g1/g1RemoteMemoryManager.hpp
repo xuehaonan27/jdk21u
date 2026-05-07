@@ -836,6 +836,10 @@ private:
     uintptr_t         base;
     size_t            byte_size;
     uint32_t          flags;
+    uint32_t          last_evict_epoch;
+    uint32_t          last_fetch_epoch;
+    uint16_t          fetch_backoff_shift;
+    uint16_t          fetch_churn_count;
     volatile uint32_t state;
 
     void clear() {
@@ -843,6 +847,10 @@ private:
       base = 0;
       byte_size = 0;
       flags = 0;
+      last_evict_epoch = 0;
+      last_fetch_epoch = 0;
+      fetch_backoff_shift = 0;
+      fetch_churn_count = 0;
       state = DenseSegmentNone;
     }
   };
