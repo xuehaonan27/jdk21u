@@ -801,6 +801,10 @@ Klass* G1RemoteMemoryManager::sim_remote_fetch(size_t slot_id, void* dest, size_
 // target and records the edge (field_offset → target_handle).
 
 static bool remote_eviction_valid_klass(Klass* k);
+static bool remote_eviction_valid_local_oop(G1CollectedHeap* g1h,
+                                            oop obj,
+                                            HeapRegion* hr,
+                                            Klass** klass_out);
 
 class EdgeTableBuildClosure : public BasicOopIterateClosure {
   G1RemoteMemoryManager* _rmm;
@@ -2062,6 +2066,19 @@ public:
     uint idx = target_hr->hrm_index();
     if (idx >= _num_regions || !_eviction_set[idx]) return;
 
+    Klass* target_klass = nullptr;
+    if (!remote_eviction_valid_local_oop(_g1h, target, target_hr, &target_klass)) {
+      _untaggable++;
+      if (_untaggable_reports_left > 0) {
+        log_warning(gc)("Tagging: kept raw ref to invalid target field="
+                        PTR_FORMAT " raw=0x%lx -> target=" PTR_FORMAT
+                        " in candidate region %u",
+                        p2i(p), (unsigned long)raw, p2i((void*)target), idx);
+        _untaggable_reports_left--;
+      }
+      return;
+    }
+
     // Root-catch relocated: object has forwarding pointer → redirect to new address
     if (target->is_forwarded()) {
       oop fwd = target->forwardee();
@@ -2091,8 +2108,10 @@ public:
 
     {
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
+      if (source_klass != nullptr && !remote_eviction_valid_klass(source_klass)) {
+        source_klass = nullptr;
+      }
       bool object_array_source = source_klass != nullptr && source_klass->is_objArray_klass();
-      Klass* target_klass = target->klass_or_null();
       bool target_type_array = target_klass != nullptr && target_klass->is_typeArray_klass();
       bool target_object = target_klass != nullptr && !target_klass->is_array_klass();
       bool unsafe_obj_array_source =
@@ -2148,6 +2167,49 @@ static bool remote_eviction_valid_klass(Klass* k) {
   if (!is_aligned((address)k, sizeof(MetaWord))) return false;
   if (!Metaspace::contains(k)) return false;
   return k->is_klass();
+}
+
+static bool remote_eviction_valid_local_oop(G1CollectedHeap* g1h,
+                                            oop obj,
+                                            HeapRegion* hr,
+                                            Klass** klass_out) {
+  if (klass_out != nullptr) {
+    *klass_out = nullptr;
+  }
+  if (g1h == nullptr || obj == nullptr || hr == nullptr) {
+    return false;
+  }
+  if (hr->is_free() || hr->is_empty() || hr->is_evict_guarded() ||
+      hr->is_continues_humongous()) {
+    return false;
+  }
+  HeapWord* addr = cast_from_oop<HeapWord*>(obj);
+  if (addr < hr->bottom() || addr >= hr->top() || !g1h->is_in(obj)) {
+    return false;
+  }
+
+  Klass* k = obj->klass_or_null_acquire();
+  if (!remote_eviction_valid_klass(k)) {
+    return false;
+  }
+  if (G1CollectedHeap::is_obj_filler(obj)) {
+    return false;
+  }
+  Klass* size_k = obj->klass_or_null_acquire();
+  if (size_k != k) {
+    return false;
+  }
+  size_t word_size = obj->size_given_klass(size_k);
+  if (word_size < (size_t)MinObjAlignment ||
+      !is_object_aligned(word_size) ||
+      word_size > (size_t)(hr->top() - addr) ||
+      word_size > (size_t)(hr->end() - addr)) {
+    return false;
+  }
+  if (klass_out != nullptr) {
+    *klass_out = k;
+  }
+  return true;
 }
 
 static bool remote_eviction_parse_obj(HeapRegion* hr, HeapWord* p,
@@ -3183,6 +3245,22 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       uint idx = target_hr->hrm_index();
       if (idx >= _num_regions || !_eviction_set[idx]) return;
 
+      Klass* target_klass = nullptr;
+      if (!remote_eviction_valid_local_oop(_g1h, target, target_hr, &target_klass)) {
+        _missed++;
+        if (idx < _region_count) _target_region_counts[idx]++;
+        if (_repair) {
+          _repair_untaggable++;
+        }
+        if (should_report_miss()) {
+          log_warning(gc)("VERIFY: invalid target oop field=" PTR_FORMAT
+                          " raw=0x%lx -> target=" PTR_FORMAT
+                          " in candidate region %u",
+                          p2i(p), (unsigned long)raw, p2i((void*)target), idx);
+        }
+        return;
+      }
+
       // Root-catch relocated objects have forwarding pointers — OK
       if (target->is_forwarded()) return;
 
@@ -3213,9 +3291,11 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       }
 
       Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
+      if (source_klass != nullptr && !remote_eviction_valid_klass(source_klass)) {
+        source_klass = nullptr;
+      }
       bool source_array = source_klass != nullptr && source_klass->is_array_klass();
       bool source_obj_array = source_klass != nullptr && source_klass->is_objArray_klass();
-      Klass* target_klass = target->klass_or_null();
       bool target_type_array = target_klass != nullptr && target_klass->is_typeArray_klass();
       bool target_object = target_klass != nullptr && !target_klass->is_array_klass();
       bool unsafe_obj_array_source =
