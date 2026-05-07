@@ -3033,6 +3033,34 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     int total_candidates = path1_candidates + path2_candidates;
 
+    if (total_candidates > 0 && rmm->dense_segments_enabled()) {
+      int dense_prefilter_removed = 0;
+      int dense_prefilter_kept = 0;
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        const char* reason = nullptr;
+        if (hr == nullptr ||
+            !rmm->can_evict_dense_segment_region(hr, &reason)) {
+          eviction_candidates[i] = false;
+          if (hr != nullptr) {
+            hr->clear_cold_destination();
+          }
+          dense_prefilter_removed++;
+          if (total_candidates > 0) {
+            total_candidates--;
+          }
+          continue;
+        }
+        dense_prefilter_kept++;
+      }
+      if (dense_prefilter_removed > 0 || dense_prefilter_kept > 0) {
+        log_info(gc)("Dense segment prefilter: kept %d compatible regions, "
+                     "removed %d non-segment candidates before Phase B/C",
+                     dense_prefilter_kept, dense_prefilter_removed);
+      }
+    }
+
     // Root-catch relocation is disabled by default. In that mode, candidate
     // regions that already have remote anchors cannot be evicted this cycle:
     // a LOCAL anchored handle would keep a raw local address into the region.

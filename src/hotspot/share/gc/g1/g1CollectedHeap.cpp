@@ -2826,7 +2826,8 @@ void G1CollectedHeap::publish_restored_evict_guarded_region(HeapRegion* hr,
 
   hr->set_top(hr->bottom() + used_bytes / HeapWordSize);
   hr->set_old();
-  hr->init_top_at_mark_start();
+  hr->set_top_at_mark_start(hr->bottom());
+  hr->reset_parsable_bottom();
 
   {
     MutexLocker x(OldSets_lock, Mutex::_no_safepoint_check_flag);
