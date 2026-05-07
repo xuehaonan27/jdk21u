@@ -615,14 +615,17 @@ static int remote_prefetch_sample_pressure_level() {
     return Atomic::load(&g1_remote_prefetch_pressure_level);
   }
 
+  size_t tier2_percent = (size_t)G1RemoteTier2Percent;
+  size_t tier3_percent = MAX2((size_t)G1RemoteTier3Percent, tier2_percent);
+  size_t target_percent = MIN2((size_t)G1RemoteTier2TargetPercent, tier2_percent);
   int level = RemotePrefetchPressureOk;
   if (capacity > 0) {
     size_t pct = (usage * 100) / capacity;
-    if (pct >= (size_t)G1RemoteTier3Percent) {
+    if (pct >= tier3_percent) {
       level = RemotePrefetchPressureOverTier3;
-    } else if (pct >= (size_t)G1RemoteTier2Percent) {
+    } else if (pct >= tier2_percent) {
       level = RemotePrefetchPressureOverTier2;
-    } else if (pct >= (size_t)G1RemoteTier2TargetPercent) {
+    } else if (pct >= target_percent) {
       level = RemotePrefetchPressureOverTarget;
     }
   }
@@ -644,9 +647,9 @@ static int remote_prefetch_sample_pressure_level() {
                    ((double)usage * 100.0) / (double)capacity,
                  total_usage / M,
                  cache_usage / M,
-                 G1RemoteTier2TargetPercent,
-                 G1RemoteTier2Percent,
-                 G1RemoteTier3Percent);
+                 (uint)target_percent,
+                 (uint)tier2_percent,
+                 (uint)tier3_percent);
   }
 
   Atomic::release_store(&g1_remote_prefetch_pressure_lock, 0);
