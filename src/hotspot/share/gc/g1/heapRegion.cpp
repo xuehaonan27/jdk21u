@@ -751,6 +751,10 @@ void HeapRegion::update_bot_for_block(HeapWord* start, HeapWord* end) {
 }
 
 void HeapRegion::object_iterate(ObjectClosure* blk) {
+  if (is_evict_guarded()) {
+    return;
+  }
+
   HeapWord* p = bottom();
   while (p < top()) {
     if (block_is_obj(p, parsable_bottom())) {

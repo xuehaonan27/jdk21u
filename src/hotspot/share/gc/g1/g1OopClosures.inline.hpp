@@ -79,6 +79,22 @@ static inline bool g1_gc_scan_valid_klass(Klass* k) {
   return k->is_klass();
 }
 
+static inline bool g1_gc_slot_readable_for_scan(G1CollectedHeap* g1h, const void* p) {
+  if (!g1_remote_gc_scan_checks_enabled()) {
+    return true;
+  }
+  if (p == nullptr) {
+    return false;
+  }
+  void* slot = (void*)p;
+  if (g1h == nullptr || !g1h->is_in_reserved(slot)) {
+    return true;
+  }
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null(slot);
+  return hr != nullptr && !hr->is_free() && !hr->is_empty() && !hr->is_evict_guarded();
+}
+
 static inline bool g1_gc_scan_region_contains_oop(G1CollectedHeap* g1h, oop obj) {
   if (obj == nullptr) {
     return false;
@@ -399,6 +415,9 @@ inline void G1ScanCardClosure::do_oop_work(T* p) {
 
 template <class T>
 inline void G1ScanRSForOptionalClosure::do_oop_work(T* p) {
+  if (!g1_gc_slot_readable_for_scan(_g1h, p)) {
+    return;
+  }
   const G1HeapRegionAttr region_attr = _g1h->region_attr(p);
   // Entries in the optional collection set may start to originate from the collection
   // set after one or more increments. In this case, previously optional regions

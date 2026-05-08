@@ -176,6 +176,9 @@ size_t G1ParScanThreadState::lab_undo_waste_words() const {
 void G1ParScanThreadState::verify_task(narrowOop* task) const {
   assert(task != nullptr, "invariant");
   assert(UseCompressedOops, "sanity");
+  if (!g1_gc_slot_readable_for_scan(_g1h, task)) {
+    return;
+  }
   oop p = g1_resolved_load(task);
   assert(_g1h->is_in_reserved(p),
          "task=" PTR_FORMAT " p=" PTR_FORMAT, p2i(task), p2i(p));
@@ -183,6 +186,9 @@ void G1ParScanThreadState::verify_task(narrowOop* task) const {
 
 void G1ParScanThreadState::verify_task(oop* task) const {
   assert(task != nullptr, "invariant");
+  if (!g1_gc_slot_readable_for_scan(_g1h, task)) {
+    return;
+  }
   oop p = g1_resolved_load(task);
   assert(_g1h->is_in_reserved(p),
          "task=" PTR_FORMAT " p=" PTR_FORMAT, p2i(task), p2i(p));
@@ -210,6 +216,10 @@ void G1ParScanThreadState::verify_task(ScannerTask task) const {
 template <class T>
 MAYBE_INLINE_EVACUATION
 void G1ParScanThreadState::do_oop_evac(T* p) {
+  if (!g1_gc_slot_readable_for_scan(_g1h, p)) {
+    return;
+  }
+
   // Reference should not be null here as such are never pushed to the task queue.
   oop obj = g1_resolved_load<IS_NOT_NULL>(p);
 

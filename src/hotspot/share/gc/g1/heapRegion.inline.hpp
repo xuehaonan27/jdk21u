@@ -437,6 +437,10 @@ inline HeapWord* HeapRegion::oops_on_memregion_iterate_in_unparsable(MemRegion m
 // tests would be unnecessary almost all the time.
 template <class Closure, bool in_gc_pause>
 inline HeapWord* HeapRegion::oops_on_memregion_iterate(MemRegion mr, Closure* cl) {
+  if (is_evict_guarded()) {
+    return mr.end();
+  }
+
   // Cache the boundaries of the memory region in some const locals
   HeapWord* const start = mr.start();
   HeapWord* const end = mr.end();
@@ -503,6 +507,9 @@ template <bool in_gc_pause, class Closure>
 HeapWord* HeapRegion::oops_on_memregion_seq_iterate_careful(MemRegion mr,
                                                             Closure* cl) {
   assert(MemRegion(bottom(), top()).contains(mr), "Card region not in heap region");
+  if (is_evict_guarded()) {
+    return mr.end();
+  }
 
   // Special handling for humongous regions.
   if (is_humongous()) {

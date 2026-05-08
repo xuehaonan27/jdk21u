@@ -284,9 +284,9 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
         return true;
       }
 
-      // Skip quarantined regions: eviction sets top=bottom and poisons data.
-      // The rebuild snapshot (top_at_rebuild_start) may predate quarantine.
-      if (hr->is_empty() || hr->is_free()) {
+      // Skip nonresident/quarantined regions. The rebuild snapshot may predate
+      // remote eviction, and guarded dense regions are intentionally unparsable.
+      if (hr->is_empty() || hr->is_free() || hr->is_evict_guarded()) {
         return false;
       }
 
