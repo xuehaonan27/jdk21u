@@ -3441,6 +3441,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
       }
 
+      bool run_phase_c5_for_candidates =
+          total_candidates > 0 && G1RemoteVerifyEvictionRefs;
+      if (run_phase_c5_for_candidates && G1RemoteUseFastPhaseC) {
+        if (G1RemoteFastPhaseCVerifyInterval == 0) {
+          run_phase_c5_for_candidates = false;
+        } else if (G1RemoteFastPhaseCVerifyInterval > 1) {
+          run_phase_c5_for_candidates =
+              (rmm->gc_epoch() % G1RemoteFastPhaseCVerifyInterval) == 0;
+        }
+      }
+
       // ---- Phase C.1: Safety-net scan of newly-evacuated areas ----
       // Objects evacuated during this GC land above _pre_evac_tops[i] in
       // destination regions.  The general Phase C scan covers them via
@@ -3450,7 +3461,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       if (total_candidates > 0 &&
           _pre_evac_tops != nullptr &&
           !(G1RemoteUseFastPhaseC &&
-            G1RemoteVerifyEvictionRefs &&
+            run_phase_c5_for_candidates &&
             G1RemoteSkipFastPhaseCSafetyNetWhenVerifying)) {
         Ticks phase_c1_start = Ticks::now();
         int c1_tagged = rmm->tag_evacuated_area_refs_to_eviction_set(
@@ -3468,17 +3479,25 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
       // ---- Phase C.5: Verify no untagged refs remain ----
       if (total_candidates > 0 && G1RemoteVerifyEvictionRefs) {
-        Ticks phase_c5_start = Ticks::now();
-        int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates,
-                                                                  num_regions,
-                                                                  _pre_evac_tops);
-        double phase_c5_ms = (Ticks::now() - phase_c5_start).seconds() * 1000.0;
-        log_info(gc)("Phase C.5 verify: %.1fms (%d missed heap refs)", phase_c5_ms, missed);
-        if (missed > 0) {
-          abort_remote_eviction_candidates(
-              _g1h, rmm, eviction_candidates, num_regions,
-              "untagged HEAP refs found after tagging", missed);
-          total_candidates = 0;
+        if (run_phase_c5_for_candidates) {
+          Ticks phase_c5_start = Ticks::now();
+          int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates,
+                                                                    num_regions,
+                                                                    _pre_evac_tops);
+          double phase_c5_ms = (Ticks::now() - phase_c5_start).seconds() * 1000.0;
+          log_info(gc)("Phase C.5 verify: %.1fms (%d missed heap refs)", phase_c5_ms, missed);
+          if (missed > 0) {
+            abort_remote_eviction_candidates(
+                _g1h, rmm, eviction_candidates, num_regions,
+                "untagged HEAP refs found after tagging", missed);
+            total_candidates = 0;
+          }
+        } else {
+          log_info(gc)("Phase C.5 verify: skipped by interval=%u "
+                       "(inbound edges=" UINT64_FORMAT ", duplicate records=" UINT64_FORMAT ")",
+                       G1RemoteFastPhaseCVerifyInterval,
+                       rmm->inbound_region_summary_edges(),
+                       rmm->inbound_region_summary_duplicates());
         }
       }
 

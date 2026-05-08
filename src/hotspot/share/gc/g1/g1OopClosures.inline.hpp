@@ -268,6 +268,7 @@ inline void G1ScanEvacuatedObjClosure::do_oop_work(T* p) {
   if (region_attr.is_in_cset()) {
     prefetch_and_push(p, obj);
   } else if (!HeapRegion::is_in_same_region(p, obj)) {
+    _par_scan_state->record_remote_inbound_ref(p, obj);
     handle_non_cset_obj_common(region_attr, p, obj);
     assert(_skip_card_enqueue != Uninitialized, "Scan location has not been initialized.");
     if (_skip_card_enqueue == True) {
@@ -350,6 +351,11 @@ inline void G1ConcurrentRefineOopClosure::do_oop_work(T* p) {
     return;
   }
 
+  G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+  if (rmm != nullptr) {
+    rmm->record_inbound_ref((void*)p, obj);
+  }
+
   HeapRegionRemSet* to_rem_set = _g1h->heap_region_containing(obj)->rem_set();
 
   assert(to_rem_set != nullptr, "Need per-region 'into' remsets.");
@@ -385,6 +391,7 @@ inline void G1ScanCardClosure::do_oop_work(T* p) {
     prefetch_and_push(p, obj);
     _heap_roots_found++;
   } else if (!HeapRegion::is_in_same_region(p, obj)) {
+    _par_scan_state->record_remote_inbound_ref(p, obj);
     handle_non_cset_obj_common(region_attr, p, obj);
     _par_scan_state->enqueue_card_if_tracked(region_attr, p, obj);
   }

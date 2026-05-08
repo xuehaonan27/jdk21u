@@ -472,6 +472,12 @@
           "misses and scan those regions in later eviction attempts. This "    \
           "turns repeated verifier repairs into bounded steady-state scans.")  \
                                                                             \
+  product(bool, G1RemoteUseInboundRegionSummary, true, DIAGNOSTIC,            \
+          "Record conservative old-source to target-region references during " \
+          "GC/refinement scans and use the summary as Fast Phase C source "    \
+          "metadata. False positives add bounded scans; false negatives are "  \
+          "covered by Phase C.5 verification while enabled.")                  \
+                                                                            \
   product(bool, G1RemoteUseObjArrayContainerPrescan, false, DIAGNOSTIC,       \
           "Before Fast Phase C, boundedly scan old source regions near "       \
           "eviction candidates for raw refs into those candidates. Safe "      \
@@ -541,6 +547,12 @@
           "still point into eviction candidate regions. Disable only for "    \
           "controlled performance ablations after Fast Phase C has passed "   \
           "verification on the target workload.")                             \
+                                                                            \
+  product(uint, G1RemoteFastPhaseCVerifyInterval, 1, DIAGNOSTIC,             \
+          "Run full Phase C.5 heap verification every N remote eviction "      \
+          "attempts. 1 verifies every attempt. 0 disables the full verifier "  \
+          "for controlled Fast Phase C experiments.")                          \
+          range(0, 1000000)                                                   \
                                                                             \
   product(bool, G1RemoteParallelVerifyEvictionRefs, true, DIAGNOSTIC,        \
           "Use GC worker threads for the heap portion of remote-eviction "    \

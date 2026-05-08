@@ -820,6 +820,11 @@ private:
   uint      _fast_phase_c_source_hint_capacity;
   uint      _fast_phase_c_source_hint_count;
   volatile int _fast_phase_c_source_hint_lock;
+  uint64_t* _inbound_region_summary;
+  uint      _inbound_region_summary_capacity;
+  volatile int _inbound_region_summary_lock;
+  volatile uint64_t _inbound_region_summary_edges;
+  volatile uint64_t _inbound_region_summary_duplicates;
   int       _last_phase_c_tagged;
   int       _last_phase_c_no_handle;
   int       _last_phase_c_untaggable;
@@ -882,6 +887,7 @@ private:
 
   void ensure_eviction_backoff_capacity(uint num_regions);
   void ensure_fast_phase_c_source_hint_capacity(uint num_regions);
+  void ensure_inbound_region_summary_capacity(uint num_regions);
   bool ensure_dense_segment_capacity(uint num_regions);
   void release_dense_segment_edges(DenseSegmentEdge* edges, uint32_t count);
   bool scan_dense_segment_region(HeapRegion* hr,
@@ -908,6 +914,12 @@ private:
   }
   void fast_phase_c_source_hint_unlock() {
     Atomic::release_store(&_fast_phase_c_source_hint_lock, 0);
+  }
+  void inbound_region_summary_lock() {
+    while (Atomic::cmpxchg(&_inbound_region_summary_lock, 0, 1) != 0) { /* spin */ }
+  }
+  void inbound_region_summary_unlock() {
+    Atomic::release_store(&_inbound_region_summary_lock, 0);
   }
 
 public:
@@ -1177,6 +1189,13 @@ public:
   bool is_fast_phase_c_source_hint(uint region_idx) const;
   bool remember_fast_phase_c_source_hint(uint region_idx);
   uint fast_phase_c_source_hint_count() const { return _fast_phase_c_source_hint_count; }
+  void record_inbound_ref(void* field_addr, oop target);
+  void record_inbound_region_ref(uint source_region, uint target_region);
+  bool is_inbound_source_for_eviction_set(uint source_region,
+                                          const bool* eviction_set,
+                                          uint num_regions) const;
+  uint64_t inbound_region_summary_edges() const { return _inbound_region_summary_edges; }
+  uint64_t inbound_region_summary_duplicates() const { return _inbound_region_summary_duplicates; }
   bool dense_segments_enabled() const;
   bool can_evict_dense_segment_region(HeapRegion* hr, const char** reason,
                                       size_t* object_count = nullptr);

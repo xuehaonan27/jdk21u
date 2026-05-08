@@ -169,6 +169,12 @@ public:
   // To be called during GC if nothing particular about p and obj are known.
   template <class T> void write_ref_field_post(T* p, oop obj);
 
+  // Record conservative source-region metadata for remote eviction. This is
+  // separate from G1 remembered-set enqueueing because remote eviction needs
+  // old-to-old inbound source summaries even when a normal remset entry is not
+  // useful for evacuation.
+  template <class T> void record_remote_inbound_ref(T* p, oop obj);
+
   // Enqueue the card if the reference's target region's remembered set is tracked.
   // Assumes that a significant amount of pre-filtering (like done by
   // write_ref_field_post() above) has already been performed.

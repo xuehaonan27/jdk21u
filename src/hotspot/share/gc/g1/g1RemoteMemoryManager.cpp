@@ -75,6 +75,11 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _fast_phase_c_source_hint_capacity(0),
     _fast_phase_c_source_hint_count(0),
     _fast_phase_c_source_hint_lock(0),
+    _inbound_region_summary(nullptr),
+    _inbound_region_summary_capacity(0),
+    _inbound_region_summary_lock(0),
+    _inbound_region_summary_edges(0),
+    _inbound_region_summary_duplicates(0),
     _last_phase_c_tagged(0),
     _last_phase_c_no_handle(0),
     _last_phase_c_untaggable(0),
@@ -707,6 +712,11 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     _fast_phase_c_source_hint_capacity = 0;
     _fast_phase_c_source_hint_count = 0;
   }
+  if (_inbound_region_summary != nullptr) {
+    FREE_C_HEAP_ARRAY(uint64_t, _inbound_region_summary);
+    _inbound_region_summary = nullptr;
+    _inbound_region_summary_capacity = 0;
+  }
   if (_dense_segments != nullptr) {
     for (uint i = 0; i < _dense_segment_capacity; i++) {
       if (_dense_segments[i].edges != nullptr) {
@@ -847,6 +857,137 @@ bool G1RemoteMemoryManager::remember_fast_phase_c_source_hint(uint region_idx) {
                G1RemoteFastPhaseCSourceHintMaxRegions);
   fast_phase_c_source_hint_unlock();
   return true;
+}
+
+static inline uint inbound_summary_words_per_row(uint capacity) {
+  return (capacity + 63) >> 6;
+}
+
+void G1RemoteMemoryManager::ensure_inbound_region_summary_capacity(uint num_regions) {
+  if (num_regions <= _inbound_region_summary_capacity) {
+    return;
+  }
+
+  uint new_cap = _g1h == nullptr ? 0 : _g1h->max_reserved_regions();
+  if (new_cap < num_regions) {
+    new_cap = MAX2(num_regions, _inbound_region_summary_capacity * 2);
+  }
+  if (new_cap < 1024) {
+    new_cap = 1024;
+  }
+
+  const uint old_cap = _inbound_region_summary_capacity;
+  const uint old_words = inbound_summary_words_per_row(old_cap);
+  const uint new_words = inbound_summary_words_per_row(new_cap);
+  const size_t new_size = (size_t)new_cap * (size_t)new_words;
+
+  uint64_t* new_summary = NEW_C_HEAP_ARRAY(uint64_t, new_size, mtGC);
+  memset(new_summary, 0, new_size * sizeof(uint64_t));
+
+  if (_inbound_region_summary != nullptr) {
+    for (uint target = 0; target < old_cap; target++) {
+      memcpy(&new_summary[(size_t)target * new_words],
+             &_inbound_region_summary[(size_t)target * old_words],
+             old_words * sizeof(uint64_t));
+    }
+    FREE_C_HEAP_ARRAY(uint64_t, _inbound_region_summary);
+  }
+
+  _inbound_region_summary = new_summary;
+  _inbound_region_summary_capacity = new_cap;
+}
+
+void G1RemoteMemoryManager::record_inbound_region_ref(uint source_region, uint target_region) {
+  if (!G1RemoteUseInboundRegionSummary ||
+      !G1RemoteUseFastPhaseC ||
+      source_region == target_region ||
+      source_region == (uint)-1 ||
+      target_region == (uint)-1) {
+    return;
+  }
+
+  uint capacity = _inbound_region_summary_capacity;
+  uint64_t* summary = _inbound_region_summary;
+  if (summary == nullptr ||
+      source_region >= capacity ||
+      target_region >= capacity) {
+    inbound_region_summary_lock();
+    ensure_inbound_region_summary_capacity(MAX2(source_region, target_region) + 1);
+    capacity = _inbound_region_summary_capacity;
+    summary = _inbound_region_summary;
+    inbound_region_summary_unlock();
+  }
+
+  if (summary == nullptr ||
+      source_region >= capacity ||
+      target_region >= capacity) {
+    return;
+  }
+
+  const uint words = inbound_summary_words_per_row(capacity);
+  const uint word = source_region >> 6;
+  const uint64_t mask = (uint64_t)1 << (source_region & 63);
+  uint64_t* entry = &summary[(size_t)target_region * words + word];
+  uint64_t cur = Atomic::load(entry);
+  while ((cur & mask) == 0) {
+    uint64_t observed = Atomic::cmpxchg(entry, cur, cur | mask);
+    if (observed == cur) {
+      Atomic::inc(&_inbound_region_summary_edges);
+      return;
+    }
+    cur = observed;
+  }
+  Atomic::inc(&_inbound_region_summary_duplicates);
+}
+
+void G1RemoteMemoryManager::record_inbound_ref(void* field_addr, oop target) {
+  if (!G1RemoteUseInboundRegionSummary ||
+      !G1RemoteUseFastPhaseC ||
+      field_addr == nullptr ||
+      target == nullptr ||
+      !_g1h->is_in(target)) {
+    return;
+  }
+
+  HeapRegion* source_hr = _g1h->heap_region_containing_or_null(field_addr);
+  HeapRegion* target_hr = _g1h->heap_region_containing_or_null((void*)target);
+  if (source_hr == nullptr ||
+      target_hr == nullptr ||
+      source_hr == target_hr ||
+      source_hr->is_empty() ||
+      source_hr->is_young() ||
+      source_hr->is_continues_humongous() ||
+      target_hr->is_empty() ||
+      target_hr->is_continues_humongous()) {
+    return;
+  }
+
+  record_inbound_region_ref(source_hr->hrm_index(), target_hr->hrm_index());
+}
+
+bool G1RemoteMemoryManager::is_inbound_source_for_eviction_set(uint source_region,
+                                                               const bool* eviction_set,
+                                                               uint num_regions) const {
+  if (!G1RemoteUseInboundRegionSummary ||
+      !G1RemoteUseFastPhaseC ||
+      _inbound_region_summary == nullptr ||
+      eviction_set == nullptr ||
+      source_region >= _inbound_region_summary_capacity) {
+    return false;
+  }
+
+  const uint cap = _inbound_region_summary_capacity;
+  const uint words = inbound_summary_words_per_row(cap);
+  const uint word = source_region >> 6;
+  const uint64_t mask = (uint64_t)1 << (source_region & 63);
+  const uint limit = MIN2(num_regions, cap);
+  for (uint target = 0; target < limit; target++) {
+    if (eviction_set[target] &&
+        (_inbound_region_summary[(size_t)target * words + word] & mask) != 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool G1RemoteMemoryManager::ensure_dense_segment_capacity(uint num_regions) {
@@ -4286,6 +4427,7 @@ class TagFastRefsTask : public WorkerTask {
   volatile int           _total_untaggable;
   volatile int           _regions_scanned;
   volatile int           _dirty_cards_scanned;
+  volatile int           _inbound_summary_regions_scanned;
   volatile int           _source_hint_regions_scanned;
   volatile int           _old_prefix_regions_scanned;
 
@@ -4304,6 +4446,7 @@ public:
       _claimer(num_workers), _total_tagged(0), _total_no_handle(0),
       _total_untaggable(0),
       _regions_scanned(0), _dirty_cards_scanned(0),
+      _inbound_summary_regions_scanned(0),
       _source_hint_regions_scanned(0), _old_prefix_regions_scanned(0),
       _num_workers(num_workers) {
     _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
@@ -4328,6 +4471,7 @@ public:
     EvictionSetRsetScanner rset_scanner(_g1h, &cl, _eviction_set, _num_regions);
     int scanned = 0;
     int dirty_cards = 0;
+    int inbound_summary_regions = 0;
     int source_hint_regions = 0;
     int old_prefix_regions = 0;
 
@@ -4365,6 +4509,13 @@ public:
         continue;
       }
 
+      if (_rmm->is_inbound_source_for_eviction_set(i, _eviction_set, _num_regions)) {
+        scan_region_for_eviction_tags(hr, &cl, _bitmap);
+        scanned++;
+        inbound_summary_regions++;
+        continue;
+      }
+
       if (_rmm->is_fast_phase_c_source_hint(i)) {
         scan_region_for_eviction_tags(hr, &cl, _bitmap);
         scanned++;
@@ -4395,6 +4546,7 @@ public:
     Atomic::add(&_total_untaggable, cl.untaggable());
     Atomic::add(&_regions_scanned, scanned);
     Atomic::add(&_dirty_cards_scanned, dirty_cards);
+    Atomic::add(&_inbound_summary_regions_scanned, inbound_summary_regions);
     Atomic::add(&_source_hint_regions_scanned, source_hint_regions);
     Atomic::add(&_old_prefix_regions_scanned, old_prefix_regions);
     _worker_bufs[worker_id] = cl.release_local_buf();
@@ -4414,6 +4566,7 @@ public:
   int total_untaggable() const { return _total_untaggable; }
   int regions_scanned() const { return _regions_scanned; }
   int dirty_cards_scanned() const { return _dirty_cards_scanned; }
+  int inbound_summary_regions_scanned() const { return _inbound_summary_regions_scanned; }
   int source_hint_regions_scanned() const { return _source_hint_regions_scanned; }
   int old_prefix_regions_scanned() const { return _old_prefix_regions_scanned; }
 };
@@ -4437,8 +4590,10 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
 
     if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
       log_info(gc)("Fast Phase C (%u workers, %d regions scanned, %d dirty cards, "
-                   "%d source hints, %d old-prefix): tagged %d refs, %d no handle, %d untaggable",
+                   "%d inbound summaries, %d source hints, %d old-prefix): "
+                   "tagged %d refs, %d no handle, %d untaggable",
                    num_workers, task.regions_scanned(), task.dirty_cards_scanned(),
+                   task.inbound_summary_regions_scanned(),
                    task.source_hint_regions_scanned(), task.old_prefix_regions_scanned(),
                    total_tagged, total_no_handle, total_untaggable);
     }
@@ -4448,6 +4603,7 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     EvictionSetRsetScanner rset_scanner(_g1h, &cl, eviction_set, num_regions);
     int scanned = 0;
     int dirty_cards = 0;
+    int inbound_summary_regions = 0;
     int source_hint_regions = 0;
     int old_prefix_regions = 0;
 
@@ -4478,6 +4634,13 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
           !hr->is_continues_humongous()) {
         scan_region_for_eviction_tags(hr, &cl, bitmap);
         scanned++;
+        continue;
+      }
+
+      if (is_inbound_source_for_eviction_set(i, eviction_set, num_regions)) {
+        scan_region_for_eviction_tags(hr, &cl, bitmap);
+        scanned++;
+        inbound_summary_regions++;
         continue;
       }
 
@@ -4515,8 +4678,10 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
 
     if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
       log_info(gc)("Fast Phase C (1 worker, %d regions scanned, %d dirty cards, "
-                   "%d source hints, %d old-prefix): tagged %d refs, %d no handle, %d untaggable",
-                   scanned, dirty_cards, source_hint_regions, old_prefix_regions,
+                   "%d inbound summaries, %d source hints, %d old-prefix): "
+                   "tagged %d refs, %d no handle, %d untaggable",
+                   scanned, dirty_cards, inbound_summary_regions,
+                   source_hint_regions, old_prefix_regions,
                    total_tagged, total_no_handle, total_untaggable);
     }
   }

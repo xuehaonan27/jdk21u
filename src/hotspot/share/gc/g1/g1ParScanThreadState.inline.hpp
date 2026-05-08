@@ -28,10 +28,11 @@
 #include "gc/g1/g1ParScanThreadState.hpp"
 
 #include "gc/g1/g1CardTable.hpp"
-#include "gc/g1/g1RemoteOop.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
 #include "gc/g1/g1OopStarChunkedList.inline.hpp"
 #include "gc/g1/g1RemSet.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "oops/access.inline.hpp"
 #include "oops/oop.inline.hpp"
 
@@ -110,6 +111,7 @@ template <class T> void G1ParScanThreadState::write_ref_field_post(T* p, oop obj
   if (HeapRegion::is_in_same_region(p, obj)) {
     return;
   }
+  record_remote_inbound_ref(p, obj);
   G1HeapRegionAttr from_attr = _g1h->region_attr(p);
   // If this is a reference from (current) survivor regions, we do not need
   // to track references from it.
@@ -126,6 +128,15 @@ template <class T> void G1ParScanThreadState::write_ref_field_post(T* p, oop obj
     return;
   }
   enqueue_card_if_tracked(dest_attr, p, obj);
+}
+
+template <class T> void G1ParScanThreadState::record_remote_inbound_ref(T* p, oop obj) {
+  if (G1RemoteUseInboundRegionSummary) {
+    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      rmm->record_inbound_ref((void*)p, obj);
+    }
+  }
 }
 
 template <class T> void G1ParScanThreadState::enqueue_card_if_tracked(G1HeapRegionAttr region_attr, T* p, oop o) {
