@@ -1355,18 +1355,16 @@ bool G1RemoteMemoryManager::scan_dense_segment_region(HeapRegion* hr,
       if (reason != nullptr) *reason = "bad-size";
       return false;
     }
-    if (G1CollectedHeap::is_obj_filler(obj)) {
-      if (reason != nullptr) *reason = "contains-filler";
-      return false;
-    }
-    if (!k->is_typeArray_klass()) {
-      obj->oop_iterate(&boundary_cl);
-      if (!boundary_cl.ok()) {
-        if (reason != nullptr) *reason = boundary_cl.reason();
-        return false;
+    if (!G1CollectedHeap::is_obj_filler(obj)) {
+      if (!k->is_typeArray_klass()) {
+        obj->oop_iterate(&boundary_cl);
+        if (!boundary_cl.ok()) {
+          if (reason != nullptr) *reason = boundary_cl.reason();
+          return false;
+        }
       }
+      objects++;
     }
-    objects++;
     p += sz;
   }
   if (p != hr->top() || objects == 0) {
