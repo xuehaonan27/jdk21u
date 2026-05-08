@@ -27,7 +27,6 @@
 #include "oops/oop.inline.hpp"
 #include "runtime/os.hpp"
 #include "runtime/safepoint.hpp"
-#include "runtime/safepointMechanism.inline.hpp"
 #include "runtime/timer.hpp"
 #include "runtime/mutexLocker.hpp"
 #include "runtime/jniHandles.hpp"
@@ -1609,28 +1608,6 @@ void G1RemoteMemoryManager::patch_dense_segment_boundary_edges(DenseSegmentEntry
                hr->hrm_index(), count, clean, shared, direct, nulled, invalid);
 }
 
-static bool dense_segment_process_safepoint_if_requested() {
-  Thread* current = Thread::current_or_null();
-  if (current == nullptr || !current->is_Java_thread()) {
-    return false;
-  }
-
-  JavaThread* jt = JavaThread::cast(current);
-  if (!SafepointMechanism::should_process(jt, true /* allow_suspend */)) {
-    return false;
-  }
-
-  SafepointMechanism::process_if_requested_with_exit_check(
-      jt, false /* check_async_exception */);
-  return true;
-}
-
-static void dense_segment_wait_safepoint_safe(SpinYield* yield) {
-  if (!dense_segment_process_safepoint_if_requested()) {
-    yield->wait();
-  }
-}
-
 bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
   if (!G1RemoteUseDenseSegments || _dense_segments == nullptr ||
       _g1h == nullptr || !_g1h->is_in_reserved((void*)addr)) {
@@ -1679,7 +1656,12 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
       break;
     }
     dense_segment_unlock();
-    dense_segment_wait_safepoint_safe(&yield);
+    // This method is reached from resolve_tagged_oop_no_safepoint(), including
+    // C1/C2 leaf load barriers.  Waiters must not process safepoints here:
+    // their Java frames are not entered through a JRT_ENTRY transition.  The
+    // fetching thread must make any contended Heap_lock wait visible through
+    // HotSpot's Mutex blocking path below.
+    yield.wait();
   }
 
   void* buf = os::malloc(byte_size, mtGC);
@@ -1723,7 +1705,7 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
     if (!Heap_lock->try_lock()) {
       log_info(gc)("Dense segment fetch waiting: Heap_lock busy before restore "
                    "for region %u segment=" UINT64_FORMAT
-                   " (blocking with safepoint check)",
+                   " (blocking in HotSpot Mutex path)",
                    idx, segment_id);
       Heap_lock->lock(Thread::current());
     }
