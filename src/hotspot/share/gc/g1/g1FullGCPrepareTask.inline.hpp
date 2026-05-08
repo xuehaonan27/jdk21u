@@ -74,7 +74,7 @@ inline void G1DetermineCompactionQueueClosure::add_to_compaction_queue(HeapRegio
 }
 
 inline bool G1DetermineCompactionQueueClosure::do_heap_region(HeapRegion* hr) {
-  if (hr->is_free() && hr->is_evict_guarded()) {
+  if (hr->is_evict_guarded()) {
     return false;
   }
 

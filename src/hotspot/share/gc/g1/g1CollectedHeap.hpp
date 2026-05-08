@@ -1035,12 +1035,6 @@ public:
   void prepend_to_freelist(FreeRegionList* list);
   void decrement_summary_bytes(size_t bytes);
 
-  // Restore one remote-evicted guarded-free region back to old-gen service.
-  // Dense segment fetch first unquarantines the address range for copying,
-  // then publishes the region as old only after bytes and BOT are restored.
-  bool unquarantine_evict_guarded_region(HeapRegion* hr);
-  bool publish_restored_evict_guarded_region(HeapRegion* hr, size_t used_bytes);
-
   bool is_in(const void* p) const override;
 
   // Return "TRUE" iff the given object address is within the collection

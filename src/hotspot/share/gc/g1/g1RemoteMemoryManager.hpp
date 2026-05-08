@@ -884,6 +884,7 @@ private:
   volatile uint64_t  _dense_segment_evict_failures;
   volatile uint64_t  _dense_segment_fetch_success;
   volatile uint64_t  _dense_segment_fetch_failures;
+  volatile uint64_t  _dense_segment_remote_bytes;
 
   void ensure_eviction_backoff_capacity(uint num_regions);
   void ensure_fast_phase_c_source_hint_capacity(uint num_regions);
@@ -1205,6 +1206,9 @@ public:
   bool evict_dense_segment_region(HeapRegion* hr, uint32_t flags = 0);
   bool is_dense_segment_remote_addr(uintptr_t addr) const;
   bool localize_dense_segment_for_addr(uintptr_t addr);
+  size_t dense_segment_remote_bytes() const {
+    return (size_t)Atomic::load(&_dense_segment_remote_bytes);
+  }
 
   // Determine eviction threshold: objects at or above this distance are cold.
   // Returns the distance threshold, or HOTNESS_LEVELS if nothing to evict.

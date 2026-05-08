@@ -2370,6 +2370,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     int regions_kept_alive = 0;
     uint freed_regions = 0;
     size_t total_freed_bytes = 0;
+    size_t total_summary_freed_bytes = 0;
     FreeRegionList freed_list("Evicted Cold Regions");
     uint num_regions = _g1h->max_reserved_regions();
 
@@ -2436,7 +2437,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       bool cgroup_expanded_batch_cap = false;
 
       if (LocalMemoryRatio < 100 && LocalMemoryRatio > 0) {
-        local_used = _g1h->used();
+        size_t logical_heap_used = _g1h->used();
+        size_t dense_remote_bytes =
+          rmm != nullptr ? rmm->dense_segment_remote_bytes() : 0;
+        local_used = logical_heap_used > dense_remote_bytes
+          ? logical_heap_used - dense_remote_bytes
+          : 0;
         size_t local_capacity = remote_local_capacity_bytes(_g1h);
         // RDMA mode keeps large native side metadata (handles, edge tables,
         // tagged-field lists, staging buffers, Spark/JVM native state). In the
@@ -2528,8 +2534,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
 
         if (eviction_tier > 0) {
-          log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB / heap_budget=" SIZE_FORMAT
-                       "MB (local_cap=" SIZE_FORMAT "MB reserve=" SIZE_FORMAT "MB, %.1f%%), "
+          log_info(gc)("Tiered eviction T%d: local_used=" SIZE_FORMAT "MB "
+                       "(logical=" SIZE_FORMAT "MB dense_remote=" SIZE_FORMAT
+                       "MB) / heap_budget=" SIZE_FORMAT "MB "
+                       "(local_cap=" SIZE_FORMAT "MB reserve=" SIZE_FORMAT "MB, %.1f%%), "
                        "alloc_rate=%.1fKB/ms, lookahead=" SIZE_FORMAT "MB, heap_effective=%.1f%%, "
                        "cgroup_anon=" SIZE_FORMAT "MB/" SIZE_FORMAT "MB %.1f%% "
                        "(total=" SIZE_FORMAT "MB cache=" SIZE_FORMAT "MB), "
@@ -2538,7 +2546,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        "MB%s, evict_target=" SIZE_FORMAT "MB "
                        "(uncapped=" SIZE_FORMAT "MB cgroup_need=" SIZE_FORMAT
                        "MB), dense_last_resort=%s",
-                       eviction_tier, local_used / M, heap_budget / M,
+                       eviction_tier, local_used / M, logical_heap_used / M,
+                       dense_remote_bytes / M, heap_budget / M,
                        local_capacity / M, native_reserve / M, heap_pressure * 100.0,
                        alloc_rate_ms / 1024.0,
                        lookahead_alloc / M,
@@ -3711,13 +3720,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           dense_evicted_regions++;
           dense_evicted_bytes += region_used;
           total_freed_bytes += region_used;
-          rmm->invalidate_fcr_if_freed(hr);
           hr->clear_cardtable();
-          _g1h->free_region(hr, &freed_list);
+          hr->clear_cold_destination();
+          hr->clear_root_pinned();
           ::madvise((char*)hr->bottom(), HeapRegion::GrainBytes, MADV_DONTNEED);
-          os::guard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+          bool guarded = os::guard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+          guarantee(guarded, "Dense segment eviction must guard non-resident region");
           hr->set_evict_guarded();
-          freed_regions++;
         }
 
         total_candidates = 0;
@@ -5043,6 +5052,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           regions_evicted++;
           size_t region_used = hr->used();
           total_freed_bytes += region_used;
+          total_summary_freed_bytes += region_used;
           rmm->invalidate_fcr_if_freed(hr);
           log_info(gc)("Evicted region %u (%d objects, " SIZE_FORMAT "KB) "
                        "[" PTR_FORMAT ", " PTR_FORMAT ")",
@@ -5163,7 +5173,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     if (freed_regions > 0) {
       _g1h->remove_from_old_gen_sets(freed_regions, 0);
       _g1h->prepend_to_freelist(&freed_list);
-      _g1h->decrement_summary_bytes(total_freed_bytes);
+      _g1h->decrement_summary_bytes(total_summary_freed_bytes);
     }
 
     if (total_evicted > 0 || regions_pinned > 0) {

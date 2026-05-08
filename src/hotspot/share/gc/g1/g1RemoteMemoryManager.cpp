@@ -91,6 +91,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _dense_segment_evict_failures(0),
     _dense_segment_fetch_success(0),
     _dense_segment_fetch_failures(0),
+    _dense_segment_remote_bytes(0),
     _remote_roots(nullptr), _remote_roots_count(0), _cm_remote_roots_count(0),
     _remote_roots_capacity(0),
     _cross_roots_count(0),
@@ -530,6 +531,7 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
   uint64_t dense_evict_failures = Atomic::load(&_dense_segment_evict_failures);
   uint64_t dense_fetch_success = Atomic::load(&_dense_segment_fetch_success);
   uint64_t dense_fetch_failures = Atomic::load(&_dense_segment_fetch_failures);
+  uint64_t dense_remote_bytes = Atomic::load(&_dense_segment_remote_bytes);
 
   if (resolve_fast_local == 0 && resolve_fast_remote == 0 &&
       resolve_fast_fetching == 0 && resolve_fast_dead == 0 &&
@@ -565,7 +567,7 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                " pref_bytes=" UINT64_FORMAT " total_ms=%.1f)"
                " dense_segment(evict_ok=" UINT64_FORMAT
                " evict_fail=" UINT64_FORMAT " fetch_ok=" UINT64_FORMAT
-               " fetch_fail=" UINT64_FORMAT ")"
+               " fetch_fail=" UINT64_FORMAT " remote_bytes=" UINT64_FORMAT ")"
                " waits(slow=" UINT64_FORMAT " no_safepoint=" UINT64_FORMAT
                " hard=" UINT64_FORMAT " loops=" UINT64_FORMAT ")",
                resolve_fast_local,
@@ -592,6 +594,7 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                dense_evict_failures,
                dense_fetch_success,
                dense_fetch_failures,
+               dense_remote_bytes,
                fetch_wait_slow,
                fetch_wait_no_safepoint,
                fetch_wait_hard,
@@ -1454,6 +1457,7 @@ bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr,
   entry->edge_count = edge_count;
   entry->flags = flags;
   entry->last_evict_epoch = _gc_epoch;
+  Atomic::add(&_dense_segment_remote_bytes, (uint64_t)byte_size);
   Atomic::release_store(&entry->state, (uint32_t)DenseSegmentRemote);
   dense_segment_unlock();
 
@@ -1699,38 +1703,45 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
     hr = _g1h->region_at_or_null(idx);
   }
 
-  bool unlock_heap_for_restore = false;
-  if (ok && !SafepointSynchronize::is_at_safepoint() &&
-      !Heap_lock->owned_by_self()) {
-    if (!Heap_lock->try_lock()) {
-      log_info(gc)("Dense segment fetch waiting: Heap_lock busy before restore "
-                   "for region %u segment=" UINT64_FORMAT
-                   " (blocking in HotSpot Mutex path)",
-                   idx, segment_id);
-      Heap_lock->lock(Thread::current());
+  if (ok) {
+    ok = hr != nullptr && hr->is_evict_guarded() && !hr->is_free();
+    if (!ok) {
+      log_warning(gc)("Dense segment fetch rejected stale region state: "
+                      "region=%u segment=" UINT64_FORMAT " hr=" PTR_FORMAT
+                      " guarded=%s free=%s",
+                      idx, segment_id, p2i(hr),
+                      hr != nullptr && hr->is_evict_guarded() ? "true" : "false",
+                      hr != nullptr && hr->is_free() ? "true" : "false");
     }
-    unlock_heap_for_restore = true;
   }
 
+  bool region_unguarded = false;
   if (ok) {
-    ok = hr != nullptr &&
-         _g1h->unquarantine_evict_guarded_region(hr);
+    region_unguarded = os::unguard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+    if (!region_unguarded) {
+      log_warning(gc)("Dense segment fetch failed to unguard region %u "
+                      "segment=" UINT64_FORMAT,
+                      idx, segment_id);
+      ok = false;
+    }
   }
   if (ok) {
+    HeapWord* expected_top = hr->bottom() + fetched_bytes / HeapWordSize;
+    guarantee(hr->top() == expected_top,
+              "Dense segment region metadata changed while remote");
     memcpy(hr->bottom(), buf, fetched_bytes);
     bool parse_ok = rebuild_dense_segment_bot(hr, fetched_bytes);
     guarantee(parse_ok, "Dense segment restore produced an unparseable region");
   }
   if (ok) {
-    ok = _g1h->publish_restored_evict_guarded_region(hr, fetched_bytes);
-  }
-  if (unlock_heap_for_restore) {
-    Heap_lock->unlock();
-  }
-  if (ok) {
     patch_dense_segment_boundary_edges(&_dense_segments[idx], hr);
     dirty_dense_segment_cards(_g1h, hr);
     _backend->discard_segment(segment_id);
+    hr->clear_evict_guarded();
+    hr->clear_rss_trimmed_free();
+  } else if (region_unguarded && hr != nullptr) {
+    bool guarded = os::guard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+    guarantee(guarded, "Dense segment restore rollback must re-guard region");
   }
 
   os::free(buf);
@@ -1767,6 +1778,11 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
       fetch_churn_count = entry->fetch_churn_count;
       backoff_cycles = dense_fetch_backoff_cycles_for_shift(fetch_backoff_shift);
       backoff_eviction_region(idx, backoff_cycles);
+      uint64_t remote_bytes = Atomic::load(&_dense_segment_remote_bytes);
+      uint64_t restored_bytes = MIN2((uint64_t)entry->byte_size, remote_bytes);
+      if (restored_bytes > 0) {
+        Atomic::sub(&_dense_segment_remote_bytes, restored_bytes);
+      }
     }
     Atomic::release_store(&entry->state,
                           (uint32_t)(ok ? DenseSegmentLocal : DenseSegmentRemote));
