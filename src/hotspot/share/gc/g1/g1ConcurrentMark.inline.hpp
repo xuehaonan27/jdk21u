@@ -398,6 +398,11 @@ template <class T>
 inline bool G1CMTask::deal_with_reference(T* p) {
   increment_refs_reached();
 
+  G1RemoteMemoryManager* rmm = nullptr;
+  if (g1_cm_remote_marking_checks_enabled()) {
+    rmm = _g1h->remote_memory_manager();
+  }
+
   // P12: Before resolving, check if this is a REMOTE shared_oop.
   // g1_resolved_load returns nullptr for REMOTE Handles, which would
   // silently drop the reference. Instead, log the handle_id so the
@@ -407,7 +412,9 @@ inline bool G1CMTask::deal_with_reference(T* p) {
     if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
         (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
       RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
-      if (h == nullptr || (((uintptr_t)h & (sizeof(void*) - 1)) != 0)) {
+      uintptr_t handle_addr = (uintptr_t)h;
+      if (rmm == nullptr ||
+          !g1_remote_handle_pointer_is_plausible(handle_addr)) {
         return false;
       }
       uintptr_t sa = h->load_state_and_addr_acquire();
@@ -426,9 +433,8 @@ inline bool G1CMTask::deal_with_reference(T* p) {
   if (!_g1h->is_in(obj)) {
     return false;
   }
-    if (LocalMemoryRatio < 100 || G1TagRefSites ||
-        G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
-    G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+  if (LocalMemoryRatio < 100 || G1TagRefSites ||
+      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
     if (rmm != nullptr) {
       RemoteHandle* h = rmm->handle_for_addr_any_state(cast_from_oop<uintptr_t>(obj));
       if (h != nullptr && !h->is_local()) {

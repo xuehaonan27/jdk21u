@@ -24,6 +24,7 @@
 #include "oops/compressedOops.hpp"
 #include "oops/access.hpp"
 #include "oops/accessBackend.hpp"
+#include "runtime/os.hpp"
 #include "utilities/globalDefinitions.hpp"
 
 // ============================================================
@@ -121,10 +122,25 @@ inline bool g1_remote_oop_is_aligned(uintptr_t value) {
   return (value & (uintptr_t)MinObjAlignmentInBytesMask) == 0;
 }
 
+inline bool g1_remote_oop_is_low_canonical(uintptr_t value) {
+  return value < (uintptr_t(1) << 47);
+}
+
+inline bool g1_remote_handle_pointer_is_plausible(uintptr_t handle_addr) {
+  if (handle_addr == 0 ||
+      !g1_remote_oop_is_low_canonical(handle_addr) ||
+      ((handle_addr & (sizeof(void*) - 1)) != 0)) {
+    return false;
+  }
+  RemoteHandle* h = (RemoteHandle*)handle_addr;
+  return os::is_readable_range(h, h + 1);
+}
+
 inline oop resolve_oop_raw(oop tagged) {
   uintptr_t v = cast_from_oop<uintptr_t>(tagged);
   if ((v & G1_OOP_TAG_MASK) == 0) {
-    if (!g1_remote_oop_is_aligned(v)) {
+    if (!g1_remote_oop_is_low_canonical(v) ||
+        !g1_remote_oop_is_aligned(v)) {
       return nullptr;
     }
     return tagged;  // Ordinary (fast path -- no tags)
@@ -133,7 +149,7 @@ inline oop resolve_oop_raw(oop tagged) {
   if (v & G1_OOP_INDIRECT_BIT) {
     // Shared OOP: bits 47:0 is Handle address. Follow the Handle.
     uintptr_t handle_addr = v & G1_OOP_ADDR_MASK;
-    if (handle_addr == 0 || ((handle_addr & (sizeof(void*) - 1)) != 0)) {
+    if (!g1_remote_handle_pointer_is_plausible(handle_addr)) {
       return nullptr;
     }
     RemoteHandle* h = (RemoteHandle*)handle_addr;
@@ -155,7 +171,8 @@ inline oop resolve_oop_raw(oop tagged) {
 
   // Unique OOP (Managed, Direct): strip tag bits, return clean address.
   uintptr_t addr = v & G1_OOP_ADDR_MASK;
-  if (!g1_remote_oop_is_aligned(addr)) {
+  if (!g1_remote_oop_is_low_canonical(addr) ||
+      !g1_remote_oop_is_aligned(addr)) {
     return nullptr;
   }
   return cast_to_oop(addr);
@@ -188,7 +205,8 @@ inline oop g1_resolved_load(T* p) {
   if (raw == 0) return nullptr;
   // Fast path: bit 63 clear → clean oop, return directly (no resolve)
   if ((raw >> 63) == 0) {
-    if (!g1_remote_oop_is_aligned(raw)) {
+    if (!g1_remote_oop_is_low_canonical(raw) ||
+        !g1_remote_oop_is_aligned(raw)) {
       return nullptr;
     }
     return cast_to_oop(raw);

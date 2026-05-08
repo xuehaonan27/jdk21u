@@ -223,6 +223,11 @@ static void sample_touch_hotness(oopDesc* obj, G1RemoteMemoryManager* rmm) {
   }
 }
 
+static bool valid_remote_handle_pointer(G1RemoteMemoryManager* rmm, RemoteHandle* h) {
+  (void)rmm;
+  return g1_remote_handle_pointer_is_plausible((uintptr_t)h);
+}
+
 JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   uintptr_t v = (uintptr_t)tagged;
   if ((v >> 63) == 0) {
@@ -267,10 +272,15 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
   }
 
   if (v & G1_OOP_INDIRECT_BIT) {
+    G1RemoteMemoryManager* rmm = G1CollectedHeap::heap()->remote_memory_manager();
     RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+    if (!valid_remote_handle_pointer(rmm, h)) {
+      log_warning(gc)("resolve_tagged_oop: invalid tagged handle payload raw=0x%lx",
+                      (unsigned long)v);
+      return nullptr;
+    }
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-    G1RemoteMemoryManager* rmm = G1CollectedHeap::heap()->remote_memory_manager();
     if (rmm != nullptr && state != REMOTE_HANDLE_LOCAL) {
       rmm->record_resolve_fast_state(state);
     }
@@ -1963,6 +1973,13 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
   }
 
   RemoteHandle* h = (RemoteHandle*)(v & G1_OOP_ADDR_MASK);
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  if (!valid_remote_handle_pointer(rmm, h)) {
+    log_warning(gc)("resolve_fast_checks: invalid tagged handle payload raw=0x%lx",
+                    (unsigned long)v);
+    return nullptr;
+  }
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
   if (state == REMOTE_HANDLE_LOCAL) {
@@ -1973,8 +1990,6 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
       *handle_out = redirect;
       return nullptr;
     }
-    G1CollectedHeap* g1h = G1CollectedHeap::heap();
-    G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
     sample_touch_hotness(resolved, rmm);
     return resolved;
   }

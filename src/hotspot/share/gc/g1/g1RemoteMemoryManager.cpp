@@ -1518,14 +1518,17 @@ bool G1RemoteMemoryManager::localize_dense_segment_for_addr(uintptr_t addr) {
   bool unlock_heap_for_restore = false;
   if (ok && !SafepointSynchronize::is_at_safepoint() &&
       !Heap_lock->owned_by_self()) {
-    if (!Heap_lock->try_lock()) {
-      log_info(gc)("Dense segment fetch retry: Heap_lock busy before restore "
-                   "for region %u segment=" UINT64_FORMAT,
-                   idx, segment_id);
-      ok = false;
-    } else {
-      unlock_heap_for_restore = true;
+    bool logged_busy = false;
+    while (!Heap_lock->try_lock()) {
+      if (!logged_busy) {
+        log_info(gc)("Dense segment fetch waiting: Heap_lock busy before restore "
+                     "for region %u segment=" UINT64_FORMAT,
+                     idx, segment_id);
+        logged_busy = true;
+      }
+      yield.wait();
     }
+    unlock_heap_for_restore = true;
   }
 
   if (ok) {
