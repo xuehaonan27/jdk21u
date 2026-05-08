@@ -1571,6 +1571,27 @@ bool G1RemoteMemoryManager::is_dense_segment_remote_addr(uintptr_t addr) const {
          addr < entry->base + entry->byte_size;
 }
 
+bool G1RemoteMemoryManager::is_dense_segment_managed_addr(uintptr_t addr) const {
+  if (!G1RemoteUseDenseSegments || _dense_segments == nullptr ||
+      _g1h == nullptr || !_g1h->is_in_reserved((void*)addr)) {
+    return false;
+  }
+  HeapRegion* hr = _g1h->heap_region_containing_or_null((void*)addr);
+  if (hr == nullptr) {
+    return false;
+  }
+  uint idx = hr->hrm_index();
+  if (idx >= _dense_segment_capacity) {
+    return false;
+  }
+  const DenseSegmentEntry* entry = &_dense_segments[idx];
+  uint32_t state = entry->state;
+  return entry->segment_id != 0 &&
+         state != DenseSegmentNone &&
+         addr >= entry->base &&
+         addr < entry->base + entry->byte_size;
+}
+
 static bool rebuild_dense_segment_bot(HeapRegion* hr, size_t byte_size) {
   HeapWord* p = hr->bottom();
   HeapWord* top = hr->bottom() + byte_size / HeapWordSize;
@@ -5022,6 +5043,12 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
         continue;
       }
 
+      if (is_dense_segment_managed_addr(addr)) {
+        _tagged_fields[retained++] = _tagged_fields[i];
+        direct_retained++;
+        continue;
+      }
+
       *(uintptr_t*)field_addr = addr;
       dirty_cards.dirty_field(field_addr);
       restored++;
@@ -5075,6 +5102,7 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
 int G1RemoteMemoryManager::cleanup_recorded_direct_refs_after_dense_phase() {
   int restored = 0;
   int dropped_remote = 0;
+  int retained_local = 0;
   int converted = 0;
   int nulled = 0;
   int removed = 0;
@@ -5147,6 +5175,12 @@ int G1RemoteMemoryManager::cleanup_recorded_direct_refs_after_dense_phase() {
       continue;
     }
 
+    if (is_dense_segment_managed_addr(addr)) {
+      _tagged_fields[retained++] = entry;
+      retained_local++;
+      continue;
+    }
+
     *(uintptr_t*)field_addr = addr;
     dirty_cards.dirty_field(field_addr);
     restored++;
@@ -5154,13 +5188,14 @@ int G1RemoteMemoryManager::cleanup_recorded_direct_refs_after_dense_phase() {
 
   dirty_cards.flush();
   _tagged_field_count = retained;
-  if (restored > 0 || dropped_remote > 0 || removed > 0 || dirty_cards.dirtied() > 0) {
+  if (restored > 0 || dropped_remote > 0 || retained_local > 0 ||
+      converted > 0 || nulled > 0 || removed > 0 || dirty_cards.dirtied() > 0) {
     log_info(gc)("Dense direct tagged-field cleanup: restored %d local refs, "
-                 "retained %d remote direct refs, converted %d stale direct refs, "
-                 "nulled %d invalid direct refs, removed %d stale entries, "
-                 "%d entries retained, dirtied %d cards",
-                 restored, dropped_remote, converted, nulled, removed,
-                 retained, dirty_cards.dirtied());
+                 "retained %d remote direct refs, retained %d local dense direct refs, "
+                 "converted %d stale direct refs, nulled %d invalid direct refs, "
+                 "removed %d stale entries, %d entries retained, dirtied %d cards",
+                 restored, dropped_remote, retained_local, converted, nulled,
+                 removed, retained, dirty_cards.dirtied());
   }
   return restored;
 }
@@ -5229,6 +5264,9 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
           _dirty_cards->dirty_field(p);
         }
         _nulled++;
+        return;
+      }
+      if (_rmm->is_dense_segment_managed_addr(addr)) {
         return;
       }
       *(uintptr_t*)p = addr;
@@ -5414,6 +5452,23 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         return false;
       }
 
+      if (_rmm->dense_segments_enabled() &&
+          _rmm->is_dense_segment_remote_addr(addr)) {
+        uintptr_t tagged_raw = G1_OOP_MANAGED_BIT | (addr & G1_OOP_ADDR_MASK);
+        *(uintptr_t*)p = tagged_raw;
+        local_buf_add_direct(p, tagged_raw);
+        _stale_alias_repaired++;
+        if (_stale_alias_repaired <= 20) {
+          log_warning(gc)("VERIFY stale-alias: repaired dense-direct field="
+                          PTR_FORMAT " raw=" PTR_FORMAT " reason=%s region=%u "
+                          "src_obj=" PTR_FORMAT,
+                          p2i(p), p2i((void*)addr), reason,
+                          hr == nullptr ? 9999 : hr->hrm_index(),
+                          p2i((void*)_cur_obj));
+        }
+        return true;
+      }
+
       RemoteHandle* h = _rmm->handle_for_stale_eviction_addr(addr);
       if (h == nullptr) {
         _stale_alias_no_handle++;
@@ -5546,7 +5601,21 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
           _g1h->heap_region_containing_or_null((void*)target_addr);
       const char* stale = stale_reason(target_addr, target_hr);
       if (stale != nullptr) {
-        repair_stale_alias(p, target_addr, target_hr, stale);
+        if (!repair_stale_alias(p, target_addr, target_hr, stale)) {
+          _missed++;
+          _repair_no_handle++;
+          if (target_hr != nullptr && target_hr->hrm_index() < _region_count) {
+            _target_region_counts[target_hr->hrm_index()]++;
+          }
+          HeapRegion* src_hr = (_cur_obj != nullptr && _g1h->is_in(_cur_obj))
+            ? _g1h->heap_region_containing(_cur_obj) : nullptr;
+          if (src_hr != nullptr && src_hr->hrm_index() < _region_count) {
+            _heap_source++;
+            _src_region_counts[src_hr->hrm_index()]++;
+          } else {
+            _root_source++;
+          }
+        }
         return;
       }
 
