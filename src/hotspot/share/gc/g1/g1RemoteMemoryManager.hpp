@@ -983,7 +983,8 @@ public:
   // field write, so cards can't track the indirection).
   enum TaggedFieldKind : uint8_t {
     TaggedFieldHandle = 0,
-    TaggedFieldDirect = 1
+    TaggedFieldDirect = 1,
+    TaggedFieldDenseHandle = 2
   };
 
   struct TaggedFieldEntry {
@@ -992,8 +993,11 @@ public:
     uintptr_t     _tagged_raw;
     uint8_t       _kind;
 
-    bool is_handle() const { return _kind == TaggedFieldHandle; }
+    bool is_handle() const {
+      return _kind == TaggedFieldHandle || _kind == TaggedFieldDenseHandle;
+    }
     bool is_direct() const { return _kind == TaggedFieldDirect; }
+    bool is_dense_handle() const { return _kind == TaggedFieldDenseHandle; }
   };
 private:
   TaggedFieldEntry* _tagged_fields;
