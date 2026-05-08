@@ -999,9 +999,12 @@ private:
   TaggedFieldEntry* _tagged_fields;
   int _tagged_field_count;
   int _tagged_field_capacity;
+  volatile int _tagged_field_lock;
 
-public:
-  void add_tagged_field_entry(const TaggedFieldEntry& entry) {
+  void tagged_field_lock()   { while (Atomic::cmpxchg(&_tagged_field_lock, 0, 1) != 0) { /* spin */ } }
+  void tagged_field_unlock() { Atomic::release_store(&_tagged_field_lock, 0); }
+
+  void add_tagged_field_entry_locked(const TaggedFieldEntry& entry) {
     if (_tagged_field_count >= _tagged_field_capacity) {
       int new_cap = (_tagged_field_capacity == 0) ? 4096 : _tagged_field_capacity * 2;
       TaggedFieldEntry* new_buf = NEW_C_HEAP_ARRAY(TaggedFieldEntry, new_cap, mtGC);
@@ -1013,6 +1016,13 @@ public:
       _tagged_field_capacity = new_cap;
     }
     _tagged_fields[_tagged_field_count++] = entry;
+  }
+
+public:
+  void add_tagged_field_entry(const TaggedFieldEntry& entry) {
+    tagged_field_lock();
+    add_tagged_field_entry_locked(entry);
+    tagged_field_unlock();
   }
 
   void add_tagged_field(oop* field_addr, RemoteHandle* h) {
