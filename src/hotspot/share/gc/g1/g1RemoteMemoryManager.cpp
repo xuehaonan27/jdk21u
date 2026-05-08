@@ -3360,15 +3360,25 @@ static bool remote_eviction_valid_local_oop(G1CollectedHeap* g1h,
   if (klass_out != nullptr) {
     *klass_out = nullptr;
   }
-  if (g1h == nullptr || obj == nullptr || hr == nullptr) {
+  if (g1h == nullptr || obj == nullptr) {
     return false;
   }
+  HeapWord* addr = cast_from_oop<HeapWord*>(obj);
+  if (!is_object_aligned((void*)addr) ||
+      !g1h->is_in_reserved(obj) ||
+      !g1h->is_in(obj)) {
+    return false;
+  }
+  HeapRegion* actual_hr = g1h->heap_region_containing_or_null(obj);
+  if (actual_hr == nullptr || (hr != nullptr && actual_hr != hr)) {
+    return false;
+  }
+  hr = actual_hr;
   if (hr->is_free() || hr->is_empty() || hr->is_evict_guarded() ||
       hr->is_continues_humongous()) {
     return false;
   }
-  HeapWord* addr = cast_from_oop<HeapWord*>(obj);
-  if (addr < hr->bottom() || addr >= hr->top() || !g1h->is_in(obj)) {
+  if (addr < hr->bottom() || addr >= hr->top()) {
     return false;
   }
 
@@ -3376,9 +3386,10 @@ static bool remote_eviction_valid_local_oop(G1CollectedHeap* g1h,
   if (!remote_eviction_valid_klass(k)) {
     return false;
   }
-  if (!hr->is_humongous() && hr->block_start(addr) != addr) {
-    return false;
-  }
+  // Do not call HeapRegion::block_start() here. Most callers are validating
+  // conservative values read from object fields after remote-memory tagging;
+  // G1's block-start path may parse interior primitive-array payload before
+  // proving the address is a real object boundary.
   if (hr->is_starts_humongous() && addr != hr->bottom()) {
     return false;
   }
