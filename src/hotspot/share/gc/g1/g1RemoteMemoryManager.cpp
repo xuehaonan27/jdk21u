@@ -1667,9 +1667,25 @@ void G1RemoteMemoryManager::patch_dense_segment_boundary_edges(DenseSegmentEntry
         direct_tracked++;
         continue;
       } else if (target_state == DenseDirectTargetLocal) {
-        *field = target_addr;
+        // This edge was recorded while the target was a remote dense segment.
+        // Keep that provenance encoded in the field even when the target is
+        // currently local: dense segment residency can change after this
+        // mutator-side localization, while compiled load barriers only enter
+        // the resolver for managed/tagged values.
+        uintptr_t tagged = G1_OOP_MANAGED_BIT | target_addr;
+        *field = tagged;
+        if (!direct_entries_locked) {
+          tagged_field_lock();
+          direct_entries_locked = true;
+        }
+        TaggedFieldEntry tagged_entry;
+        tagged_entry._field_addr = (oop*)field;
+        tagged_entry._handle = nullptr;
+        tagged_entry._tagged_raw = tagged;
+        tagged_entry._kind = TaggedFieldDirect;
+        add_tagged_field_entry_locked(tagged_entry);
         direct++;
-        direct_clean++;
+        direct_tracked++;
         continue;
       } else if (target_state == DenseDirectTargetAlias && alias != nullptr) {
         alias->increment_remote_refcount();
