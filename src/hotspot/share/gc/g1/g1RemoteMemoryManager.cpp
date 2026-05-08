@@ -5330,7 +5330,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     int                    _repair_untaggable;
     int                    _repair_limit_skipped;
     int                    _stale_alias_repaired;
-    int                    _stale_alias_no_handle;
+    int                    _stale_alias_nulled;
     int                    _heap_source;
     int                    _root_source;
     int                    _candidate_source;
@@ -5471,23 +5471,33 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
       RemoteHandle* h = _rmm->handle_for_stale_eviction_addr(addr);
       if (h == nullptr) {
-        _stale_alias_no_handle++;
-        if (_stale_alias_no_handle <= 20) {
-          log_warning(gc)("VERIFY stale-alias: no handle for stale field="
+        *(uintptr_t*)p = 0;
+        _stale_alias_nulled++;
+        if (_stale_alias_nulled <= 20) {
+          log_warning(gc)("VERIFY stale-alias: nulled no-handle stale field="
                           PTR_FORMAT " raw=" PTR_FORMAT " reason=%s region=%u "
                           "src_obj=" PTR_FORMAT,
                           p2i(p), p2i((void*)addr), reason,
                           hr == nullptr ? 9999 : hr->hrm_index(),
                           p2i((void*)_cur_obj));
         }
-        return false;
+        return true;
       }
 
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
       if (state == REMOTE_HANDLE_DEAD) {
-        _stale_alias_no_handle++;
-        return false;
+        *(uintptr_t*)p = 0;
+        _stale_alias_nulled++;
+        if (_stale_alias_nulled <= 20) {
+          log_warning(gc)("VERIFY stale-alias: nulled dead-handle stale field="
+                          PTR_FORMAT " raw=" PTR_FORMAT " reason=%s region=%u "
+                          "handle=" PTR_FORMAT " src_obj=" PTR_FORMAT,
+                          p2i(p), p2i((void*)addr), reason,
+                          hr == nullptr ? 9999 : hr->hrm_index(),
+                          p2i(h), p2i((void*)_cur_obj));
+        }
+        return true;
       }
 
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
@@ -5548,7 +5558,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         _repair(repair), _repair_limit(repair_limit),
         _missed(0), _repaired(0), _repair_no_handle(0),
         _repair_untaggable(0), _repair_limit_skipped(0),
-        _stale_alias_repaired(0), _stale_alias_no_handle(0),
+        _stale_alias_repaired(0), _stale_alias_nulled(0),
         _heap_source(0), _root_source(0),
         _candidate_source(0), _young_source(0), _destination_source(0),
         _direct_scanned_source(0), _dirty_card_source(0), _clean_old_source(0),
@@ -5771,7 +5781,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       _repair_untaggable += other._repair_untaggable;
       _repair_limit_skipped += other._repair_limit_skipped;
       _stale_alias_repaired += other._stale_alias_repaired;
-      _stale_alias_no_handle += other._stale_alias_no_handle;
+      _stale_alias_nulled += other._stale_alias_nulled;
       _heap_source += other._heap_source;
       _root_source += other._root_source;
       _candidate_source += other._candidate_source;
@@ -5799,35 +5809,40 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
     int missed() const { return _missed; }
     int repaired() const { return _repaired; }
-    int stale_alias_repaired() const { return _stale_alias_repaired; }
-    int stale_alias_no_handle() const { return _stale_alias_no_handle; }
     int unrepaired() const {
       int unrepaired_count = _missed - _repaired;
       return unrepaired_count > 0 ? unrepaired_count : 0;
     }
     void log_summary(const char* phase, int phase_missed) const {
-      if (phase_missed <= 0) return;
-      log_warning(gc)("VERIFY detail (%s): missed=%d heap_src=%d root_src=%d "
-                      "direct_src=%d candidate_src=%d young_src=%d dest_src=%d "
-                      "dirty_card_src=%d clean_old_src=%d same_region=%d "
-                      "array_src=%d obj_array_src=%d non_array_src=%d cont_hum_src=%d",
-                      phase, phase_missed, _heap_source, _root_source,
-                      _direct_scanned_source, _candidate_source, _young_source,
-                      _destination_source, _dirty_card_source, _clean_old_source,
-                      _same_region, _array_source, _obj_array_source,
-                      _non_array_source, _continue_humongous_source);
-      if (_repair) {
+      bool has_stale_alias =
+          _stale_alias_repaired > 0 ||
+          _stale_alias_nulled > 0;
+      if (phase_missed <= 0 && !has_stale_alias) return;
+      if (phase_missed > 0) {
+        log_warning(gc)("VERIFY detail (%s): missed=%d heap_src=%d root_src=%d "
+                        "direct_src=%d candidate_src=%d young_src=%d dest_src=%d "
+                        "dirty_card_src=%d clean_old_src=%d same_region=%d "
+                        "array_src=%d obj_array_src=%d non_array_src=%d cont_hum_src=%d",
+                        phase, phase_missed, _heap_source, _root_source,
+                        _direct_scanned_source, _candidate_source, _young_source,
+                        _destination_source, _dirty_card_source, _clean_old_source,
+                        _same_region, _array_source, _obj_array_source,
+                        _non_array_source, _continue_humongous_source);
+      }
+      if (_repair && phase_missed > 0) {
         log_warning(gc)("VERIFY repair (%s): repaired=%d unrepaired=%d "
                         "no_handle=%d untaggable=%d limit_skipped=%d limit=%u",
                         phase, _repaired, unrepaired(), _repair_no_handle,
                         _repair_untaggable, _repair_limit_skipped, _repair_limit);
       }
-      if (_stale_alias_repaired > 0 || _stale_alias_no_handle > 0) {
-        log_warning(gc)("VERIFY stale-alias (%s): repaired=%d no_handle=%d",
-                        phase, _stale_alias_repaired, _stale_alias_no_handle);
+      if (has_stale_alias) {
+        log_warning(gc)("VERIFY stale-alias (%s): repaired=%d nulled=%d",
+                        phase, _stale_alias_repaired, _stale_alias_nulled);
       }
-      log_top_regions(phase, "src", _src_region_counts);
-      log_top_regions(phase, "target", _target_region_counts);
+      if (phase_missed > 0) {
+        log_top_regions(phase, "src", _src_region_counts);
+        log_top_regions(phase, "target", _target_region_counts);
+      }
     }
   };
 
