@@ -3676,22 +3676,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
           const char* reason = nullptr;
           size_t objects = 0;
-          if (!rmm->can_evict_dense_segment_region(hr, &reason, &objects)) {
-            eviction_candidates[i] = false;
-            hr->clear_cold_destination();
-            regions_kept_alive++;
-            dense_skipped_regions++;
-            log_debug(gc)("Dense segment kept region %u local: %s",
-                          hr->hrm_index(), reason != nullptr ? reason : "unknown");
-            continue;
-          }
-
           size_t region_used = hr->used();
-          if (!rmm->evict_dense_segment_region(hr)) {
+          if (!rmm->evict_dense_segment_region(hr, &reason, &objects)) {
             eviction_candidates[i] = false;
             hr->clear_cold_destination();
             regions_kept_alive++;
             dense_failed_regions++;
+            log_debug(gc)("Dense segment kept region %u local: %s",
+                          hr->hrm_index(), reason != nullptr ? reason : "unknown");
             continue;
           }
 

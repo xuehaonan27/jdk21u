@@ -1180,6 +1180,9 @@ public:
   bool dense_segments_enabled() const;
   bool can_evict_dense_segment_region(HeapRegion* hr, const char** reason,
                                       size_t* object_count = nullptr);
+  bool evict_dense_segment_region(HeapRegion* hr, const char** reason,
+                                  size_t* object_count,
+                                  uint32_t flags = 0);
   bool evict_dense_segment_region(HeapRegion* hr, uint32_t flags = 0);
   bool is_dense_segment_remote_addr(uintptr_t addr) const;
   bool localize_dense_segment_for_addr(uintptr_t addr);

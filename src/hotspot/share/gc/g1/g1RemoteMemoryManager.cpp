@@ -1214,25 +1214,74 @@ bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
 }
 
 bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr, uint32_t flags) {
-  const char* reason = nullptr;
+  return evict_dense_segment_region(hr, nullptr, nullptr, flags);
+}
+
+bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr,
+                                                       const char** out_reason,
+                                                       size_t* out_object_count,
+                                                       uint32_t flags) {
+  const char* reason = "ok";
   size_t objects = 0;
-  if (!can_evict_dense_segment_region(hr, &reason, &objects)) {
+  if (out_reason != nullptr) *out_reason = reason;
+  if (out_object_count != nullptr) *out_object_count = 0;
+
+  if (!dense_segments_enabled()) {
+    if (out_reason != nullptr) *out_reason = "disabled";
+    return false;
+  }
+  if (hr == nullptr || hr->is_free() || hr->is_empty() || hr->is_evict_guarded()) {
+    if (out_reason != nullptr) *out_reason = "bad-region-state";
+    return false;
+  }
+  if (!hr->is_old() || hr->is_humongous() || hr->is_continues_humongous() ||
+      hr->is_fetch_cache()) {
+    if (out_reason != nullptr) *out_reason = "unsupported-region-kind";
+    return false;
+  }
+  if (hr->used() == 0 || hr->used() > HeapRegion::GrainBytes) {
+    if (out_reason != nullptr) *out_reason = "invalid-used";
+    return false;
+  }
+
+  int local_handles = count_local_handles_in_region(hr, 0);
+  if (local_handles > 0) {
+    if (out_reason != nullptr) *out_reason = "local-handles";
+    return false;
+  }
+
+  if (!ensure_dense_segment_capacity(hr->hrm_index() + 1)) {
+    if (out_reason != nullptr) *out_reason = "dense-segment-capacity";
+    Atomic::inc(&_dense_segment_evict_failures);
+    return false;
+  }
+
+  DenseSegmentEdge* edges = nullptr;
+  uint32_t edge_count = 0;
+  if (!scan_dense_segment_region(hr, true, &edges, &edge_count,
+                                 &objects, &reason)) {
+    release_dense_segment_edges(edges, edge_count);
+    if (out_reason != nullptr) {
+      *out_reason = reason != nullptr ? reason : "scan-failed";
+    }
+    Atomic::inc(&_dense_segment_evict_failures);
     log_debug(gc)("Dense segment evict rejected: region=%u reason=%s",
                   hr != nullptr ? hr->hrm_index() : (uint)-1,
                   reason != nullptr ? reason : "unknown");
     return false;
   }
+  if (out_reason != nullptr) *out_reason = "ok";
+  if (out_object_count != nullptr) *out_object_count = objects;
+
   uint region_idx = hr->hrm_index();
-  if (!ensure_dense_segment_capacity(region_idx + 1)) {
-    Atomic::inc(&_dense_segment_evict_failures);
-    return false;
-  }
 
   uint64_t segment_id = 0;
   dense_segment_lock();
   DenseSegmentEntry* entry = &_dense_segments[region_idx];
   if (entry->state == DenseSegmentRemote || entry->state == DenseSegmentFetching) {
     dense_segment_unlock();
+    release_dense_segment_edges(edges, edge_count);
+    if (out_reason != nullptr) *out_reason = "already-remote-or-fetching";
     Atomic::inc(&_dense_segment_evict_failures);
     log_warning(gc)("Dense segment evict rejected: region=%u already has "
                     "segment state=%u id=" UINT64_FORMAT,
@@ -1242,23 +1291,12 @@ bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr, uint32_t 
   segment_id = ((uint64_t)region_idx << 32) | (_dense_segment_next_id++);
   dense_segment_unlock();
 
-  DenseSegmentEdge* edges = nullptr;
-  uint32_t edge_count = 0;
-  if (!scan_dense_segment_region(hr, true, &edges, &edge_count,
-                                 &objects, &reason)) {
-    release_dense_segment_edges(edges, edge_count);
-    Atomic::inc(&_dense_segment_evict_failures);
-    log_warning(gc)("Dense segment evict rejected during boundary build: "
-                    "region=%u reason=%s",
-                    region_idx, reason != nullptr ? reason : "unknown");
-    return false;
-  }
-
   size_t byte_size = hr->used();
   bool ok = _backend->evict_segment(segment_id, (uintptr_t)hr->bottom(),
                                     hr->bottom(), byte_size, flags);
   if (!ok) {
     release_dense_segment_edges(edges, edge_count);
+    if (out_reason != nullptr) *out_reason = "backend-evict-failed";
     Atomic::inc(&_dense_segment_evict_failures);
     return false;
   }
