@@ -3708,7 +3708,11 @@ static int remote_eviction_scan_region_objects(HeapRegion* hr,
                                                const G1CMBitMap* bitmap,
                                                const char* phase,
                                                ObjectClosure* cl) {
-  if (hr->is_continues_humongous()) {
+  // Dense segments that have been pushed remote remain logical old regions,
+  // but their backing pages are protected and not locally parsable.  All
+  // remote-eviction heap walks must treat them like absent heap contents.
+  if (hr == nullptr || hr->is_empty() || hr->is_free() ||
+      hr->is_evict_guarded() || hr->is_continues_humongous()) {
     return 0;
   }
 
@@ -7009,7 +7013,8 @@ int G1RemoteMemoryManager::purge_stale_local_handles(const char* phase, int log_
 static bool is_valid_region_object(G1CollectedHeap* g1h, oop obj, HeapRegion** region_out = nullptr) {
   if (obj == nullptr || !g1h->is_in(obj)) return false;
   HeapRegion* hr = g1h->heap_region_containing(obj);
-  if (hr == nullptr || hr->is_free() || hr->is_empty() || hr->is_continues_humongous()) {
+  if (hr == nullptr || hr->is_free() || hr->is_empty() ||
+      hr->is_evict_guarded() || hr->is_continues_humongous()) {
     return false;
   }
 
