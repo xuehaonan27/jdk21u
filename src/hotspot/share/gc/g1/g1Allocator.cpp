@@ -92,7 +92,10 @@ void G1Allocator::release_mutator_alloc_regions() {
 }
 
 bool G1Allocator::is_retained_old_region(HeapRegion* hr) {
-  return _retained_old_gc_alloc_region == hr;
+  return _retained_old_gc_alloc_region == hr ||
+         _retained_cold_old_gc_alloc_region == hr ||
+         old_gc_alloc_region()->get() == hr ||
+         cold_old_gc_alloc_region()->get() == hr;
 }
 
 void G1Allocator::reuse_retained_old_region(G1EvacInfo* evacuation_info,
@@ -114,6 +117,7 @@ void G1Allocator::reuse_retained_old_region(G1EvacInfo* evacuation_info,
       !retained_region->in_collection_set() &&
       !(retained_region->top() == retained_region->end()) &&
       !retained_region->is_empty() &&
+      !retained_region->is_evict_guarded() &&
       !retained_region->is_humongous()) {
     // The retained region was added to the old region set when it was
     // retired. We have to remove it now, since we don't allow regions

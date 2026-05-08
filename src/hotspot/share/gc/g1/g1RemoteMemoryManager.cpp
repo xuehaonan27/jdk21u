@@ -1337,6 +1337,10 @@ bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
     if (reason != nullptr) *reason = "collection-set-region";
     return false;
   }
+  if (_g1h->is_old_gc_alloc_region(hr)) {
+    if (reason != nullptr) *reason = "old-gc-alloc-region";
+    return false;
+  }
   if (!hr->is_old() || hr->is_humongous() || hr->is_continues_humongous() ||
       hr->is_fetch_cache()) {
     if (reason != nullptr) *reason = "unsupported-region-kind";
@@ -1384,6 +1388,10 @@ bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr,
   }
   if (hr->in_collection_set() || hr->has_index_in_opt_cset()) {
     if (out_reason != nullptr) *out_reason = "collection-set-region";
+    return false;
+  }
+  if (_g1h->is_old_gc_alloc_region(hr)) {
+    if (out_reason != nullptr) *out_reason = "old-gc-alloc-region";
     return false;
   }
   if (!hr->is_old() || hr->is_humongous() || hr->is_continues_humongous() ||
