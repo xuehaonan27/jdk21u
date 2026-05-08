@@ -153,6 +153,11 @@ class G1BuildCandidateRegionsTask : public WorkerTask {
       // before we fill them up).
       if (should_add(r) && !G1CollectedHeap::heap()->is_old_gc_alloc_region(r)) {
         add_region(r);
+      } else if (r->is_old() && r->is_evict_guarded()) {
+        // Non-resident remote regions may be localized later.  Keep their
+        // remembered sets intact; treating them like ordinary unused old
+        // candidates can make mixed GC free the backing region while dense
+        // direct oops still point at it.
       } else if (r->is_old()) {
         // Keep remembered sets for humongous regions, otherwise clean them out.
         r->rem_set()->clear(true /* only_cardset */);
@@ -254,6 +259,7 @@ uint G1CollectionSetChooser::calculate_work_chunk_size(uint num_workers, uint nu
 bool G1CollectionSetChooser::should_add(HeapRegion* hr) {
   return !hr->is_young() &&
          !hr->is_humongous() &&
+         !hr->is_evict_guarded() &&
          region_occupancy_low_enough_for_evac(hr->live_bytes()) &&
          hr->rem_set()->is_complete();
 }

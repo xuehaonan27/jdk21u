@@ -2746,6 +2746,7 @@ void G1CollectedHeap::clear_bitmap_for_region(HeapRegion* hr) {
 void G1CollectedHeap::free_region(HeapRegion* hr, FreeRegionList* free_list) {
   assert(!hr->is_free(), "the region should not be free");
   assert(!hr->is_empty(), "the region should not be empty");
+  guarantee(!hr->is_evict_guarded(), "must not free a non-resident remote region");
   assert(_hrm.is_available(hr->hrm_index()), "region should be committed");
 
   // Reset region metadata to allow reuse.

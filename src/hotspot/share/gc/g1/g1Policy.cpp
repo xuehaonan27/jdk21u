@@ -1423,6 +1423,7 @@ double G1Policy::select_candidates_from_marking(G1CollectionCandidateList* marki
 
   uint num_initial_regions_selected = 0;
   uint num_optional_regions_selected = 0;
+  uint num_guarded_regions_discarded = 0;
 
   double predicted_initial_time_ms = 0.0;
   double predicted_optional_time_ms = 0.0;
@@ -1447,10 +1448,17 @@ double G1Policy::select_candidates_from_marking(G1CollectionCandidateList* marki
       break;
     }
     HeapRegion* hr = *iter;
+    if (hr->is_evict_guarded()) {
+      initial_old_regions->append(hr);
+      num_guarded_regions_discarded++;
+      log_debug(gc, ergo, cset)("Discarding evict-guarded marking candidate region %u",
+                                hr->hrm_index());
+      continue;
+    }
     double predicted_time_ms = predict_region_total_time_ms(hr, false);
     time_remaining_ms = MAX2(time_remaining_ms - predicted_time_ms, 0.0);
     // Add regions to old set until we reach the minimum amount
-    if (initial_old_regions->length() < min_old_cset_length) {
+    if (num_initial_regions_selected < min_old_cset_length) {
       initial_old_regions->append(hr);
       num_initial_regions_selected++;
       predicted_initial_time_ms += predicted_time_ms;
@@ -1491,11 +1499,13 @@ double G1Policy::select_candidates_from_marking(G1CollectionCandidateList* marki
   }
 
   log_debug(gc, ergo, cset)("Finish adding marking candidates to collection set. Initial: %u, optional: %u, "
-                            "predicted initial time: %1.2fms, predicted optional time: %1.2fms, time remaining: %1.2fms",
+                            "guarded discarded: %u, predicted initial time: %1.2fms, "
+                            "predicted optional time: %1.2fms, time remaining: %1.2fms",
                             num_initial_regions_selected, num_optional_regions_selected,
+                            num_guarded_regions_discarded,
                             predicted_initial_time_ms, predicted_optional_time_ms, time_remaining_ms);
 
-  assert(initial_old_regions->length() == num_initial_regions_selected, "must be");
+  assert(initial_old_regions->length() == num_initial_regions_selected + num_guarded_regions_discarded, "must be");
   assert(optional_old_regions->length() == num_optional_regions_selected, "must be");
   return time_remaining_ms;
 }
@@ -1507,8 +1517,16 @@ void G1Policy::calculate_optional_collection_set_regions(G1CollectionCandidateRe
          "Should only be called when there are optional regions");
 
   double total_prediction_ms = 0.0;
+  uint num_guarded_regions_discarded = 0;
 
   for (HeapRegion* r : *optional_regions) {
+    if (r->is_evict_guarded()) {
+      selected_regions->append(r);
+      num_guarded_regions_discarded++;
+      log_debug(gc, ergo, cset)("Discarding evict-guarded optional candidate region %u",
+                                r->hrm_index());
+      continue;
+    }
     double prediction_ms = predict_region_total_time_ms(r, false);
 
     if (prediction_ms > time_remaining_ms) {
@@ -1524,8 +1542,10 @@ void G1Policy::calculate_optional_collection_set_regions(G1CollectionCandidateRe
     selected_regions->append(r);
   }
 
-  log_debug(gc, ergo, cset)("Prepared %u regions out of %u for optional evacuation. Total predicted time: %.3fms",
-                            selected_regions->length(), optional_regions->length(), total_prediction_ms);
+  log_debug(gc, ergo, cset)("Prepared %u regions out of %u for optional evacuation "
+                            "(guarded discarded: %u). Total predicted time: %.3fms",
+                            selected_regions->length(), optional_regions->length(),
+                            num_guarded_regions_discarded, total_prediction_ms);
 }
 
 void G1Policy::transfer_survivors_to_cset(const G1SurvivorRegions* survivors) {

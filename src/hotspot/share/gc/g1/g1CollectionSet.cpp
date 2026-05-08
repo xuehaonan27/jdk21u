@@ -101,6 +101,7 @@ void G1CollectionSet::add_old_region(HeapRegion* hr) {
   assert(_inc_build_state == Active,
          "Precondition, actively building cset or adding optional later on");
   assert(hr->is_old(), "the region should be old");
+  guarantee(!hr->is_evict_guarded(), "must not add non-resident remote region to collection set");
 
   assert(!hr->in_collection_set(), "should not already be in the collection set");
   _g1h->register_old_region_with_region_attr(hr);
@@ -352,6 +353,11 @@ void G1CollectionSet::finalize_old_part(double time_remaining_ms) {
 void G1CollectionSet::move_candidates_to_collection_set(G1CollectionCandidateRegionList* regions) {
   for (HeapRegion* r : *regions) {
     _g1h->clear_region_attr(r);
+    if (r->is_evict_guarded()) {
+      log_debug(gc, ergo, cset)("Skipped evict-guarded region %u while moving candidates to collection set",
+                                r->hrm_index());
+      continue;
+    }
     add_old_region(r);
   }
   candidates()->remove(regions);
@@ -362,6 +368,11 @@ void G1CollectionSet::prepare_optional_regions(G1CollectionCandidateRegionList* 
   for (HeapRegion* r : *regions) {
     assert(r->is_old(), "the region should be old");
     assert(!r->in_collection_set(), "should not already be in the CSet");
+    if (r->is_evict_guarded()) {
+      log_debug(gc, ergo, cset)("Skipped evict-guarded region %u while preparing optional collection set",
+                                r->hrm_index());
+      continue;
+    }
 
     _g1h->register_optional_region_with_region_attr(r);
 
