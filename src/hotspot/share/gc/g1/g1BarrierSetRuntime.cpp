@@ -1888,6 +1888,25 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
 // Returns non-null oop if resolved without needing the state machine.
 // Returns nullptr if the caller must enter the state machine.
 // Sets *handle_out to the RemoteHandle* if state machine is needed.
+static bool g1_remote_resolved_oop_is_usable(G1CollectedHeap* g1h, uintptr_t v) {
+  if (g1h == nullptr ||
+      !is_aligned((address)v, HeapWordSize) ||
+      !g1h->is_in_reserved((void*)v) ||
+      !g1h->is_in((void*)v)) {
+    return false;
+  }
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null((void*)v);
+  if (hr == nullptr || hr->is_free() || hr->is_empty() ||
+      hr->is_evict_guarded() || hr->is_continues_humongous()) {
+    return false;
+  }
+
+  oop obj = cast_to_oop((HeapWord*)v);
+  Klass* k = obj->klass_or_null();
+  return k != nullptr && !G1CollectedHeap::is_obj_filler(obj);
+}
+
 static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) {
   uintptr_t v = (uintptr_t)tagged;
   if ((v >> 63) == 0) {
@@ -1920,12 +1939,20 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
       }
       if (stale_clean) {
         G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
-        if (rmm != nullptr && rmm->localize_dense_segment_for_addr(v)) {
-          log_debug(gc)("Resolved clean stale oop " PTR_FORMAT
-                        " from dense segment region %u",
-                        p2i((void*)v),
-                        hr == nullptr ? 9999 : hr->hrm_index());
-          return tagged;
+        if (rmm != nullptr && rmm->is_dense_segment_remote_addr(v)) {
+          if (rmm->localize_dense_segment_for_addr(v) &&
+              g1_remote_resolved_oop_is_usable(g1h, v)) {
+            log_debug(gc)("Resolved clean stale oop " PTR_FORMAT
+                          " from dense segment region %u",
+                          p2i((void*)v),
+                          hr == nullptr ? 9999 : hr->hrm_index());
+            return tagged;
+          }
+          log_debug(gc)("Clean oop " PTR_FORMAT
+                        " points into dense segment but does not resolve to a "
+                        "usable object",
+                        p2i((void*)v));
+          return nullptr;
         }
         RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(v);
         if (h != nullptr) {
@@ -1965,6 +1992,12 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
         log_warning(gc)("resolve_fast_checks: dense segment fetch failed for "
                         "direct oop " PTR_FORMAT,
                         p2i(resolved));
+        return nullptr;
+      }
+      if (!g1_remote_resolved_oop_is_usable(g1h, (uintptr_t)resolved)) {
+        log_debug(gc)("resolve_fast_checks: dense segment direct oop "
+                      PTR_FORMAT " resolved to an unusable object",
+                      p2i(resolved));
         return nullptr;
       }
     }
