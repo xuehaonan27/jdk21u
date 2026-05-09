@@ -1553,7 +1553,7 @@ Node* GraphKit::make_load(Node* ctl, Node* adr, const Type* t, BasicType bt,
                           bool unaligned,
                           bool mismatched,
                           bool unsafe,
-                          uint8_t barrier_data) {
+                          C2BarrierData barrier_data) {
   assert(adr_idx == C->get_alias_index(_gvn.type(adr)->isa_ptr()), "slice of address and input slice don't match");
   assert(adr_idx != Compile::AliasIdxTop, "use other make_load factory" );
   const TypePtr* adr_type = nullptr; // debug-mode-only argument

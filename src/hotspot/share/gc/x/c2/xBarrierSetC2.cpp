@@ -84,7 +84,7 @@ static XBarrierSetC2State* barrier_set_state() {
   return reinterpret_cast<XBarrierSetC2State*>(Compile::current()->barrier_set_state());
 }
 
-XLoadBarrierStubC2* XLoadBarrierStubC2::create(const MachNode* node, Address ref_addr, Register ref, Register tmp, uint8_t barrier_data) {
+XLoadBarrierStubC2* XLoadBarrierStubC2::create(const MachNode* node, Address ref_addr, Register ref, Register tmp, C2BarrierData barrier_data) {
   XLoadBarrierStubC2* const stub = new (Compile::current()->comp_arena()) XLoadBarrierStubC2(node, ref_addr, ref, tmp, barrier_data);
   if (!Compile::current()->output()->in_scratch_emit_size()) {
     barrier_set_state()->stubs()->append(stub);
@@ -93,7 +93,7 @@ XLoadBarrierStubC2* XLoadBarrierStubC2::create(const MachNode* node, Address ref
   return stub;
 }
 
-XLoadBarrierStubC2::XLoadBarrierStubC2(const MachNode* node, Address ref_addr, Register ref, Register tmp, uint8_t barrier_data) :
+XLoadBarrierStubC2::XLoadBarrierStubC2(const MachNode* node, Address ref_addr, Register ref, Register tmp, C2BarrierData barrier_data) :
     _node(node),
     _ref_addr(ref_addr),
     _ref(ref),
@@ -196,7 +196,7 @@ int XBarrierSetC2::estimate_stub_size() const {
 
 static void set_barrier_data(C2Access& access) {
   if (XBarrierSet::barrier_needed(access.decorators(), access.type())) {
-    uint8_t barrier_data = 0;
+    C2BarrierData barrier_data = 0;
 
     if (access.decorators() & ON_PHANTOM_OOP_REF) {
       barrier_data |= XLoadBarrierPhantom;

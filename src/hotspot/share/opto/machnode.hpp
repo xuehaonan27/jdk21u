@@ -33,6 +33,11 @@
 #include "opto/regmask.hpp"
 #include "utilities/growableArray.hpp"
 
+#ifndef C2_BARRIER_DATA_TYPE_DEFINED
+#define C2_BARRIER_DATA_TYPE_DEFINED
+typedef uint32_t C2BarrierData;
+#endif
+
 class BufferBlob;
 class CodeBuffer;
 class JVMState;
@@ -226,8 +231,8 @@ public:
   // no constant base node input.
   virtual uint mach_constant_base_node_input() const { return (uint)-1; }
 
-  uint8_t barrier_data() const { return _barrier; }
-  void set_barrier_data(uint8_t data) { _barrier = data; }
+  C2BarrierData barrier_data() const { return _barrier; }
+  void set_barrier_data(C2BarrierData data) { _barrier = data; }
 
   // Copy inputs and operands to new node of instruction.
   // Called from cisc_version() and short_branch_version().
@@ -275,7 +280,7 @@ public:
   virtual uint two_adr( ) const { return 0; }
 
   // The GC might require some barrier metadata for machine code emission.
-  uint8_t _barrier;
+  C2BarrierData _barrier;
 
   // Array of complex operand pointers.  Each corresponds to zero or
   // more leafs.  Must be set by MachNode constructor to point to an

@@ -41,14 +41,14 @@ private:
   const Address   _ref_addr;
   const Register  _ref;
   const Register  _tmp;
-  const uint8_t   _barrier_data;
+  const C2BarrierData _barrier_data;
   Label           _entry;
   Label           _continuation;
 
-  XLoadBarrierStubC2(const MachNode* node, Address ref_addr, Register ref, Register tmp, uint8_t barrier_data);
+  XLoadBarrierStubC2(const MachNode* node, Address ref_addr, Register ref, Register tmp, C2BarrierData barrier_data);
 
 public:
-  static XLoadBarrierStubC2* create(const MachNode* node, Address ref_addr, Register ref, Register tmp, uint8_t barrier_data);
+  static XLoadBarrierStubC2* create(const MachNode* node, Address ref_addr, Register ref, Register tmp, C2BarrierData barrier_data);
 
   Address ref_addr() const;
   Register ref() const;

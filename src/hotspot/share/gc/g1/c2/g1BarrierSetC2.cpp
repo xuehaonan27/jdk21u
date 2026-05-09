@@ -49,13 +49,24 @@
 // G1 disaggregated-memory C2 load-barrier stub implementation
 // ============================================================
 
+static G1BarrierSetC2State* barrier_set_state();
+
 G1TagResolveStubC2::G1TagResolveStubC2(const MachNode* node, Address ref_addr, Register ref)
   : _node(node),
     _ref_addr(ref_addr),
     _ref(ref),
     _access_hint(g1_access_hint_from_barrier_data(node->barrier_data())),
+    _site_id(g1_site_id_from_barrier_data(node->barrier_data())),
+    _semantic_kind(G1C2RemoteAccessSite::SemanticNone),
+    _semantic_offset(-1),
     _entry(),
-    _continuation() {}
+    _continuation() {
+  const G1C2RemoteAccessSite* site = barrier_set_state()->access_site(_site_id);
+  if (site != nullptr) {
+    _semantic_kind = site->kind();
+    _semantic_offset = site->offset();
+  }
+}
 
 Label* G1TagResolveStubC2::entry() {
   return Compile::current()->output()->in_scratch_emit_size() ? &_continuation : &_entry;
@@ -109,7 +120,15 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   masm.bind(slow_path);
   masm.movptr(c_rarg0, rax);
   masm.movl(c_rarg1, _access_hint);
-  masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint)));
+  if (_semantic_kind == G1C2RemoteAccessSite::SemanticField &&
+      _semantic_offset >= 0) {
+    masm.leaq(c_rarg2, _ref_addr);
+    masm.subptr(c_rarg2, _semantic_offset);
+    masm.movptr(c_rarg3, _semantic_offset);
+    masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_context)));
+  } else {
+    masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint)));
+  }
   // Fall through to common exit.
 
   // === Common exit: resolved oop in rax ===
@@ -126,9 +145,32 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
 }
 
 G1BarrierSetC2State::G1BarrierSetC2State(Arena* arena)
-  : _stubs(new (arena) GrowableArray<G1TagResolveStubC2*>(arena, 8, 0, nullptr)) {}
+  : _stubs(new (arena) GrowableArray<G1TagResolveStubC2*>(arena, 8, 0, nullptr)),
+    _access_sites(new (arena) GrowableArray<G1C2RemoteAccessSite>(arena, 32, 0,
+                                                                  G1C2RemoteAccessSite())) {}
 
 GrowableArray<G1TagResolveStubC2*>* G1BarrierSetC2State::stubs() { return _stubs; }
+
+uint32_t G1BarrierSetC2State::add_access_site(uint32_t access_hint,
+                                              G1C2RemoteAccessSite::SemanticKind kind,
+                                              int offset,
+                                              int bci,
+                                              ciMethod* method) {
+  uint32_t id = (uint32_t)_access_sites->length() + 1;
+  if (id > G1BarrierSiteIdMask) {
+    return 0;
+  }
+  _access_sites->append(G1C2RemoteAccessSite(id, access_hint, kind, offset,
+                                             bci, method));
+  return id;
+}
+
+const G1C2RemoteAccessSite* G1BarrierSetC2State::access_site(uint32_t id) const {
+  if (id == 0 || id > (uint32_t)_access_sites->length()) {
+    return nullptr;
+  }
+  return _access_sites->adr_at((int)id - 1);
+}
 
 static G1BarrierSetC2State* barrier_set_state() {
   return reinterpret_cast<G1BarrierSetC2State*>(Compile::current()->barrier_set_state());
@@ -145,6 +187,41 @@ static uint32_t g1_remote_access_hint_for_c2(DecoratorSet decorators, bool atomi
     return G1RemoteAccessHintArray;
   }
   return G1RemoteAccessHintField;
+}
+
+static uint32_t g1_c2_register_semantic_access_site(C2Access& access,
+                                                    uint32_t access_hint) {
+  if (!G1RemoteUseCompilerFetchHints || !access.is_parse_access()) {
+    return 0;
+  }
+
+  G1C2RemoteAccessSite::SemanticKind kind = G1C2RemoteAccessSite::SemanticNone;
+  int semantic_offset = -1;
+
+  // C2 already preserves the exact memory slot address in the Mach operand.
+  // For a normal field load, the bytecode/IR semantic is "base oop + field
+  // offset"; the emitted stub can reconstruct the base as slot - offset and
+  // hand that explicit context to the runtime.  Dynamic object-array indexes
+  // need an explicit IR operand carried to the stub; do not infer them from
+  // arbitrary machine addressing here.
+  if (access_hint == G1RemoteAccessHintField) {
+    const TypePtr* adr_type = access.addr().type();
+    int offset = adr_type == nullptr ? Type::OffsetBot : adr_type->offset();
+    if (offset >= 0 && offset != Type::OffsetBot && offset != Type::OffsetTop) {
+      kind = G1C2RemoteAccessSite::SemanticField;
+      semantic_offset = offset;
+    }
+  }
+
+  if (kind == G1C2RemoteAccessSite::SemanticNone) {
+    return 0;
+  }
+
+  C2ParseAccess& parse_access = static_cast<C2ParseAccess&>(access);
+  GraphKit* kit = parse_access.kit();
+  return barrier_set_state()->add_access_site(access_hint, kind, semantic_offset,
+                                              kit == nullptr ? -1 : kit->bci(),
+                                              kit == nullptr ? nullptr : kit->method());
 }
 
 const TypeFunc *G1BarrierSetC2::write_ref_field_pre_entry_Type() {
@@ -737,8 +814,10 @@ Node* G1BarrierSetC2::load_at_resolved(C2Access& access, const Type* val_type) c
   // oops, LoadN is 32-bit and bit 63 has no meaning.  The barrier is
   // only meaningful when -XX:-UseCompressedOops.
   if (!UseCompressedOops && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
-    access.set_barrier_data(g1_barrier_data_with_access_hint(
-        g1_remote_access_hint_for_c2(access.decorators())));
+    uint32_t access_hint = g1_remote_access_hint_for_c2(access.decorators());
+    uint32_t site_id = g1_c2_register_semantic_access_site(access, access_hint);
+    access.set_barrier_data(g1_barrier_data_with_access_hint(access_hint,
+                                                             site_id));
   }
 
   if (!need_read_barrier) {

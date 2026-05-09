@@ -29,16 +29,32 @@
 #include "memory/allocation.hpp"
 #include "utilities/growableArray.hpp"
 
-// G1 disaggregated-memory barrier_data bit for C2 load barrier.
-const uint8_t G1BarrierTag = 1;
-const uint8_t G1BarrierAccessHintShift = 1;
+// G1 disaggregated-memory barrier_data bits for C2 load barriers.
+// Low byte keeps the historical "barrier present + access hint" encoding.
+// Upper bits carry a compile-time site id into the emitted Mach stub, so the
+// runtime slow path can use bytecode/IR semantics instead of guessing from
+// arbitrary registers after code generation.
+const C2BarrierData G1BarrierTag = 1;
+const uint G1BarrierAccessHintShift = 1;
+const C2BarrierData G1BarrierAccessHintMask = 0x7f;
+const uint G1BarrierSiteIdShift = 8;
+const C2BarrierData G1BarrierSiteIdMask = 0x00ffffff;
 
-inline uint8_t g1_barrier_data_with_access_hint(uint32_t access_hint) {
-  return (uint8_t)(G1BarrierTag | ((access_hint & 0x7f) << G1BarrierAccessHintShift));
+inline C2BarrierData g1_barrier_data_with_access_hint(uint32_t access_hint,
+                                                      uint32_t site_id = 0) {
+  return G1BarrierTag |
+      ((access_hint & G1BarrierAccessHintMask) << G1BarrierAccessHintShift) |
+      ((site_id & G1BarrierSiteIdMask) << G1BarrierSiteIdShift);
 }
 
-inline uint32_t g1_access_hint_from_barrier_data(uint8_t barrier_data) {
-  return (uint32_t)(barrier_data >> G1BarrierAccessHintShift);
+inline uint32_t g1_access_hint_from_barrier_data(C2BarrierData barrier_data) {
+  return (uint32_t)((barrier_data >> G1BarrierAccessHintShift) &
+                    G1BarrierAccessHintMask);
+}
+
+inline uint32_t g1_site_id_from_barrier_data(C2BarrierData barrier_data) {
+  return (uint32_t)((barrier_data >> G1BarrierSiteIdShift) &
+                    G1BarrierSiteIdMask);
 }
 
 class MacroAssembler;
@@ -46,6 +62,49 @@ class MachNode;
 class PhaseTransform;
 class Type;
 class TypeFunc;
+class ciMethod;
+
+class G1C2RemoteAccessSite {
+public:
+  enum SemanticKind {
+    SemanticNone,
+    SemanticField,
+    SemanticArray
+  };
+
+private:
+  uint32_t      _id;
+  uint32_t      _access_hint;
+  SemanticKind  _kind;
+  int           _offset;
+  int           _bci;
+  ciMethod*     _method;
+
+public:
+  G1C2RemoteAccessSite()
+    : _id(0),
+      _access_hint(0),
+      _kind(SemanticNone),
+      _offset(-1),
+      _bci(-1),
+      _method(nullptr) {}
+
+  G1C2RemoteAccessSite(uint32_t id, uint32_t access_hint, SemanticKind kind,
+                       int offset, int bci, ciMethod* method)
+    : _id(id),
+      _access_hint(access_hint),
+      _kind(kind),
+      _offset(offset),
+      _bci(bci),
+      _method(method) {}
+
+  uint32_t id() const { return _id; }
+  uint32_t access_hint() const { return _access_hint; }
+  SemanticKind kind() const { return _kind; }
+  int offset() const { return _offset; }
+  int bci() const { return _bci; }
+  ciMethod* method() const { return _method; }
+};
 
 // ============================================================
 // G1 disaggregated-memory C2 load-barrier stub (out-of-line)
@@ -59,6 +118,9 @@ private:
   Address         _ref_addr;
   Register        _ref;
   uint32_t        _access_hint;
+  uint32_t        _site_id;
+  G1C2RemoteAccessSite::SemanticKind _semantic_kind;
+  int             _semantic_offset;
   Label           _entry;
   Label           _continuation;
 
@@ -76,10 +138,17 @@ public:
 class G1BarrierSetC2State : public ArenaObj {
 private:
   GrowableArray<G1TagResolveStubC2*>* _stubs;
+  GrowableArray<G1C2RemoteAccessSite>* _access_sites;
 
 public:
   G1BarrierSetC2State(Arena* arena);
   GrowableArray<G1TagResolveStubC2*>* stubs();
+  uint32_t add_access_site(uint32_t access_hint,
+                           G1C2RemoteAccessSite::SemanticKind kind,
+                           int offset,
+                           int bci,
+                           ciMethod* method);
+  const G1C2RemoteAccessSite* access_site(uint32_t id) const;
 };
 
 class G1BarrierSetC2: public CardTableBarrierSetC2 {

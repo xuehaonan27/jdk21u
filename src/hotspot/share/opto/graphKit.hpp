@@ -541,7 +541,7 @@ class GraphKit : public Phase {
   Node* make_load(Node* ctl, Node* adr, const Type* t, BasicType bt,
                   MemNode::MemOrd mo, LoadNode::ControlDependency control_dependency = LoadNode::DependsOnlyOnTest,
                   bool require_atomic_access = false, bool unaligned = false,
-                  bool mismatched = false, bool unsafe = false, uint8_t barrier_data = 0) {
+                  bool mismatched = false, bool unsafe = false, C2BarrierData barrier_data = 0) {
     // This version computes alias_index from bottom_type
     return make_load(ctl, adr, t, bt, adr->bottom_type()->is_ptr(),
                      mo, control_dependency, require_atomic_access,
@@ -550,7 +550,7 @@ class GraphKit : public Phase {
   Node* make_load(Node* ctl, Node* adr, const Type* t, BasicType bt, const TypePtr* adr_type,
                   MemNode::MemOrd mo, LoadNode::ControlDependency control_dependency = LoadNode::DependsOnlyOnTest,
                   bool require_atomic_access = false, bool unaligned = false,
-                  bool mismatched = false, bool unsafe = false, uint8_t barrier_data = 0) {
+                  bool mismatched = false, bool unsafe = false, C2BarrierData barrier_data = 0) {
     // This version computes alias_index from an address type
     assert(adr_type != nullptr, "use other make_load factory");
     return make_load(ctl, adr, t, bt, C->get_alias_index(adr_type),
@@ -561,7 +561,7 @@ class GraphKit : public Phase {
   Node* make_load(Node* ctl, Node* adr, const Type* t, BasicType bt, int adr_idx,
                   MemNode::MemOrd mo, LoadNode::ControlDependency control_dependency = LoadNode::DependsOnlyOnTest,
                   bool require_atomic_access = false, bool unaligned = false,
-                  bool mismatched = false, bool unsafe = false, uint8_t barrier_data = 0);
+                  bool mismatched = false, bool unsafe = false, C2BarrierData barrier_data = 0);
 
   // Create & transform a StoreNode and store the effect into the
   // parser's memory state.
