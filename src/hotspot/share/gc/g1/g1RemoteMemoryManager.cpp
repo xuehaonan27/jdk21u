@@ -75,6 +75,10 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _fast_phase_c_source_hint_capacity(0),
     _fast_phase_c_source_hint_count(0),
     _fast_phase_c_source_hint_lock(0),
+    _old_cset_source_hints(nullptr),
+    _old_cset_source_hint_capacity(0),
+    _old_cset_source_hint_count(0),
+    _old_cset_source_hint_lock(0),
     _inbound_region_summary(nullptr),
     _inbound_region_summary_capacity(0),
     _inbound_region_summary_lock(0),
@@ -716,6 +720,12 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     _fast_phase_c_source_hint_capacity = 0;
     _fast_phase_c_source_hint_count = 0;
   }
+  if (_old_cset_source_hints != nullptr) {
+    FREE_C_HEAP_ARRAY(bool, _old_cset_source_hints);
+    _old_cset_source_hints = nullptr;
+    _old_cset_source_hint_capacity = 0;
+    _old_cset_source_hint_count = 0;
+  }
   if (_inbound_region_summary != nullptr) {
     FREE_C_HEAP_ARRAY(uint64_t, _inbound_region_summary);
     _inbound_region_summary = nullptr;
@@ -860,6 +870,51 @@ bool G1RemoteMemoryManager::remember_fast_phase_c_source_hint(uint region_idx) {
                region_idx, _fast_phase_c_source_hint_count,
                G1RemoteFastPhaseCSourceHintMaxRegions);
   fast_phase_c_source_hint_unlock();
+  return true;
+}
+
+void G1RemoteMemoryManager::ensure_old_cset_source_hint_capacity(uint num_regions) {
+  if (num_regions <= _old_cset_source_hint_capacity) {
+    return;
+  }
+  uint new_cap = MAX2(num_regions, _old_cset_source_hint_capacity * 2);
+  if (new_cap < 1024) {
+    new_cap = 1024;
+  }
+  bool* new_hints = NEW_C_HEAP_ARRAY(bool, new_cap, mtGC);
+  memset(new_hints, 0, new_cap * sizeof(bool));
+  if (_old_cset_source_hints != nullptr) {
+    memcpy(new_hints, _old_cset_source_hints,
+           _old_cset_source_hint_capacity * sizeof(bool));
+    FREE_C_HEAP_ARRAY(bool, _old_cset_source_hints);
+  }
+  _old_cset_source_hints = new_hints;
+  _old_cset_source_hint_capacity = new_cap;
+}
+
+bool G1RemoteMemoryManager::is_old_cset_source_hint(uint region_idx) const {
+  return region_idx < _old_cset_source_hint_capacity &&
+         _old_cset_source_hints[region_idx];
+}
+
+bool G1RemoteMemoryManager::remember_old_cset_source_hint(uint region_idx,
+                                                          const char* reason) {
+  if (region_idx == (uint)-1) {
+    return false;
+  }
+
+  old_cset_source_hint_lock();
+  ensure_old_cset_source_hint_capacity(region_idx + 1);
+  if (_old_cset_source_hints[region_idx]) {
+    old_cset_source_hint_unlock();
+    return true;
+  }
+  _old_cset_source_hints[region_idx] = true;
+  _old_cset_source_hint_count++;
+  log_info(gc)("Old/cset source hint: learned region %u reason=%s (%u total)",
+               region_idx, reason != nullptr ? reason : "unknown",
+               _old_cset_source_hint_count);
+  old_cset_source_hint_unlock();
   return true;
 }
 
@@ -3271,6 +3326,24 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
     local_buf_add_entry(entry);
   }
 
+  void remember_old_cset_source(oop* p, const char* reason) {
+    if (p == nullptr) {
+      return;
+    }
+    HeapRegion* src_hr = nullptr;
+    if (_cur_obj != nullptr && _g1h->is_in(_cur_obj)) {
+      src_hr = _g1h->heap_region_containing_or_null(_cur_obj);
+    }
+    if (src_hr == nullptr && _g1h->is_in((void*)p)) {
+      src_hr = _g1h->heap_region_containing_or_null((void*)p);
+    }
+    if (src_hr == nullptr || src_hr->is_empty() || src_hr->is_free() ||
+        src_hr->is_young() || src_hr->is_continues_humongous()) {
+      return;
+    }
+    _rmm->remember_old_cset_source_hint(src_hr->hrm_index(), reason);
+  }
+
 public:
   EvictionSetTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
                         const bool* eset, uint nregions,
@@ -3388,6 +3461,7 @@ public:
                              (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
       *(uintptr_t*)p = tagged_raw;
       local_buf_add_direct(p, tagged_raw);
+      remember_old_cset_source(p, "phase-c-dense-direct");
       _tagged++;
       return;
     }
@@ -3396,6 +3470,7 @@ public:
     if (h != nullptr) {
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
       local_buf_add(p, h);
+      remember_old_cset_source(p, "phase-c-handle");
       _tagged++;
     } else {
       _no_handle++;
@@ -5577,6 +5652,24 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       dcqs.flush_queue(tmp_queue);
     }
 
+    void remember_old_cset_source(oop* p, const char* reason) {
+      if (p == nullptr) {
+        return;
+      }
+      HeapRegion* src_hr = nullptr;
+      if (_cur_obj != nullptr && _g1h->is_in(_cur_obj)) {
+        src_hr = _g1h->heap_region_containing_or_null(_cur_obj);
+      }
+      if (src_hr == nullptr && _g1h->is_in((void*)p)) {
+        src_hr = _g1h->heap_region_containing_or_null((void*)p);
+      }
+      if (src_hr == nullptr || src_hr->is_empty() || src_hr->is_free() ||
+          src_hr->is_young() || src_hr->is_continues_humongous()) {
+        return;
+      }
+      _rmm->remember_old_cset_source_hint(src_hr->hrm_index(), reason);
+    }
+
     static bool take_budget(volatile int* budget) {
       if (budget == nullptr) {
         return false;
@@ -5640,6 +5733,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       if (_cur_obj == nullptr || !_g1h->is_in((void*)p)) {
         return false;
       }
+      remember_old_cset_source(p, "verify-stale-alias");
 
       if (_rmm->dense_segments_enabled() &&
           _rmm->is_dense_segment_remote_addr(addr)) {
@@ -5923,6 +6017,9 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       if (!src_direct && src_hr != nullptr && !src_dirty_card && !src_young) {
         _rmm->remember_fast_phase_c_source_hint(src_idx);
       }
+      if (src_hr != nullptr && !src_young && !src_continue_humongous) {
+        _rmm->remember_old_cset_source_hint(src_idx, "verify-missed-candidate");
+      }
 
       if (_repair) {
         if (untaggable_source) {
@@ -6075,6 +6172,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     int                    _destination_regions;
     int                    _inbound_summary_regions;
     int                    _source_hint_regions;
+    int                    _old_cset_source_hint_regions;
     int                    _neighbor_regions;
     int                    _old_prefix_regions;
     int                    _rset_cards;
@@ -6121,7 +6219,8 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         _requires_full_heap(false), _selected_regions(0),
         _candidate_regions(0), _young_regions(0), _destination_regions(0),
         _inbound_summary_regions(0), _source_hint_regions(0),
-        _neighbor_regions(0), _old_prefix_regions(0),
+        _old_cset_source_hint_regions(0), _neighbor_regions(0),
+        _old_prefix_regions(0),
         _rset_cards(0), _rset_source_regions(0),
         _dirty_cards(0), _dirty_source_regions(0),
         _incomplete_rsets(0) {}
@@ -6188,6 +6287,12 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       }
     }
 
+    void select_old_cset_source_hint(uint region_idx) {
+      if (select_region(region_idx)) {
+        _old_cset_source_hint_regions++;
+      }
+    }
+
     void select_neighbor(uint region_idx) {
       if (select_region(region_idx)) {
         _neighbor_regions++;
@@ -6233,14 +6338,15 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
     void log_summary(bool fallback_full_heap) const {
       log_info(gc)("Phase C.5 targeted sources: selected=%d candidates=%d young=%d "
-                   "destinations=%d inbound=%d hints=%d neighbors=%d old-prefix=%d "
-                   "rset_cards=%d rset_sources=%d dirty_cards=%d dirty_sources=%d "
-                   "incomplete_rsets=%d mode=%s",
+                   "destinations=%d inbound=%d hints=%d old_cset_hints=%d "
+                   "neighbors=%d old-prefix=%d rset_cards=%d rset_sources=%d "
+                   "dirty_cards=%d dirty_sources=%d incomplete_rsets=%d mode=%s",
                    _selected_regions, _candidate_regions, _young_regions,
                    _destination_regions, _inbound_summary_regions,
-                   _source_hint_regions, _neighbor_regions, _old_prefix_regions,
-                   _rset_cards, _rset_source_regions, _dirty_cards,
-                   _dirty_source_regions, _incomplete_rsets,
+                   _source_hint_regions, _old_cset_source_hint_regions,
+                   _neighbor_regions, _old_prefix_regions, _rset_cards,
+                   _rset_source_regions, _dirty_cards, _dirty_source_regions,
+                   _incomplete_rsets,
                    fallback_full_heap ? "fallback-full" : "targeted");
     }
   };
@@ -6284,6 +6390,11 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
       if (is_fast_phase_c_source_hint(i)) {
         selector.select_source_hint(i);
+        continue;
+      }
+
+      if (is_old_cset_source_hint(i)) {
+        selector.select_old_cset_source_hint(i);
         continue;
       }
 
@@ -8146,29 +8257,14 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
   const uint num_regions = _g1h->max_reserved_regions();
 
-  static bool* old_cset_source_hints = nullptr;
-  static uint old_cset_hint_capacity = 0;
   static uint old_cset_fixup_cycle = 0;
-  if (old_cset_hint_capacity < num_regions) {
-    bool* new_hints = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
-    memset(new_hints, 0, num_regions * sizeof(bool));
-    if (old_cset_source_hints != nullptr) {
-      memcpy(new_hints, old_cset_source_hints,
-             old_cset_hint_capacity * sizeof(bool));
-      FREE_C_HEAP_ARRAY(bool, old_cset_source_hints);
-    }
-    old_cset_source_hints = new_hints;
-    old_cset_hint_capacity = num_regions;
-  }
-  // G1RemoteFastPhaseCVerifyInterval=0 disables the full Phase C.5 verifier,
-  // but old/cset repair is a different correctness barrier: dirty cards and
-  // learned hints are not a complete source map for stale references left in
-  // old regions. Keep it full on the default Spark/RDMA path until a precise
-  // source-region map exists.
+  const bool missing_source_map =
+      old_cset_source_hint_count() == 0 &&
+      (local_handle_count() > 0 || _dense_segment_evict_success > 0);
   const bool full_heap_fixup =
       !G1RemoteUseFastPhaseC ||
-      G1RemoteFastPhaseCVerifyInterval == 0 ||
       G1RemoteFastPhaseCVerifyInterval == 1 ||
+      missing_source_map ||
       (G1RemoteFastPhaseCVerifyInterval > 1 &&
        (old_cset_fixup_cycle % G1RemoteFastPhaseCVerifyInterval) == 0);
 
@@ -8199,8 +8295,7 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
     bool selected = full_heap_fixup;
     bool selected_by_fcr = hr->is_fetch_cache();
-    bool selected_by_hint = old_cset_source_hints != nullptr &&
-                            old_cset_source_hints[i];
+    bool selected_by_hint = is_old_cset_source_hint(i);
     bool selected_by_phase_c_hint = is_fast_phase_c_source_hint(i);
     int region_dirty_cards = 0;
     if (!full_heap_fixup) {
@@ -8239,12 +8334,8 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
     double region_ms = (Ticks::now() - region_start).seconds() * 1000.0;
     regions_scanned++;
     objects_scanned += scanned;
-    if (old_cset_source_hints != nullptr) {
-      if (cl.updated() != before) {
-        old_cset_source_hints[i] = true;
-      } else if (!full_heap_fixup && selected_by_hint && !selected_by_fcr) {
-        old_cset_source_hints[i] = false;
-      }
+    if (cl.updated() != before) {
+      remember_old_cset_source_hint(i, "old-cset-repair");
     }
     if (region_ms > 100.0) {
       log_debug(gc)("Old/cset fixup region %u type=%s scanned=%d in %.1fms",
@@ -8253,9 +8344,14 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
   }
   if (!full_heap_fixup) {
     log_info(gc)("Old/cset fixup targeted sources: selected=%d fcr=%d dirty=%d "
-                 "hints=%d phase_c_hints=%d dirty_cards=%d mode=targeted",
+                 "hints=%d phase_c_hints=%d dirty_cards=%d hint_total=%u "
+                 "mode=targeted",
                  selected_regions, fcr_regions, dirty_regions, hint_regions,
-                 phase_c_hint_regions, dirty_cards);
+                 phase_c_hint_regions, dirty_cards, old_cset_source_hint_count());
+  } else if (missing_source_map) {
+    log_info(gc)("Old/cset fixup full: missing source map with local_handles="
+                 SIZE_FORMAT " dense_evicts=" UINT64_FORMAT,
+                 local_handle_count(), (uint64_t)_dense_segment_evict_success);
   }
   log_debug(gc)("Old/cset fixup heap scan DONE: scanned %d regions, %d objects",
                 regions_scanned, objects_scanned);
