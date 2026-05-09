@@ -58,6 +58,7 @@ void G1BarrierSetRuntime::write_ref_array_post_entry(HeapWord* dst, size_t lengt
 }
 
 static bool remote_resolve_enabled();
+static bool g1_remote_resolved_oop_is_usable(G1CollectedHeap* g1h, uintptr_t v);
 
 // G1 pre write barrier slowpath
 JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_pre_entry(oopDesc* orig, JavaThread* thread))
