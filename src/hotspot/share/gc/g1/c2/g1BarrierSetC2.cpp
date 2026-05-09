@@ -230,23 +230,33 @@ static bool g1_c2_remote_store_handleify_active() {
           G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0);
 }
 
+static Node* g1_c2_oop_value_as_raw(GraphKit* kit, Node* ctrl, Node* value) {
+  if (kit == nullptr || value == nullptr) {
+    return value;
+  }
+  PhaseGVN& gvn = kit->gvn();
+  Node* raw_bits = gvn.transform(new CastP2XNode(ctrl, value));
+  return gvn.transform(new CastX2PNode(raw_bits));
+}
+
 static Node* g1_c2_handleify_store_value(GraphKit* kit, Node* value) {
   if (kit == nullptr || value == nullptr || !g1_c2_remote_store_handleify_active()) {
     return value;
   }
   IdealKit ideal(kit, true);
+  Node* raw_value = g1_c2_oop_value_as_raw(kit, ideal.ctrl(), value);
   Node* handled = ideal.make_leaf_call(
       G1BarrierSetC2::handleify_old_oop_for_store_Type(),
       CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::handleify_old_oop_for_store),
       "handleify_old_oop_for_store",
-      value);
+      raw_value);
   kit->final_sync(ideal);
   return handled;
 }
 
 const TypeFunc *G1BarrierSetC2::write_ref_field_pre_entry_Type() {
   const Type **fields = TypeTuple::fields(2);
-  fields[TypeFunc::Parms+0] = TypeInstPtr::NOTNULL; // original field value
+  fields[TypeFunc::Parms+0] = TypeRawPtr::BOTTOM; // original field value, possibly tagged
   fields[TypeFunc::Parms+1] = TypeRawPtr::NOTNULL; // thread
   const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+2, fields);
 
@@ -272,11 +282,11 @@ const TypeFunc *G1BarrierSetC2::write_ref_field_post_entry_Type() {
 
 const TypeFunc *G1BarrierSetC2::handleify_old_oop_for_store_Type() {
   const Type **fields = TypeTuple::fields(1);
-  fields[TypeFunc::Parms+0] = TypeOopPtr::BOTTOM; // oop value
+  fields[TypeFunc::Parms+0] = TypeRawPtr::BOTTOM; // pointer-shaped oop/tagged value
   const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+1, fields);
 
   fields = TypeTuple::fields(1);
-  fields[TypeFunc::Parms+0] = TypeOopPtr::BOTTOM;
+  fields[TypeFunc::Parms+0] = TypeRawPtr::BOTTOM;
   const TypeTuple *range = TypeTuple::make(TypeFunc::Parms+1, fields);
 
   return TypeFunc::make(domain, range);
@@ -468,7 +478,8 @@ void G1BarrierSetC2::pre_barrier(GraphKit* kit,
     __ if_then(pre_val, BoolTest::ne, kit->null()); {
       if (g1_c2_remote_store_handleify_active()) {
         const TypeFunc *tf = write_ref_field_pre_entry_Type();
-        __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_pre_entry), "write_ref_field_pre_entry", pre_val, tls);
+        Node* raw_pre_val = g1_c2_oop_value_as_raw(kit, __ ctrl(), pre_val);
+        __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_pre_entry), "write_ref_field_pre_entry", raw_pre_val, tls);
       } else {
         Node* buffer  = __ load(__ ctrl(), buffer_adr, TypeRawPtr::NOTNULL, T_ADDRESS, Compile::AliasIdxRaw);
 
@@ -488,7 +499,8 @@ void G1BarrierSetC2::pre_barrier(GraphKit* kit,
 
           // logging buffer is full, call the runtime
           const TypeFunc *tf = write_ref_field_pre_entry_Type();
-          __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_pre_entry), "write_ref_field_pre_entry", pre_val, tls);
+          Node* raw_pre_val = g1_c2_oop_value_as_raw(kit, __ ctrl(), pre_val);
+          __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_pre_entry), "write_ref_field_pre_entry", raw_pre_val, tls);
         } __ end_if();  // (!index)
       }
     } __ end_if();  // (pre_val != nullptr)
