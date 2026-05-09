@@ -8263,6 +8263,7 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
       (local_handle_count() > 0 || _dense_segment_evict_success > 0);
   const bool full_heap_fixup =
       !G1RemoteUseFastPhaseC ||
+      G1RemoteFastPhaseCVerifyInterval == 0 ||
       G1RemoteFastPhaseCVerifyInterval == 1 ||
       missing_source_map ||
       (G1RemoteFastPhaseCVerifyInterval > 1 &&
