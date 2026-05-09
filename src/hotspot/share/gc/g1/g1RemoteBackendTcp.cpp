@@ -36,11 +36,20 @@ static const uint32_t RE_CMD_EVICT_WITH_EDGES       = 0x12;
 static const uint32_t RE_CMD_REPORT_REMOTE_ROOTS_V2 = 0x13;
 static const uint32_t RE_RESP_COLLECTION_RESULT = 0x84;
 static const uint32_t RE_CMD_TRACE_AND_REPORT      = 0x17;
+static const uint32_t RE_CMD_FETCH_AROUND          = 0x18;
+static const uint32_t RE_CMD_FETCH_EXACT           = 0x1C;
 static const uint32_t RE_CMD_EVICT_SEGMENT         = 0x1D;
 static const uint32_t RE_CMD_FETCH_SEGMENT         = 0x1E;
 static const uint32_t RE_CMD_DISCARD_SEGMENT       = 0x1F;
+static const uint32_t RE_CMD_EVICT_SEGMENT_STAGED  = 0x20;
+static const uint32_t RE_CMD_FETCH_SEGMENT_STAGED  = 0x21;
+static const uint32_t RE_CMD_STAGE_WRITE           = 0x22;
+static const uint32_t RE_CMD_STAGE_READ            = 0x23;
 static const uint32_t RE_RESP_TRACE_RESULT          = 0x86;
+static const uint32_t RE_RESP_BATCH_OBJECT_DATA     = 0x87;
 static const uint32_t RE_RESP_SEGMENT_DATA          = 0x88;
+static const uint32_t RE_RESP_SEGMENT_STAGED        = 0x89;
+static const uint32_t RE_RESP_STAGE_DATA            = 0x8A;
 static const size_t   RE_MAX_MSG_SIZE              = 16 * 1024 * 1024;
 
 TCPExecutorBackend::TCPExecutorBackend()
@@ -113,6 +122,112 @@ bool TCPExecutorBackend::recv_msg(void* buf, size_t max_len, size_t* actual_len)
   return true;
 }
 
+bool TCPExecutorBackend::stage_write_locked(uint64_t remote_offset,
+                                            const void* data,
+                                            size_t len) {
+  const size_t header_size = 32;
+  const size_t max_payload = RE_MAX_MSG_SIZE - header_size;
+  const uint8_t* src = (const uint8_t*)data;
+  size_t done = 0;
+
+  while (done < len) {
+    size_t chunk = MIN2(len - done, max_payload);
+    size_t msg_size = header_size + chunk;
+    uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+    if (msg == nullptr) {
+      return false;
+    }
+
+    *(uint32_t*)(msg + 0) = RE_CMD_STAGE_WRITE;
+    *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+    *(uint64_t*)(msg + 8) = _seq_id++;
+    *(uint64_t*)(msg + 16) = remote_offset + done;
+    *(uint64_t*)(msg + 24) = (uint64_t)chunk;
+    memcpy(msg + header_size, src + done, chunk);
+
+    bool sent = send_msg(msg, msg_size);
+    os::free(msg);
+    if (!sent) {
+      return false;
+    }
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    if (!recv_msg(resp, sizeof(resp), &resp_len) ||
+        resp_len < 16 || *(uint32_t*)resp != RE_RESP_OK) {
+      log_warning(gc)("TCPExecutor: staged write failed at offset="
+                      UINT64_FORMAT " chunk=" SIZE_FORMAT,
+                      remote_offset + done, chunk);
+      return false;
+    }
+
+    done += chunk;
+  }
+
+  return true;
+}
+
+bool TCPExecutorBackend::stage_read_locked(uint64_t remote_offset,
+                                           void* dest,
+                                           size_t len) {
+  const size_t request_size = 32;
+  const size_t response_header_size = 32;
+  const size_t max_payload = RE_MAX_MSG_SIZE - response_header_size;
+  uint8_t* dst = (uint8_t*)dest;
+  size_t done = 0;
+
+  while (done < len) {
+    size_t chunk = MIN2(len - done, max_payload);
+    uint8_t msg[request_size];
+    *(uint32_t*)(msg + 0) = RE_CMD_STAGE_READ;
+    *(uint32_t*)(msg + 4) = request_size;
+    *(uint64_t*)(msg + 8) = _seq_id++;
+    *(uint64_t*)(msg + 16) = remote_offset + done;
+    *(uint64_t*)(msg + 24) = (uint64_t)chunk;
+
+    if (!send_msg(msg, sizeof(msg))) {
+      return false;
+    }
+
+    size_t resp_cap = response_header_size + chunk;
+    uint8_t* resp = (uint8_t*)os::malloc(resp_cap, mtGC);
+    if (resp == nullptr) {
+      return false;
+    }
+
+    size_t resp_len = 0;
+    bool ok = recv_msg(resp, resp_cap, &resp_len);
+    if (ok && resp_len >= response_header_size &&
+        *(uint32_t*)(resp + 0) == RE_RESP_STAGE_DATA) {
+      uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+      uint64_t resp_offset = *(uint64_t*)(resp + 16);
+      size_t resp_byte_size = (size_t)*(uint64_t*)(resp + 24);
+      ok = resp_msg_len <= resp_len &&
+           resp_msg_len >= response_header_size &&
+           resp_offset == remote_offset + done &&
+           resp_byte_size == chunk &&
+           resp_byte_size <= resp_msg_len - response_header_size;
+      if (ok) {
+        memcpy(dst + done, resp + response_header_size, chunk);
+      }
+    } else {
+      ok = false;
+    }
+
+    os::free(resp);
+    if (!ok) {
+      log_warning(gc)("TCPExecutor: staged read failed at offset="
+                      UINT64_FORMAT " chunk=" SIZE_FORMAT,
+                      remote_offset + done, chunk);
+      return false;
+    }
+
+    done += chunk;
+  }
+
+  return true;
+}
+
 // ================================================================
 // Lifecycle
 // ================================================================
@@ -180,11 +295,11 @@ bool TCPExecutorBackend::send_hello() {
 
 void TCPExecutorBackend::shutdown() {
   if (_connected && _fd >= 0) {
-    uint8_t msg[12];
+    uint8_t msg[16];
     *(uint32_t*)(msg + 0) = RE_CMD_SHUTDOWN;
-    *(uint32_t*)(msg + 4) = 12;
-    *(uint32_t*)(msg + 8) = 0;
-    send_msg(msg, 12);  // best-effort
+    *(uint32_t*)(msg + 4) = sizeof(msg);
+    *(uint64_t*)(msg + 8) = _seq_id++;
+    send_msg(msg, sizeof(msg));  // best-effort
     ::close(_fd);
     _fd = -1;
     _connected = false;
@@ -203,11 +318,41 @@ bool TCPExecutorBackend::evict_segment(uint64_t segment_id, uintptr_t vaddr_base
   }
 
   const size_t header_size = 48;
-  if (byte_size > RE_MAX_MSG_SIZE - header_size ||
-      byte_size > (size_t)UINT32_MAX - header_size) {
-    log_warning(gc)("TCPExecutor: segment evict too large: segment="
-                    UINT64_FORMAT " bytes=" SIZE_FORMAT,
-                    segment_id, byte_size);
+  bool use_staged = RDMAMsgBufSize <= header_size ||
+                    byte_size > RDMAMsgBufSize - header_size ||
+                    byte_size > RE_MAX_MSG_SIZE - header_size;
+
+  if (use_staged) {
+    const size_t staged_msg_size = 56;
+    uint8_t msg[staged_msg_size];
+
+    io_lock();
+    if (!stage_write_locked(0, bytes, byte_size)) {
+      io_unlock();
+      return false;
+    }
+
+    *(uint32_t*)(msg + 0) = RE_CMD_EVICT_SEGMENT_STAGED;
+    *(uint32_t*)(msg + 4) = staged_msg_size;
+    *(uint64_t*)(msg + 8) = _seq_id++;
+    *(uint64_t*)(msg + 16) = segment_id;
+    *(uint64_t*)(msg + 24) = (uint64_t)vaddr_base;
+    *(uint64_t*)(msg + 32) = (uint64_t)byte_size;
+    *(uint32_t*)(msg + 40) = flags;
+    *(uint32_t*)(msg + 44) = 0;
+    *(uint64_t*)(msg + 48) = 0;
+
+    bool sent = send_msg(msg, sizeof(msg));
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    bool ok = sent &&
+              recv_msg(resp, sizeof(resp), &resp_len) &&
+              resp_len >= 16 && *(uint32_t*)resp == RE_RESP_OK;
+    io_unlock();
+    return ok;
+  }
+
+  if (byte_size > (size_t)UINT32_MAX - header_size) {
     return false;
   }
 
@@ -255,6 +400,63 @@ bool TCPExecutorBackend::fetch_segment(uint64_t segment_id,
   }
 
   const size_t header_size = 48;
+  bool use_staged = RDMAMsgBufSize <= header_size ||
+                    byte_capacity > RDMAMsgBufSize - header_size ||
+                    byte_capacity > RE_MAX_MSG_SIZE - header_size;
+
+  if (use_staged) {
+    io_lock();
+
+    uint8_t msg[40];
+    *(uint32_t*)(msg + 0) = RE_CMD_FETCH_SEGMENT_STAGED;
+    *(uint32_t*)(msg + 4) = sizeof(msg);
+    *(uint64_t*)(msg + 8) = _seq_id++;
+    *(uint64_t*)(msg + 16) = segment_id;
+    *(uint64_t*)(msg + 24) = 0;
+    *(uint64_t*)(msg + 32) = (uint64_t)byte_capacity;
+    if (!send_msg(msg, sizeof(msg))) {
+      io_unlock();
+      return false;
+    }
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    if (!recv_msg(resp, sizeof(resp), &resp_len) || resp_len < header_size ||
+        *(uint32_t*)(resp + 0) != RE_RESP_SEGMENT_STAGED) {
+      io_unlock();
+      return false;
+    }
+
+    uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+    uint64_t resp_segment_id = *(uint64_t*)(resp + 16);
+    uintptr_t resp_vaddr_base = (uintptr_t)*(uint64_t*)(resp + 24);
+    size_t resp_byte_size = (size_t)*(uint64_t*)(resp + 32);
+    uint32_t resp_flags = *(uint32_t*)(resp + 40);
+
+    if (resp_msg_len > resp_len || resp_msg_len < header_size ||
+        resp_segment_id != segment_id || resp_byte_size > byte_capacity) {
+      io_unlock();
+      return false;
+    }
+
+    bool ok = stage_read_locked(0, dest, resp_byte_size);
+    io_unlock();
+    if (!ok) {
+      return false;
+    }
+
+    if (out_vaddr_base != nullptr) {
+      *out_vaddr_base = resp_vaddr_base;
+    }
+    if (out_byte_size != nullptr) {
+      *out_byte_size = resp_byte_size;
+    }
+    if (out_flags != nullptr) {
+      *out_flags = resp_flags;
+    }
+    return true;
+  }
+
   size_t max_response_bytes = MIN2(RE_MAX_MSG_SIZE, byte_capacity + header_size);
   if (max_response_bytes < byte_capacity) {
     max_response_bytes = RE_MAX_MSG_SIZE;
@@ -459,6 +661,207 @@ Klass* TCPExecutorBackend::fetch(size_t slot_id, void* dest, size_t* out_word_si
   return (Klass*)resp_klass_val;
 }
 
+static size_t parse_tcp_batch_fetch_response(const char* caller,
+                                             uint8_t* resp,
+                                             size_t resp_len,
+                                             size_t max_response_bytes,
+                                             G1RemoteBackend::FetchBatchClosure* cl) {
+  if (resp_len < 24) {
+    log_warning(gc)("TCPExecutor: %s response too short: " SIZE_FORMAT " bytes",
+                    caller, resp_len);
+    return 0;
+  }
+
+  if (*(uint32_t*)resp != RE_RESP_BATCH_OBJECT_DATA) {
+    log_warning(gc)("TCPExecutor: %s unexpected response cmd=0x%x",
+                    caller, *(uint32_t*)resp);
+    return 0;
+  }
+
+  uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+  if (resp_msg_len > resp_len || resp_msg_len > max_response_bytes) {
+    log_warning(gc)("TCPExecutor: %s malformed response length: hdr=%u "
+                    "actual=" SIZE_FORMAT " max=" SIZE_FORMAT,
+                    caller, resp_msg_len, resp_len, max_response_bytes);
+    return 0;
+  }
+
+  uint32_t num_objects = *(uint32_t*)(resp + 16);
+  uint8_t* cursor = resp + 24;
+  uint8_t* end = resp + resp_msg_len;
+  size_t fetched = 0;
+
+  for (uint32_t i = 0; i < num_objects; i++) {
+    if (cursor + 32 > end) {
+      log_warning(gc)("TCPExecutor: %s truncated entry header at %u/%u",
+                      caller, i, num_objects);
+      break;
+    }
+    uintptr_t entry_handle = (uintptr_t)*(uint64_t*)(cursor + 0);
+    size_t entry_slot = (size_t)*(uint64_t*)(cursor + 8);
+    Klass* entry_klass = (Klass*)(uintptr_t)*(uint64_t*)(cursor + 16);
+    uint32_t word_size = *(uint32_t*)(cursor + 24);
+    uint32_t byte_size = *(uint32_t*)(cursor + 28);
+    cursor += 32;
+
+    if ((size_t)word_size * HeapWordSize != byte_size || cursor + byte_size > end) {
+      log_warning(gc)("TCPExecutor: %s malformed entry %u/%u "
+                      "(ws=%u bytes=%u remaining=" SIZE_FORMAT ")",
+                      caller, i, num_objects, word_size, byte_size,
+                      (size_t)(end - cursor));
+      break;
+    }
+
+    cl->do_object(entry_handle, entry_slot, entry_klass, word_size, cursor);
+    cursor += byte_size;
+    fetched++;
+  }
+
+  return fetched;
+}
+
+bool TCPExecutorBackend::supports_batch_fetch() const {
+  return true;
+}
+
+size_t TCPExecutorBackend::fetch_batch_around(uintptr_t handle_id, size_t slot_id,
+                                              uint max_objects, uint slot_window,
+                                              size_t max_response_bytes,
+                                              FetchBatchClosure* cl) {
+  if (!_connected || cl == nullptr || max_objects == 0) {
+    return 0;
+  }
+
+  if (max_response_bytes == 0 || max_response_bytes > RE_MAX_MSG_SIZE) {
+    max_response_bytes = RE_MAX_MSG_SIZE;
+  }
+  if (max_response_bytes < 24 + 32) {
+    return 0;
+  }
+  size_t max_by_header = (max_response_bytes - 24) / 32;
+  if (max_objects > max_by_header) {
+    max_objects = (uint)max_by_header;
+  }
+  if (max_objects == 0) {
+    return 0;
+  }
+
+  uint8_t msg[48];
+  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_AROUND;
+  *(uint32_t*)(msg + 4) = sizeof(msg);
+  *(uint64_t*)(msg + 8) = 0;
+  *(uint64_t*)(msg + 16) = (uint64_t)handle_id;
+  *(uint64_t*)(msg + 24) = (uint64_t)slot_id;
+  *(uint32_t*)(msg + 32) = max_objects;
+  *(uint32_t*)(msg + 36) = slot_window;
+  *(uint64_t*)(msg + 40) = (uint64_t)max_response_bytes;
+
+  uint8_t* resp = (uint8_t*)os::malloc(max_response_bytes, mtGC);
+  if (resp == nullptr) {
+    return 0;
+  }
+
+  io_lock();
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  bool ok = send_msg(msg, sizeof(msg));
+  size_t resp_len = 0;
+  if (ok) {
+    ok = recv_msg(resp, max_response_bytes, &resp_len);
+  }
+  io_unlock();
+
+  if (!ok) {
+    os::free(resp);
+    return 0;
+  }
+
+  size_t fetched = parse_tcp_batch_fetch_response("fetch_batch_around",
+                                                  resp, resp_len,
+                                                  max_response_bytes, cl);
+  os::free(resp);
+  _total_fetched += fetched;
+  return fetched;
+}
+
+bool TCPExecutorBackend::supports_exact_batch_fetch() const {
+  return true;
+}
+
+size_t TCPExecutorBackend::fetch_batch_exact(const uintptr_t* handle_ids,
+                                             const size_t* slot_ids,
+                                             size_t count,
+                                             size_t max_response_bytes,
+                                             FetchBatchClosure* cl) {
+  if (!_connected || cl == nullptr || handle_ids == nullptr ||
+      slot_ids == nullptr || count == 0) {
+    return 0;
+  }
+
+  if (max_response_bytes == 0 || max_response_bytes > RE_MAX_MSG_SIZE) {
+    max_response_bytes = RE_MAX_MSG_SIZE;
+  }
+  if (max_response_bytes < 24 + 32) {
+    return 0;
+  }
+
+  const size_t header_size = 32;
+  const size_t entry_size = 16;
+  size_t max_by_request = (RE_MAX_MSG_SIZE > header_size) ?
+      ((RE_MAX_MSG_SIZE - header_size) / entry_size) : 0;
+  size_t max_by_response = (max_response_bytes - 24) / 32;
+  size_t max_objects = MIN2(max_by_request, max_by_response);
+  if (count > max_objects) {
+    count = max_objects;
+  }
+  if (count == 0) {
+    return 0;
+  }
+
+  size_t msg_size = header_size + count * entry_size;
+  uint8_t* msg = (uint8_t*)os::malloc(msg_size, mtGC);
+  uint8_t* resp = (uint8_t*)os::malloc(max_response_bytes, mtGC);
+  if (msg == nullptr || resp == nullptr) {
+    if (msg != nullptr) os::free(msg);
+    if (resp != nullptr) os::free(resp);
+    return 0;
+  }
+
+  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_EXACT;
+  *(uint32_t*)(msg + 4) = (uint32_t)msg_size;
+  *(uint64_t*)(msg + 8) = 0;
+  *(uint32_t*)(msg + 16) = (uint32_t)count;
+  *(uint32_t*)(msg + 20) = 0;
+  *(uint64_t*)(msg + 24) = (uint64_t)max_response_bytes;
+  uint8_t* cursor = msg + header_size;
+  for (size_t i = 0; i < count; i++) {
+    *(uint64_t*)(cursor + 0) = (uint64_t)handle_ids[i];
+    *(uint64_t*)(cursor + 8) = (uint64_t)slot_ids[i];
+    cursor += entry_size;
+  }
+
+  io_lock();
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  bool ok = send_msg(msg, msg_size);
+  size_t resp_len = 0;
+  if (ok) {
+    ok = recv_msg(resp, max_response_bytes, &resp_len);
+  }
+  io_unlock();
+
+  os::free(msg);
+  if (!ok) {
+    os::free(resp);
+    return 0;
+  }
+
+  size_t fetched = parse_tcp_batch_fetch_response("fetch_batch_exact",
+                                                  resp, resp_len,
+                                                  max_response_bytes, cl);
+  os::free(resp);
+  _total_fetched += fetched;
+  return fetched;
+}
+
 void TCPExecutorBackend::report_roots(const size_t* root_slot_ids, size_t num_roots) {
   if (!_connected) return;
 
@@ -636,8 +1039,8 @@ void TCPExecutorBackend::report_remote_roots_v2(const uintptr_t* handle_ids, siz
 
   io_lock();
 
-  // Executor recv buffer is REMOTE_MAX_MSG_SIZE (4MB). Chunk if needed.
-  size_t max_per_msg = (4 * 1024 * 1024 - 20) / 8;
+  // Executor recv buffer is REMOTE_MAX_MSG_SIZE. Chunk if needed.
+  size_t max_per_msg = (RE_MAX_MSG_SIZE - 20) / 8;
   size_t remaining = count;
   size_t offset = 0;
 

@@ -32,6 +32,8 @@ class TCPExecutorBackend : public G1RemoteBackend {
   bool send_msg(const void* data, size_t len);
   bool recv_msg(void* buf, size_t max_len, size_t* actual_len);
   bool send_hello();
+  bool stage_write_locked(uint64_t remote_offset, const void* data, size_t len);
+  bool stage_read_locked(uint64_t remote_offset, void* dest, size_t len);
 
 public:
   TCPExecutorBackend();
@@ -44,6 +46,18 @@ public:
                Klass* klass, size_t hint_slot_id) override;
 
   Klass* fetch(size_t slot_id, void* dest, size_t* out_word_size) override;
+
+  bool supports_batch_fetch() const override;
+  size_t fetch_batch_around(uintptr_t handle_id, size_t slot_id,
+                            uint max_objects, uint slot_window,
+                            size_t max_response_bytes,
+                            FetchBatchClosure* cl) override;
+  bool supports_exact_batch_fetch() const override;
+  size_t fetch_batch_exact(const uintptr_t* handle_ids,
+                           const size_t* slot_ids,
+                           size_t count,
+                           size_t max_response_bytes,
+                           FetchBatchClosure* cl) override;
 
   void report_roots(const size_t* root_slot_ids, size_t num_roots) override;
 

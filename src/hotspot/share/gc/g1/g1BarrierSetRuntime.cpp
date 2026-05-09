@@ -791,6 +791,7 @@ static uint remote_prefetch_cache_hash(RemoteHandle* h, size_t slot_id) {
   return (uint)(x % RemotePrefetchCacheSlots);
 }
 
+static bool remote_fetch_hint_prefers_graph_cluster(uint32_t access_hint);
 static bool remote_fetch_hint_prefers_around(uint32_t access_hint);
 
 static uint remote_fetch_effective_batch_objects(uint configured,
@@ -801,6 +802,7 @@ static uint remote_fetch_effective_batch_objects(uint configured,
 
   int pressure_level = remote_prefetch_sample_pressure_level();
   bool spatial_hint = remote_fetch_hint_prefers_around(access_hint);
+  bool graph_cluster = remote_fetch_hint_prefers_graph_cluster(access_hint);
   uint bounded = MIN2(configured, G1RemoteFetchBatchHardCap);
   uint effective = bounded;
   uint64_t hits = 0;
@@ -810,7 +812,7 @@ static uint remote_fetch_effective_batch_objects(uint configured,
   uint64_t useful_per_mille = 0;
   uint64_t evict_per_mille = 0;
   bool log_change = false;
-  bool disabled_by_policy = false;
+  bool degraded_by_policy = false;
   bool pressure_limited = false;
   uint64_t pressure_suppressed = 0;
 
@@ -847,6 +849,10 @@ static uint remote_fetch_effective_batch_objects(uint configured,
     } else if (useful_per_mille < 700) {
       effective = MIN2(bounded, 64u);
     }
+  }
+
+  if (graph_cluster) {
+    effective = MAX2(effective, MIN2(bounded, 16u));
   }
 
   if (pressure_level >= RemotePrefetchPressureOverTier2) {
@@ -889,10 +895,8 @@ static uint remote_fetch_effective_batch_objects(uint configured,
     g1_remote_fetch_batch_policy_log_next_stores = stores + 64 * 1024;
     log_change = true;
   }
-  if (!pressure_limited && effective == 1 && stores >= 64 * 1024 &&
-      Atomic::cmpxchg(&g1_remote_fetch_batch_disabled, 0, 1) == 0) {
-    remote_prefetch_cache_clear_locked();
-    disabled_by_policy = true;
+  if (!pressure_limited && effective == 1 && stores >= 64 * 1024) {
+    degraded_by_policy = true;
   }
   remote_prefetch_cache_unlock();
 
@@ -902,19 +906,21 @@ static uint remote_fetch_effective_batch_objects(uint configured,
                  " evictions=" UINT64_FORMAT " drops=" UINT64_FORMAT
                  " useful_per_mille=" UINT64_FORMAT
                  " evict_per_mille=" UINT64_FORMAT
-                 " pressure=%s action=%s spatial=%d suppress(batch=" UINT64_FORMAT
-                 " eager=" UINT64_FORMAT " cache=" UINT64_FORMAT ")",
+                 " pressure=%s action=%s spatial=%d graph=%d "
+                 "suppress(batch=" UINT64_FORMAT " eager=" UINT64_FORMAT
+                 " cache=" UINT64_FORMAT ")",
                  configured, effective, hits, stores, evictions, drops,
                  useful_per_mille, evict_per_mille,
                  remote_prefetch_pressure_level_name(pressure_level),
                  remote_prefetch_pressure_action(pressure_level),
                  spatial_hint ? 1 : 0,
+                 graph_cluster ? 1 : 0,
                  Atomic::load(&g1_remote_prefetch_batch_suppressed),
                  Atomic::load(&g1_remote_prefetch_eager_suppressed),
                  Atomic::load(&g1_remote_prefetch_cache_suppressed));
   }
-  if (disabled_by_policy) {
-    log_info(gc)("Remote batch fetch disabled by storm breaker: "
+  if (degraded_by_policy) {
+    log_info(gc)("Remote batch fetch policy degraded this miss to single-object: "
                  "cache_hits=" UINT64_FORMAT " stores=" UINT64_FORMAT
                  " evictions=" UINT64_FORMAT " drops=" UINT64_FORMAT
                  " useful_per_mille=" UINT64_FORMAT
@@ -1159,13 +1165,16 @@ class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
   uint _publish_count;
   bool _eager_prefetch;
   bool _spatial_prefetch;
+  bool _graph_cluster;
 
   bool try_eager_install_prefetch(RemoteHandle* h, size_t slot_id, Klass* klass,
                                   size_t word_size, const void* obj_bytes) {
     if (!_eager_prefetch || _publish_count >= G1RemoteFetchBatchHardCap) {
       return false;
     }
-    if (!remote_prefetch_budget_allows_eager_install()) {
+    bool budget_ok = _graph_cluster ? remote_graph_cluster_eager_budget_allows()
+                                    : remote_prefetch_budget_allows_eager_install();
+    if (!budget_ok) {
       Atomic::inc(&g1_remote_prefetch_eager_suppressed);
       return false;
     }
@@ -1199,12 +1208,13 @@ public:
   BatchFetchInstallClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm,
                            RemoteHandle* primary, size_t primary_slot,
                            bool eager_prefetch,
-                           bool spatial_prefetch)
+                           bool spatial_prefetch,
+                           bool graph_cluster)
     : _g1h(g1h), _rmm(rmm), _primary(primary), _primary_result(nullptr),
       _primary_slot(primary_slot), _returned(0), _installed(0), _prefetched(0),
       _raced(0), _failed(0), _prefetch_words(0), _primary_alloc_failed(false),
       _publish_count(0), _eager_prefetch(eager_prefetch),
-      _spatial_prefetch(spatial_prefetch) {}
+      _spatial_prefetch(spatial_prefetch), _graph_cluster(graph_cluster) {}
 
   void do_object(uintptr_t handle_id, size_t slot_id, Klass* klass,
                  size_t word_size, const void* obj_bytes) override {
@@ -1338,19 +1348,44 @@ static size_t remote_fetch_max_response_bytes() {
                                     (size_t)RDMAMsgBufSize);
 }
 
+static bool remote_fetch_hint_prefers_graph_cluster(uint32_t access_hint) {
+  if (!G1RemoteUseCompilerFetchHints) {
+    return false;
+  }
+  // Unknown reaches here from generic managed-oop slow paths. Treat it as a
+  // small graph-cluster miss instead of falling back to one-object fetch; true
+  // unsafe/atomic paths pass explicit hints below and stay exact/single.
+  return access_hint == G1RemoteAccessHintField ||
+         access_hint == G1RemoteAccessHintInterpreter ||
+         access_hint == G1RemoteAccessHintUnknown;
+}
+
 static bool remote_fetch_hint_prefers_around(uint32_t access_hint) {
   if (!G1RemoteUseCompilerFetchHints) {
     return false;
   }
-  return access_hint == G1RemoteAccessHintField ||
-         access_hint == G1RemoteAccessHintArray ||
-         access_hint == G1RemoteAccessHintInterpreter;
+  return access_hint == G1RemoteAccessHintArray ||
+         remote_fetch_hint_prefers_graph_cluster(access_hint);
+}
+
+static bool remote_graph_cluster_eager_budget_allows() {
+  // Graph-neighbor results are demand-guided by the faulting object's edge
+  // metadata, not blind spatial prefetch. Keep installing them until tier-3
+  // pressure, where avoiding an immediate cgroup/OOM hit is more important.
+  return remote_prefetch_sample_pressure_level() < RemotePrefetchPressureOverTier3;
 }
 
 static bool remote_fetch_hint_eager_installs_prefetch(uint32_t access_hint) {
   if (!G1RemoteEagerInstallPrefetch ||
       !remote_fetch_hint_prefers_around(access_hint)) {
     return false;
+  }
+  if (remote_fetch_hint_prefers_graph_cluster(access_hint)) {
+    if (!remote_graph_cluster_eager_budget_allows()) {
+      Atomic::inc(&g1_remote_prefetch_eager_suppressed);
+      return false;
+    }
+    return true;
   }
   if (!remote_prefetch_budget_allows_eager_install()) {
     Atomic::inc(&g1_remote_prefetch_eager_suppressed);
@@ -1380,9 +1415,12 @@ static void remote_apply_compiler_fetch_hint(uint32_t access_hint,
     case G1RemoteAccessHintInterpreter:
       *max_objects = MAX2(*max_objects, MIN2((uint)16, G1RemoteFetchBatchHardCap));
       break;
+    case G1RemoteAccessHintUnknown:
+      *max_objects = MAX2(*max_objects, MIN2((uint)16, G1RemoteFetchBatchHardCap));
+      *slot_window = MAX2(*slot_window, (uint)256);
+      break;
     case G1RemoteAccessHintUnsafe:
     case G1RemoteAccessHintAtomic:
-    case G1RemoteAccessHintUnknown:
     default:
       return;
   }
@@ -1703,7 +1741,8 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
                                         uint slot_window,
                                         size_t max_response_bytes,
                                         bool eager_prefetch,
-                                        bool spatial_prefetch) {
+                                        bool spatial_prefetch,
+                                        bool graph_cluster) {
   *out_retry = false;
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
@@ -1713,7 +1752,7 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
   size_t word_size = h->eviction_word_size();
   BatchFetchInstallClosure installer(g1h, rmm, h, slot_id, eager_prefetch,
-                                     spatial_prefetch);
+                                     spatial_prefetch, graph_cluster);
   jlong fetch_start = os::elapsed_counter();
   size_t returned = backend->fetch_batch_around((uintptr_t)h, slot_id, max_objects,
                                                 slot_window, max_response_bytes,
@@ -1803,6 +1842,7 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
   }
 
   bool prefer_around = remote_fetch_hint_prefers_around(access_hint);
+  bool graph_cluster = remote_fetch_hint_prefers_graph_cluster(access_hint);
 
   oopDesc* combined_result = nullptr;
   bool combined_retry = false;
@@ -1815,7 +1855,8 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
     return combined_result;
   }
 
-  if (G1RemoteFetchBatchObjects > 1 &&
+  if (prefer_around &&
+      G1RemoteFetchBatchObjects > 1 &&
       Atomic::load(&g1_remote_fetch_batch_disabled) == 0 &&
       rmm->backend()->supports_batch_fetch()) {
     uint max_objects = MIN2((uint)G1RemoteFetchBatchObjects,
@@ -1829,7 +1870,7 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
       bool eager_prefetch = remote_fetch_hint_eager_installs_prefetch(access_hint);
       return fetch_and_install_batch(h, fetch_attempts, out_retry, max_objects,
                                      slot_window, max_response_bytes,
-                                     eager_prefetch, prefer_around);
+                                     eager_prefetch, prefer_around, graph_cluster);
     }
   }
 

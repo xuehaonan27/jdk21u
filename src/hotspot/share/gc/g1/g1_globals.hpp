@@ -625,7 +625,8 @@
           "RDMAMsgBufSize.")                                                \
                                                                             \
   product(bool, G1RemoteUseCompilerFetchHints, true, DIAGNOSTIC,             \
-          "Use interpreter/C1/C2 access-shape hints to choose remote "        \
+          "Use interpreter/C1/C2 access-shape hints, plus generic "           \
+          "managed-load slow paths, to choose remote graph/spatial "          \
           "fetch-around policy before falling back to exact fetch.")          \
                                                                             \
   product(bool, G1RemoteEagerInstallPrefetch, true, DIAGNOSTIC,              \
