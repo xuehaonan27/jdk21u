@@ -4642,6 +4642,24 @@ private:
   }
 };
 
+static bool remote_fast_phase_c_is_candidate_neighbor(uint region_idx,
+                                                      const bool* eviction_set,
+                                                      uint num_regions) {
+  static const uint NeighborWindow = 8;
+  if (eviction_set == nullptr || region_idx >= num_regions) {
+    return false;
+  }
+
+  uint start = region_idx > NeighborWindow ? region_idx - NeighborWindow : 0;
+  uint end = MIN2(num_regions - 1, region_idx + NeighborWindow);
+  for (uint i = start; i <= end; i++) {
+    if (eviction_set[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
 class TagFastRefsTask : public WorkerTask {
   G1RemoteMemoryManager* _rmm;
   G1CollectedHeap*       _g1h;
@@ -4657,6 +4675,7 @@ class TagFastRefsTask : public WorkerTask {
   volatile int           _dirty_cards_scanned;
   volatile int           _inbound_summary_regions_scanned;
   volatile int           _source_hint_regions_scanned;
+  volatile int           _neighbor_regions_scanned;
   volatile int           _old_prefix_regions_scanned;
 
   typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
@@ -4675,7 +4694,8 @@ public:
       _total_untaggable(0),
       _regions_scanned(0), _dirty_cards_scanned(0),
       _inbound_summary_regions_scanned(0),
-      _source_hint_regions_scanned(0), _old_prefix_regions_scanned(0),
+      _source_hint_regions_scanned(0), _neighbor_regions_scanned(0),
+      _old_prefix_regions_scanned(0),
       _num_workers(num_workers) {
     _worker_bufs = NEW_C_HEAP_ARRAY(TaggedFieldEntry*, num_workers, mtGC);
     _worker_counts = NEW_C_HEAP_ARRAY(int, num_workers, mtGC);
@@ -4701,6 +4721,7 @@ public:
     int dirty_cards = 0;
     int inbound_summary_regions = 0;
     int source_hint_regions = 0;
+    int neighbor_regions = 0;
     int old_prefix_regions = 0;
 
     for (uint i = _claimer.offset_for_worker(worker_id); i < _claimer.n_regions(); i++) {
@@ -4751,6 +4772,16 @@ public:
         continue;
       }
 
+      if (remote_fast_phase_c_is_candidate_neighbor(i, _eviction_set, _num_regions) &&
+          hr->is_old() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
+        scan_region_for_eviction_tags(hr, &cl, _bitmap);
+        scanned++;
+        neighbor_regions++;
+        continue;
+      }
+
       if (G1RemoteFastPhaseCOldPrefixRegions > 0 &&
           i < G1RemoteFastPhaseCOldPrefixRegions &&
           hr->is_old() &&
@@ -4776,6 +4807,7 @@ public:
     Atomic::add(&_dirty_cards_scanned, dirty_cards);
     Atomic::add(&_inbound_summary_regions_scanned, inbound_summary_regions);
     Atomic::add(&_source_hint_regions_scanned, source_hint_regions);
+    Atomic::add(&_neighbor_regions_scanned, neighbor_regions);
     Atomic::add(&_old_prefix_regions_scanned, old_prefix_regions);
     _worker_bufs[worker_id] = cl.release_local_buf();
     _worker_counts[worker_id] = cl.local_count();
@@ -4796,6 +4828,7 @@ public:
   int dirty_cards_scanned() const { return _dirty_cards_scanned; }
   int inbound_summary_regions_scanned() const { return _inbound_summary_regions_scanned; }
   int source_hint_regions_scanned() const { return _source_hint_regions_scanned; }
+  int neighbor_regions_scanned() const { return _neighbor_regions_scanned; }
   int old_prefix_regions_scanned() const { return _old_prefix_regions_scanned; }
 };
 
@@ -4818,11 +4851,14 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
 
     if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
       log_info(gc)("Fast Phase C (%u workers, %d regions scanned, %d dirty cards, "
-                   "%d inbound summaries, %d source hints, %d old-prefix): "
+                   "%d inbound summaries, %d source hints, %d neighbors, "
+                   "%d old-prefix): "
                    "tagged %d refs, %d no handle, %d untaggable",
                    num_workers, task.regions_scanned(), task.dirty_cards_scanned(),
                    task.inbound_summary_regions_scanned(),
-                   task.source_hint_regions_scanned(), task.old_prefix_regions_scanned(),
+                   task.source_hint_regions_scanned(),
+                   task.neighbor_regions_scanned(),
+                   task.old_prefix_regions_scanned(),
                    total_tagged, total_no_handle, total_untaggable);
     }
   } else {
@@ -4833,6 +4869,7 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     int dirty_cards = 0;
     int inbound_summary_regions = 0;
     int source_hint_regions = 0;
+    int neighbor_regions = 0;
     int old_prefix_regions = 0;
 
     for (uint i = 0; i < num_regions; i++) {
@@ -4879,6 +4916,16 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
         continue;
       }
 
+      if (remote_fast_phase_c_is_candidate_neighbor(i, eviction_set, num_regions) &&
+          hr->is_old() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
+        scan_region_for_eviction_tags(hr, &cl, bitmap);
+        scanned++;
+        neighbor_regions++;
+        continue;
+      }
+
       if (G1RemoteFastPhaseCOldPrefixRegions > 0 &&
           i < G1RemoteFastPhaseCOldPrefixRegions &&
           hr->is_old() &&
@@ -4906,10 +4953,11 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
 
     if (total_tagged > 0 || total_no_handle > 0 || total_untaggable > 0) {
       log_info(gc)("Fast Phase C (1 worker, %d regions scanned, %d dirty cards, "
-                   "%d inbound summaries, %d source hints, %d old-prefix): "
+                   "%d inbound summaries, %d source hints, %d neighbors, "
+                   "%d old-prefix): "
                    "tagged %d refs, %d no handle, %d untaggable",
                    scanned, dirty_cards, inbound_summary_regions,
-                   source_hint_regions, old_prefix_regions,
+                   source_hint_regions, neighbor_regions, old_prefix_regions,
                    total_tagged, total_no_handle, total_untaggable);
     }
   }
