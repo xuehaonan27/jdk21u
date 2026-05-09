@@ -3457,9 +3457,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       bool run_phase_c5_for_candidates =
           total_candidates > 0 &&
           (G1RemoteVerifyEvictionRefs || force_dense_phase_c5);
+      bool phase_c5_full_heap = true;
       if (run_phase_c5_for_candidates && G1RemoteUseFastPhaseC) {
         if (force_dense_phase_c5) {
-          run_phase_c5_for_candidates = true;
+          if (!G1RemoteVerifyEvictionRefs) {
+            if (G1RemoteFastPhaseCVerifyInterval == 0) {
+              phase_c5_full_heap = false;
+            } else if (G1RemoteFastPhaseCVerifyInterval > 1) {
+              phase_c5_full_heap =
+                  (rmm->gc_epoch() % G1RemoteFastPhaseCVerifyInterval) == 0;
+            }
+          }
         } else if (G1RemoteFastPhaseCVerifyInterval == 0) {
           run_phase_c5_for_candidates = false;
         } else if (G1RemoteFastPhaseCVerifyInterval > 1) {
@@ -3508,9 +3516,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           Ticks phase_c5_start = Ticks::now();
           int missed = rmm->verify_no_untagged_refs_to_eviction_set(eviction_candidates,
                                                                     num_regions,
-                                                                    _pre_evac_tops);
+                                                                    _pre_evac_tops,
+                                                                    phase_c5_full_heap);
           double phase_c5_ms = (Ticks::now() - phase_c5_start).seconds() * 1000.0;
-          log_info(gc)("Phase C.5 verify: %.1fms (%d missed heap refs)", phase_c5_ms, missed);
+          log_info(gc)("Phase C.5 %s verify: %.1fms (%d missed heap refs)",
+                       phase_c5_full_heap ? "full" : "targeted",
+                       phase_c5_ms, missed);
           if (missed > 0) {
             abort_remote_eviction_candidates(
                 _g1h, rmm, eviction_candidates, num_regions,

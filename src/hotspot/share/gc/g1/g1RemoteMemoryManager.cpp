@@ -5485,7 +5485,8 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
 
 int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     const bool* eviction_set, uint num_regions,
-    HeapWord* const* pre_evac_tops) {
+    HeapWord* const* pre_evac_tops,
+    bool full_heap) {
 
   class VerifyTagClosure : public BasicOopIterateClosure {
     G1RemoteMemoryManager* _rmm;
@@ -6018,6 +6019,254 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     }
   };
 
+  class VerifySourceSelector {
+    G1CollectedHeap*       _g1h;
+    G1CardTable*           _ct;
+    uint                   _num_regions;
+    bool*                  _selected;
+    bool                   _requires_full_heap;
+    int                    _selected_regions;
+    int                    _candidate_regions;
+    int                    _young_regions;
+    int                    _destination_regions;
+    int                    _inbound_summary_regions;
+    int                    _source_hint_regions;
+    int                    _neighbor_regions;
+    int                    _old_prefix_regions;
+    int                    _rset_cards;
+    int                    _rset_source_regions;
+    int                    _dirty_cards;
+    int                    _dirty_source_regions;
+    int                    _incomplete_rsets;
+
+    bool select_region(uint region_idx) {
+      if (region_idx >= _num_regions) {
+        return false;
+      }
+      if (!_selected[region_idx]) {
+        _selected[region_idx] = true;
+        _selected_regions++;
+        return true;
+      }
+      return false;
+    }
+
+    bool select_card_source(uint card_idx, bool rset_card) {
+      HeapWord* card_start = _ct->addr_for(_ct->byte_for_index(card_idx));
+      if (!_g1h->is_in_reserved(card_start)) {
+        return false;
+      }
+      HeapRegion* source_hr = _g1h->heap_region_containing_or_null(card_start);
+      if (source_hr == nullptr || source_hr->is_empty() || source_hr->is_free()) {
+        return false;
+      }
+      uint src_idx = source_hr->hrm_index();
+      bool added = select_region(src_idx);
+      if (added && rset_card) {
+        _rset_source_regions++;
+      }
+      return added;
+    }
+
+  public:
+    VerifySourceSelector(G1CollectedHeap* g1h,
+                         uint num_regions,
+                         bool* selected)
+      : _g1h(g1h), _ct(g1h->card_table()),
+        _num_regions(num_regions), _selected(selected),
+        _requires_full_heap(false), _selected_regions(0),
+        _candidate_regions(0), _young_regions(0), _destination_regions(0),
+        _inbound_summary_regions(0), _source_hint_regions(0),
+        _neighbor_regions(0), _old_prefix_regions(0),
+        _rset_cards(0), _rset_source_regions(0),
+        _dirty_cards(0), _dirty_source_regions(0),
+        _incomplete_rsets(0) {}
+
+    bool start_iterate(uint tag, uint region_idx) { return true; }
+
+    void do_card(uint card_idx) {
+      _rset_cards++;
+      select_card_source(card_idx, true /* rset_card */);
+    }
+
+    void do_card_range(uint start_card_idx, uint length) {
+      for (uint i = 0; i < length; i++) {
+        do_card(start_card_idx + i);
+      }
+    }
+
+    void select_candidate(HeapRegion* hr) {
+      if (hr == nullptr) {
+        return;
+      }
+      select_region(hr->hrm_index());
+      _candidate_regions++;
+
+      HeapRegionRemSet* rem_set = hr->rem_set();
+      if (rem_set == nullptr) {
+        _requires_full_heap = true;
+        _incomplete_rsets++;
+        return;
+      }
+      if (!rem_set->is_complete()) {
+        _requires_full_heap = true;
+        _incomplete_rsets++;
+        return;
+      }
+      if (!rem_set->is_empty()) {
+        rem_set->iterate_for_merge(*this);
+      }
+    }
+
+    void select_young(uint region_idx) {
+      if (select_region(region_idx)) {
+        _young_regions++;
+      }
+    }
+
+    void select_destination(uint region_idx) {
+      if (select_region(region_idx)) {
+        _destination_regions++;
+      }
+    }
+
+    void select_inbound_summary(uint region_idx) {
+      if (select_region(region_idx)) {
+        _inbound_summary_regions++;
+      }
+    }
+
+    void select_source_hint(uint region_idx) {
+      if (select_region(region_idx)) {
+        _source_hint_regions++;
+      }
+    }
+
+    void select_neighbor(uint region_idx) {
+      if (select_region(region_idx)) {
+        _neighbor_regions++;
+      }
+    }
+
+    void select_old_prefix(uint region_idx) {
+      if (select_region(region_idx)) {
+        _old_prefix_regions++;
+      }
+    }
+
+    int scan_dirty_cards_in_region(HeapRegion* source_hr) {
+      if (source_hr == nullptr || source_hr->is_empty() || source_hr->is_free()) {
+        return 0;
+      }
+      if (source_hr->is_young() || source_hr->is_continues_humongous()) {
+        return 0;
+      }
+      if (source_hr->bottom() >= source_hr->top()) {
+        return 0;
+      }
+
+      CardTable::CardValue* card = _ct->byte_for(source_hr->bottom());
+      CardTable::CardValue* end_card = _ct->byte_for(source_hr->top() - 1) + 1;
+      int dirty_cards = 0;
+      while (card < end_card) {
+        if (*card == G1CardTable::dirty_card_val()) {
+          dirty_cards++;
+        }
+        card++;
+      }
+      if (dirty_cards > 0 && select_region(source_hr->hrm_index())) {
+        _dirty_source_regions++;
+      }
+      _dirty_cards += dirty_cards;
+      return dirty_cards;
+    }
+
+    bool requires_full_heap() const { return _requires_full_heap; }
+    int selected_regions() const { return _selected_regions; }
+    int incomplete_rsets() const { return _incomplete_rsets; }
+
+    void log_summary(bool fallback_full_heap) const {
+      log_info(gc)("Phase C.5 targeted sources: selected=%d candidates=%d young=%d "
+                   "destinations=%d inbound=%d hints=%d neighbors=%d old-prefix=%d "
+                   "rset_cards=%d rset_sources=%d dirty_cards=%d dirty_sources=%d "
+                   "incomplete_rsets=%d mode=%s",
+                   _selected_regions, _candidate_regions, _young_regions,
+                   _destination_regions, _inbound_summary_regions,
+                   _source_hint_regions, _neighbor_regions, _old_prefix_regions,
+                   _rset_cards, _rset_source_regions, _dirty_cards,
+                   _dirty_source_regions, _incomplete_rsets,
+                   fallback_full_heap ? "fallback-full" : "targeted");
+    }
+  };
+
+  bool* selected_sources = nullptr;
+  bool targeted_heap_verify = !full_heap;
+  if (targeted_heap_verify) {
+    selected_sources = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+    memset(selected_sources, 0, num_regions * sizeof(bool));
+    VerifySourceSelector selector(_g1h, num_regions, selected_sources);
+
+    for (uint i = 0; i < num_regions; i++) {
+      HeapRegion* hr = _g1h->region_at_or_null(i);
+      if (hr == nullptr) {
+        continue;
+      }
+
+      if (eviction_set[i]) {
+        selector.select_candidate(hr);
+        continue;
+      }
+
+      if (hr->is_young()) {
+        selector.select_young(i);
+        continue;
+      }
+
+      if (pre_evac_tops != nullptr &&
+          pre_evac_tops[i] != nullptr &&
+          pre_evac_tops[i] < hr->top() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
+        selector.select_destination(i);
+        continue;
+      }
+
+      if (is_inbound_source_for_eviction_set(i, eviction_set, num_regions)) {
+        selector.select_inbound_summary(i);
+        continue;
+      }
+
+      if (is_fast_phase_c_source_hint(i)) {
+        selector.select_source_hint(i);
+        continue;
+      }
+
+      if (remote_fast_phase_c_is_candidate_neighbor(i, eviction_set, num_regions) &&
+          hr->is_old() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
+        selector.select_neighbor(i);
+        continue;
+      }
+
+      if (G1RemoteFastPhaseCOldPrefixRegions > 0 &&
+          i < G1RemoteFastPhaseCOldPrefixRegions &&
+          hr->is_old() &&
+          !hr->is_empty() &&
+          !hr->is_continues_humongous()) {
+        selector.select_old_prefix(i);
+        continue;
+      }
+
+      selector.scan_dirty_cards_in_region(hr);
+    }
+
+    if (selector.requires_full_heap()) {
+      targeted_heap_verify = false;
+    }
+    selector.log_summary(!targeted_heap_verify);
+  }
+
   // 1. Verify heap: use the same conservative walk as Phase C tagging so the
   // verifier can catch bitmap/parser blind spots instead of repeating them.
   WorkerThreads* verify_workers = _g1h->workers();
@@ -6029,6 +6278,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       G1RemoteMemoryManager* _rmm;
       G1CollectedHeap*       _g1h;
       const bool*            _eviction_set;
+      const bool*            _selected_sources;
       uint                   _num_regions;
       HeapWord* const*       _pre_evac_tops;
       const G1CMBitMap*      _bitmap;
@@ -6052,6 +6302,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       VerifyHeapRefsTask(G1RemoteMemoryManager* rmm,
                          G1CollectedHeap* g1h,
                          const bool* eviction_set,
+                         const bool* selected_sources,
                          uint num_regions,
                          HeapWord* const* pre_evac_tops,
                          const G1CMBitMap* bitmap,
@@ -6061,6 +6312,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
                          uint num_workers)
         : WorkerTask("Verify remote eviction refs"),
           _rmm(rmm), _g1h(g1h), _eviction_set(eviction_set),
+          _selected_sources(selected_sources),
           _num_regions(num_regions), _pre_evac_tops(pre_evac_tops),
           _bitmap(bitmap), _repair(repair), _repair_limit(repair_limit),
           _summary(summary), _claimer(num_workers), _merge_lock(0),
@@ -6076,6 +6328,10 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
              i < _claimer.n_regions();
              i++) {
           if (!_claimer.claim_region(i)) continue;
+          if (_selected_sources != nullptr &&
+              (i >= _num_regions || !_selected_sources[i])) {
+            continue;
+          }
           HeapRegion* hr = _g1h->region_at_or_null(i);
           if (hr == nullptr) continue;
           if (hr->is_empty() || hr->is_free()) continue;
@@ -6090,13 +6346,18 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       }
     };
 
-    VerifyHeapRefsTask task(this, _g1h, eviction_set, num_regions, pre_evac_tops,
-                            bitmap, repair_misses,
+    VerifyHeapRefsTask task(this, _g1h, eviction_set,
+                            targeted_heap_verify ? selected_sources : nullptr,
+                            num_regions, pre_evac_tops, bitmap, repair_misses,
                             G1RemoteFastPhaseCRepairMissLimit, &cl,
                             active_workers);
     verify_workers->run_task(&task, active_workers);
   } else {
     for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
+      if (targeted_heap_verify &&
+          (i >= num_regions || selected_sources == nullptr || !selected_sources[i])) {
+        continue;
+      }
       HeapRegion* hr = _g1h->region_at_or_null(i);
       if (hr == nullptr) continue;
       if (hr->is_empty() || hr->is_free()) continue;
@@ -6139,6 +6400,9 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
   if (root_missed > 0) {
     log_info(gc)("VERIFY: %d root refs to candidates (handled by Pre-E guard, not Phase C)",
                  root_missed);
+  }
+  if (selected_sources != nullptr) {
+    FREE_C_HEAP_ARRAY(bool, selected_sources);
   }
   return heap_unrepaired;
 }
