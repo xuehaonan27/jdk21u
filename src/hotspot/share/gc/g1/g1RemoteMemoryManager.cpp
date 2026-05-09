@@ -8118,6 +8118,25 @@ public:
   int updated() const { return _fixed + _rescued + _invalid_nulled; }
 };
 
+static int old_cset_fixup_dirty_cards(G1CollectedHeap* g1h, HeapRegion* hr) {
+  if (g1h == nullptr || hr == nullptr || hr->is_empty() || hr->is_free() ||
+      hr->is_continues_humongous() || hr->bottom() >= hr->top()) {
+    return 0;
+  }
+
+  G1CardTable* ct = g1h->card_table();
+  CardTable::CardValue* card = ct->byte_for(hr->bottom());
+  CardTable::CardValue* end_card = ct->byte_for(hr->top() - 1) + 1;
+  int dirty = 0;
+  while (card < end_card) {
+    if (*card == G1CardTable::dirty_card_val()) {
+      dirty++;
+    }
+    card++;
+  }
+  return dirty;
+}
+
 int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_failed) {
   Ticks start = Ticks::now();
   log_debug(gc)("Old/cset fixup START (allow_rescue=%s)",
@@ -8125,6 +8144,27 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
   CSetRefFixupClosure cl(_g1h, this, !evacuation_failed);
   const G1CMBitMap* bitmap = _g1h->concurrent_mark()->mark_bitmap();
+  const uint num_regions = _g1h->max_reserved_regions();
+
+  static bool* old_cset_source_hints = nullptr;
+  static uint old_cset_hint_capacity = 0;
+  static uint old_cset_fixup_cycle = 0;
+  if (old_cset_hint_capacity < num_regions) {
+    bool* new_hints = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+    memset(new_hints, 0, num_regions * sizeof(bool));
+    if (old_cset_source_hints != nullptr) {
+      memcpy(new_hints, old_cset_source_hints,
+             old_cset_hint_capacity * sizeof(bool));
+      FREE_C_HEAP_ARRAY(bool, old_cset_source_hints);
+    }
+    old_cset_source_hints = new_hints;
+    old_cset_hint_capacity = num_regions;
+  }
+  const bool full_heap_fixup =
+      !G1RemoteUseFastPhaseC ||
+      G1RemoteFastPhaseCVerifyInterval == 1 ||
+      (G1RemoteFastPhaseCVerifyInterval > 1 &&
+       (old_cset_fixup_cycle % G1RemoteFastPhaseCVerifyInterval) == 0);
 
   class CSetFixupObjectClosure {
     CSetRefFixupClosure* _cl;
@@ -8137,17 +8177,54 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
 
   int regions_scanned = 0;
   int objects_scanned = 0;
-  log_debug(gc)("Old/cset fixup heap scan START: heap_regions=%u", _g1h->max_reserved_regions());
-  for (uint i = 0; i < _g1h->max_reserved_regions(); i++) {
+  int selected_regions = 0;
+  int fcr_regions = 0;
+  int dirty_regions = 0;
+  int hint_regions = 0;
+  int phase_c_hint_regions = 0;
+  int dirty_cards = 0;
+  log_debug(gc)("Old/cset fixup heap scan START: heap_regions=%u", num_regions);
+  for (uint i = 0; i < num_regions; i++) {
     HeapRegion* hr = _g1h->region_at_or_null(i);
     if (hr == nullptr) continue;
     if (hr->is_empty() || hr->is_free()) continue;
     if (hr->is_continues_humongous()) continue;
     if (!hr->is_old() && !hr->is_starts_humongous()) continue;
 
+    bool selected = full_heap_fixup;
+    bool selected_by_fcr = hr->is_fetch_cache();
+    bool selected_by_hint = old_cset_source_hints != nullptr &&
+                            old_cset_source_hints[i];
+    bool selected_by_phase_c_hint = is_fast_phase_c_source_hint(i);
+    int region_dirty_cards = 0;
+    if (!full_heap_fixup) {
+      if (selected_by_fcr) {
+        selected = true;
+        fcr_regions++;
+      } else if (selected_by_hint) {
+        selected = true;
+        hint_regions++;
+      } else if (selected_by_phase_c_hint) {
+        selected = true;
+        phase_c_hint_regions++;
+      } else {
+        region_dirty_cards = old_cset_fixup_dirty_cards(_g1h, hr);
+        if (region_dirty_cards > 0) {
+          selected = true;
+          dirty_regions++;
+          dirty_cards += region_dirty_cards;
+        }
+      }
+    }
+    if (!selected) {
+      continue;
+    }
+
+    selected_regions++;
     cl.set_src_is_fcr(hr->is_fetch_cache());
     CSetFixupObjectClosure obj_cl(&cl);
     Ticks region_start = Ticks::now();
+    int before = cl.updated();
     log_trace(gc)("Old/cset fixup region START: index=%u type=%s bottom=" PTR_FORMAT
                   " top=" PTR_FORMAT " src_fcr=%s",
                   hr->hrm_index(), hr->get_short_type_str(), p2i(hr->bottom()),
@@ -8156,10 +8233,23 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
     double region_ms = (Ticks::now() - region_start).seconds() * 1000.0;
     regions_scanned++;
     objects_scanned += scanned;
+    if (old_cset_source_hints != nullptr) {
+      if (cl.updated() != before) {
+        old_cset_source_hints[i] = true;
+      } else if (!full_heap_fixup && selected_by_hint && !selected_by_fcr) {
+        old_cset_source_hints[i] = false;
+      }
+    }
     if (region_ms > 100.0) {
       log_debug(gc)("Old/cset fixup region %u type=%s scanned=%d in %.1fms",
                     hr->hrm_index(), hr->get_short_type_str(), scanned, region_ms);
     }
+  }
+  if (!full_heap_fixup) {
+    log_info(gc)("Old/cset fixup targeted sources: selected=%d fcr=%d dirty=%d "
+                 "hints=%d phase_c_hints=%d dirty_cards=%d mode=targeted",
+                 selected_regions, fcr_regions, dirty_regions, hint_regions,
+                 phase_c_hint_regions, dirty_cards);
   }
   log_debug(gc)("Old/cset fixup heap scan DONE: scanned %d regions, %d objects",
                 regions_scanned, objects_scanned);
@@ -8218,6 +8308,7 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
                     (unsigned long long)fcr_evac_writes(),
                     (unsigned long long)fcr_fixup_nulls());
   }
+  old_cset_fixup_cycle++;
   return cl.fixed() + cl.rescued() + cl.skipped() + cl.invalid() + cl.rescue_failed();
 }
 
