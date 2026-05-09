@@ -1822,7 +1822,7 @@ static bool remote_semantic_add_request(G1RemoteMemoryManager* rmm,
   return true;
 }
 
-class SemanticFieldPrefetchClosure : public OopClosure {
+class SemanticFieldPrefetchClosure : public BasicOopIterateClosure {
   G1RemoteMemoryManager* _rmm;
   RemoteHandle* _primary;
   RemoteExactFetchRequest* _storage;
@@ -1839,6 +1839,10 @@ public:
                                uint limit)
     : _rmm(rmm), _primary(primary), _storage(storage), _requests(requests),
       _count(count), _limit(limit) {}
+
+  ReferenceIterationMode reference_iteration_mode() override {
+    return DO_FIELDS;
+  }
 
   void do_oop(oop* p) override {
     uintptr_t raw = *(uintptr_t*)p;
