@@ -83,6 +83,13 @@ static inline oop g1_resolve_remote_oop_if_needed(oop value,
   return value;
 }
 
+static inline oop g1_handleify_old_oop_for_store_if_needed(oop value) {
+  if (value == nullptr || UseCompressedOops || !g1_remote_mode_active()) {
+    return value;
+  }
+  return cast_to_oop(G1BarrierSetRuntime::handleify_old_oop_for_store((oopDesc*)value));
+}
+
 inline void G1BarrierSet::enqueue_preloaded(oop pre_val) {
   // Nulls should have been already filtered.
   oop resolved = resolve_oop_raw(pre_val);
@@ -313,6 +320,7 @@ template <typename T>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap(T* addr, oop new_value) {
   new_value = g1_resolve_remote_oop_if_needed(new_value, G1RemoteAccessHintField);
+  new_value = g1_handleify_old_oop_for_store_if_needed(new_value);
   ModRef::oop_store_in_heap(addr, new_value);
 }
 
@@ -326,6 +334,7 @@ oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
       return;
     }
   }
+  new_value = g1_handleify_old_oop_for_store_if_needed(new_value);
   ModRef::oop_store_in_heap_at(base, offset, new_value);
 }
 
@@ -335,6 +344,8 @@ inline oop G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_atomic_cmpxchg_in_heap(T* addr, oop compare_value, oop new_value) {
   BarrierSetT* bs = barrier_set_cast<BarrierSetT>(barrier_set());
   bs->template write_ref_field_pre<decorators>(addr);
+  new_value = g1_resolve_remote_oop_if_needed(new_value, G1RemoteAccessHintAtomic);
+  new_value = g1_handleify_old_oop_for_store_if_needed(new_value);
 
   oop result = Raw::oop_atomic_cmpxchg(addr, compare_value, new_value);
   if (result == compare_value) {

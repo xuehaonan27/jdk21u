@@ -202,6 +202,7 @@ protected:
   static const TypeFunc* write_ref_field_pre_entry_Type();
   static const TypeFunc* write_ref_field_post_entry_Type();
 
+  virtual Node* store_at_resolved(C2Access& access, C2AccessValue& val) const;
   virtual Node* load_at_resolved(C2Access& access, const Type* val_type) const;
 
 #ifdef ASSERT
@@ -212,11 +213,14 @@ protected:
 
   static bool is_g1_pre_val_load(Node* n);
 public:
+  static const TypeFunc* handleify_old_oop_for_store_Type();
   virtual void* create_barrier_state(Arena* comp_arena) const;
   virtual void emit_stubs(CodeBuffer& cb) const;
   virtual int estimate_stub_size() const;
   virtual Node* atomic_cmpxchg_val_at_resolved(C2AtomicParseAccess& access, Node* expected_val,
                                                 Node* new_val, const Type* val_type) const;
+  virtual Node* atomic_cmpxchg_bool_at_resolved(C2AtomicParseAccess& access, Node* expected_val,
+                                                Node* new_val, const Type* value_type) const;
   virtual Node* atomic_xchg_at_resolved(C2AtomicParseAccess& access, Node* new_val, const Type* val_type) const;
 
   virtual bool is_gc_pre_barrier_node(Node* node) const;

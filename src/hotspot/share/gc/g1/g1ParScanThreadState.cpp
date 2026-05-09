@@ -838,45 +838,25 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
         uintptr_t existing_cls = mw.remote_class();
 
         if (existing_cls == markWord::remote_class_shared) {
-          // Already SHARED. No re-tagging — heap slots stay as-is.
-          // Re-tagging without stale validation caused SIGSEGV in release builds.
-          goto next_entry;
+          // Old generation is handle-managed. Even if the object already has
+          // SHARED metadata, newly discovered promotion ref-sites still need
+          // to be rewritten through the stable Handle below.
         }
 
         if (existing_cls == markWord::remote_class_unique) {
-          // Already UNIQUE. If RC increased, upgrade to Shared (mark word only).
-          if (info.count > 1) {
-            obj->set_mark(mw.set_remote_class(markWord::remote_class_shared));
-            shared_count++;
-          }
-          goto next_entry;
+          // UNIQUE is no longer a heap-slot representation for remotely
+          // manageable old objects. Upgrade through the shared handle path.
         }
 
         // New classification for this object.
-        // Determine if tagging is safe: skip arrays and JVM-internal types
-        // that are accessed by non-barrier paths (arraycopy, MH dispatch).
-        bool in_cold_region = dest->is_cold_destination() && !dest->is_root_pinned();
-        // Persistent promotion-time heap-slot tagging is disabled. Phase C still
-        // performs bounded STW tagging for explicit remote eviction attempts.
-        bool safe_to_tag = false;
-        if (safe_to_tag) {
-          Klass* k = obj->klass();
-          if (k->is_array_klass()) {
-            safe_to_tag = false;
-            tag_skip++;
-            // If array in cold region, pin the region (can't tag array refs)
-            if (in_cold_region) {
-              dest->set_root_pinned();
-              in_cold_region = false;
-            }
-          }
-        }
+        bool safe_to_tag = !UseCompressedOops;
 
-        // Cold region objects MUST use shared-handle path (for eviction).
-        // Force RC > 1 path so they get Handles + shared_oop tagging.
-        if (safe_to_tag && in_cold_region && info.count == 1) {
-          // Treat as shared (RC > 1) for eviction purposes
-          info.count = 2;  // Force shared path
+        // Old-generation objects are handle-managed under remote mode: do not
+        // create new long-lived UNIQUE/direct heap slots. Ref-sites that cannot
+        // carry an uncompressed shared_oop are left clean and will be handled by
+        // the conservative eviction-time tagging path.
+        if (safe_to_tag && info.count == 1) {
+          info.count = 2;
         }
 
         if (info.count == 1) {
@@ -886,33 +866,6 @@ void G1ParScanThreadStateSet::process_oop_classification_fixup() {
           obj->set_mark(new_mw);
           dest->set_has_classified_objects();
           _g1h->remote_memory_manager()->record_hotness(new_mw, obj->size());
-          if (safe_to_tag && !info.first_site._is_narrow) {
-            oop* p = (oop*)info.first_site._ref_site;
-            // Verify ref-site before writing
-            if (_g1h->is_in((void*)p)) {
-              // Load raw to avoid debug oop constructor check for tagged values.
-              oop resolved = resolve_oop_raw(cast_to_oop(*(uintptr_t*)p));
-              if (resolved == obj) {
-                *p = g1_make_unique_oop(obj);
-                // Dirty card so future GCs discover this tagged cross-region ref.
-                // The evacuation write_ref_field_post dirtied the card earlier,
-                // but classification overwrites the value; ensure the card stays
-                // dirty for concurrent refinement to build the correct remset entry.
-                CardTable::CardValue* card = _g1h->card_table()->byte_for((HeapWord*)p);
-                if (*card != G1CardTable::g1_young_card_val()) {
-                  *card = CardTable::dirty_card_val();
-                }
-              } else {
-                // Stale ref-site: value doesn't match expected object.
-                // This ref-site was recorded during evacuation but the slot
-                // was subsequently updated. Do NOT tag — would corrupt data.
-                log_warning(gc)("TagRefSite SKIP stale UNIQUE: p=" PTR_FORMAT
-                  " expected=" PTR_FORMAT " resolved=" PTR_FORMAT,
-                  p2i(p), p2i((void*)obj), p2i((void*)resolved));
-                stale_skip++;
-              }
-            }
-          }
           unique_count++;
         } else {
           uint32_t cur_epoch = _g1h->remote_memory_manager()->gc_epoch() & 0xF;

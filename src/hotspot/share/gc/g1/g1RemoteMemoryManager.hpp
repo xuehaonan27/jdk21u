@@ -1056,15 +1056,6 @@ public:
     add_tagged_field_entry(entry);
   }
 
-  void add_direct_tagged_field(oop* field_addr, uintptr_t tagged_raw) {
-    TaggedFieldEntry entry;
-    entry._field_addr = field_addr;
-    entry._handle = nullptr;
-    entry._tagged_raw = tagged_raw;
-    entry._kind = TaggedFieldDirect;
-    add_tagged_field_entry(entry);
-  }
-
   int tagged_field_count() const { return _tagged_field_count; }
   const TaggedFieldEntry* tagged_fields() const { return _tagged_fields; }
   int last_phase_c_tagged() const { return _last_phase_c_tagged; }

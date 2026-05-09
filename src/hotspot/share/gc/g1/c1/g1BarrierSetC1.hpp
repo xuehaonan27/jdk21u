@@ -217,6 +217,7 @@ class G1BarrierSetC1 : public ModRefBarrierSetC1 {
                            LIR_Opr pre_val, CodeEmitInfo* info);
   virtual void post_barrier(LIRAccess& access, LIR_Opr addr, LIR_Opr new_val);
 
+  virtual void store_at_resolved(LIRAccess& access, LIR_Opr value);
   virtual void load_at_resolved(LIRAccess& access, LIR_Opr result);
 
  public:

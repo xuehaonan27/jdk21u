@@ -247,6 +247,22 @@ void G1BarrierSetC1::post_barrier(LIRAccess& access, LIR_Opr addr, LIR_Opr new_v
   __ branch_destination(slow->continuation());
 }
 
+void G1BarrierSetC1::store_at_resolved(LIRAccess& access, LIR_Opr value) {
+  if (access.is_oop() && !UseCompressedOops &&
+      (LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    LIRGenerator* gen = access.gen();
+    LIR_OprList* args = new LIR_OprList(1);
+    args->append(value);
+    LIR_Opr handled_value = gen->new_register(T_OBJECT);
+    __ call_runtime_leaf(CAST_FROM_FN_PTR(address,
+                                          G1BarrierSetRuntime::handleify_old_oop_for_store),
+                         gen->getThreadTemp(), handled_value, args);
+    value = handled_value;
+  }
+  ModRefBarrierSetC1::store_at_resolved(access, value);
+}
+
 void G1BarrierSetC1::load_at_resolved(LIRAccess& access, LIR_Opr result) {
   DecoratorSet decorators = access.decorators();
   bool is_weak = (decorators & ON_WEAK_OOP_REF) != 0;

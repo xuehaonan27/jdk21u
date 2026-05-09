@@ -671,6 +671,11 @@ void G1BarrierSetAssembler::generate_c1_pre_barrier_runtime_stub(StubAssembler* 
   }
   __ jcc(Assembler::equal, done);
 
+  if (LocalMemoryRatio < 100 || G1TagRefSites ||
+      G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0) {
+    __ jmp(runtime);
+  }
+
   // Can we store original value in the thread's buffer?
 
   __ movptr(tmp, queue_index);

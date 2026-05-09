@@ -224,6 +224,26 @@ static uint32_t g1_c2_register_semantic_access_site(C2Access& access,
                                               kit == nullptr ? nullptr : kit->method());
 }
 
+static bool g1_c2_remote_store_handleify_active() {
+  return !UseCompressedOops &&
+         (LocalMemoryRatio < 100 || G1TagRefSites ||
+          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0);
+}
+
+static Node* g1_c2_handleify_store_value(GraphKit* kit, Node* value) {
+  if (kit == nullptr || value == nullptr || !g1_c2_remote_store_handleify_active()) {
+    return value;
+  }
+  IdealKit ideal(kit, true);
+  Node* handled = ideal.make_leaf_call(
+      G1BarrierSetC2::handleify_old_oop_for_store_Type(),
+      CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::handleify_old_oop_for_store),
+      "handleify_old_oop_for_store",
+      value);
+  kit->final_sync(ideal);
+  return handled;
+}
+
 const TypeFunc *G1BarrierSetC2::write_ref_field_pre_entry_Type() {
   const Type **fields = TypeTuple::fields(2);
   fields[TypeFunc::Parms+0] = TypeInstPtr::NOTNULL; // original field value
@@ -246,6 +266,18 @@ const TypeFunc *G1BarrierSetC2::write_ref_field_post_entry_Type() {
   // create result type (range)
   fields = TypeTuple::fields(0);
   const TypeTuple *range = TypeTuple::make(TypeFunc::Parms, fields);
+
+  return TypeFunc::make(domain, range);
+}
+
+const TypeFunc *G1BarrierSetC2::handleify_old_oop_for_store_Type() {
+  const Type **fields = TypeTuple::fields(1);
+  fields[TypeFunc::Parms+0] = TypeOopPtr::BOTTOM; // oop value
+  const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+1, fields);
+
+  fields = TypeTuple::fields(1);
+  fields[TypeFunc::Parms+0] = TypeOopPtr::BOTTOM;
+  const TypeTuple *range = TypeTuple::make(TypeFunc::Parms+1, fields);
 
   return TypeFunc::make(domain, range);
 }
@@ -434,26 +466,31 @@ void G1BarrierSetC2::pre_barrier(GraphKit* kit,
 
     // if (pre_val != nullptr)
     __ if_then(pre_val, BoolTest::ne, kit->null()); {
-      Node* buffer  = __ load(__ ctrl(), buffer_adr, TypeRawPtr::NOTNULL, T_ADDRESS, Compile::AliasIdxRaw);
-
-      // is the queue for this thread full?
-      __ if_then(index, BoolTest::ne, zeroX, likely); {
-
-        // decrement the index
-        Node* next_index = kit->gvn().transform(new SubXNode(index, __ ConX(sizeof(intptr_t))));
-
-        // Now get the buffer location we will log the previous value into and store it
-        Node *log_addr = __ AddP(no_base, buffer, next_index);
-        __ store(__ ctrl(), log_addr, pre_val, T_OBJECT, Compile::AliasIdxRaw, MemNode::unordered);
-        // update the index
-        __ store(__ ctrl(), index_adr, next_index, index_bt, Compile::AliasIdxRaw, MemNode::unordered);
-
-      } __ else_(); {
-
-        // logging buffer is full, call the runtime
+      if (g1_c2_remote_store_handleify_active()) {
         const TypeFunc *tf = write_ref_field_pre_entry_Type();
         __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_pre_entry), "write_ref_field_pre_entry", pre_val, tls);
-      } __ end_if();  // (!index)
+      } else {
+        Node* buffer  = __ load(__ ctrl(), buffer_adr, TypeRawPtr::NOTNULL, T_ADDRESS, Compile::AliasIdxRaw);
+
+        // is the queue for this thread full?
+        __ if_then(index, BoolTest::ne, zeroX, likely); {
+
+          // decrement the index
+          Node* next_index = kit->gvn().transform(new SubXNode(index, __ ConX(sizeof(intptr_t))));
+
+          // Now get the buffer location we will log the previous value into and store it
+          Node *log_addr = __ AddP(no_base, buffer, next_index);
+          __ store(__ ctrl(), log_addr, pre_val, T_OBJECT, Compile::AliasIdxRaw, MemNode::unordered);
+          // update the index
+          __ store(__ ctrl(), index_adr, next_index, index_bt, Compile::AliasIdxRaw, MemNode::unordered);
+
+        } __ else_(); {
+
+          // logging buffer is full, call the runtime
+          const TypeFunc *tf = write_ref_field_pre_entry_Type();
+          __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_pre_entry), "write_ref_field_pre_entry", pre_val, tls);
+        } __ end_if();  // (!index)
+      }
     } __ end_if();  // (pre_val != nullptr)
   } __ end_if();  // (!marking)
 
@@ -775,6 +812,15 @@ void G1BarrierSetC2::insert_pre_barrier(GraphKit* kit, Node* base_oop, Node* off
 }
 
 #undef __
+
+Node* G1BarrierSetC2::store_at_resolved(C2Access& access, C2AccessValue& val) const {
+  if (access.is_oop() && access.is_parse_access()) {
+    C2ParseAccess& parse_access = static_cast<C2ParseAccess&>(access);
+    Node* handled = g1_c2_handleify_store_value(parse_access.kit(), val.node());
+    val.set_node(handled);
+  }
+  return ModRefBarrierSetC2::store_at_resolved(access, val);
+}
 
 Node* G1BarrierSetC2::load_at_resolved(C2Access& access, const Type* val_type) const {
   DecoratorSet decorators = access.decorators();
@@ -1276,13 +1322,31 @@ Node* G1BarrierSetC2::atomic_cmpxchg_val_at_resolved(C2AtomicParseAccess& access
     access.set_barrier_data(g1_barrier_data_with_access_hint(
         g1_remote_access_hint_for_c2(access.decorators(), true)));
   }
+  if (access.is_oop()) {
+    new_val = g1_c2_handleify_store_value(access.kit(), new_val);
+  }
   return CardTableBarrierSetC2::atomic_cmpxchg_val_at_resolved(access, expected_val, new_val, val_type);
+}
+
+Node* G1BarrierSetC2::atomic_cmpxchg_bool_at_resolved(C2AtomicParseAccess& access, Node* expected_val,
+                                                       Node* new_val, const Type* value_type) const {
+  if (!UseCompressedOops && access.is_oop() && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
+    access.set_barrier_data(g1_barrier_data_with_access_hint(
+        g1_remote_access_hint_for_c2(access.decorators(), true)));
+  }
+  if (access.is_oop()) {
+    new_val = g1_c2_handleify_store_value(access.kit(), new_val);
+  }
+  return CardTableBarrierSetC2::atomic_cmpxchg_bool_at_resolved(access, expected_val, new_val, value_type);
 }
 
 Node* G1BarrierSetC2::atomic_xchg_at_resolved(C2AtomicParseAccess& access, Node* new_val, const Type* val_type) const {
   if (!UseCompressedOops && access.is_oop() && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
     access.set_barrier_data(g1_barrier_data_with_access_hint(
         g1_remote_access_hint_for_c2(access.decorators(), true)));
+  }
+  if (access.is_oop()) {
+    new_val = g1_c2_handleify_store_value(access.kit(), new_val);
   }
   return CardTableBarrierSetC2::atomic_xchg_at_resolved(access, new_val, val_type);
 }

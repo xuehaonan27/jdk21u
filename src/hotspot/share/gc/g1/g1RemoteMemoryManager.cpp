@@ -1240,23 +1240,6 @@ bool G1RemoteMemoryManager::scan_dense_segment_region(HeapRegion* hr,
       _edge_count++;
     }
 
-    void add_direct_edge(oop* field, uintptr_t target_addr) {
-      if (!_ok) {
-        return;
-      }
-      if (_build_edges && !ensure_capacity()) {
-        return;
-      }
-      uint32_t offset = (uint32_t)((uintptr_t)field - (uintptr_t)_bottom);
-      if (_build_edges) {
-        _edges[_edge_count].field_offset = offset;
-        _edges[_edge_count].kind = DenseSegmentEdgeDirect;
-        _edges[_edge_count].target_handle = nullptr;
-        _edges[_edge_count].target_addr = target_addr & G1_OOP_ADDR_MASK;
-      }
-      _edge_count++;
-    }
-
     bool valid_local_target(uintptr_t target_addr, oop* field) {
       if (!is_aligned((address)target_addr, HeapWordSize)) {
         fail("unaligned-oop");
@@ -1269,8 +1252,8 @@ bool G1RemoteMemoryManager::scan_dense_segment_region(HeapRegion* hr,
       }
 
       if (_rmm->is_dense_segment_remote_addr(target_addr)) {
-        add_direct_edge(field, target_addr);
-        return true;
+        fail("dense-direct-edge-disabled");
+        return false;
       }
 
       if (!_g1h->is_in_reserved((void*)target_addr) ||
@@ -1712,6 +1695,7 @@ void G1RemoteMemoryManager::patch_dense_segment_boundary_edges(DenseSegmentEntry
   int nulled = 0;
   int invalid = 0;
   bool direct_entries_locked = false;
+  RemoteHandleAllocBuffer hab;
 
   uintptr_t base = (uintptr_t)hr->bottom();
   for (uint32_t i = 0; i < count; i++) {
@@ -1727,42 +1711,30 @@ void G1RemoteMemoryManager::patch_dense_segment_boundary_edges(DenseSegmentEntry
       RemoteHandle* alias = nullptr;
       DenseDirectTargetState target_state =
           classify_dense_direct_target(this, _g1h, target_addr, &alias, nullptr);
-      if (target_state == DenseDirectTargetRemote) {
-        uintptr_t tagged = G1_OOP_MANAGED_BIT | target_addr;
-        *field = tagged;
+      if (target_state == DenseDirectTargetLocal) {
+        RemoteHandle* h =
+            ensure_dormant_anchor_for(cast_to_oop((HeapWord*)target_addr), &hab);
+        if (h == nullptr) {
+          *field = 0;
+          nulled++;
+          invalid++;
+          continue;
+        }
+        h->increment_remote_refcount();
+        *field = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
         if (!direct_entries_locked) {
           tagged_field_lock();
           direct_entries_locked = true;
         }
         TaggedFieldEntry tagged_entry;
         tagged_entry._field_addr = (oop*)field;
-        tagged_entry._handle = nullptr;
-        tagged_entry._tagged_raw = tagged;
-        tagged_entry._kind = TaggedFieldDirect;
+        tagged_entry._handle = h;
+        tagged_entry._tagged_raw = 0;
+        tagged_entry._kind = TaggedFieldDenseHandle;
         add_tagged_field_entry_locked(tagged_entry);
-        direct++;
-        direct_tracked++;
-        continue;
-      } else if (target_state == DenseDirectTargetLocal) {
-        // This edge was recorded while the target was a remote dense segment.
-        // Keep that provenance encoded in the field even when the target is
-        // currently local: dense segment residency can change after this
-        // mutator-side localization, while compiled load barriers only enter
-        // the resolver for managed/tagged values.
-        uintptr_t tagged = G1_OOP_MANAGED_BIT | target_addr;
-        *field = tagged;
-        if (!direct_entries_locked) {
-          tagged_field_lock();
-          direct_entries_locked = true;
-        }
-        TaggedFieldEntry tagged_entry;
-        tagged_entry._field_addr = (oop*)field;
-        tagged_entry._handle = nullptr;
-        tagged_entry._tagged_raw = tagged;
-        tagged_entry._kind = TaggedFieldDirect;
-        add_tagged_field_entry_locked(tagged_entry);
-        direct++;
-        direct_tracked++;
+        shared++;
+        direct_shared++;
+        handle_tracked++;
         continue;
       } else if (target_state == DenseDirectTargetAlias && alias != nullptr) {
         alias->increment_remote_refcount();
@@ -1783,6 +1755,11 @@ void G1RemoteMemoryManager::patch_dense_segment_boundary_edges(DenseSegmentEntry
         continue;
       }
 
+      if (target_state == DenseDirectTargetRemote) {
+        log_debug(gc)("Dense segment boundary patch: dropping legacy direct edge "
+                      "without handle target=" PTR_FORMAT " region=%u",
+                      p2i((void*)target_addr), hr->hrm_index());
+      }
       *field = 0;
       nulled++;
       invalid++;
@@ -3288,6 +3265,7 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
   int                    _untaggable_reports_left;
   oop                    _cur_obj;
   bool                   _allow_unknown_heap_source;
+  RemoteHandleAllocBuffer _hab;
 
   typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
   TaggedFieldEntry* _local_buf;
@@ -3317,15 +3295,6 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
     local_buf_add_entry(entry);
   }
 
-  void local_buf_add_direct(oop* field_addr, uintptr_t tagged_raw) {
-    TaggedFieldEntry entry;
-    entry._field_addr = field_addr;
-    entry._handle = nullptr;
-    entry._tagged_raw = tagged_raw;
-    entry._kind = G1RemoteMemoryManager::TaggedFieldDirect;
-    local_buf_add_entry(entry);
-  }
-
   void remember_old_cset_source(oop* p, const char* reason) {
     if (p == nullptr) {
       return;
@@ -3351,7 +3320,7 @@ public:
     : _rmm(rmm), _g1h(g1h), _eviction_set(eset),
       _num_regions(nregions), _tagged(0), _no_handle(0),
       _untaggable(0), _untaggable_reports_left(10), _cur_obj(nullptr),
-      _allow_unknown_heap_source(allow_unknown_heap_source),
+      _allow_unknown_heap_source(allow_unknown_heap_source), _hab(),
       _local_buf(nullptr), _local_count(0), _local_capacity(0) {}
 
   ~EvictionSetTagClosure() {
@@ -3456,17 +3425,10 @@ public:
       }
     }
 
-    if (_rmm->dense_segments_enabled() && target_klass != nullptr) {
-      uintptr_t tagged_raw = G1_OOP_MANAGED_BIT |
-                             (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
-      *(uintptr_t*)p = tagged_raw;
-      local_buf_add_direct(p, tagged_raw);
-      remember_old_cset_source(p, "phase-c-dense-direct");
-      _tagged++;
-      return;
-    }
-
     RemoteHandle* h = _rmm->handle_for(target);
+    if (h == nullptr) {
+      h = _rmm->ensure_handle_for(target, &_hab);
+    }
     if (h != nullptr) {
       *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
       local_buf_add(p, h);
@@ -5202,8 +5164,10 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
       DenseDirectTargetState target_state =
           classify_dense_direct_target(this, _g1h, addr, &alias, nullptr);
       if (target_state == DenseDirectTargetRemote) {
-        _tagged_fields[retained++] = _tagged_fields[i];
-        direct_retained++;
+        *(uintptr_t*)field_addr = 0;
+        dirty_cards.dirty_field(field_addr);
+        direct_nulled++;
+        removed++;
         continue;
       }
       if (target_state == DenseDirectTargetAlias && alias != nullptr) {
@@ -5228,8 +5192,10 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
       }
 
       if (is_dense_segment_managed_addr(addr)) {
-        _tagged_fields[retained++] = _tagged_fields[i];
-        direct_retained++;
+        *(uintptr_t*)field_addr = 0;
+        dirty_cards.dirty_field(field_addr);
+        direct_nulled++;
+        removed++;
         continue;
       }
 
@@ -5392,7 +5358,10 @@ int G1RemoteMemoryManager::cleanup_recorded_direct_refs_after_dense_phase() {
         classify_dense_direct_target(this, _g1h, addr, &alias, nullptr);
     if (target_state == DenseDirectTargetRemote) {
       dropped_remote++;
-      _tagged_fields[retained++] = entry;
+      *(uintptr_t*)field_addr = 0;
+      dirty_cards.dirty_field(field_addr);
+      nulled++;
+      removed++;
       continue;
     }
     if (target_state == DenseDirectTargetAlias && alias != nullptr) {
@@ -5494,6 +5463,11 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
       DenseDirectTargetState target_state =
           classify_dense_direct_target(_rmm, _g1h, addr, &alias, nullptr);
       if (target_state == DenseDirectTargetRemote) {
+        *(uintptr_t*)p = 0;
+        if (_dirty_cards != nullptr) {
+          _dirty_cards->dirty_field(p);
+        }
+        _nulled++;
         return;
       }
       if (target_state == DenseDirectTargetAlias && alias != nullptr) {
@@ -5599,6 +5573,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     oop                    _cur_obj;
     volatile int*          _repair_budget;
     volatile int*          _report_budget;
+    RemoteHandleAllocBuffer _hab;
 
     typedef G1RemoteMemoryManager::TaggedFieldEntry TaggedFieldEntry;
     TaggedFieldEntry*      _local_buf;
@@ -5625,15 +5600,6 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       entry._handle = h;
       entry._tagged_raw = 0;
       entry._kind = G1RemoteMemoryManager::TaggedFieldHandle;
-      local_buf_add_entry(entry);
-    }
-
-    void local_buf_add_direct(oop* field_addr, uintptr_t tagged_raw) {
-      TaggedFieldEntry entry;
-      entry._field_addr = field_addr;
-      entry._handle = nullptr;
-      entry._tagged_raw = tagged_raw;
-      entry._kind = G1RemoteMemoryManager::TaggedFieldDirect;
       local_buf_add_entry(entry);
     }
 
@@ -5734,23 +5700,6 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         return false;
       }
       remember_old_cset_source(p, "verify-stale-alias");
-
-      if (_rmm->dense_segments_enabled() &&
-          _rmm->is_dense_segment_remote_addr(addr)) {
-        uintptr_t tagged_raw = G1_OOP_MANAGED_BIT | (addr & G1_OOP_ADDR_MASK);
-        *(uintptr_t*)p = tagged_raw;
-        local_buf_add_direct(p, tagged_raw);
-        _stale_alias_repaired++;
-        if (_stale_alias_repaired <= 20) {
-          log_warning(gc)("VERIFY stale-alias: repaired dense-direct field="
-                          PTR_FORMAT " raw=" PTR_FORMAT " reason=%s region=%u "
-                          "src_obj=" PTR_FORMAT,
-                          p2i(p), p2i((void*)addr), reason,
-                          hr == nullptr ? 9999 : hr->hrm_index(),
-                          p2i((void*)_cur_obj));
-        }
-        return true;
-      }
 
       RemoteHandle* h = _rmm->handle_for_stale_eviction_addr(addr);
       if (h == nullptr) {
@@ -5866,7 +5815,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         _src_region_counts(NEW_C_HEAP_ARRAY(int, nregions, mtGC)),
         _target_region_counts(NEW_C_HEAP_ARRAY(int, nregions, mtGC)),
         _cur_obj(nullptr),
-        _repair_budget(repair_budget), _report_budget(report_budget),
+        _repair_budget(repair_budget), _report_budget(report_budget), _hab(),
         _local_buf(nullptr), _local_count(0), _local_capacity(0) {
       memset(_src_region_counts, 0, nregions * sizeof(int));
       memset(_target_region_counts, 0, nregions * sizeof(int));
@@ -6025,29 +5974,20 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         if (untaggable_source) {
           _repair_untaggable++;
         } else {
-          if (_rmm->dense_segments_enabled() && target_klass != nullptr) {
+          RemoteHandle* h = _rmm->handle_for(target);
+          if (h == nullptr) {
+            h = _rmm->ensure_handle_for(target, &_hab);
+          }
+          if (h != nullptr) {
             if (can_repair_next()) {
-              uintptr_t tagged_raw = G1_OOP_MANAGED_BIT |
-                                     (cast_from_oop<uintptr_t>(target) & G1_OOP_ADDR_MASK);
-              *(uintptr_t*)p = tagged_raw;
-              local_buf_add_direct(p, tagged_raw);
+              *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+              local_buf_add(p, h);
               _repaired++;
             } else {
               _repair_limit_skipped++;
             }
           } else {
-            RemoteHandle* h = _rmm->handle_for(target);
-            if (h != nullptr) {
-              if (can_repair_next()) {
-                *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
-                local_buf_add(p, h);
-                _repaired++;
-              } else {
-                _repair_limit_skipped++;
-              }
-            } else {
-              _repair_no_handle++;
-            }
+            _repair_no_handle++;
           }
         }
       }
@@ -7597,6 +7537,7 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
   int direct_nulled = 0;
   int write_idx = 0;
   G1RemoteRollbackDirtyCards dirty_cards(_g1h);
+  RemoteHandleAllocBuffer hab;
 
   for (int i = 0; i < _tagged_field_count; i++) {
     TaggedFieldEntry entry = _tagged_fields[i];
@@ -7642,8 +7583,10 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
       DenseDirectTargetState target_state =
           classify_dense_direct_target(this, _g1h, addr, &alias, nullptr);
       if (target_state == DenseDirectTargetRemote) {
-        _tagged_fields[write_idx++] = entry;
-        direct_retained++;
+        *(uintptr_t*)field_addr = 0;
+        dirty_cards.dirty_field(field_addr);
+        direct_nulled++;
+        removed++;
         continue;
       }
 
@@ -7669,18 +7612,30 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
       oop target_oop = cast_to_oop((HeapWord*)addr);
       markWord m = target_oop->mark();
       if (m.is_marked()) {
-        oop forwardee = cast_to_oop(m.decode_pointer());
-        uintptr_t new_raw = G1_OOP_MANAGED_BIT |
-                            (cast_from_oop<uintptr_t>(forwardee) &
-                             G1_OOP_ADDR_MASK);
-        *(uintptr_t*)field_addr = new_raw;
-        dirty_cards.dirty_field(field_addr);
-        entry._tagged_raw = new_raw;
+        target_oop = cast_to_oop(m.decode_pointer());
         direct_updated++;
       }
 
+      RemoteHandle* direct_target = handle_for(target_oop);
+      if (direct_target == nullptr) {
+        direct_target = ensure_handle_for(target_oop, &hab);
+      }
+      if (direct_target == nullptr) {
+        *(uintptr_t*)field_addr = 0;
+        dirty_cards.dirty_field(field_addr);
+        direct_nulled++;
+        removed++;
+        continue;
+      }
+      *(uintptr_t*)field_addr =
+          G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)direct_target;
+      dirty_cards.dirty_field(field_addr);
+      entry._handle = direct_target;
+      entry._tagged_raw = 0;
+      entry._kind = TaggedFieldHandle;
+
       _tagged_fields[write_idx++] = entry;
-      direct_retained++;
+      direct_converted++;
       continue;
     }
 

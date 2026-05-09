@@ -57,6 +57,8 @@ void G1BarrierSetRuntime::write_ref_array_post_entry(HeapWord* dst, size_t lengt
   bs->G1BarrierSet::write_ref_array(dst, length);
 }
 
+static bool remote_resolve_enabled();
+
 // G1 pre write barrier slowpath
 JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_pre_entry(oopDesc* orig, JavaThread* thread))
   assert(thread == JavaThread::current(), "pre-condition");
@@ -93,6 +95,58 @@ JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_post_entry(volatile G1CardTa
   assert(thread == JavaThread::current(), "pre-condition");
   G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(thread);
   G1BarrierSet::dirty_card_queue_set().enqueue(queue, card_addr);
+JRT_END
+
+JRT_LEAF(oopDesc*, G1BarrierSetRuntime::handleify_old_oop_for_store(oopDesc* value))
+  if (value == nullptr || !remote_resolve_enabled() || UseCompressedOops) {
+    return value;
+  }
+
+  uintptr_t raw = (uintptr_t)value;
+  if ((raw & G1_OOP_TAG_MASK) != 0) {
+    if ((raw & G1_OOP_INDIRECT_BIT) != 0) {
+      return value;
+    }
+    oop resolved = resolve_oop_raw(cast_to_oop(value));
+    if (resolved == nullptr) {
+      return value;
+    }
+    value = (oopDesc*)resolved;
+    raw = (uintptr_t)value;
+  }
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  if (g1h == nullptr || !g1h->is_in_reserved((void*)raw)) {
+    return value;
+  }
+
+  HeapRegion* hr = g1h->heap_region_containing_or_null((void*)raw);
+  G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+  if (hr == nullptr || hr->is_free() || hr->is_evict_guarded() ||
+      !g1h->is_in((void*)raw)) {
+    RemoteHandle* stale = rmm == nullptr ? nullptr :
+        rmm->handle_for_addr_any_state(raw);
+    if (stale == nullptr) {
+      return nullptr;
+    }
+    uintptr_t state = stale->load_state_and_addr_acquire() &
+                      REMOTE_HANDLE_STATE_MASK;
+    return state == REMOTE_HANDLE_DEAD ? nullptr :
+        (oopDesc*)(G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT |
+                   (uintptr_t)stale);
+  }
+
+  if (!hr->is_old() && !hr->is_starts_humongous() && !hr->is_fetch_cache()) {
+    return value;
+  }
+
+  RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for(cast_to_oop(value));
+  if (h == nullptr) {
+    return value;
+  }
+  uintptr_t state = h->load_state_and_addr_acquire() & REMOTE_HANDLE_STATE_MASK;
+  return state == REMOTE_HANDLE_DEAD ? nullptr :
+      (oopDesc*)(G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h);
 JRT_END
 
 // ============================================================
@@ -252,7 +306,11 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
         if (stale_raw) {
           G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
           if (rmm != nullptr && rmm->is_dense_segment_remote_addr(v)) {
-            return (oopDesc*)(G1_OOP_MANAGED_BIT | (v & G1_OOP_ADDR_MASK));
+            if (rmm->localize_dense_segment_for_addr(v) &&
+                g1_remote_resolved_oop_is_usable(g1h, v)) {
+              return (oopDesc*)v;
+            }
+            return nullptr;
           }
           RemoteHandle* h = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(v);
           if (h != nullptr) {
