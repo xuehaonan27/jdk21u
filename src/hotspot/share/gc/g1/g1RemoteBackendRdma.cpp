@@ -25,6 +25,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <infiniband/verbs.h>
 
@@ -107,6 +109,60 @@ static bool tcp_recv_exact(int fd, void* buf, size_t len) {
     p += n; len -= n;
   }
   return true;
+}
+
+static bool tcp_connect_with_timeout(int fd, const struct sockaddr_in* addr,
+                                     int timeout_ms) {
+  int old_flags = ::fcntl(fd, F_GETFL, 0);
+  if (old_flags < 0) {
+    return false;
+  }
+  if (::fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) < 0) {
+    return false;
+  }
+
+  bool ok = false;
+  int connect_errno = 0;
+  if (::connect(fd, (const struct sockaddr*)addr, sizeof(*addr)) == 0) {
+    ok = true;
+  } else if (errno == EINPROGRESS) {
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+
+    int pr;
+    do {
+      pr = ::poll(&pfd, 1, timeout_ms);
+    } while (pr < 0 && errno == EINTR);
+
+    if (pr > 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP)) != 0) {
+      socklen_t len = sizeof(connect_errno);
+      if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &connect_errno, &len) == 0 &&
+          connect_errno == 0) {
+        ok = true;
+      }
+    } else if (pr == 0) {
+      connect_errno = ETIMEDOUT;
+    } else {
+      connect_errno = errno;
+    }
+  } else {
+    connect_errno = errno;
+  }
+
+  int restore_errno = ok ? 0 : connect_errno;
+  (void)::fcntl(fd, F_SETFL, old_flags);
+  if (!ok && restore_errno != 0) {
+    errno = restore_errno;
+  }
+  return ok;
+}
+
+static void configure_tcp_bootstrap_socket(int fd) {
+  int one = 1;
+  (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  (void)::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
 }
 
 // ================================================================
@@ -557,6 +613,7 @@ bool RDMAExecutorBackend::initialize() {
   log_info(gc)("RDMA: trying to open TCP socket");
   _tcp_fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (_tcp_fd < 0) { log_warning(gc)("RDMA: socket failed"); return false; }
+  configure_tcp_bootstrap_socket(_tcp_fd);
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -567,8 +624,10 @@ bool RDMAExecutorBackend::initialize() {
     return false;
   }
 
-  log_info(gc)("RDMA: trying to connect to TCP socket");
-  if (::connect(_tcp_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+  const int connect_timeout_ms = 5000;
+  log_info(gc)("RDMA: trying to connect to TCP socket %s:%d (timeout=%dms)",
+               host, port, connect_timeout_ms);
+  if (!tcp_connect_with_timeout(_tcp_fd, &addr, connect_timeout_ms)) {
     log_warning(gc)("RDMA: TCP connect to %s:%d failed: %s", host, port, os::strerror(errno));
     return false;
   }

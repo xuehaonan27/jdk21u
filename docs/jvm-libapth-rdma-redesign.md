@@ -461,6 +461,14 @@ Current decisions:
 - Use libapth only where the JVM can yield before kernel blocking.
 - Keep correctness conservative even if the first chunk-GC policy retains extra
   remote data.
+- The current x86 signal path treats SIGSEGV on an evict-guarded G1 region as
+  fatal.  Therefore `mprotect` is only a last-resort correctness mechanism in
+  the current prototype, not a cheap miss path.  The performance path must
+  localize or prefetch before a raw CPU load reaches the protected range.
+- Phase C.5 full-heap verification is currently correctness work, not stale
+  diagnostics: disabling it can leave raw refs that fault on guarded dense
+  regions.  The next optimization should replace it with remembered-source /
+  card-summary validation and repair, not simply skip it.
 
 Open decisions:
 
