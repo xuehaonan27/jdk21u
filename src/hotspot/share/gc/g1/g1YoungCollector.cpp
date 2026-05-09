@@ -3460,13 +3460,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       bool phase_c5_full_heap = true;
       if (run_phase_c5_for_candidates && G1RemoteUseFastPhaseC) {
         if (force_dense_phase_c5) {
-          if (!G1RemoteVerifyEvictionRefs) {
-            if (G1RemoteFastPhaseCVerifyInterval == 0) {
-              phase_c5_full_heap = false;
-            } else if (G1RemoteFastPhaseCVerifyInterval > 1) {
-              phase_c5_full_heap =
-                  (rmm->gc_epoch() % G1RemoteFastPhaseCVerifyInterval) == 0;
-            }
+          if (G1RemoteFastPhaseCVerifyInterval == 0) {
+            phase_c5_full_heap = false;
+          } else if (G1RemoteFastPhaseCVerifyInterval > 1) {
+            phase_c5_full_heap =
+                (rmm->gc_epoch() % G1RemoteFastPhaseCVerifyInterval) == 0;
           }
         } else if (G1RemoteFastPhaseCVerifyInterval == 0) {
           run_phase_c5_for_candidates = false;
