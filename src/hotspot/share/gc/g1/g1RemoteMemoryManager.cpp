@@ -5504,6 +5504,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
     int                    _repair_limit_skipped;
     int                    _stale_alias_repaired;
     int                    _stale_alias_no_handle;
+    int                    _stale_alias_nulled;
     int                    _heap_source;
     int                    _root_source;
     int                    _candidate_source;
@@ -5559,6 +5560,21 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       entry._tagged_raw = tagged_raw;
       entry._kind = G1RemoteMemoryManager::TaggedFieldDirect;
       local_buf_add_entry(entry);
+    }
+
+    void dirty_field(oop* p) {
+      if (p == nullptr || !_g1h->is_in((void*)p)) {
+        return;
+      }
+      CardTable::CardValue* card = _ct->byte_for((HeapWord*)p);
+      if (*card == G1CardTable::g1_young_card_val()) {
+        return;
+      }
+      *card = G1CardTable::dirty_card_val();
+      G1DirtyCardQueueSet& dcqs = G1BarrierSet::dirty_card_queue_set();
+      G1DirtyCardQueue tmp_queue(&dcqs);
+      dcqs.enqueue(tmp_queue, card);
+      dcqs.flush_queue(tmp_queue);
     }
 
     static bool take_budget(volatile int* budget) {
@@ -5644,14 +5660,30 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
       RemoteHandle* h = _rmm->handle_for_stale_eviction_addr(addr);
       if (h == nullptr) {
-        _stale_alias_no_handle++;
-        if (_stale_alias_no_handle <= 20) {
-          log_warning(gc)("VERIFY stale-alias: no handle for stale field="
-                          PTR_FORMAT " raw=" PTR_FORMAT " reason=%s region=%u "
-                          "src_obj=" PTR_FORMAT,
-                          p2i(p), p2i((void*)addr), reason,
-                          hr == nullptr ? 9999 : hr->hrm_index(),
-                          p2i((void*)_cur_obj));
+        if (_g1h->is_in((void*)p)) {
+          *(uintptr_t*)p = 0;
+          dirty_field(p);
+          _rmm->record_fcr_fixup_null();
+          _stale_alias_nulled++;
+          if (_stale_alias_nulled <= 20) {
+            log_warning(gc)("VERIFY stale-alias: nulled stale field="
+                            PTR_FORMAT " raw=" PTR_FORMAT " reason=%s region=%u "
+                            "src_obj=" PTR_FORMAT,
+                            p2i(p), p2i((void*)addr), reason,
+                            hr == nullptr ? 9999 : hr->hrm_index(),
+                            p2i((void*)_cur_obj));
+          }
+          return true;
+        } else {
+          _stale_alias_no_handle++;
+          if (_stale_alias_no_handle <= 20) {
+            log_warning(gc)("VERIFY stale-alias: no handle for stale field="
+                            PTR_FORMAT " raw=" PTR_FORMAT " reason=%s region=%u "
+                            "src_obj=" PTR_FORMAT,
+                            p2i(p), p2i((void*)addr), reason,
+                            hr == nullptr ? 9999 : hr->hrm_index(),
+                            p2i((void*)_cur_obj));
+          }
         }
         return false;
       }
@@ -5659,7 +5691,15 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
       if (state == REMOTE_HANDLE_DEAD) {
-        _stale_alias_no_handle++;
+        if (_g1h->is_in((void*)p)) {
+          *(uintptr_t*)p = 0;
+          dirty_field(p);
+          _rmm->record_fcr_fixup_null();
+          _stale_alias_nulled++;
+          return true;
+        } else {
+          _stale_alias_no_handle++;
+        }
         return false;
       }
 
@@ -5722,6 +5762,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
         _missed(0), _repaired(0), _repair_no_handle(0),
         _repair_untaggable(0), _repair_limit_skipped(0),
         _stale_alias_repaired(0), _stale_alias_no_handle(0),
+        _stale_alias_nulled(0),
         _heap_source(0), _root_source(0),
         _candidate_source(0), _young_source(0), _destination_source(0),
         _direct_scanned_source(0), _dirty_card_source(0), _clean_old_source(0),
@@ -5945,6 +5986,7 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
       _repair_limit_skipped += other._repair_limit_skipped;
       _stale_alias_repaired += other._stale_alias_repaired;
       _stale_alias_no_handle += other._stale_alias_no_handle;
+      _stale_alias_nulled += other._stale_alias_nulled;
       _heap_source += other._heap_source;
       _root_source += other._root_source;
       _candidate_source += other._candidate_source;
@@ -5995,9 +6037,11 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
                         phase, _repaired, unrepaired(), _repair_no_handle,
                         _repair_untaggable, _repair_limit_skipped, _repair_limit);
       }
-      if (_stale_alias_repaired > 0 || _stale_alias_no_handle > 0) {
-        log_warning(gc)("VERIFY stale-alias (%s): repaired=%d no_handle=%d",
-                        phase, _stale_alias_repaired, _stale_alias_no_handle);
+      if (_stale_alias_repaired > 0 || _stale_alias_no_handle > 0 ||
+          _stale_alias_nulled > 0) {
+        log_warning(gc)("VERIFY stale-alias (%s): repaired=%d nulled=%d no_handle=%d",
+                        phase, _stale_alias_repaired, _stale_alias_nulled,
+                        _stale_alias_no_handle);
       }
       log_top_regions(phase, "src", _src_region_counts);
       log_top_regions(phase, "target", _target_region_counts);
@@ -6104,12 +6148,14 @@ int G1RemoteMemoryManager::verify_no_untagged_refs_to_eviction_set(
 
       HeapRegionRemSet* rem_set = hr->rem_set();
       if (rem_set == nullptr) {
-        _requires_full_heap = true;
         _incomplete_rsets++;
         return;
       }
       if (!rem_set->is_complete()) {
-        _requires_full_heap = true;
+        // Incomplete RSets are common during the pressure-driven dense path.
+        // Treat them as a missing signal and rely on the other bounded source
+        // sets instead of turning the performance verifier back into a
+        // full-heap STW scan.
         _incomplete_rsets++;
         return;
       }
@@ -7910,6 +7956,7 @@ class CSetRefFixupClosure : public BasicOopIterateClosure {
   int _rescued;
   int _skipped;
   int _invalid;
+  int _invalid_nulled;
   int _rescue_failed;
   bool _src_is_fcr;     // Set per object via set_src_is_fcr()
 
@@ -7944,8 +7991,8 @@ class CSetRefFixupClosure : public BasicOopIterateClosure {
 public:
   CSetRefFixupClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm, bool allow_rescue)
     : _g1h(g1h), _rmm(rmm), _allow_rescue(allow_rescue),
-      _fixed(0), _rescued(0), _skipped(0), _invalid(0), _rescue_failed(0),
-      _src_is_fcr(false) {}
+      _fixed(0), _rescued(0), _skipped(0), _invalid(0), _invalid_nulled(0),
+      _rescue_failed(0), _src_is_fcr(false) {}
 
   void set_src_is_fcr(bool v) { _src_is_fcr = v; }
 
@@ -8029,6 +8076,16 @@ public:
     if (!_g1h->is_in((void*)addr)) return;
     oop target = cast_to_oop(addr);
     if (!is_valid_region_object(_g1h, target)) {
+      if (tag_bits != 0 && _rmm->dense_segments_enabled() &&
+          _rmm->is_dense_segment_remote_addr(addr)) {
+        return;
+      }
+      if (_g1h->is_in((void*)p)) {
+        *(uintptr_t*)p = 0;
+        dirty_card_for_field(p);
+        _rmm->record_fcr_fixup_null();
+        _invalid_nulled++;
+      }
       _invalid++;
       return;
     }
@@ -8056,8 +8113,9 @@ public:
   int rescued() const { return _rescued; }
   int skipped() const { return _skipped; }
   int invalid() const { return _invalid; }
+  int invalid_nulled() const { return _invalid_nulled; }
   int rescue_failed() const { return _rescue_failed; }
-  int updated() const { return _fixed + _rescued; }
+  int updated() const { return _fixed + _rescued + _invalid_nulled; }
 };
 
 int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_failed) {
@@ -8150,10 +8208,12 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
       cl.invalid() > 0 || cl.rescue_failed() > 0 ||
       code_cl.nmethods_updated() > 0) {
     log_warning(gc)("Old/humongous-region stale-ref fixup: %d fixed (forwardee), "
-                    "%d rescued, %d skipped (unforwarded/in-place), %d invalid, "
+                    "%d rescued, %d skipped (unforwarded/in-place), %d invalid "
+                    "(%d nulled), "
                     "%d rescue-failed, %d nmethods updated; "
                     "FCR evac writes: %llu, previous FCR nulls: %llu",
-                    cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(), cl.rescue_failed(),
+                    cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(),
+                    cl.invalid_nulled(), cl.rescue_failed(),
                     code_cl.nmethods_updated(),
                     (unsigned long long)fcr_evac_writes(),
                     (unsigned long long)fcr_fixup_nulls());

@@ -536,6 +536,12 @@ public:
           pp = &(entry->_next);
           continue;
         }
+        // Keep the old local address as a repair alias.  Direct clean refs can
+        // miss normal G1 remset processing in the remote/FCR path; if they are
+        // discovered after the old region has been filled, the alias lets the
+        // verifier rewrite them to the stable Handle instead of leaving a
+        // stale raw heap pointer behind.
+        remember_eviction_alias_locked(old_addr, entry->_handle);
         *pp = entry->_next;  // unlink from old bucket
 
         move_local_handle_region(entry->_handle, old_addr, new_addr);
@@ -554,6 +560,7 @@ public:
       pp = &(entry->_next);
     }
     if (expected_h != nullptr && expected_h->is_local()) {
+      remember_eviction_alias_locked(old_addr, expected_h);
       move_local_handle_region(expected_h, old_addr, new_addr);
       expected_h->set_local(cast_from_oop<void*>(new_obj));
       HandleEntry* entry = alloc_entry();
