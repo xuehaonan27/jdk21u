@@ -37,6 +37,7 @@
 #include "runtime/atomic.hpp"
 #include "runtime/os.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
+#include "oops/objArrayOop.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "runtime/threadWXSetters.inline.hpp"
 #include "utilities/macros.hpp"
@@ -1324,6 +1325,8 @@ struct RemoteExactFetchRequest {
   oopDesc* result;
 };
 
+static bool g1_remote_resolved_oop_is_usable(G1CollectedHeap* g1h, uintptr_t v);
+
 static const uint G1RemoteExactFetchCombineSpin = 4096;
 static volatile int g1_remote_exact_fetch_combine_lock = 0;
 static volatile int g1_remote_exact_fetch_combine_active = 0;
@@ -1737,6 +1740,220 @@ static bool fetch_and_install_exact_combined(RemoteHandle* h,
   return true;
 }
 
+static bool remote_semantic_find_remote_handle(G1RemoteMemoryManager* rmm,
+                                               uintptr_t raw,
+                                               RemoteHandle** out,
+                                               size_t* slot_out) {
+  *out = nullptr;
+  *slot_out = 0;
+  if (raw == 0 || rmm == nullptr) {
+    return false;
+  }
+
+  RemoteHandle* h = nullptr;
+  if ((raw >> 63) != 0) {
+    if ((raw & G1_OOP_INDIRECT_BIT) == 0) {
+      return false;
+    }
+    h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+    if (!valid_remote_handle_pointer(rmm, h)) {
+      return false;
+    }
+  } else {
+    h = rmm->handle_for_addr_any_state(raw);
+    if (h == nullptr) {
+      return false;
+    }
+  }
+
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE) {
+    return false;
+  }
+  *out = h;
+  *slot_out = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+  return true;
+}
+
+static void remote_semantic_init_request(RemoteExactFetchRequest* req,
+                                         RemoteHandle* h,
+                                         size_t slot_id) {
+  req->handle = h;
+  req->slot_id = slot_id;
+  req->word_size = h->eviction_word_size();
+  req->done = 0;
+  req->skipped = false;
+  req->retry = false;
+  req->installed = false;
+  req->result = nullptr;
+}
+
+static bool remote_semantic_add_request(G1RemoteMemoryManager* rmm,
+                                        uintptr_t raw,
+                                        RemoteHandle* primary,
+                                        RemoteExactFetchRequest* storage,
+                                        RemoteExactFetchRequest** requests,
+                                        uint* count,
+                                        uint limit) {
+  if (*count >= limit) {
+    return false;
+  }
+
+  RemoteHandle* h = nullptr;
+  size_t slot_id = 0;
+  if (!remote_semantic_find_remote_handle(rmm, raw, &h, &slot_id) ||
+      h == primary) {
+    return false;
+  }
+
+  for (uint i = 0; i < *count; i++) {
+    if (requests[i]->handle == h) {
+      return false;
+    }
+  }
+
+  if (!h->try_remote_to_fetching(slot_id)) {
+    return false;
+  }
+
+  remote_semantic_init_request(&storage[*count], h, slot_id);
+  requests[*count] = &storage[*count];
+  (*count)++;
+  return true;
+}
+
+class SemanticFieldPrefetchClosure : public OopClosure {
+  G1RemoteMemoryManager* _rmm;
+  RemoteHandle* _primary;
+  RemoteExactFetchRequest* _storage;
+  RemoteExactFetchRequest** _requests;
+  uint* _count;
+  uint _limit;
+
+public:
+  SemanticFieldPrefetchClosure(G1RemoteMemoryManager* rmm,
+                               RemoteHandle* primary,
+                               RemoteExactFetchRequest* storage,
+                               RemoteExactFetchRequest** requests,
+                               uint* count,
+                               uint limit)
+    : _rmm(rmm), _primary(primary), _storage(storage), _requests(requests),
+      _count(count), _limit(limit) {}
+
+  void do_oop(oop* p) override {
+    uintptr_t raw = *(uintptr_t*)p;
+    remote_semantic_add_request(_rmm, raw, _primary, _storage, _requests,
+                                _count, _limit);
+  }
+
+  void do_oop(narrowOop* p) override {}
+};
+
+static void remote_semantic_collect_field_cluster(G1RemoteMemoryManager* rmm,
+                                                  oop base,
+                                                  RemoteHandle* primary,
+                                                  RemoteExactFetchRequest* storage,
+                                                  RemoteExactFetchRequest** requests,
+                                                  uint* count,
+                                                  uint limit) {
+  SemanticFieldPrefetchClosure cl(rmm, primary, storage, requests, count, limit);
+  base->oop_iterate(&cl);
+}
+
+static void remote_semantic_collect_array_window(G1RemoteMemoryManager* rmm,
+                                                 oop base,
+                                                 intptr_t index,
+                                                 RemoteHandle* primary,
+                                                 RemoteExactFetchRequest* storage,
+                                                 RemoteExactFetchRequest** requests,
+                                                 uint* count,
+                                                 uint limit) {
+  if (UseCompressedOops || index < 0 || !base->is_objArray()) {
+    return;
+  }
+  arrayOop array = arrayOop(base);
+  int length = array->length();
+  if (length <= 0 || index >= length) {
+    return;
+  }
+
+  const int window = MIN2((int)(limit - 1), 64);
+  int start = MAX2(0, (int)index - window / 2);
+  int end = MIN2(length, start + window);
+  start = MAX2(0, end - window);
+  for (int i = start; i < end && *count < limit; i++) {
+    oop* slot = (oop*)((address)base + objArrayOopDesc::base_offset_in_bytes() +
+                       (intptr_t)i * (intptr_t)heapOopSize);
+    uintptr_t raw = *(uintptr_t*)slot;
+    remote_semantic_add_request(rmm, raw, primary, storage, requests,
+                                count, limit);
+  }
+}
+
+static bool fetch_and_install_semantic(RemoteHandle* h,
+                                       bool* out_retry,
+                                       oopDesc** out_result,
+                                       uint32_t access_hint,
+                                       oopDesc* base,
+                                       intptr_t index_or_offset) {
+  *out_retry = false;
+  *out_result = nullptr;
+  if (!G1RemoteUseCompilerFetchHints ||
+      access_hint == G1RemoteAccessHintUnsafe ||
+      access_hint == G1RemoteAccessHintAtomic ||
+      base == nullptr ||
+      remote_exact_fetch_limit() < 2) {
+    return false;
+  }
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  G1RemoteBackend* backend = rmm == nullptr ? nullptr : rmm->backend();
+  if (rmm == nullptr || backend == nullptr ||
+      !backend->supports_exact_batch_fetch() ||
+      !g1_remote_resolved_oop_is_usable(g1h, (uintptr_t)base)) {
+    return false;
+  }
+
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_FETCHING) {
+    return false;
+  }
+
+  uint limit = remote_exact_fetch_limit();
+  RemoteExactFetchRequest storage[G1RemoteFetchBatchHardCap];
+  RemoteExactFetchRequest* requests[G1RemoteFetchBatchHardCap];
+  uint count = 0;
+
+  remote_semantic_init_request(&storage[count], h,
+                               (size_t)(sa & REMOTE_HANDLE_ADDR_MASK));
+  requests[count] = &storage[count];
+  count++;
+
+  oop base_oop = cast_to_oop(base);
+  if (access_hint == G1RemoteAccessHintArray) {
+    remote_semantic_collect_array_window(rmm, base_oop, index_or_offset, h,
+                                         storage, requests, &count, limit);
+  } else {
+    remote_semantic_collect_field_cluster(rmm, base_oop, h, storage,
+                                          requests, &count, limit);
+  }
+
+  if (count <= 1) {
+    return false;
+  }
+
+  remote_exact_fetch_run_batch(requests, count, g1h, rmm, backend);
+
+  if (storage[0].installed && storage[0].result != nullptr) {
+    *out_result = storage[0].result;
+    return true;
+  }
+
+  *out_retry = true;
+  return true;
+}
+
 static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
                                         bool* out_retry, uint max_objects,
                                         uint slot_window,
@@ -1805,7 +2022,9 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
 // after max retries, or set back to REMOTE for caller to retry).
 // *out_retry is set to true if the caller should re-enter the state machine.
 static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
-                                  bool* out_retry, uint32_t access_hint) {
+                                  bool* out_retry, uint32_t access_hint,
+                                  oopDesc* semantic_base = nullptr,
+                                  intptr_t semantic_index_or_offset = 0) {
   *out_retry = false;
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
@@ -1847,6 +2066,16 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
 
   oopDesc* combined_result = nullptr;
   bool combined_retry = false;
+  if (fetch_and_install_semantic(h, &combined_retry, &combined_result,
+                                 access_hint, semantic_base,
+                                 semantic_index_or_offset)) {
+    if (combined_retry) {
+      *out_retry = true;
+      return nullptr;
+    }
+    return combined_result;
+  }
+
   if (!prefer_around &&
       fetch_and_install_exact_combined(h, &combined_retry, &combined_result)) {
     if (combined_retry) {
@@ -2108,12 +2337,10 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_slow(oopDesc* tagged) {
 // and not allowing safepoints, the empty OopMap is harmless.
 // Blocking I/O (RDMA/TCP) adds at most ~50us to safepoint initiation.
 // ============================================================
-oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
-  return resolve_tagged_oop_no_safepoint_with_hint(tagged, G1RemoteAccessHintUnknown);
-}
-
-oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint(oopDesc* tagged,
-                                                                         uint32_t access_hint) {
+static oopDesc* resolve_tagged_oop_no_safepoint_impl(oopDesc* tagged,
+                                                     uint32_t access_hint,
+                                                     oopDesc* semantic_base,
+                                                     intptr_t semantic_index_or_offset) {
   RemoteHandle* h = nullptr;
   oopDesc* fast = resolve_fast_checks(tagged, &h);
   if (h == nullptr) return fast;
@@ -2151,7 +2378,9 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint(oopDesc*
     if (state == REMOTE_HANDLE_REMOTE) {
       if (h->cas_remote_to_fetching()) {
         bool retry = false;
-        oopDesc* result = fetch_and_install(h, fetch_attempts, &retry, access_hint);
+        oopDesc* result = fetch_and_install(h, fetch_attempts, &retry,
+                                            access_hint, semantic_base,
+                                            semantic_index_or_offset);
         if (retry) continue;
         return result;
       }
@@ -2192,4 +2421,20 @@ oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint(oopDesc*
 
     SpinPause();
   }
+}
+
+oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint(oopDesc* tagged) {
+  return resolve_tagged_oop_no_safepoint_with_hint(tagged, G1RemoteAccessHintUnknown);
+}
+
+oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint(oopDesc* tagged,
+                                                                         uint32_t access_hint) {
+  return resolve_tagged_oop_no_safepoint_impl(tagged, access_hint, nullptr, 0);
+}
+
+oopDesc* G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_context(oopDesc* tagged,
+                                                                           uint32_t access_hint,
+                                                                           oopDesc* base,
+                                                                           intptr_t index_or_offset) {
+  return resolve_tagged_oop_no_safepoint_impl(tagged, access_hint, base, index_or_offset);
 }

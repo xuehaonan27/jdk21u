@@ -77,6 +77,15 @@ public:
   // to safepoint initiation, which is acceptable.
   static oopDesc* resolve_tagged_oop_no_safepoint(oopDesc* tagged);
   static oopDesc* resolve_tagged_oop_no_safepoint_with_hint(oopDesc* tagged, uint32_t access_hint);
+  // C1 semantic slow path. The compiler supplies the access shape explicitly:
+  // Field: base is the object containing the loaded field and index_or_offset
+  //        is the byte offset when known.
+  // Array: base is the object array and index_or_offset is the Java index when
+  //        known. Runtime uses this to fetch a bounded semantic cluster.
+  static oopDesc* resolve_tagged_oop_no_safepoint_with_context(oopDesc* tagged,
+                                                               uint32_t access_hint,
+                                                               oopDesc* base,
+                                                               intptr_t index_or_offset);
 };
 
 #endif // SHARE_GC_G1_G1BARRIERSETRUNTIME_HPP

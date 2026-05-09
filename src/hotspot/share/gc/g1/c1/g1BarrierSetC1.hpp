@@ -132,17 +132,38 @@ class G1TagResolveStub: public CodeStub {
  private:
   LIR_Opr _ref;       // result register (loaded oop / resolved oop)
   LIR_Opr _ref_addr;  // memory address to re-read from (ZGC pattern)
+  LIR_Opr _base;      // compiler-known base object for this access
+  LIR_Opr _index;     // compiler-known Java array index, if dynamic
   LIR_Opr _tmp;       // temp register for complex addresses
+  intptr_t _semantic_value; // field offset or constant array index
   uint32_t _access_hint;
 
  public:
   G1TagResolveStub(LIRAccess& access, LIR_Opr ref, uint32_t access_hint)
     : _ref(ref),
       _ref_addr(access.resolved_addr()),
+      _base(access.base().opr()),
+      _index(LIR_OprFact::illegalOpr),
       _tmp(LIR_OprFact::illegalOpr),
+      _semantic_value(0),
       _access_hint(access_hint) {
     assert(_ref->is_register(), "must be a register");
     assert(_ref_addr->is_address(), "must be an address");
+
+    if (access_hint == G1RemoteAccessHintArray) {
+      LIR_Opr idx = access.offset().opr();
+      if (idx->is_constant()) {
+        LIR_Const* c = idx->as_constant_ptr();
+        _semantic_value = c->type() == T_LONG ? (intptr_t)c->as_jlong()
+                                              : (intptr_t)c->as_jint();
+      } else {
+        _index = idx;
+        _semantic_value = min_jint;
+      }
+    } else if (access_hint == G1RemoteAccessHintField) {
+      LIR_Address* addr = _ref_addr->as_address_ptr();
+      _semantic_value = addr->disp();
+    }
 
     // Allocate tmp register if address has index or displacement
     if (_ref_addr->as_address_ptr()->index()->is_valid() ||
@@ -151,12 +172,15 @@ class G1TagResolveStub: public CodeStub {
     }
 
     FrameMap* f = Compilation::current()->frame_map();
-    f->update_reserved_argument_area_size(2 * BytesPerWord);
+    f->update_reserved_argument_area_size(4 * BytesPerWord);
   }
 
   LIR_Opr ref() const { return _ref; }
   LIR_Opr ref_addr() const { return _ref_addr; }
+  LIR_Opr base() const { return _base; }
+  LIR_Opr index() const { return _index; }
   LIR_Opr tmp() const { return _tmp; }
+  intptr_t semantic_value() const { return _semantic_value; }
   uint32_t access_hint() const { return _access_hint; }
   void set_ref(LIR_Opr ref) { _ref = ref; }
 
@@ -165,6 +189,12 @@ class G1TagResolveStub: public CodeStub {
     visitor->do_slow_case();
     visitor->do_input(_ref_addr);  // keep address live for re-read
     visitor->do_input(_ref);       // input: loaded (possibly tagged) oop
+    if (_base->is_valid()) {
+      visitor->do_input(_base);
+    }
+    if (_index->is_valid()) {
+      visitor->do_input(_index);
+    }
     visitor->do_output(_ref);      // output: resolved (clean) oop
     if (_tmp->is_valid()) {
       visitor->do_temp(_tmp);

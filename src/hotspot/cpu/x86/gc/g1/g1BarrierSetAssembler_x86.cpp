@@ -599,9 +599,27 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_stub(LIR_Assembler* ce, G1Ta
     __ push(rax);
   }
 
-  // Pass tagged oop and access-shape hint to the runtime blob via parameter area.
+  // Pass tagged oop and compiler-supplied access shape to the runtime blob.
   ce->store_parameter(ref, 0);
   ce->store_parameter((jint)stub->access_hint(), 1);
+  if (stub->base()->is_valid() && stub->base()->is_register()) {
+    ce->store_parameter(stub->base()->as_pointer_register(), 2);
+  } else {
+    ce->store_parameter((jint)0, 2);
+  }
+  if (stub->index()->is_valid()) {
+    if (stub->index()->is_register()) {
+      ce->store_parameter(stub->index()->as_register(), 3);
+    } else if (stub->index()->is_constant()) {
+      LIR_Const* c = stub->index()->as_constant_ptr();
+      ce->store_parameter(c->type() == T_LONG ? (jint)c->as_jlong()
+                                              : c->as_jint(), 3);
+    } else {
+      ce->store_parameter((jint)stub->semantic_value(), 3);
+    }
+  } else {
+    ce->store_parameter((jint)stub->semantic_value(), 3);
+  }
   __ call(RuntimeAddress(bs->tag_resolve_c1_runtime_code_blob()->code_begin()));
 
   // Move result into ref register
@@ -804,8 +822,10 @@ void G1BarrierSetAssembler::generate_c1_tag_resolve_runtime_stub(StubAssembler* 
   // Use call_VM_leaf for automatic RSP alignment.
   __ bind(slow_path);
   __ load_parameter(1, c_rarg1);
-  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_hint),
-                  rax, c_rarg1);
+  __ load_parameter(2, c_rarg2);
+  __ load_parameter(3, c_rarg3);
+  __ call_VM_leaf(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_no_safepoint_with_context),
+                  rax, c_rarg1, c_rarg2, c_rarg3);
   // Fall through to common exit.
 
   __ bind(done);
