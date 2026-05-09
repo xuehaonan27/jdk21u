@@ -8160,8 +8160,14 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
     old_cset_source_hints = new_hints;
     old_cset_hint_capacity = num_regions;
   }
+  // G1RemoteFastPhaseCVerifyInterval=0 disables the full Phase C.5 verifier,
+  // but old/cset repair is a different correctness barrier: dirty cards and
+  // learned hints are not a complete source map for stale references left in
+  // old regions. Keep it full on the default Spark/RDMA path until a precise
+  // source-region map exists.
   const bool full_heap_fixup =
       !G1RemoteUseFastPhaseC ||
+      G1RemoteFastPhaseCVerifyInterval == 0 ||
       G1RemoteFastPhaseCVerifyInterval == 1 ||
       (G1RemoteFastPhaseCVerifyInterval > 1 &&
        (old_cset_fixup_cycle % G1RemoteFastPhaseCVerifyInterval) == 0);
