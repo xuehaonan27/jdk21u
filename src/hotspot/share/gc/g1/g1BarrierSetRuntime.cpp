@@ -793,6 +793,7 @@ static uint remote_prefetch_cache_hash(RemoteHandle* h, size_t slot_id) {
 
 static bool remote_fetch_hint_prefers_graph_cluster(uint32_t access_hint);
 static bool remote_fetch_hint_prefers_around(uint32_t access_hint);
+static bool remote_graph_cluster_eager_budget_allows();
 
 static uint remote_fetch_effective_batch_objects(uint configured,
                                                  uint32_t access_hint) {
