@@ -4352,6 +4352,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       // header(24) + N × [slot_id(8) + handle_id(8) + klass(8) + word_size(4) +
       //                    num_edges(4) + obj_bytes(ws*8) + edges(num_edges*12)]
       static const size_t BATCH_HDR_SIZE = 24;
+      static const size_t STAGED_HDR_SIZE = 56;
       const bool use_batch_evict = backend->supports_batch_evict();
       const size_t requested_batch_buf_size =
           MAX2((size_t)G1RemoteEvictBatchBytes, BATCH_HDR_SIZE);
@@ -4360,16 +4361,144 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       const size_t max_entry_payload =
           use_batch_evict && batch_buf_size > BATCH_HDR_SIZE ?
           (batch_buf_size - BATCH_HDR_SIZE) : (size_t)-1;
-      const bool use_staged_homogeneous_evict =
+      bool use_staged_homogeneous_evict =
           (G1RemoteUseRdmaStagedHomogeneousBatch ||
            G1RemoteUseRdmaDerivedEdgeBatch) &&
           backend->supports_staged_homogeneous_batch_evict() &&
           backend->max_staged_batch_data_size() > 0;
       const bool derive_edges_from_staged_copy =
           G1RemoteUseRdmaDerivedEdgeBatch;
+      const size_t staged_data_capacity_available =
+          backend->max_staged_batch_data_size();
+
+      if (use_staged_homogeneous_evict &&
+          use_batch_evict &&
+          batch_buf_size > BATCH_HDR_SIZE) {
+        int estimated_objects = 0;
+        int estimated_staged_batches = 0;
+        int estimated_legacy_batches = 0;
+        int legacy_batch_count = 0;
+        size_t legacy_batch_offset = BATCH_HDR_SIZE;
+        bool legacy_has_oversized_entry = false;
+
+        PreparedEviction* staged_template = nullptr;
+        Klass* staged_klass = nullptr;
+        int staged_word_size = 0;
+        uint32_t staged_num_edges = 0;
+        int staged_batch_count = 0;
+        size_t staged_batch_offset = 0;
+        size_t staged_data_offset = 0;
+
+        for (int e = 0; e < num_entries; e++) {
+          if (!entry_active[e]) continue;
+          PreparedEviction* pe = &entries[e];
+          if (pe->location_kind == RemoteLocationArrayChunk) continue;
+
+          size_t byte_size = pe->word_size * HeapWordSize;
+          uint32_t num_edges = (pe->edge_table != nullptr) ?
+              pe->edge_table->_entry_count : 0;
+          size_t legacy_edge_bytes = num_edges * 12;
+          size_t legacy_entry_size = 32 + byte_size + legacy_edge_bytes;
+          if (legacy_entry_size > max_entry_payload) {
+            legacy_has_oversized_entry = true;
+          } else {
+            if (legacy_batch_count > 0 &&
+                legacy_batch_offset + legacy_entry_size > batch_buf_size) {
+              estimated_legacy_batches++;
+              legacy_batch_offset = BATCH_HDR_SIZE;
+              legacy_batch_count = 0;
+            }
+            legacy_batch_offset += legacy_entry_size;
+            legacy_batch_count++;
+          }
+
+          size_t metadata_entry_size = 16 +
+              (derive_edges_from_staged_copy ? 0 : (size_t)num_edges * 8);
+          size_t staged_header_size = STAGED_HDR_SIZE + (size_t)num_edges * 4;
+
+          bool compatible = true;
+          if (staged_batch_count > 0) {
+            compatible = pe->klass == staged_klass &&
+                         (int)pe->word_size == staged_word_size &&
+                         num_edges == staged_num_edges;
+            if (compatible && num_edges > 0) {
+              ObjectEdgeTable* template_edges =
+                  staged_template == nullptr ? nullptr : staged_template->edge_table;
+              ObjectEdgeTable* current_edges = pe->edge_table;
+              if (template_edges == nullptr || current_edges == nullptr) {
+                compatible = false;
+              } else {
+                for (uint32_t j = 0; j < num_edges; j++) {
+                  if (template_edges->_entries[j]._field_offset !=
+                      current_edges->_entries[j]._field_offset) {
+                    compatible = false;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+
+          if (staged_batch_count > 0 &&
+              (!compatible ||
+               staged_batch_offset + metadata_entry_size > batch_buf_size ||
+               staged_data_offset + byte_size > staged_data_capacity_available)) {
+            estimated_staged_batches++;
+            staged_template = nullptr;
+            staged_klass = nullptr;
+            staged_word_size = 0;
+            staged_num_edges = 0;
+            staged_batch_count = 0;
+            staged_batch_offset = 0;
+            staged_data_offset = 0;
+          }
+
+          if (staged_batch_count == 0) {
+            staged_template = pe;
+            staged_klass = pe->klass;
+            staged_word_size = (int)pe->word_size;
+            staged_num_edges = num_edges;
+            staged_batch_offset = staged_header_size;
+            staged_data_offset = 0;
+          }
+
+          staged_batch_offset += metadata_entry_size;
+          staged_data_offset += byte_size;
+          staged_batch_count++;
+          estimated_objects++;
+        }
+
+        if (legacy_batch_count > 0) {
+          estimated_legacy_batches++;
+        }
+        if (staged_batch_count > 0) {
+          estimated_staged_batches++;
+        }
+
+        static const int StagedFragmentationMultiplier = 8;
+        static const int MinUsefulStagedObjectsPerBatch = 8;
+        if (!legacy_has_oversized_entry &&
+            estimated_objects > 0 &&
+            estimated_legacy_batches > 0 &&
+            estimated_staged_batches >
+                estimated_legacy_batches * StagedFragmentationMultiplier &&
+            estimated_objects <
+                estimated_staged_batches * MinUsefulStagedObjectsPerBatch) {
+          log_info(gc)("Phase E2 adaptive transport: using heterogeneous "
+                       "batch eviction because staged homogeneous runs are "
+                       "fragmented (objects=%d staged_batches=%d "
+                       "legacy_batches=%d avg_staged=%.1f)",
+                       estimated_objects, estimated_staged_batches,
+                       estimated_legacy_batches,
+                       (double)estimated_objects /
+                           (double)estimated_staged_batches);
+          use_staged_homogeneous_evict = false;
+        }
+      }
+
       const size_t staged_data_capacity =
           use_staged_homogeneous_evict ?
-          backend->max_staged_batch_data_size() : 0;
+          staged_data_capacity_available : 0;
 
       int* message_blockers_by_region = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
       memset(message_blockers_by_region, 0, num_regions * sizeof(int));
@@ -4631,7 +4760,6 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             }
           }
         } else if (use_staged_homogeneous_evict) {
-          static const size_t STAGED_HDR_SIZE = 56;
           static const uint64_t STAGED_REMOTE_OFFSET = 0;
           const size_t staged_data_buf_size = backend->max_staged_batch_data_size();
           uint8_t* data_buf = (uint8_t*)os::malloc(staged_data_buf_size, mtGC);
