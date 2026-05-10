@@ -2628,10 +2628,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_regions_scanned = 0;
         int path2_regions_not_cold = 0;
         int path2_regions_dense_small = 0;
+        int path2_fcr_candidates = 0;
         int path2_regions_backoff_skipped = 0;
         int path2_regions_sparse_skipped = 0;
         int path2_regions_unevictable_sample_skipped = 0;
         int path2_regions_dense_incompatible_backoff = 0;
+        size_t path2_fcr_bytes = 0;
         size_t path2_dense_small_bytes = 0;
         size_t path2_dense_small_objects = 0;
         int path2_dense_last_resort_candidates = 0;
@@ -2653,6 +2655,39 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
         dense_deferred_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
         memset(dense_deferred_candidates, 0, num_regions * sizeof(bool));
+
+        // FCR is the local cache for fetched remote objects.  Letting it grow
+        // outside the eviction loop makes remote misses turn into unreclaimable
+        // old regions and eventually memcg OOM.  Under pressure, reclaim FCR
+        // first: the objects already have handles, and Phase E will rewrite
+        // those handles back to remote locations before freeing the region.
+        for (uint i = 0; i < num_regions; i++) {
+          if (!unlimited && path2_bytes >= evict_target_bytes) break;
+
+          HeapRegion* hr = _g1h->region_at_or_null(i);
+          if (hr == nullptr) continue;
+          if (!hr->is_fetch_cache()) continue;
+          if (hr->is_humongous() || hr->is_empty() || hr->is_evict_guarded()) continue;
+          if (hr->is_cold_destination()) continue;
+          if (eviction_candidates[i]) continue;
+          if (rmm->is_region_in_eviction_backoff(i)) {
+            path2_regions_backoff_skipped++;
+            continue;
+          }
+
+          hr->set_cold_destination();
+          eviction_candidates[i] = true;
+          path2_candidates++;
+          path2_fcr_candidates++;
+          path2_bytes += hr->used();
+          path2_fcr_bytes += hr->used();
+        }
+
+        if (path2_fcr_candidates > 0) {
+          log_info(gc)("Path 2 FCR reclaim selected %d regions (" SIZE_FORMAT
+                       "MB) before old-region eviction",
+                       path2_fcr_candidates, path2_fcr_bytes / M);
+        }
 
         // Prefer old regions whose sampled objects have stale hotness epochs.
         // This makes T1 truly cold-region eviction instead of heap-index-order
@@ -2908,10 +2943,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
 
         if (path2_candidates > 0) {
-          log_info(gc)("Path 2 selected %d regions (" SIZE_FORMAT "MB, cold="
-                       SIZE_FORMAT "MB fallback=" SIZE_FORMAT "MB) for T%d eviction",
-                       path2_candidates, path2_bytes / M, path2_cold_bytes / M,
-                       path2_fallback_bytes / M, eviction_tier);
+          log_info(gc)("Path 2 selected %d regions (" SIZE_FORMAT "MB, fcr="
+                       SIZE_FORMAT "MB cold=" SIZE_FORMAT "MB fallback="
+                       SIZE_FORMAT "MB) for T%d eviction",
+                       path2_candidates, path2_bytes / M, path2_fcr_bytes / M,
+                       path2_cold_bytes / M, path2_fallback_bytes / M,
+                       eviction_tier);
         }
 
         if (path2_requested_evict_bytes > 0 && path2_bytes < path2_requested_evict_bytes) {
@@ -2997,6 +3034,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (!early_anchor_candidate_regions[i] || !eviction_candidates[i]) {
           continue;
         }
+        HeapRegion* hr = _g1h->region_at_or_null(i);
         // A remote edge to a LOCAL object is not by itself a raw local root.
         // If the whole dense region survives the exact metadata/local-handle
         // guards below, finalization turns the target Handle REMOTE and the
@@ -3004,13 +3042,17 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         // remote-to-remote edge.  Treating such handles as hard pins made
         // Spark dense regions unevictable and caused cgroup OOM even though
         // the candidate objects themselves were complete.
-        if (dense_deferred_candidates != nullptr &&
-            dense_deferred_candidates[i]) {
+        //
+        // The same reasoning applies to Fetch Cache Regions: every fetched
+        // object already has a handle, so FCR reclaim should be rejected only
+        // by real roots or by the later complete-region/local-handle guards.
+        if ((dense_deferred_candidates != nullptr &&
+             dense_deferred_candidates[i]) ||
+            (hr != nullptr && hr->is_fetch_cache())) {
           early_dense_anchor_allowed++;
           continue;
         }
         eviction_candidates[i] = false;
-        HeapRegion* hr = _g1h->region_at_or_null(i);
         if (hr != nullptr) {
           hr->clear_cold_destination();
         }
@@ -3021,9 +3063,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       }
 
       if (early_dense_anchor_allowed > 0) {
-        log_info(gc)("Pre-D remote-anchor guard: allowed %d dense candidate "
-                     "regions with local handles through cascade path; late "
-                     "guards will reject any incomplete or unprepared handles",
+        log_info(gc)("Pre-D remote-anchor guard: allowed %d dense/FCR "
+                     "candidate regions with local handles through cascade "
+                     "path; late guards will reject any incomplete or "
+                     "unprepared handles",
                      early_dense_anchor_allowed);
       }
 
@@ -3250,6 +3293,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           if (remote_anchor_regions[idx] && eviction_candidates[idx]) {
             HeapRegion* hr = _g1h->region_at_or_null(idx);
             if (hr == nullptr) continue;
+            if (hr->is_fetch_cache()) {
+              continue;
+            }
             eviction_candidates[idx] = false;
             if (root_guarded_regions != nullptr) {
               root_guarded_regions[idx] = true;
@@ -3492,7 +3538,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       bool force_dense_phase_c5 =
           total_candidates > 0 &&
           G1RemoteUseFastPhaseC &&
-          rmm->dense_segments_enabled();
+          rmm->dense_segments_enabled() &&
+          use_whole_region_dense_segments;
       bool run_phase_c5_for_candidates =
           total_candidates > 0 &&
           (G1RemoteVerifyEvictionRefs || force_dense_phase_c5);

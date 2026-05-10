@@ -772,6 +772,16 @@ static bool remote_prefetch_budget_allows_eager_install() {
          RemotePrefetchPressureOverTarget;
 }
 
+static bool remote_object_cluster_sibling_install_allowed() {
+  return remote_prefetch_sample_pressure_level() <
+         RemotePrefetchPressureOverTarget;
+}
+
+static bool remote_array_chunk_sibling_install_allowed() {
+  return remote_prefetch_sample_pressure_level() <
+         RemotePrefetchPressureOverTier2;
+}
+
 static size_t remote_prefetch_cache_cap_for_pressure(int pressure_level,
                                                      bool spatial_hint) {
   if (!spatial_hint) {
@@ -2215,9 +2225,15 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
                                                 &segment_member_total);
     }
   }
+  bool install_segment_siblings =
+      segment_member_count > 1 && remote_array_chunk_sibling_install_allowed();
+  if (!install_segment_siblings && segment_member_count > 1) {
+    Atomic::inc(&g1_remote_prefetch_eager_suppressed);
+  }
 
   bool can_bulk_fcr =
       grouped_segment &&
+      install_segment_siblings &&
       segment_member_count > 0 &&
       segment_member_count == segment_member_total &&
       registry_bytes == segment_byte_size &&
@@ -2355,7 +2371,9 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
   publish_dests[publish_count] = dest;
   publish_count++;
 
-  if ((can_bulk_fcr || segment_buf != nullptr) && segment_member_count > 1) {
+  if (install_segment_siblings &&
+      (can_bulk_fcr || segment_buf != nullptr) &&
+      segment_member_count > 1) {
     for (uint i = 0;
          i < segment_member_count &&
          publish_count < G1RemoteArrayChunkSiblingInstallHardCap;
@@ -2539,9 +2557,15 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
                                                 &segment_member_total);
     }
   }
+  bool install_segment_siblings =
+      segment_member_count > 1 && remote_object_cluster_sibling_install_allowed();
+  if (!install_segment_siblings && segment_member_count > 1) {
+    Atomic::inc(&g1_remote_prefetch_eager_suppressed);
+  }
 
   bool can_bulk_fcr =
       grouped_segment &&
+      install_segment_siblings &&
       segment_member_count > 0 &&
       segment_member_count == segment_member_total &&
       registry_bytes == segment_byte_size;
@@ -2714,7 +2738,9 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
   publish_dests[publish_count] = dest;
   publish_count++;
 
-  if ((can_bulk_fcr || segment_buf != nullptr) && segment_member_count > 1) {
+  if (install_segment_siblings &&
+      (can_bulk_fcr || segment_buf != nullptr) &&
+      segment_member_count > 1) {
     for (uint i = 0;
          i < segment_member_count &&
          publish_count < G1RemoteArrayChunkSiblingInstallHardCap;
