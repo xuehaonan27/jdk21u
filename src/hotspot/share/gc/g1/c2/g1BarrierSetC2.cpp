@@ -225,9 +225,7 @@ static uint32_t g1_c2_register_semantic_access_site(C2Access& access,
 }
 
 static bool g1_c2_remote_store_handleify_active() {
-  return !UseCompressedOops &&
-         (LocalMemoryRatio < 100 || G1TagRefSites ||
-          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0);
+  return false;
 }
 
 static bool g1_c2_store_base_is_class_mirror(C2Access& access) {
