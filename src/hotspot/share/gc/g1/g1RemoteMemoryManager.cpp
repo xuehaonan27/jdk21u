@@ -2704,34 +2704,45 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
     return;
   }
 
-  for (int e = start; e < start + count; e++) {
+  // Array chunk groups are produced by Phase E2 in entry order: all primitive
+  // array entries for a remote segment appear as one ordered run among array
+  // chunk entries, although non-array entries may be interleaved in the region
+  // entry array. Register those runs linearly. The old implementation scanned
+  // the whole region for every array entry and made E3 O(n^2) for Spark regions
+  // with hundreds of thousands of primitive arrays.
+  for (int e = start; e < start + count;) {
     PreparedEviction* entry = &entries[e];
     if (entry->location_kind != RemoteLocationArrayChunk ||
         entry->segment_id == 0 ||
         entry->segment_byte_size == 0) {
+      e++;
       continue;
     }
 
-    bool first = true;
+    uintptr_t segment_id = entry->segment_id;
+    size_t segment_byte_size = entry->segment_byte_size;
     uint32_t refs = 0;
-    for (int f = start; f < start + count; f++) {
-      if (entries[f].location_kind == RemoteLocationArrayChunk &&
-          entries[f].segment_id == entry->segment_id) {
-        if (f < e) {
-          first = false;
+    int run_end = e;
+    while (run_end < start + count) {
+      PreparedEviction* cur = &entries[run_end];
+      if (cur->location_kind == RemoteLocationArrayChunk &&
+          cur->segment_id != 0) {
+        if (cur->segment_id != segment_id) {
           break;
         }
         refs++;
       }
+      run_end++;
     }
-    if (first && refs > 0) {
+
+    if (refs > 0) {
       RemoteHandle** handles =
           (RemoteHandle**)os::malloc(sizeof(RemoteHandle*) * refs, mtGC);
       if (handles != nullptr) {
         uint32_t n = 0;
-        for (int f = start; f < start + count && n < refs; f++) {
+        for (int f = e; f < run_end && n < refs; f++) {
           if (entries[f].location_kind == RemoteLocationArrayChunk &&
-              entries[f].segment_id == entry->segment_id) {
+              entries[f].segment_id == segment_id) {
             handles[n++] = entries[f].handle;
           }
         }
@@ -2739,11 +2750,12 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
       } else {
         log_warning(gc)("Array chunk segment registry member allocation failed: "
                         "segment=" UINT64_FORMAT " refs=%u",
-                        (uint64_t)entry->segment_id, refs);
+                        (uint64_t)segment_id, refs);
       }
-      register_array_chunk_segment((uint64_t)entry->segment_id, handles,
-                                   refs, entry->segment_byte_size);
+      register_array_chunk_segment((uint64_t)segment_id, handles,
+                                   refs, segment_byte_size);
     }
+    e = run_end;
   }
 
   local_handle_lock();
