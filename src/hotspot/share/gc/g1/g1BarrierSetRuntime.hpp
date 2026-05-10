@@ -56,6 +56,7 @@ public:
   static void write_ref_field_pre_entry(oopDesc* orig, JavaThread *thread);
   static void write_ref_field_post_entry(volatile CardValue* card_addr, JavaThread* thread);
   static oopDesc* handleify_old_oop_for_store(oopDesc* value);
+  static void handleify_old_oop_slot_for_store(oop* slot);
 
   // Disaggregated memory: resolve a tagged oop to a clean oop.
   //

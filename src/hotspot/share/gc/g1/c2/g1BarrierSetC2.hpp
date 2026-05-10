@@ -201,6 +201,7 @@ protected:
 
   static const TypeFunc* write_ref_field_pre_entry_Type();
   static const TypeFunc* write_ref_field_post_entry_Type();
+  static const TypeFunc* handleify_old_oop_slot_for_store_Type();
 
   virtual Node* store_at_resolved(C2Access& access, C2AccessValue& val) const;
   virtual Node* load_at_resolved(C2Access& access, const Type* val_type) const;

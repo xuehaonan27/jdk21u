@@ -272,6 +272,29 @@ static bool g1_c2_remote_pre_barrier_needs_runtime() {
           G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0);
 }
 
+static bool g1_c2_remote_store_handleify_needs_runtime(C2Access& access,
+                                                       C2AccessValue& val) {
+  if (!access.is_parse_access() || !access.is_oop() || UseCompressedOops ||
+      !g1_c2_remote_pre_barrier_needs_runtime()) {
+    return false;
+  }
+
+  DecoratorSet decorators = access.decorators();
+  if ((decorators & C2_TIGHTLY_COUPLED_ALLOC) != 0 ||
+      (decorators & MO_UNORDERED) == 0) {
+    return false;
+  }
+
+  if ((decorators & IN_HEAP) == 0 &&
+      (decorators & ON_UNKNOWN_OOP_REF) == 0) {
+    return false;
+  }
+
+  Node* value = val.node();
+  return value != nullptr &&
+         !(value->is_Con() && value->bottom_type() == TypePtr::NULL_PTR);
+}
+
 static Node* g1_c2_oop_value_as_raw(GraphKit* kit, Node* ctrl, Node* value) {
   if (kit == nullptr || value == nullptr) {
     return value;
@@ -301,6 +324,17 @@ const TypeFunc *G1BarrierSetC2::write_ref_field_post_entry_Type() {
   const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+2, fields);
 
   // create result type (range)
+  fields = TypeTuple::fields(0);
+  const TypeTuple *range = TypeTuple::make(TypeFunc::Parms, fields);
+
+  return TypeFunc::make(domain, range);
+}
+
+const TypeFunc *G1BarrierSetC2::handleify_old_oop_slot_for_store_Type() {
+  const Type **fields = TypeTuple::fields(1);
+  fields[TypeFunc::Parms+0] = TypeRawPtr::BOTTOM; // heap oop slot
+  const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+1, fields);
+
   fields = TypeTuple::fields(0);
   const TypeTuple *range = TypeTuple::make(TypeFunc::Parms, fields);
 
@@ -841,13 +875,21 @@ void G1BarrierSetC2::insert_pre_barrier(GraphKit* kit, Node* base_oop, Node* off
 #undef __
 
 Node* G1BarrierSetC2::store_at_resolved(C2Access& access, C2AccessValue& val) const {
-  // Do not insert per-store handleification into C2's mutator data path.
-  // A tagged/indirect remote handle is not a HotSpot oop, and modeling it as
-  // the value of a normal StoreP breaks C2's type, oop-map, and barrier
-  // invariants. C2 stores remain clean oop stores; promotion/eviction code is
-  // responsible for publishing handles and canonicalizing slots at GC
-  // boundaries.
-  return ModRefBarrierSetC2::store_at_resolved(access, val);
+  Node* store = ModRefBarrierSetC2::store_at_resolved(access, val);
+
+  if (g1_c2_remote_store_handleify_needs_runtime(access, val)) {
+    C2ParseAccess& parse_access = static_cast<C2ParseAccess&>(access);
+    GraphKit* kit = parse_access.kit();
+    kit->make_runtime_call(GraphKit::RC_NO_FP | GraphKit::RC_NARROW_MEM,
+                           handleify_old_oop_slot_for_store_Type(),
+                           CAST_FROM_FN_PTR(address,
+                               G1BarrierSetRuntime::handleify_old_oop_slot_for_store),
+                           "handleify_old_oop_slot_for_store",
+                           access.addr().type(),
+                           access.addr().node());
+  }
+
+  return store;
 }
 
 Node* G1BarrierSetC2::load_at_resolved(C2Access& access, const Type* val_type) const {

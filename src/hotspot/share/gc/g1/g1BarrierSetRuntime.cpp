@@ -98,7 +98,7 @@ JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_post_entry(volatile G1CardTa
   G1BarrierSet::dirty_card_queue_set().enqueue(queue, card_addr);
 JRT_END
 
-JRT_LEAF(oopDesc*, G1BarrierSetRuntime::handleify_old_oop_for_store(oopDesc* value))
+static oopDesc* handleify_old_oop_for_store_impl(oopDesc* value) {
   if (value == nullptr || !remote_resolve_enabled() || UseCompressedOops) {
     return value;
   }
@@ -148,6 +148,32 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::handleify_old_oop_for_store(oopDesc* val
   uintptr_t state = h->load_state_and_addr_acquire() & REMOTE_HANDLE_STATE_MASK;
   return state == REMOTE_HANDLE_DEAD ? nullptr :
       (oopDesc*)(G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h);
+}
+
+JRT_LEAF(oopDesc*, G1BarrierSetRuntime::handleify_old_oop_for_store(oopDesc* value))
+  return handleify_old_oop_for_store_impl(value);
+JRT_END
+
+JRT_LEAF(void, G1BarrierSetRuntime::handleify_old_oop_slot_for_store(oop* slot))
+  if (slot == nullptr || !remote_resolve_enabled() || UseCompressedOops) {
+    return;
+  }
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  if (g1h == nullptr || !g1h->is_in_reserved(slot)) {
+    return;
+  }
+
+  uintptr_t raw = *(uintptr_t*)slot;
+  if (raw == 0) {
+    return;
+  }
+
+  oopDesc* handled = handleify_old_oop_for_store_impl((oopDesc*)raw);
+  uintptr_t next = (uintptr_t)handled;
+  if (next != raw) {
+    *(uintptr_t*)slot = next;
+  }
 JRT_END
 
 // ============================================================
