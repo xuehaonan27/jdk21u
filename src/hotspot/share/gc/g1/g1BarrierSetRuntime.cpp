@@ -1019,7 +1019,7 @@ static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
 
   uintptr_t sa = h->load_state_and_addr_acquire();
   if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE ||
-      (size_t)(sa & REMOTE_HANDLE_ADDR_MASK) != slot_id ||
+      (size_t)h->remote_object_slot_id(sa) != slot_id ||
       word_size != h->eviction_word_size()) {
     return false;
   }
@@ -1039,7 +1039,7 @@ static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
 
   sa = h->load_state_and_addr_acquire();
   if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE ||
-      (size_t)(sa & REMOTE_HANDLE_ADDR_MASK) != slot_id ||
+      (size_t)h->remote_object_slot_id(sa) != slot_id ||
       word_size != h->eviction_word_size()) {
     remote_prefetch_cache_unlock();
     os::free(bytes);
@@ -1304,7 +1304,7 @@ public:
       }
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-      size_t current_slot = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+      size_t current_slot = (size_t)h->remote_object_slot_id(sa);
       if (state != REMOTE_HANDLE_FETCHING || current_slot != slot_id ||
           slot_id != _primary_slot) {
         _failed++;
@@ -1582,7 +1582,7 @@ public:
 
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-    size_t current_slot = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+    size_t current_slot = (size_t)h->remote_object_slot_id(sa);
     if (state != REMOTE_HANDLE_FETCHING || current_slot != slot_id) {
       req->retry = true;
       _failed++;
@@ -1751,7 +1751,7 @@ static bool fetch_and_install_exact_combined(RemoteHandle* h,
 
   RemoteExactFetchRequest req;
   req.handle = h;
-  req.slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+  req.slot_id = (size_t)h->remote_object_slot_id(sa);
   req.word_size = h->eviction_word_size();
   req.done = 0;
   req.skipped = false;
@@ -1830,7 +1830,7 @@ static bool remote_semantic_find_remote_handle(G1RemoteMemoryManager* rmm,
     return false;
   }
   *out = h;
-  *slot_out = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+  *slot_out = (size_t)h->remote_object_slot_id(sa);
   return true;
 }
 
@@ -1989,7 +1989,7 @@ static bool fetch_and_install_semantic(RemoteHandle* h,
   uint count = 0;
 
   remote_semantic_init_request(&storage[count], h,
-                               (size_t)(sa & REMOTE_HANDLE_ADDR_MASK));
+                               (size_t)h->remote_object_slot_id(sa));
   requests[count] = &storage[count];
   count++;
 
@@ -2030,7 +2030,7 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   G1RemoteBackend* backend = rmm->backend();
 
   uintptr_t sa = h->load_state_and_addr_acquire();
-  size_t slot_id = (size_t)(sa & REMOTE_HANDLE_ADDR_MASK);
+  size_t slot_id = (size_t)h->remote_object_slot_id(sa);
   size_t word_size = h->eviction_word_size();
   BatchFetchInstallClosure installer(g1h, rmm, h, slot_id, eager_prefetch,
                                      spatial_prefetch, graph_cluster);
@@ -2093,7 +2093,7 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
   size_t word_size = h->eviction_word_size();
   uintptr_t fetch_sa = h->load_state_and_addr_acquire();
-  size_t slot_id = (size_t)(fetch_sa & REMOTE_HANDLE_ADDR_MASK);
+  size_t slot_id = (size_t)h->remote_object_slot_id(fetch_sa);
 
   Klass* cached_klass = nullptr;
   size_t cached_word_size = 0;
@@ -2363,7 +2363,7 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
   if (state == REMOTE_HANDLE_DEAD) {
     log_warning(gc)("resolve_fast_checks: DEAD handle " PTR_FORMAT
                     " reached by mutator (slot=%lu) — returning nullptr",
-                    p2i(h), (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
+                    p2i(h), (unsigned long)h->remote_object_slot_id(sa));
     return nullptr;
   }
 
@@ -2434,7 +2434,7 @@ static oopDesc* resolve_tagged_oop_no_safepoint_impl(oopDesc* tagged,
       // SIGSEGV at offset N from null in JIT'd code. Log loudly.
       log_warning(gc)("resolve_tagged_oop_no_safepoint: DEAD handle " PTR_FORMAT
                       " reached by mutator (slot=%lu) — returning nullptr",
-                      p2i(h), (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
+                      p2i(h), (unsigned long)h->remote_object_slot_id(sa));
       return nullptr;
     }
 
@@ -2463,7 +2463,7 @@ static oopDesc* resolve_tagged_oop_no_safepoint_impl(oopDesc* tagged,
           log_warning(gc)("FETCHING wait exceeded %llu spins for handle " PTR_FORMAT
                           " (slot=%lu) — fetcher may be stuck",
                           (unsigned long long)spins, p2i(h),
-                          (unsigned long)(sa & REMOTE_HANDLE_ADDR_MASK));
+                          (unsigned long)h->remote_object_slot_id(sa));
         }
         if (spins >= HardLimit) {
           if (h->cas_fetching_to_remote()) {

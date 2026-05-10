@@ -35,9 +35,13 @@
 // On x86-64 with heap below 2^47, these bits are naturally zero
 // for valid heap pointers, so tagging is non-destructive.
 
-const uintptr_t G1_OOP_MANAGED_BIT   = uintptr_t(1) << 63;  // is_managed
-const uintptr_t G1_OOP_INDIRECT_BIT  = uintptr_t(1) << 62;  // is_indirect (Shared)
-const uintptr_t G1_OOP_REMOTE_BIT    = uintptr_t(1) << 61;  // is_remote
+const int G1_OOP_MANAGED_BIT_SHIFT   = 63;
+const int G1_OOP_INDIRECT_BIT_SHIFT  = 62;
+const int G1_OOP_REMOTE_BIT_SHIFT    = 61;
+
+const uintptr_t G1_OOP_MANAGED_BIT   = uintptr_t(1) << G1_OOP_MANAGED_BIT_SHIFT;  // is_managed
+const uintptr_t G1_OOP_INDIRECT_BIT  = uintptr_t(1) << G1_OOP_INDIRECT_BIT_SHIFT; // is_indirect (Shared)
+const uintptr_t G1_OOP_REMOTE_BIT    = uintptr_t(1) << G1_OOP_REMOTE_BIT_SHIFT;   // is_remote
 
 // Mask covering all tag bits (bits 48-63)
 const uintptr_t G1_OOP_TAG_MASK      = ~((uintptr_t(1) << 48) - 1);

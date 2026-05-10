@@ -7039,7 +7039,7 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
   assert(state == REMOTE_HANDLE_REMOTE || state == REMOTE_HANDLE_FETCHING,
          "Handle must be REMOTE or FETCHING");
 
-  size_t slot_id = sa & REMOTE_HANDLE_ADDR_MASK;
+  size_t slot_id = h->remote_object_slot_id(sa);
 
   // Fetch object bytes via backend (SIM/TCP/RDMA)
   size_t word_size = 0;

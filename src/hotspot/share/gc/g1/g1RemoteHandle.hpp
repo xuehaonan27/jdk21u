@@ -32,7 +32,7 @@
 #include "utilities/globalDefinitions.hpp"
 
 // ============================================================
-// RemoteHandle: 16-byte metadata for a managed object
+// RemoteHandle: HIT entry for a managed object
 // ============================================================
 
 // Fetch state encoding in state_and_addr bits 63:62
@@ -48,18 +48,65 @@ const uintptr_t REMOTE_HANDLE_DEAD          = uintptr_t(3) << REMOTE_HANDLE_STAT
 // Handle flags (stored in _flags field)
 const uint32_t REMOTE_HANDLE_FLAG_DORMANT   = 0x1;  // Dormant anchor (local obj referenced by remote)
 
+enum RemoteLocationKind : uint32_t {
+  RemoteLocationNone          = 0,
+  RemoteLocationObjectSlot    = 1,
+  RemoteLocationClusterObject = 2,
+  RemoteLocationArrayChunk    = 3
+};
+
+struct RemoteLocation {
+  volatile uint32_t _kind;
+  uint32_t          _flags;
+  uintptr_t         _primary_id;    // slot id, cluster id, or array HIT id
+  uintptr_t         _secondary_id;  // chunk id, cluster-local index, etc.
+  size_t            _offset;
+  size_t            _byte_size;
+
+  void clear() {
+    _kind = RemoteLocationNone;
+    _flags = 0;
+    _primary_id = 0;
+    _secondary_id = 0;
+    _offset = 0;
+    _byte_size = 0;
+  }
+
+  void set_object_slot(uintptr_t slot_id, size_t byte_size) {
+    _flags = 0;
+    _primary_id = slot_id;
+    _secondary_id = 0;
+    _offset = 0;
+    _byte_size = byte_size;
+    Atomic::release_store(&_kind, (uint32_t)RemoteLocationObjectSlot);
+  }
+
+  uint32_t kind_acquire() const {
+    return Atomic::load_acquire(&_kind);
+  }
+
+  bool is_object_slot() const {
+    return kind_acquire() == RemoteLocationObjectSlot;
+  }
+};
+
 struct RemoteHandle {
   volatile uintptr_t _state_and_addr;  // [63:62]=state, [47:0]=addr or remote_loc
   volatile uint32_t  _remote_refcount; // Count of remote oop fields pointing to this Handle
   volatile uint32_t  _flags;           // REMOTE_HANDLE_FLAG_* bits
   uintptr_t          _eviction_addr;   // Local address at eviction time (for O(1) table rekey)
   size_t             _eviction_word_size; // Full object size for fetch-time FCR allocation
+  RemoteLocation     _remote_location; // HIT remote location side descriptor
   RemoteHandle*      _local_prev;      // Intrusive list of currently LOCAL handles
   RemoteHandle*      _local_next;
   RemoteHandle*      _region_prev;     // Intrusive list of LOCAL handles by heap region
   RemoteHandle*      _region_next;
   uint               _local_region_index;
   bool               _local_listed;
+
+  static ByteSize state_and_addr_offset() {
+    return byte_offset_of(RemoteHandle, _state_and_addr);
+  }
 
   // State queries (non-atomic, for use under lock or single-threaded)
   uintptr_t state() const { return _state_and_addr & REMOTE_HANDLE_STATE_MASK; }
@@ -86,6 +133,17 @@ struct RemoteHandle {
   uintptr_t remote_id() const {
     assert(!is_local() && !is_dead(), "must be remote or fetching");
     return addr();
+  }
+
+  uintptr_t remote_object_slot_id(uintptr_t state_and_addr) const {
+    if (_remote_location.is_object_slot()) {
+      return _remote_location._primary_id;
+    }
+    return state_and_addr & REMOTE_HANDLE_ADDR_MASK;
+  }
+
+  uintptr_t remote_object_slot_id() const {
+    return remote_object_slot_id(load_state_and_addr_acquire());
   }
 
   // Atomic state transitions for fetch deduplication
@@ -123,6 +181,8 @@ struct RemoteHandle {
   // not update _eviction_addr; that field is the old local address captured
   // when the object was evicted, not the remote slot id.
   void restore_remote_release(uintptr_t remote_id) {
+    _remote_location.set_object_slot(remote_id,
+      _eviction_word_size > 0 ? _eviction_word_size * HeapWordSize : 0);
     Atomic::release_store(&_state_and_addr,
       (uintptr_t)(REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK)));
   }
@@ -141,6 +201,8 @@ struct RemoteHandle {
   // are visible to readers who see REMOTE via load_state_and_addr_acquire.
   void set_remote(uintptr_t remote_id) {
     _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
+    _remote_location.set_object_slot(remote_id,
+      _eviction_word_size > 0 ? _eviction_word_size * HeapWordSize : 0);
     Atomic::release_store(&_state_and_addr,
       (uintptr_t)(REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK)));
   }
@@ -152,6 +214,7 @@ struct RemoteHandle {
 
   // Set to dead (used when referent object dies)
   void set_dead() {
+    _remote_location.clear();
     _state_and_addr = REMOTE_HANDLE_DEAD;
   }
 
@@ -209,6 +272,7 @@ struct RemoteHandle {
     _flags = 0;
     _eviction_addr = 0;
     _eviction_word_size = 0;
+    _remote_location.clear();
     _local_prev = nullptr;
     _local_next = nullptr;
     _region_prev = nullptr;
@@ -224,6 +288,7 @@ struct RemoteHandle {
     _flags = REMOTE_HANDLE_FLAG_DORMANT;
     _eviction_addr = 0;
     _eviction_word_size = 0;
+    _remote_location.clear();
     _local_prev = nullptr;
     _local_next = nullptr;
     _region_prev = nullptr;
@@ -251,6 +316,7 @@ struct RemoteHandleChunk : public CHeapObj<mtGC> {
       _handles[i]._flags = 0;
       _handles[i]._eviction_addr = 0;
       _handles[i]._eviction_word_size = 0;
+      _handles[i]._remote_location.clear();
       _handles[i]._local_prev = nullptr;
       _handles[i]._local_next = nullptr;
       _handles[i]._region_prev = nullptr;

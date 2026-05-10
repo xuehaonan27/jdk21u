@@ -28,6 +28,7 @@
 #include "gc/g1/c2/g1BarrierSetC2.hpp"
 #include "gc/g1/g1BarrierSet.hpp"
 #include "gc/g1/g1BarrierSetRuntime.hpp"
+#include "gc/g1/g1RemoteOop.hpp"
 #include "compiler/oopMap.hpp"
 #include "gc/g1/g1CardTable.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
@@ -76,6 +77,41 @@ Label* G1TagResolveStubC2::continuation() { return &_continuation; }
 
 Register G1TagResolveStubC2::ref() const { return _ref; }
 
+static void g1_c2_inline_local_handle_resolve(MacroAssembler& masm,
+                                              Register tagged,
+                                              Label& runtime_path,
+                                              Label& resolved) {
+  // The out-of-line C2 stub is entered only for negative/tagged oops. In the
+  // handle-centric design the common case should be an indirect Handle whose
+  // current location is LOCAL. Resolve that path without entering C++.
+  assert(tagged == c_rarg0, "tagged oop must be kept for the runtime fallback");
+
+  // Non-indirect managed oops are legacy/direct values; keep their semantics
+  // centralized in the runtime resolver.
+  masm.btq(tagged, G1_OOP_INDIRECT_BIT_SHIFT);
+  masm.jcc(Assembler::carryClear, runtime_path);
+
+  masm.movptr(rax, tagged);
+  masm.mov64(c_rarg1, (int64_t)G1_OOP_ADDR_MASK);
+  masm.andptr(rax, c_rarg1);
+  masm.testptr(rax, rax);
+  masm.jcc(Assembler::zero, runtime_path);
+  masm.testptr(rax, sizeof(void*) - 1);
+  masm.jcc(Assembler::notZero, runtime_path);
+
+  masm.movptr(rax, Address(rax, in_bytes(RemoteHandle::state_and_addr_offset())));
+  masm.btq(rax, REMOTE_HANDLE_STATE_SHIFT);
+  masm.jcc(Assembler::carrySet, runtime_path);
+  masm.btq(rax, REMOTE_HANDLE_STATE_SHIFT + 1);
+  masm.jcc(Assembler::carrySet, runtime_path);
+
+  masm.mov64(c_rarg1, (int64_t)REMOTE_HANDLE_ADDR_MASK);
+  masm.andptr(rax, c_rarg1);
+  masm.testptr(rax, rax);
+  masm.jcc(Assembler::zero, runtime_path);
+  masm.jmp(resolved);
+}
+
 void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   // Register save strategy: push_call_clobbered_registers once on entry,
   // pop once on exit.  Both the leaf call (Phase 1) and the slow-path
@@ -99,15 +135,21 @@ void G1TagResolveStubC2::emit_code(MacroAssembler& masm) {
   Address barrier_scratch(r15_thread, G1ThreadLocalData::barrier_scratch_offset());
 
   masm.bind(_entry);
-  Label slow_path, done;
+  Label runtime_path, slow_path, done;
 
   masm.movptr(barrier_scratch, rbx);
   masm.push_call_clobbered_registers(true /* save_fpu */);
 
-  // Phase 1: Leaf call (handles LOCAL + Unique)
   if (_ref != c_rarg0) {
     masm.movptr(c_rarg0, _ref);
   }
+
+  // Phase 0: inline LOCAL Handle resolution. This is the throughput-critical
+  // path once Old generation references are represented uniformly as Handles.
+  g1_c2_inline_local_handle_resolve(masm, c_rarg0, runtime_path, done);
+
+  // Phase 1: Leaf call (handles legacy direct tags and conservative fallback)
+  masm.bind(runtime_path);
   masm.movl(c_rarg1, _access_hint);
   masm.call(RuntimeAddress(CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::resolve_tagged_oop_with_hint)));
   masm.testptr(rax, rax);
