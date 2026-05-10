@@ -2545,6 +2545,13 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
       segment_member_count > 0 &&
       segment_member_count == segment_member_total &&
       registry_bytes == segment_byte_size;
+  // Primitive array chunks can safely be materialized as one contiguous FCR
+  // segment because they have no oop fields. Ordinary object clusters cannot:
+  // any sibling that fails to install would still be parsable in the FCR chunk
+  // with unpatched raw oop fields. Keep the first object-cluster step as one
+  // RDMA segment fetch plus per-object FCR install; contiguous object-cluster
+  // placement needs filler/hole metadata or all-or-nothing sibling claiming.
+  can_bulk_fcr = false;
   size_t segment_word_size = segment_byte_size / HeapWordSize;
   HeapWord* segment_dest = nullptr;
   HeapWord* dest = nullptr;
