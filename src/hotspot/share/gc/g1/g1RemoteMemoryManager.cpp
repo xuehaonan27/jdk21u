@@ -41,6 +41,8 @@
 #include "code/nmethod.hpp"
 #include "gc/shared/referenceProcessor.hpp"
 
+static bool remote_handle_managed_local_oop(G1CollectedHeap* g1h, oop obj);
+
 // TCP client for remote executor communication
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -3313,6 +3315,38 @@ class EvictionSetTagClosure : public BasicOopIterateClosure {
     _rmm->remember_old_cset_source_hint(src_hr->hrm_index(), reason);
   }
 
+  bool heap_source_allows_handle_slot(Klass* target_klass,
+                                      Klass** source_klass_out,
+                                      const char** source_reason_out) {
+    Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
+    if (source_klass != nullptr && !remote_eviction_valid_klass(source_klass)) {
+      source_klass = nullptr;
+    }
+
+    bool object_array_source =
+        source_klass != nullptr && source_klass->is_objArray_klass();
+    bool target_type_array =
+        target_klass != nullptr && target_klass->is_typeArray_klass();
+    bool target_object =
+        target_klass != nullptr && !target_klass->is_array_klass();
+    bool unsafe_obj_array_source =
+        object_array_source &&
+        ((!target_type_array || !G1RemoteTagObjArraySources) &&
+         (!target_object || !G1RemoteTagObjArrayObjectSources));
+    bool unknown_source = _cur_obj == nullptr && !_allow_unknown_heap_source;
+    bool untaggable_source = unknown_source ||
+        (source_klass != nullptr && source_klass->is_array_klass() &&
+         (!object_array_source || unsafe_obj_array_source));
+
+    if (source_klass_out != nullptr) {
+      *source_klass_out = source_klass;
+    }
+    if (source_reason_out != nullptr) {
+      *source_reason_out = unknown_source ? "unknown" : "untaggable-array";
+    }
+    return !untaggable_source;
+  }
+
 public:
   EvictionSetTagClosure(G1RemoteMemoryManager* rmm, G1CollectedHeap* g1h,
                         const bool* eset, uint nregions,
@@ -3366,18 +3400,54 @@ public:
       return;
     }
 
+    bool heap_source = _g1h->is_in((void*)p);
+
     // Evacuation or an earlier guarded path installed a forwarding pointer.
-    // Redirect the reference to the current object address.
+    // Redirect the reference to the current object address. If this is a
+    // heap slot that can safely hold a remote Handle, canonicalize directly
+    // to the HIT representation instead of preserving a legacy direct tag.
     if (target->is_forwarded()) {
       oop fwd = target->forwardee();
-      uintptr_t tag_bits = raw & G1_OOP_TAG_MASK;
+      if (fwd == nullptr || !_g1h->is_in(fwd)) {
+        _untaggable++;
+        if (_untaggable_reports_left > 0) {
+          log_warning(gc)("Tagging: kept raw ref to invalid forwarded target field="
+                          PTR_FORMAT " raw=0x%lx -> target=" PTR_FORMAT
+                          " in candidate region %u",
+                          p2i(p), (unsigned long)raw, p2i((void*)fwd), idx);
+          _untaggable_reports_left--;
+        }
+        return;
+      }
+
+      bool handle_slot_allowed =
+          heap_source && heap_source_allows_handle_slot(target_klass, nullptr, nullptr);
+      if (handle_slot_allowed && remote_handle_managed_local_oop(_g1h, fwd)) {
+        RemoteHandle* h = _rmm->handle_for(fwd);
+        if (h == nullptr) {
+          h = _rmm->ensure_handle_for(fwd, &_hab);
+        }
+        if (h != nullptr) {
+          *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+          local_buf_add(p, h);
+          remember_old_cset_source(p, "phase-c-forwarded-handle");
+          _tagged++;
+          return;
+        }
+        _no_handle++;
+        if (_no_handle <= 10) {
+          log_warning(gc)("Tagging: no handle for forwarded target " PTR_FORMAT
+                          " in candidate region %u (field at " PTR_FORMAT ")",
+                          p2i((void*)fwd), idx, p2i(p));
+        }
+      }
+
       uintptr_t new_addr = cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK;
-      *(uintptr_t*)p = tag_bits | new_addr;
+      *(uintptr_t*)p = new_addr;
       _tagged++;
       return;
     }
 
-    bool heap_source = _g1h->is_in((void*)p);
     if (!heap_source) {
       // Non-heap root slots (thread stacks, JNI handles, OopStorage, CLD
       // handles) are not stable enough to keep in the persistent tagged-field
@@ -3395,28 +3465,15 @@ public:
     }
 
     {
-      Klass* source_klass = (_cur_obj != nullptr) ? _cur_obj->klass_or_null() : nullptr;
-      if (source_klass != nullptr && !remote_eviction_valid_klass(source_klass)) {
-        source_klass = nullptr;
-      }
-      bool object_array_source = source_klass != nullptr && source_klass->is_objArray_klass();
-      bool target_type_array = target_klass != nullptr && target_klass->is_typeArray_klass();
-      bool target_object = target_klass != nullptr && !target_klass->is_array_klass();
-      bool unsafe_obj_array_source =
-          object_array_source &&
-          ((!target_type_array || !G1RemoteTagObjArraySources) &&
-           (!target_object || !G1RemoteTagObjArrayObjectSources));
-      bool unknown_source = _cur_obj == nullptr && !_allow_unknown_heap_source;
-      bool untaggable_source = unknown_source ||
-          (source_klass != nullptr && source_klass->is_array_klass() &&
-           (!object_array_source || unsafe_obj_array_source));
-      if (untaggable_source) {
+      Klass* source_klass = nullptr;
+      const char* source_reason = nullptr;
+      if (!heap_source_allows_handle_slot(target_klass, &source_klass, &source_reason)) {
         _untaggable++;
         if (_untaggable_reports_left > 0) {
           log_warning(gc)("Tagging: kept raw ref from %s heap source field=" PTR_FORMAT
                           " -> target=" PTR_FORMAT " in candidate region %u "
                           "(src_obj=" PTR_FORMAT " src_klass=%s)",
-                          _cur_obj == nullptr ? "unknown" : "untaggable-array",
+                          source_reason != nullptr ? source_reason : "untaggable",
                           p2i(p), p2i((void*)target), idx, p2i((void*)_cur_obj),
                           source_klass != nullptr ? source_klass->external_name() : "unknown");
           _untaggable_reports_left--;
@@ -5100,6 +5157,9 @@ static void release_dense_tagged_handle_ref(G1RemoteMemoryManager* rmm,
 
 static bool remote_handle_managed_local_oop(G1CollectedHeap* g1h, oop obj) {
   if (g1h == nullptr || obj == nullptr) {
+    return false;
+  }
+  if (!g1h->is_in_reserved(obj) || !g1h->is_in(obj)) {
     return false;
   }
   HeapRegion* hr = g1h->heap_region_containing_or_null(obj);
