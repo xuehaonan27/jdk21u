@@ -47,6 +47,7 @@
 #include "opto/runtime.hpp"
 #include "opto/subtypenode.hpp"
 #include "runtime/deoptimization.hpp"
+#include "runtime/globals.hpp"
 #include "runtime/sharedRuntime.hpp"
 #include "utilities/bitMap.inline.hpp"
 #include "utilities/powerOfTwo.hpp"
