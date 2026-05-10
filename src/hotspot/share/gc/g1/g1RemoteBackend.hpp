@@ -171,6 +171,16 @@ public:
     return false;
   }
 
+  // Fetch only one byte range from a remote segment.  This keeps chunk/cluster
+  // remote placement usable when local RSS pressure is too high to materialize
+  // the entire segment and install all siblings.
+  virtual bool fetch_segment_part(uint64_t segment_id, size_t segment_offset,
+                                  void* dest, size_t byte_size,
+                                  uintptr_t* out_vaddr_base,
+                                  uint32_t* out_flags) {
+    return false;
+  }
+
   virtual void discard_segment(uint64_t segment_id) {
     // Default: no-op
   }

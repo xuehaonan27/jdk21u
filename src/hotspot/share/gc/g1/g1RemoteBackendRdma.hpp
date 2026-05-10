@@ -129,6 +129,10 @@ public:
   bool fetch_segment(uint64_t segment_id, uintptr_t* out_vaddr_base,
                      void* dest, size_t byte_capacity,
                      size_t* out_byte_size, uint32_t* out_flags) override;
+  bool fetch_segment_part(uint64_t segment_id, size_t segment_offset,
+                          void* dest, size_t byte_size,
+                          uintptr_t* out_vaddr_base,
+                          uint32_t* out_flags) override;
   void discard_segment(uint64_t segment_id) override;
   void trace_and_report(uintptr_t** out_dead_ids, size_t* out_num_dead,
                         size_t* out_bytes_freed,

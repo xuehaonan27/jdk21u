@@ -546,6 +546,162 @@ bool TCPExecutorBackend::fetch_segment(uint64_t segment_id,
   return true;
 }
 
+bool TCPExecutorBackend::fetch_segment_part(uint64_t segment_id,
+                                            size_t segment_offset,
+                                            void* dest,
+                                            size_t byte_size,
+                                            uintptr_t* out_vaddr_base,
+                                            uint32_t* out_flags) {
+  if (!_connected || segment_id == 0 || dest == nullptr || byte_size == 0) {
+    return false;
+  }
+
+  const size_t header_size = 48;
+  bool use_staged = RDMAMsgBufSize <= header_size ||
+                    byte_size > RDMAMsgBufSize - header_size ||
+                    byte_size > RE_MAX_MSG_SIZE - header_size;
+
+  if (use_staged) {
+    io_lock();
+
+    uint8_t msg[56];
+    *(uint32_t*)(msg + 0) = RE_CMD_FETCH_SEGMENT_STAGED;
+    *(uint32_t*)(msg + 4) = sizeof(msg);
+    *(uint64_t*)(msg + 8) = _seq_id++;
+    *(uint64_t*)(msg + 16) = segment_id;
+    *(uint64_t*)(msg + 24) = 0;
+    *(uint64_t*)(msg + 32) = (uint64_t)byte_size;
+    *(uint64_t*)(msg + 40) = (uint64_t)segment_offset;
+    *(uint64_t*)(msg + 48) = (uint64_t)byte_size;
+    if (!send_msg(msg, sizeof(msg))) {
+      io_unlock();
+      return false;
+    }
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    if (!recv_msg(resp, sizeof(resp), &resp_len) || resp_len < header_size ||
+        *(uint32_t*)(resp + 0) != RE_RESP_SEGMENT_STAGED) {
+      io_unlock();
+      return false;
+    }
+
+    uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+    uint64_t resp_segment_id = *(uint64_t*)(resp + 16);
+    uintptr_t resp_vaddr_base = (uintptr_t)*(uint64_t*)(resp + 24);
+    size_t resp_byte_size = (size_t)*(uint64_t*)(resp + 32);
+    uint32_t resp_flags = *(uint32_t*)(resp + 40);
+
+    if (resp_msg_len > resp_len || resp_msg_len < header_size ||
+        resp_segment_id != segment_id || resp_byte_size != byte_size) {
+      io_unlock();
+      return false;
+    }
+
+    bool ok = stage_read_locked(0, dest, resp_byte_size);
+    io_unlock();
+    if (!ok) {
+      return false;
+    }
+
+    if (out_vaddr_base != nullptr) {
+      *out_vaddr_base = resp_vaddr_base;
+    }
+    if (out_flags != nullptr) {
+      *out_flags = resp_flags;
+    }
+    return true;
+  }
+
+  size_t max_response_bytes = MIN2(RE_MAX_MSG_SIZE, byte_size + header_size);
+  if (max_response_bytes < byte_size) {
+    max_response_bytes = RE_MAX_MSG_SIZE;
+  }
+
+  io_lock();
+
+  uint8_t msg[48];
+  *(uint32_t*)(msg + 0) = RE_CMD_FETCH_SEGMENT;
+  *(uint32_t*)(msg + 4) = sizeof(msg);
+  *(uint64_t*)(msg + 8) = _seq_id++;
+  *(uint64_t*)(msg + 16) = segment_id;
+  *(uint64_t*)(msg + 24) = (uint64_t)max_response_bytes;
+  *(uint64_t*)(msg + 32) = (uint64_t)segment_offset;
+  *(uint64_t*)(msg + 40) = (uint64_t)byte_size;
+  if (!send_msg(msg, sizeof(msg))) {
+    io_unlock();
+    return false;
+  }
+
+  uint32_t net_len = 0;
+  if (!recv_all(&net_len, 4)) {
+    io_unlock();
+    return false;
+  }
+
+  if (net_len > RE_MAX_MSG_SIZE) {
+    uint8_t drain[4096];
+    size_t remaining = net_len;
+    while (remaining > 0) {
+      size_t chunk = MIN2(remaining, sizeof(drain));
+      if (!recv_all(drain, chunk)) {
+        break;
+      }
+      remaining -= chunk;
+    }
+    io_unlock();
+    return false;
+  }
+
+  uint8_t* resp = (uint8_t*)os::malloc(net_len, mtGC);
+  if (resp == nullptr) {
+    io_unlock();
+    return false;
+  }
+  if (!recv_all(resp, net_len)) {
+    os::free(resp);
+    io_unlock();
+    return false;
+  }
+
+  io_unlock();
+
+  if (net_len < header_size || *(uint32_t*)resp != RE_RESP_SEGMENT_DATA) {
+    os::free(resp);
+    return false;
+  }
+
+  uint32_t resp_msg_len = *(uint32_t*)(resp + 4);
+  uint64_t resp_segment_id = *(uint64_t*)(resp + 16);
+  uintptr_t resp_vaddr_base = (uintptr_t)*(uint64_t*)(resp + 24);
+  size_t resp_byte_size = (size_t)*(uint64_t*)(resp + 32);
+  uint32_t resp_flags = *(uint32_t*)(resp + 40);
+
+  if (resp_msg_len > net_len || resp_msg_len > max_response_bytes ||
+      resp_msg_len < header_size || resp_segment_id != segment_id ||
+      resp_byte_size != byte_size ||
+      resp_byte_size > resp_msg_len - header_size) {
+    log_warning(gc)("TCPExecutor: malformed partial segment fetch response: "
+                    "segment=" UINT64_FORMAT " offset=" SIZE_FORMAT
+                    " hdr_len=%u actual=%u bytes=" SIZE_FORMAT
+                    " expected=" SIZE_FORMAT,
+                    segment_id, segment_offset, resp_msg_len, net_len,
+                    resp_byte_size, byte_size);
+    os::free(resp);
+    return false;
+  }
+
+  memcpy(dest, resp + header_size, resp_byte_size);
+  if (out_vaddr_base != nullptr) {
+    *out_vaddr_base = resp_vaddr_base;
+  }
+  if (out_flags != nullptr) {
+    *out_flags = resp_flags;
+  }
+  os::free(resp);
+  return true;
+}
+
 void TCPExecutorBackend::discard_segment(uint64_t segment_id) {
   if (!_connected || segment_id == 0) {
     return;

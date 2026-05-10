@@ -772,23 +772,70 @@ static bool remote_prefetch_budget_allows_eager_install() {
          RemotePrefetchPressureOverTarget;
 }
 
-static bool remote_object_cluster_sibling_install_allowed() {
-  // Cluster locations are not speculative prefetch: the runtime has already
-  // paid to fetch the whole remote segment.  Suppressing sibling install under
-  // the normal local-memory pressure policy turns a locality cluster into
-  // repeated segment fetches for adjacent objects, which is exactly the Spark
-  // NB fetch-storm pattern.  Keep pressure gating for ordinary around-prefetch,
-  // but always consume fetched cluster payloads here; GC/FCR reclaim controls
-  // the resident set at region granularity.
+static bool remote_segment_sibling_install_allowed(size_t segment_byte_size,
+                                                   uint segment_member_count,
+                                                   bool primitive_array) {
+  if (segment_byte_size == 0 || segment_member_count <= 1) {
+    return false;
+  }
+  if (!G1RemoteUseCgroupPressure || LocalMemoryRatio >= 100) {
+    return true;
+  }
+
+  size_t usage = 0;
+  size_t capacity = 0;
+  size_t total_usage = 0;
+  size_t cache_usage = 0;
+  if (!remote_prefetch_read_cgroup_pressure(&usage, &capacity,
+                                            &total_usage, &cache_usage) ||
+      capacity == 0) {
+    return remote_prefetch_budget_allows_eager_install();
+  }
+
+  size_t tier2_percent = (size_t)G1RemoteTier2Percent;
+  size_t tier3_percent = MAX2((size_t)G1RemoteTier3Percent, tier2_percent);
+  size_t target_percent = MIN2((size_t)G1RemoteTier2TargetPercent, tier2_percent);
+  size_t tier2_bytes = (capacity * tier2_percent) / 100;
+  size_t tier3_bytes = (capacity * tier3_percent) / 100;
+  size_t target_bytes = (capacity * target_percent) / 100;
+  size_t hard_headroom = MIN2(capacity / 16, (size_t)512 * M);
+
+  if (usage >= tier3_bytes ||
+      usage + hard_headroom >= tier3_bytes ||
+      segment_byte_size > tier3_bytes - MIN2(usage, tier3_bytes)) {
+    return false;
+  }
+
+  // Once the process crosses T2, sibling installation is admitted only for
+  // very small segments.  Demand faults still use the same chunk/cluster
+  // remote locations, but fetch only the faulting object's byte range.
+  if (usage >= tier2_bytes) {
+    size_t t2_cap = primitive_array ? (size_t)256 * K : (size_t)128 * K;
+    return segment_byte_size <= t2_cap;
+  }
+
+  // Above the post-eviction target, keep medium clusters bounded so a burst of
+  // mutator misses cannot allocate dozens of FCR regions before the next GC.
+  if (usage >= target_bytes) {
+    size_t target_cap = primitive_array ? (size_t)1 * M : (size_t)512 * K;
+    return segment_byte_size <= target_cap;
+  }
+
   return true;
 }
 
-static bool remote_array_chunk_sibling_install_allowed() {
-  // Same rationale as object clusters.  Primitive-array chunk groups are
-  // bounded by G1RemoteArrayChunkGroupMaxBytes/Objects and have no oop fields,
-  // so installing fetched siblings is the cheapest way to preserve sequential
-  // array locality without repeated RDMA reads of the same segment.
-  return true;
+static bool remote_object_cluster_sibling_install_allowed(size_t segment_byte_size,
+                                                          uint segment_member_count) {
+  return remote_segment_sibling_install_allowed(segment_byte_size,
+                                                segment_member_count,
+                                                false /* primitive_array */);
+}
+
+static bool remote_array_chunk_sibling_install_allowed(size_t segment_byte_size,
+                                                       uint segment_member_count) {
+  return remote_segment_sibling_install_allowed(segment_byte_size,
+                                                segment_member_count,
+                                                true /* primitive_array */);
 }
 
 static size_t remote_prefetch_cache_cap_for_pressure(int pressure_level,
@@ -2235,10 +2282,13 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
     }
   }
   bool install_segment_siblings =
-      segment_member_count > 1 && remote_array_chunk_sibling_install_allowed();
+      segment_member_count > 1 &&
+      remote_array_chunk_sibling_install_allowed(segment_byte_size,
+                                                 segment_member_count);
   if (!install_segment_siblings && segment_member_count > 1) {
     Atomic::inc(&g1_remote_prefetch_eager_suppressed);
   }
+  bool use_partial_segment_fetch = grouped_segment && !install_segment_siblings;
 
   bool can_bulk_fcr =
       grouped_segment &&
@@ -2277,7 +2327,7 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
     fetch_dest = dest;
   }
 
-  if (!can_bulk_fcr && grouped_segment) {
+  if (!can_bulk_fcr && grouped_segment && !use_partial_segment_fetch) {
     segment_buf = (uint8_t*)os::malloc(segment_byte_size, mtGC);
     if (segment_buf == nullptr) {
       h->cas_fetching_to_remote();
@@ -2292,12 +2342,35 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
   size_t fetched_bytes = 0;
   uint32_t fetched_flags = 0;
   jlong fetch_start = os::elapsed_counter();
-  bool ok = backend->fetch_segment(segment_id, &fetched_base, fetch_dest,
-                                   segment_byte_size, &fetched_bytes,
-                                   &fetched_flags);
+  bool ok = false;
+  if (use_partial_segment_fetch) {
+    ok = backend->fetch_segment_part(segment_id, segment_offset, fetch_dest,
+                                     byte_size, &fetched_base,
+                                     &fetched_flags);
+    fetched_bytes = ok ? byte_size : 0;
+    if (!ok) {
+      // Older backends do not support range fetch; keep the object usable by
+      // falling back to the full segment fetch, but still avoid sibling install.
+      segment_buf = (uint8_t*)os::malloc(segment_byte_size, mtGC);
+      if (segment_buf != nullptr) {
+        fetch_dest = segment_buf;
+        ok = backend->fetch_segment(segment_id, &fetched_base, fetch_dest,
+                                    segment_byte_size, &fetched_bytes,
+                                    &fetched_flags);
+      }
+    }
+  } else {
+    ok = backend->fetch_segment(segment_id, &fetched_base, fetch_dest,
+                                segment_byte_size, &fetched_bytes,
+                                &fetched_flags);
+  }
   jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
 
-  if (ok && (fetched_bytes != segment_byte_size ||
+  size_t expected_fetched_bytes =
+      use_partial_segment_fetch && segment_buf == nullptr
+          ? byte_size
+          : segment_byte_size;
+  if (ok && (fetched_bytes != expected_fetched_bytes ||
              (expected_base != 0 && fetched_base != expected_base) ||
              fetched_flags != expected_flags)) {
     log_warning(gc)("Array chunk fetch metadata mismatch: handle=" PTR_FORMAT
@@ -2306,7 +2379,7 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
                     " actual_bytes=" SIZE_FORMAT " expected_flags=%u"
                     " actual_flags=%u",
                     p2i(h), segment_id, p2i((void*)expected_base),
-                    p2i((void*)fetched_base), segment_byte_size, fetched_bytes,
+                    p2i((void*)fetched_base), expected_fetched_bytes, fetched_bytes,
                     expected_flags, fetched_flags);
     ok = false;
   }
@@ -2327,7 +2400,8 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
     }
   }
 
-  rmm->record_fetch_result(segment_byte_size / HeapWordSize, fetch_elapsed, ok);
+  rmm->record_fetch_result(expected_fetched_bytes / HeapWordSize,
+                           fetch_elapsed, ok);
   if (!ok) {
     if (segment_buf != nullptr) {
       os::free(segment_buf);
@@ -2465,11 +2539,17 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
   }
   if (segment_member_count > 1 || sibling_installed > 0 ||
       sibling_raced > 0 || sibling_failed > 0) {
+    size_t returned_count = use_partial_segment_fetch && segment_buf == nullptr
+        ? (size_t)1
+        : (size_t)segment_member_count;
+    size_t suppressed_siblings = use_partial_segment_fetch && segment_buf == nullptr
+        ? (size_t)(segment_member_count - 1)
+        : (size_t)0;
     rmm->record_fetch_batch_result(segment_member_count,
-                                   segment_member_count,
+                                   returned_count,
                                    publish_count,
                                    sibling_installed,
-                                   sibling_raced,
+                                   sibling_raced + suppressed_siblings,
                                    sibling_failed,
                                    sibling_words,
                                    fetch_elapsed);
@@ -2567,10 +2647,13 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
     }
   }
   bool install_segment_siblings =
-      segment_member_count > 1 && remote_object_cluster_sibling_install_allowed();
+      segment_member_count > 1 &&
+      remote_object_cluster_sibling_install_allowed(segment_byte_size,
+                                                    segment_member_count);
   if (!install_segment_siblings && segment_member_count > 1) {
     Atomic::inc(&g1_remote_prefetch_eager_suppressed);
   }
+  bool use_partial_segment_fetch = grouped_segment && !install_segment_siblings;
 
   bool can_bulk_fcr =
       grouped_segment &&
@@ -2614,7 +2697,7 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
     fetch_dest = dest;
   }
 
-  if (!can_bulk_fcr && grouped_segment) {
+  if (!can_bulk_fcr && grouped_segment && !use_partial_segment_fetch) {
     segment_buf = (uint8_t*)os::malloc(segment_byte_size, mtGC);
     if (segment_buf == nullptr) {
       h->cas_fetching_to_remote();
@@ -2629,12 +2712,33 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
   size_t fetched_bytes = 0;
   uint32_t fetched_flags = 0;
   jlong fetch_start = os::elapsed_counter();
-  bool ok = backend->fetch_segment(segment_id, &fetched_base, fetch_dest,
-                                   segment_byte_size, &fetched_bytes,
-                                   &fetched_flags);
+  bool ok = false;
+  if (use_partial_segment_fetch) {
+    ok = backend->fetch_segment_part(segment_id, segment_offset, fetch_dest,
+                                     byte_size, &fetched_base,
+                                     &fetched_flags);
+    fetched_bytes = ok ? byte_size : 0;
+    if (!ok) {
+      segment_buf = (uint8_t*)os::malloc(segment_byte_size, mtGC);
+      if (segment_buf != nullptr) {
+        fetch_dest = segment_buf;
+        ok = backend->fetch_segment(segment_id, &fetched_base, fetch_dest,
+                                    segment_byte_size, &fetched_bytes,
+                                    &fetched_flags);
+      }
+    }
+  } else {
+    ok = backend->fetch_segment(segment_id, &fetched_base, fetch_dest,
+                                segment_byte_size, &fetched_bytes,
+                                &fetched_flags);
+  }
   jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
 
-  if (ok && (fetched_bytes != segment_byte_size ||
+  size_t expected_fetched_bytes =
+      use_partial_segment_fetch && segment_buf == nullptr
+          ? byte_size
+          : segment_byte_size;
+  if (ok && (fetched_bytes != expected_fetched_bytes ||
              (expected_base != 0 && fetched_base != expected_base) ||
              fetched_flags != expected_flags)) {
     log_warning(gc)("Object cluster fetch metadata mismatch: handle=" PTR_FORMAT
@@ -2643,7 +2747,7 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
                     " actual_bytes=" SIZE_FORMAT " expected_flags=%u"
                     " actual_flags=%u",
                     p2i(h), segment_id, p2i((void*)expected_base),
-                    p2i((void*)fetched_base), segment_byte_size, fetched_bytes,
+                    p2i((void*)fetched_base), expected_fetched_bytes, fetched_bytes,
                     expected_flags, fetched_flags);
     ok = false;
   }
@@ -2702,7 +2806,8 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
     }
   }
 
-  rmm->record_fetch_result(segment_byte_size / HeapWordSize, fetch_elapsed, ok);
+  rmm->record_fetch_result(expected_fetched_bytes / HeapWordSize,
+                           fetch_elapsed, ok);
   if (!ok) {
     if (segment_buf != nullptr) {
       os::free(segment_buf);
@@ -2830,11 +2935,17 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
   }
   if (segment_member_count > 1 || sibling_installed > 0 ||
       sibling_raced > 0 || sibling_failed > 0) {
+    size_t returned_count = use_partial_segment_fetch && segment_buf == nullptr
+        ? (size_t)1
+        : (size_t)segment_member_count;
+    size_t suppressed_siblings = use_partial_segment_fetch && segment_buf == nullptr
+        ? (size_t)(segment_member_count - 1)
+        : (size_t)0;
     rmm->record_fetch_batch_result(segment_member_count,
-                                   segment_member_count,
+                                   returned_count,
                                    publish_count,
                                    sibling_installed,
-                                   sibling_raced,
+                                   sibling_raced + suppressed_siblings,
                                    sibling_failed,
                                    sibling_words,
                                    fetch_elapsed);
