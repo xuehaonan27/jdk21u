@@ -1504,6 +1504,7 @@ static int refill_dense_eviction_candidates(G1CollectedHeap* g1h,
                                             uint num_regions,
                                             uint refill_budget,
                                             bool use_whole_region_dense_segments,
+                                            bool ignore_backoff,
                                             int removed_regions,
                                             const char* reason,
                                             int* path2_candidates,
@@ -1528,7 +1529,7 @@ static int refill_dense_eviction_candidates(G1CollectedHeap* g1h,
     if (!hr->is_old() || hr->is_humongous() || hr->is_empty()) continue;
     if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
     if (eviction_candidates[i]) continue;
-    if (rmm->is_region_in_eviction_backoff(i)) continue;
+    if (!ignore_backoff && rmm->is_region_in_eviction_backoff(i)) continue;
 
     RegionColdnessSample region_sample;
     (void)region_is_cold_by_epoch(hr, rmm, false, &region_sample);
@@ -2422,6 +2423,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     int path1_candidates = 0;
     int path2_candidates = 0;
     size_t path2_requested_evict_bytes = 0;
+    bool cgroup_emergency_eviction = false;
     const bool use_whole_region_dense_segments =
         rmm != nullptr && rmm->dense_segments_enabled() &&
         !G1RemoteAllowDenseObjectEviction;
@@ -2554,6 +2556,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               cgroup_evict_target_bytes > 0 &&
               cgroup_pressure * 100.0 > (double)tier3_percent;
             if (cgroup_emergency) {
+              cgroup_emergency_eviction = true;
               size_t required_regions =
                 (cgroup_evict_target_bytes + HeapRegion::GrainBytes - 1) /
                 HeapRegion::GrainBytes;
@@ -2630,6 +2633,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int path2_regions_dense_small = 0;
         int path2_fcr_candidates = 0;
         int path2_regions_backoff_skipped = 0;
+        int path2_regions_backoff_overridden = 0;
         int path2_regions_sparse_skipped = 0;
         int path2_regions_unevictable_sample_skipped = 0;
         int path2_regions_dense_incompatible_backoff = 0;
@@ -2671,8 +2675,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           if (hr->is_cold_destination()) continue;
           if (eviction_candidates[i]) continue;
           if (rmm->is_region_in_eviction_backoff(i)) {
-            path2_regions_backoff_skipped++;
-            continue;
+            if (!cgroup_emergency_eviction) {
+              path2_regions_backoff_skipped++;
+              continue;
+            }
+            path2_regions_backoff_overridden++;
           }
 
           hr->set_cold_destination();
@@ -2704,8 +2711,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
             if (rmm->is_region_in_eviction_backoff(i)) {
-              path2_regions_backoff_skipped++;
-              continue;
+              if (!cgroup_emergency_eviction) {
+                path2_regions_backoff_skipped++;
+                continue;
+              }
+              path2_regions_backoff_overridden++;
             }
             if (!remote_old_region_meets_min_evict_used(hr)) {
               path2_regions_sparse_skipped++;
@@ -2760,7 +2770,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           size_t hot_bytes = hot_words * HeapWordSize;
           size_t unknown_bytes = unknown_words * HeapWordSize;
           log_info(gc)("Path 2 cold scan: selected=%d/%d regions (" SIZE_FORMAT "MB), "
-                       "not_cold=%d, backoff=%d, sparse=%d, dense_small=%d ("
+                       "not_cold=%d, backoff=%d, backoff_override=%d, "
+                       "sparse=%d, dense_small=%d ("
                        SIZE_FORMAT "MB, "
                        SIZE_FORMAT " objs), sample cold=" SIZE_FORMAT "MB hot="
                        SIZE_FORMAT "MB unknown=" SIZE_FORMAT "MB sampled="
@@ -2768,6 +2779,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                        path2_cold_candidates, path2_regions_scanned,
                        path2_cold_bytes / M, path2_regions_not_cold,
                        path2_regions_backoff_skipped,
+                       path2_regions_backoff_overridden,
                        path2_regions_sparse_skipped,
                        path2_regions_dense_small, path2_dense_small_bytes / M,
                        path2_dense_small_objects,
@@ -2791,8 +2803,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (eviction_candidates[i]) continue;
             if (dense_deferred_candidates[i]) continue;
             if (rmm != nullptr && rmm->is_region_in_eviction_backoff(i)) {
-              path2_regions_backoff_skipped++;
-              continue;
+              if (!cgroup_emergency_eviction) {
+                path2_regions_backoff_skipped++;
+                continue;
+              }
+              path2_regions_backoff_overridden++;
             }
             if (!remote_old_region_meets_min_evict_used(hr)) {
               path2_regions_sparse_skipped++;
@@ -2877,8 +2892,11 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             if (hr->is_cold_destination() || hr->is_fetch_cache() || hr->is_evict_guarded()) continue;
             if (eviction_candidates[i]) continue;
             if (rmm != nullptr && rmm->is_region_in_eviction_backoff(i)) {
-              path2_regions_backoff_skipped++;
-              continue;
+              if (!cgroup_emergency_eviction) {
+                path2_regions_backoff_skipped++;
+                continue;
+              }
+              path2_regions_backoff_overridden++;
             }
 
             RegionColdnessSample region_sample;
@@ -3096,6 +3114,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               _g1h, rmm, eviction_candidates, dense_deferred_candidates,
               nullptr, early_anchor_dense_regions, num_regions, refill_budget,
               use_whole_region_dense_segments,
+              cgroup_emergency_eviction,
               early_anchor_removed, "Pre-D remote-anchor",
               &path2_candidates, &total_candidates);
         }
@@ -3156,6 +3175,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             _g1h, rmm, eviction_candidates, dense_deferred_candidates,
             raw_stack_guarded_regions, nullptr, num_regions, refill_budget,
             use_whole_region_dense_segments,
+            cgroup_emergency_eviction,
             raw_guarded, "Pre-D", &path2_candidates, &total_candidates);
       }
 
@@ -3330,6 +3350,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               _g1h, rmm, eviction_candidates, dense_deferred_candidates,
               raw_stack_guarded_regions, root_guarded_regions, num_regions,
               refill_budget, use_whole_region_dense_segments,
+              cgroup_emergency_eviction,
               removed_for_refill, "Root-guard",
               &path2_candidates, &total_candidates);
         }
