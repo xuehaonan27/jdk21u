@@ -28,9 +28,9 @@
 #include "ci/ciObjArray.hpp"
 #include "asm/register.hpp"
 #include "compiler/compileLog.hpp"
-#include "gc/g1/g1_globals.hpp"
 #include "gc/shared/barrierSet.hpp"
 #include "gc/shared/c2/barrierSetC2.hpp"
+#include "gc/shared/gc_globals.hpp"
 #include "interpreter/interpreter.hpp"
 #include "memory/resourceArea.hpp"
 #include "opto/addnode.hpp"
@@ -4211,9 +4211,7 @@ Node* GraphKit::make_constant_from_field(ciField* field, Node* obj) {
   if (!field->is_constant()) {
     return nullptr; // Field not marked as constant.
   }
-  if (UseG1GC && is_reference_type(field->layout_type()) && !UseCompressedOops &&
-      (LocalMemoryRatio < 100 || G1TagRefSites ||
-       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+  if (UseG1GC && is_reference_type(field->layout_type()) && !UseCompressedOops) {
     return nullptr;
   }
   ciInstance* holder = nullptr;
