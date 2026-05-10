@@ -4344,6 +4344,16 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       const size_t max_entry_payload =
           use_batch_evict && batch_buf_size > BATCH_HDR_SIZE ?
           (batch_buf_size - BATCH_HDR_SIZE) : (size_t)-1;
+      const bool use_staged_homogeneous_evict =
+          (G1RemoteUseRdmaStagedHomogeneousBatch ||
+           G1RemoteUseRdmaDerivedEdgeBatch) &&
+          backend->supports_staged_homogeneous_batch_evict() &&
+          backend->max_staged_batch_data_size() > 0;
+      const bool derive_edges_from_staged_copy =
+          G1RemoteUseRdmaDerivedEdgeBatch;
+      const size_t staged_data_capacity =
+          use_staged_homogeneous_evict ?
+          backend->max_staged_batch_data_size() : 0;
 
       int* message_blockers_by_region = NEW_C_HEAP_ARRAY(int, num_regions, mtGC);
       memset(message_blockers_by_region, 0, num_regions * sizeof(int));
@@ -4358,14 +4368,28 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
         size_t edge_bytes = num_edges * 12;
         size_t entry_size = 32 + byte_size + edge_bytes;
-        if (entry_size > max_entry_payload) {
+        bool oversized_for_backend = entry_size > max_entry_payload;
+        size_t effective_entry_size = entry_size;
+        if (use_staged_homogeneous_evict) {
+          static const size_t STAGED_HDR_SIZE = 56;
+          size_t staged_header_size = STAGED_HDR_SIZE + (size_t)num_edges * 4;
+          size_t metadata_entry_size = 16 +
+              (derive_edges_from_staged_copy ? 0 : (size_t)num_edges * 8);
+          size_t staged_metadata_size = staged_header_size + metadata_entry_size;
+          effective_entry_size = MAX2(staged_metadata_size, byte_size);
+          oversized_for_backend =
+              staged_metadata_size > batch_buf_size ||
+              byte_size > staged_data_capacity;
+        }
+        if (oversized_for_backend) {
           HeapRegion* hr = _g1h->heap_region_containing(pe->obj);
           uint idx = hr->hrm_index();
           if (idx < num_regions) {
             message_blockers_by_region[idx]++;
           }
           oversized_entries++;
-          largest_oversized_entry = MAX2(largest_oversized_entry, entry_size);
+          largest_oversized_entry = MAX2(largest_oversized_entry,
+                                         effective_entry_size);
         }
       }
       for (uint i = 0; i < num_regions; i++) {
@@ -4396,10 +4420,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       if (message_guarded_regions > 0) {
         log_warning(gc)("Pre-E message-size guard: removed %d regions, aborted %d "
                         "prepared entries, found %d oversized entries "
-                        "(largest=" SIZE_FORMAT "KB, limit=" SIZE_FORMAT "KB)",
+                        "(mode=%s largest=" SIZE_FORMAT "KB, control_limit="
+                        SIZE_FORMAT "KB, data_limit=" SIZE_FORMAT "KB)",
                         message_guarded_regions, message_guarded_entries,
-                        oversized_entries, largest_oversized_entry / K,
-                        max_entry_payload / K);
+                        oversized_entries,
+                        use_staged_homogeneous_evict ? "staged" : "legacy",
+                        largest_oversized_entry / K,
+                        (use_staged_homogeneous_evict ? batch_buf_size
+                                                      : max_entry_payload) / K,
+                        staged_data_capacity / K);
       }
 
       bool* send_failed_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
@@ -4426,14 +4455,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               send_failed_regions[i] = true;
             }
           }
-        } else if ((G1RemoteUseRdmaStagedHomogeneousBatch ||
-                    G1RemoteUseRdmaDerivedEdgeBatch) &&
-                   backend->supports_staged_homogeneous_batch_evict() &&
-                   backend->max_staged_batch_data_size() > 0) {
+        } else if (use_staged_homogeneous_evict) {
           static const size_t STAGED_HDR_SIZE = 56;
           static const uint64_t STAGED_REMOTE_OFFSET = 0;
-          const bool derive_edges_from_staged_copy =
-              G1RemoteUseRdmaDerivedEdgeBatch;
           const size_t staged_data_buf_size = backend->max_staged_batch_data_size();
           uint8_t* data_buf = (uint8_t*)os::malloc(staged_data_buf_size, mtGC);
           int batch_word_size = 0;

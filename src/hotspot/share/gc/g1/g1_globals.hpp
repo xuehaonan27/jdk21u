@@ -586,7 +586,7 @@
           "only compact metadata with "                                      \
           "CMD_BATCH_EVICT_HOMOG_STAGED_WITH_EDGES.")                       \
                                                                             \
-  product(bool, G1RemoteUseRdmaDerivedEdgeBatch, false, DIAGNOSTIC,          \
+  product(bool, G1RemoteUseRdmaDerivedEdgeBatch, true, DIAGNOSTIC,           \
           "For RDMA-staged homogeneous batches, patch the staged object "     \
           "copy with tagged handle fields and let the executor derive edge "  \
           "targets from object bytes. This avoids sending per-edge target "   \
