@@ -2377,6 +2377,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // ---- Phase A: Collect eviction candidates ----
     bool* eviction_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
     memset(eviction_candidates, 0, num_regions * sizeof(bool));
+    bool* dense_segment_evicted_regions = nullptr;
     bool* dense_deferred_candidates = nullptr;
     bool* raw_stack_guarded_regions = nullptr;
     bool* raw_stack_backoff_regions = nullptr;
@@ -3716,7 +3717,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int dense_evicted_regions = 0;
         int dense_skipped_regions = 0;
         int dense_failed_regions = 0;
+        int dense_fallback_regions = 0;
         size_t dense_evicted_bytes = 0;
+        if (dense_segment_evicted_regions == nullptr) {
+          dense_segment_evicted_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+          memset(dense_segment_evicted_regions, 0, num_regions * sizeof(bool));
+        }
 
         for (uint i = 0; i < num_regions; i++) {
           if (!eviction_candidates[i]) continue;
@@ -3731,12 +3737,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           size_t objects = 0;
           size_t region_used = hr->used();
           if (!rmm->evict_dense_segment_region(hr, &reason, &objects)) {
-            eviction_candidates[i] = false;
-            hr->clear_cold_destination();
-            regions_kept_alive++;
             dense_failed_regions++;
-            log_debug(gc)("Dense segment kept region %u local: %s",
-                          hr->hrm_index(), reason != nullptr ? reason : "unknown");
+            dense_fallback_regions++;
+            if (G1RemoteEvictionAbortBackoffGCCycles > 0) {
+              rmm->backoff_eviction_region(i, G1RemoteEvictionAbortBackoffGCCycles);
+            }
+            log_info(gc)("Dense segment failed for region %u (%s); "
+                         "falling back to object/array batch eviction",
+                         hr->hrm_index(), reason != nullptr ? reason : "unknown");
             continue;
           }
 
@@ -3745,6 +3753,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           dense_evicted_regions++;
           dense_evicted_bytes += region_used;
           total_freed_bytes += region_used;
+          dense_segment_evicted_regions[i] = true;
+          eviction_candidates[i] = false;
           hr->clear_cardtable();
           hr->clear_cold_destination();
           hr->clear_root_pinned();
@@ -3754,13 +3764,19 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           hr->set_evict_guarded();
         }
 
-        total_candidates = 0;
+        total_candidates = dense_fallback_regions;
         double dense_ms = (Ticks::now() - dense_start).seconds() * 1000.0;
         log_info(gc)("Dense segment Phase E: %.1fms (%d regions evicted, "
-                     "%d skipped, %d failed, " SIZE_FORMAT "KB)",
+                     "%d skipped, %d failed, %d fallback, " SIZE_FORMAT "KB)",
                      dense_ms, dense_evicted_regions, dense_skipped_regions,
-                     dense_failed_regions, dense_evicted_bytes / K);
-        rmm->cleanup_recorded_direct_refs_after_dense_phase();
+                     dense_failed_regions, dense_fallback_regions,
+                     dense_evicted_bytes / K);
+        if (total_candidates == 0) {
+          rmm->cleanup_recorded_direct_refs_after_dense_phase();
+        } else {
+          log_info(gc)("Dense segment fallback: %d regions continue through "
+                       "object/array staged batch eviction", total_candidates);
+        }
       }
 
       // ---- Phase E: Evict non-pinned candidates (batched) ----
@@ -5147,6 +5163,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     // Post-eviction diagnostic: verify no root oops point into freed regions.
     // Uses eviction_candidates boolean array (independent of region state).
     if (regions_evicted > 0) {
+      if (dense_segment_evicted_regions != nullptr) {
+        for (uint i = 0; i < num_regions; i++) {
+          if (dense_segment_evicted_regions[i]) {
+            eviction_candidates[i] = true;
+          }
+        }
+      }
       class VerifyNoRootToFreedClosure : public OopClosure {
         G1CollectedHeap* _g1h;
         bool* _freed_set;
@@ -5217,6 +5240,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     }
 
     FREE_C_HEAP_ARRAY(bool, eviction_candidates);
+    if (dense_segment_evicted_regions != nullptr) {
+      FREE_C_HEAP_ARRAY(bool, dense_segment_evicted_regions);
+    }
 
     // Return freed regions to the free pool
     if (freed_regions > 0) {
