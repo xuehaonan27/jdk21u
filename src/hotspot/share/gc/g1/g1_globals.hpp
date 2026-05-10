@@ -461,6 +461,13 @@
           "tables. Dense-region selection still requires complete "           \
           "Phase-E-evictable regions.")                                      \
                                                                             \
+  product(bool, G1RemoteUseArrayChunkLocations, true, DIAGNOSTIC,             \
+          "Store primitive array evictions as contiguous remote chunks "       \
+          "through the Handle remote-location descriptor when the backend "    \
+          "supports segment operations. This avoids treating array payloads "  \
+          "as one-object remote slots and is the first array-aware remote "    \
+          "location mode.")                                                   \
+                                                                            \
   product(bool, G1RemoteUseFastPhaseC, false, DIAGNOSTIC,                    \
           "Use the bounded remote-eviction Phase C scanner: candidate "       \
           "regions, young regions, newly evacuated ranges, roots, and "       \

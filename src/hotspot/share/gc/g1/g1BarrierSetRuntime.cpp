@@ -37,6 +37,7 @@
 #include "runtime/atomic.hpp"
 #include "runtime/os.hpp"
 #include "gc/g1/g1ThreadLocalData.hpp"
+#include "memory/metaspace.hpp"
 #include "oops/objArrayOop.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "runtime/threadWXSetters.inline.hpp"
@@ -185,6 +186,14 @@ JRT_END
 static bool remote_resolve_enabled() {
   return LocalMemoryRatio < 100 || G1TagRefSites ||
          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0;
+}
+
+static bool remote_runtime_valid_klass(Klass* k) {
+  if (k == nullptr) return false;
+  if ((uintptr_t)k < os::min_page_size()) return false;
+  if (!is_aligned((address)k, sizeof(MetaWord))) return false;
+  if (!Metaspace::contains(k)) return false;
+  return k->is_klass();
 }
 
 static bool local_handle_addr_is_stale(G1CollectedHeap* g1h, uintptr_t addr,
@@ -1028,6 +1037,9 @@ static bool remote_prefetch_cache_store(RemoteHandle* h, size_t slot_id,
   if (h == nullptr || klass == nullptr || obj_bytes == nullptr || word_size == 0) {
     return false;
   }
+  if (!h->_remote_location.is_object_slot()) {
+    return false;
+  }
   if (word_size > SIZE_MAX / HeapWordSize) {
     return false;
   }
@@ -1259,6 +1271,9 @@ class BatchFetchInstallClosure : public G1RemoteBackend::FetchBatchClosure {
     if (!_eager_prefetch || _publish_count >= G1RemoteFetchBatchHardCap) {
       return false;
     }
+    if (h == nullptr || !h->_remote_location.is_object_slot()) {
+      return false;
+    }
     bool budget_ok = _graph_cluster ? remote_graph_cluster_eager_budget_allows()
                                     : remote_prefetch_budget_allows_eager_install();
     if (!budget_ok) {
@@ -1309,7 +1324,8 @@ public:
     RemoteHandle* h = (RemoteHandle*)handle_id;
     bool is_primary = (h == _primary);
 
-    if (h == nullptr || klass == nullptr || word_size == 0 || obj_bytes == nullptr) {
+    if (h == nullptr || klass == nullptr || word_size == 0 ||
+        obj_bytes == nullptr || !h->_remote_location.is_object_slot()) {
       _failed++;
       return;
     }
@@ -1591,7 +1607,8 @@ public:
     RemoteHandle* h = (RemoteHandle*)handle_id;
     RemoteExactFetchRequest* req = find_request(h, slot_id);
     if (req == nullptr || req->installed || h == nullptr ||
-        klass == nullptr || obj_bytes == nullptr || word_size == 0) {
+        klass == nullptr || obj_bytes == nullptr || word_size == 0 ||
+        !h->_remote_location.is_object_slot()) {
       _failed++;
       return;
     }
@@ -1774,6 +1791,9 @@ static bool fetch_and_install_exact_combined(RemoteHandle* h,
   if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_FETCHING) {
     return false;
   }
+  if (!h->_remote_location.is_object_slot()) {
+    return false;
+  }
 
   RemoteExactFetchRequest req;
   req.handle = h;
@@ -1853,6 +1873,9 @@ static bool remote_semantic_find_remote_handle(G1RemoteMemoryManager* rmm,
 
   uintptr_t sa = h->load_state_and_addr_acquire();
   if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE) {
+    return false;
+  }
+  if (!h->_remote_location.is_object_slot()) {
     return false;
   }
   *out = h;
@@ -2008,6 +2031,9 @@ static bool fetch_and_install_semantic(RemoteHandle* h,
   if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_FETCHING) {
     return false;
   }
+  if (!h->_remote_location.is_object_slot()) {
+    return false;
+  }
 
   uint limit = remote_exact_fetch_limit();
   RemoteExactFetchRequest storage[G1RemoteFetchBatchHardCap];
@@ -2056,6 +2082,9 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   G1RemoteBackend* backend = rmm->backend();
 
   uintptr_t sa = h->load_state_and_addr_acquire();
+  if (!h->_remote_location.is_object_slot()) {
+    return nullptr;
+  }
   size_t slot_id = (size_t)h->remote_object_slot_id(sa);
   size_t word_size = h->eviction_word_size();
   BatchFetchInstallClosure installer(g1h, rmm, h, slot_id, eager_prefetch,
@@ -2105,6 +2134,120 @@ static oopDesc* fetch_and_install_batch(RemoteHandle* h, int& fetch_attempts,
   return nullptr;
 }
 
+static oopDesc* array_chunk_fetch_failed(G1RemoteMemoryManager* rmm,
+                                         RemoteHandle* h,
+                                         int& fetch_attempts,
+                                         bool* out_retry,
+                                         const char* reason) {
+  fetch_attempts++;
+  if (rmm != nullptr) {
+    rmm->record_fetch_retry();
+  }
+  if (fetch_attempts >= 3) {
+    if (rmm != nullptr) {
+      rmm->mark_handle_dead(h);
+    }
+    log_warning(gc)("Array chunk fetch failed %d times for handle " PTR_FORMAT
+                    " (%s) - marking DEAD",
+                    fetch_attempts, p2i(h), reason);
+    return nullptr;
+  }
+
+  h->cas_fetching_to_remote();
+  log_warning(gc)("Array chunk fetch failed for handle " PTR_FORMAT
+                  " (%s) - retry %d/3",
+                  p2i(h), reason, fetch_attempts);
+  *out_retry = true;
+  return nullptr;
+}
+
+static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
+                                              int& fetch_attempts,
+                                              bool* out_retry) {
+  *out_retry = false;
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  G1RemoteBackend* backend = rmm == nullptr ? nullptr : rmm->backend();
+  if (backend == nullptr || !backend->supports_segments()) {
+    return array_chunk_fetch_failed(rmm, h, fetch_attempts, out_retry,
+                                    "backend-has-no-segment-support");
+  }
+
+  RemoteLocation* loc = &h->_remote_location;
+  if (!loc->is_array_chunk()) {
+    return array_chunk_fetch_failed(rmm, h, fetch_attempts, out_retry,
+                                    "not-array-chunk");
+  }
+
+  size_t word_size = h->eviction_word_size();
+  size_t byte_size = loc->_byte_size;
+  uint64_t segment_id = (uint64_t)loc->_secondary_id;
+  uintptr_t expected_base = loc->_primary_id;
+  uint32_t expected_flags = loc->_flags;
+  if (segment_id == 0 || byte_size == 0 ||
+      word_size == 0 || word_size > SIZE_MAX / HeapWordSize ||
+      byte_size != word_size * HeapWordSize) {
+    return array_chunk_fetch_failed(rmm, h, fetch_attempts, out_retry,
+                                    "bad-array-chunk-metadata");
+  }
+
+  HeapWord* dest = rmm->allocate_in_fcr(word_size);
+  if (dest == nullptr) {
+    h->cas_fetching_to_remote();
+    rmm->record_fetch_retry();
+    *out_retry = true;
+    return nullptr;
+  }
+  memset(dest, 0, byte_size);
+
+  uintptr_t fetched_base = 0;
+  size_t fetched_bytes = 0;
+  uint32_t fetched_flags = 0;
+  jlong fetch_start = os::elapsed_counter();
+  bool ok = backend->fetch_segment(segment_id, &fetched_base, dest,
+                                   byte_size, &fetched_bytes, &fetched_flags);
+  jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
+
+  if (ok && (fetched_bytes != byte_size ||
+             (expected_base != 0 && fetched_base != expected_base) ||
+             fetched_flags != expected_flags)) {
+    log_warning(gc)("Array chunk fetch metadata mismatch: handle=" PTR_FORMAT
+                    " segment=" UINT64_FORMAT " expected_base=" PTR_FORMAT
+                    " actual_base=" PTR_FORMAT " expected_bytes=" SIZE_FORMAT
+                    " actual_bytes=" SIZE_FORMAT " expected_flags=%u"
+                    " actual_flags=%u",
+                    p2i(h), segment_id, p2i((void*)expected_base),
+                    p2i((void*)fetched_base), byte_size, fetched_bytes,
+                    expected_flags, fetched_flags);
+    ok = false;
+  }
+
+  Klass* fetched_klass = nullptr;
+  if (ok) {
+    fetched_klass = cast_to_oop(dest)->klass_or_null_acquire();
+    if (!remote_runtime_valid_klass(fetched_klass) ||
+        !fetched_klass->is_typeArray_klass()) {
+      log_warning(gc)("Array chunk fetch rejected invalid klass: handle="
+                      PTR_FORMAT " segment=" UINT64_FORMAT " klass="
+                      PTR_FORMAT " bytes=" SIZE_FORMAT,
+                      p2i(h), segment_id, p2i((void*)fetched_klass), byte_size);
+      ok = false;
+    }
+  }
+
+  rmm->record_fetch_result(word_size, fetch_elapsed, ok);
+  if (!ok) {
+    return array_chunk_fetch_failed(rmm, h, fetch_attempts, out_retry,
+                                    "backend-or-validation-failed");
+  }
+
+  oopDesc* result = finish_fetched_object(g1h, rmm, h, dest,
+                                          fetched_klass, word_size);
+  backend->discard_segment(segment_id);
+  rmm->publish_local_handle(h, dest);
+  return result;
+}
+
 // Fetch a REMOTE object, install it locally, and publish the Handle as LOCAL.
 // Caller must have already CAS'd the Handle to FETCHING.
 // Returns the local oop on success, nullptr on failure (Handle set to DEAD
@@ -2118,6 +2261,24 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
   size_t word_size = h->eviction_word_size();
+  if (h->_remote_location.is_array_chunk()) {
+    return fetch_and_install_array_chunk(h, fetch_attempts, out_retry);
+  }
+  if (!h->_remote_location.is_object_slot()) {
+    log_warning(gc)("Remote fetch rejected unsupported location kind: handle="
+                    PTR_FORMAT " kind=%u",
+                    p2i(h), h->_remote_location.kind_acquire());
+    fetch_attempts++;
+    rmm->record_fetch_retry();
+    if (fetch_attempts >= 3) {
+      rmm->mark_handle_dead(h);
+      return nullptr;
+    }
+    h->cas_fetching_to_remote();
+    *out_retry = true;
+    return nullptr;
+  }
+
   uintptr_t fetch_sa = h->load_state_and_addr_acquire();
   size_t slot_id = (size_t)h->remote_object_slot_id(fetch_sa);
 

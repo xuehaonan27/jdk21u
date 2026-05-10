@@ -81,12 +81,29 @@ struct RemoteLocation {
     Atomic::release_store(&_kind, (uint32_t)RemoteLocationObjectSlot);
   }
 
+  void set_array_chunk(uintptr_t array_id,
+                       uintptr_t segment_id,
+                       size_t offset,
+                       size_t byte_size,
+                       uint32_t flags) {
+    _flags = flags;
+    _primary_id = array_id;
+    _secondary_id = segment_id;
+    _offset = offset;
+    _byte_size = byte_size;
+    Atomic::release_store(&_kind, (uint32_t)RemoteLocationArrayChunk);
+  }
+
   uint32_t kind_acquire() const {
     return Atomic::load_acquire(&_kind);
   }
 
   bool is_object_slot() const {
     return kind_acquire() == RemoteLocationObjectSlot;
+  }
+
+  bool is_array_chunk() const {
+    return kind_acquire() == RemoteLocationArrayChunk;
   }
 };
 
@@ -205,6 +222,16 @@ struct RemoteHandle {
       _eviction_word_size > 0 ? _eviction_word_size * HeapWordSize : 0);
     Atomic::release_store(&_state_and_addr,
       (uintptr_t)(REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK)));
+  }
+
+  void set_remote_array_chunk(uintptr_t array_id,
+                              uintptr_t segment_id,
+                              size_t byte_size,
+                              uint32_t flags) {
+    _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
+    _remote_location.set_array_chunk(array_id, segment_id, 0, byte_size, flags);
+    Atomic::release_store(&_state_and_addr,
+      (uintptr_t)(REMOTE_HANDLE_REMOTE | (segment_id & REMOTE_HANDLE_ADDR_MASK)));
   }
 
   // Set to local (used during Handle creation and GC evacuation)

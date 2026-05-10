@@ -435,9 +435,31 @@ void G1RemoteMemoryManager::make_handle_remote(RemoteHandle* h, uintptr_t remote
   local_handle_unlock();
 }
 
+void G1RemoteMemoryManager::make_handle_remote_array_chunk(RemoteHandle* h,
+                                                           uintptr_t array_id,
+                                                           uintptr_t segment_id,
+                                                           size_t byte_size,
+                                                           uint32_t flags) {
+  if (h == nullptr) {
+    return;
+  }
+  local_handle_lock();
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  uintptr_t old_addr = ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL)
+      ? (sa & REMOTE_HANDLE_ADDR_MASK) : 0;
+  h->set_remote_array_chunk(array_id, segment_id, byte_size, flags);
+  unlink_local_handle_locked(h, old_addr);
+  local_handle_unlock();
+}
+
 void G1RemoteMemoryManager::mark_handle_dead(RemoteHandle* h) {
   if (h == nullptr) {
     return;
+  }
+  if (h->_remote_location.is_array_chunk() &&
+      _backend != nullptr &&
+      h->_remote_location._secondary_id != 0) {
+    _backend->discard_segment((uint64_t)h->_remote_location._secondary_id);
   }
   local_handle_lock();
   uintptr_t sa = h->load_state_and_addr_acquire();
@@ -2284,6 +2306,11 @@ static volatile int _prep_success_type_array = 0;
 static volatile int _prep_success_obj_array = 0;
 static volatile int _prep_diag_logged = 0;
 
+static uintptr_t array_chunk_segment_id_for(RemoteHandle* h) {
+  return ((uintptr_t)RemoteLocationArrayChunk << 60) |
+         ((uintptr_t)h & ((((uintptr_t)1) << 60) - 1));
+}
+
 bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAllocBuffer* hab,
                                                       PreparedEviction* out) {
   if (obj == nullptr || out == nullptr) { Atomic::add(&_prep_fail_null, 1); return false; }
@@ -2346,6 +2373,16 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
   out->word_size = word_size;
   out->slot_id = (size_t)-1;
   out->edge_table = nullptr;
+  out->location_kind = RemoteLocationObjectSlot;
+  out->location_flags = 0;
+  out->segment_id = 0;
+  if (G1RemoteUseArrayChunkLocations &&
+      klass->is_typeArray_klass() &&
+      _backend != nullptr &&
+      _backend->supports_segments()) {
+    out->location_kind = RemoteLocationArrayChunk;
+    out->segment_id = array_chunk_segment_id_for(h);
+  }
   return true;
 }
 
@@ -2356,6 +2393,10 @@ bool G1RemoteMemoryManager::finish_prepared_eviction(PreparedEviction* entry,
     return false;
   }
   if (entry->edge_table != nullptr && entry->slot_id != (size_t)-1) {
+    return true;
+  }
+
+  if (entry->location_kind == RemoteLocationArrayChunk) {
     return true;
   }
 
@@ -2386,12 +2427,22 @@ bool G1RemoteMemoryManager::finish_prepared_eviction_edges(
     EdgeTableEntry** pending_edge_head,
     EdgeTableEntry** pending_edge_tail,
     size_t* pending_edge_count) {
-  if (entry == nullptr || entry->obj == nullptr || entry->handle == nullptr ||
-      entry->slot_id == (size_t)-1) {
+  if (entry == nullptr || entry->obj == nullptr || entry->handle == nullptr) {
     Atomic::add(&_prep_fail_null, 1);
     return false;
   }
+  if (entry->location_kind != RemoteLocationArrayChunk &&
+      entry->slot_id == (size_t)-1) {
+    Atomic::add(&_prep_fail_slot, 1);
+    return false;
+  }
   if (entry->edge_table != nullptr) {
+    return true;
+  }
+
+  if (entry->location_kind == RemoteLocationArrayChunk) {
+    Atomic::add(&_prep_success, 1);
+    Atomic::add(&_prep_success_type_array, 1);
     return true;
   }
 
@@ -2493,7 +2544,14 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
       continue;
     }
     h->set_eviction_word_size(entry->word_size);
-    h->set_remote(entry->slot_id);
+    if (entry->location_kind == RemoteLocationArrayChunk) {
+      h->set_remote_array_chunk((uintptr_t)entry->obj,
+                                entry->segment_id,
+                                entry->word_size * HeapWordSize,
+                                entry->location_flags);
+    } else {
+      h->set_remote(entry->slot_id);
+    }
     unlink_local_handle_locked(h);
   }
   local_handle_unlock();
@@ -2520,7 +2578,17 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
 }
 
 void G1RemoteMemoryManager::abort_prepared_eviction(PreparedEviction* entry) {
-  if (entry == nullptr || entry->edge_table == nullptr) {
+  if (entry == nullptr) {
+    return;
+  }
+
+  if (entry->location_kind == RemoteLocationArrayChunk &&
+      entry->segment_id != 0 &&
+      _backend != nullptr) {
+    _backend->discard_segment((uint64_t)entry->segment_id);
+  }
+
+  if (entry->edge_table == nullptr) {
     return;
   }
 
@@ -7126,6 +7194,13 @@ Klass* G1RemoteMemoryManager::fetch_remote_object(RemoteHandle* h, void* dest) {
   uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
   assert(state == REMOTE_HANDLE_REMOTE || state == REMOTE_HANDLE_FETCHING,
          "Handle must be REMOTE or FETCHING");
+
+  if (!h->_remote_location.is_object_slot()) {
+    log_warning(gc)("Remote fetch rejected non-object-slot handle=" PTR_FORMAT
+                    " location_kind=%u",
+                    p2i(h), h->_remote_location.kind_acquire());
+    return nullptr;
+  }
 
   size_t slot_id = h->remote_object_slot_id(sa);
 

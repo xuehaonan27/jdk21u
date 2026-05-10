@@ -4380,6 +4380,23 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       for (int e = 0; e < num_entries; e++) {
         if (!entry_active[e]) continue;
         PreparedEviction* pe = &entries[e];
+        if (pe->location_kind == RemoteLocationArrayChunk) {
+          size_t max_segment_bytes = backend->max_staged_batch_data_size();
+          if (!backend->supports_segments() ||
+              pe->segment_id == 0 ||
+              (max_segment_bytes > 0 &&
+               pe->word_size * HeapWordSize > max_segment_bytes)) {
+            HeapRegion* hr = _g1h->heap_region_containing(pe->obj);
+            uint idx = hr->hrm_index();
+            if (idx < num_regions) {
+              message_blockers_by_region[idx]++;
+            }
+            oversized_entries++;
+            largest_oversized_entry =
+                MAX2(largest_oversized_entry, pe->word_size * HeapWordSize);
+          }
+          continue;
+        }
         size_t byte_size = pe->word_size * HeapWordSize;
         uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
         size_t edge_bytes = num_edges * 12;
@@ -4455,6 +4472,47 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       uintptr_t* failed_localize_ids =
           NEW_C_HEAP_ARRAY(uintptr_t, FAILED_LOCALIZE_BATCH, mtGC);
 
+      int array_chunk_segments_sent = 0;
+      int array_chunk_segment_failures = 0;
+      size_t array_chunk_segment_bytes = 0;
+      if (backend->supports_segments()) {
+        for (int e = 0; e < num_entries; e++) {
+          if (!entry_active[e]) continue;
+          PreparedEviction* pe = &entries[e];
+          if (pe->location_kind != RemoteLocationArrayChunk) continue;
+
+          size_t byte_size = pe->word_size * HeapWordSize;
+          Ticks seg_start = Ticks::now();
+          bool ok = backend->evict_segment((uint64_t)pe->segment_id,
+                                           (uintptr_t)pe->obj,
+                                           cast_from_oop<void*>(pe->obj),
+                                           byte_size,
+                                           pe->location_flags);
+          e2_backend_ms += (Ticks::now() - seg_start).seconds() * 1000.0;
+          if (ok) {
+            array_chunk_segments_sent++;
+            array_chunk_segment_bytes += byte_size;
+            e2_backend_objects++;
+            e2_backend_bytes += byte_size;
+          } else {
+            HeapRegion* hr = _g1h->heap_region_containing(pe->obj);
+            uint idx = hr->hrm_index();
+            if (idx < num_regions) {
+              send_failed_regions[idx] = true;
+            }
+            send_failed_entries++;
+            entry_active[e] = false;
+            array_chunk_segment_failures++;
+          }
+        }
+      }
+      if (array_chunk_segments_sent > 0 || array_chunk_segment_failures > 0) {
+        log_info(gc)("Phase E2 array chunks: sent=%d failed=%d bytes="
+                     SIZE_FORMAT "KB",
+                     array_chunk_segments_sent, array_chunk_segment_failures,
+                     array_chunk_segment_bytes / K);
+      }
+
       if (num_entries > 0 && use_batch_evict && batch_buf_size > BATCH_HDR_SIZE) {
         uint8_t* batch_buf = (uint8_t*)os::malloc(batch_buf_size, mtGC);
         size_t batch_offset = BATCH_HDR_SIZE;
@@ -4494,6 +4552,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             for (int e = 0; e < num_entries; e++) {
               if (!entry_active[e]) continue;
               PreparedEviction* pe = &entries[e];
+              if (pe->location_kind == RemoteLocationArrayChunk) continue;
               size_t byte_size = pe->word_size * HeapWordSize;
               uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
               size_t legacy_edge_bytes = num_edges * 12;
@@ -4573,7 +4632,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                   break;
                 } else {
                   for (int f = batch_start_entry; f < e; f++) {
-                    if (entry_active[f]) entry_sent[f] = true;
+                    if (entry_active[f] &&
+                        entries[f].location_kind != RemoteLocationArrayChunk) {
+                      entry_sent[f] = true;
+                    }
                   }
                 }
                 batches_sent++;
@@ -4666,7 +4728,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 }
               } else {
                 for (int f = batch_start_entry; f < num_entries; f++) {
-                  if (entry_active[f]) entry_sent[f] = true;
+                  if (entry_active[f] &&
+                      entries[f].location_kind != RemoteLocationArrayChunk) {
+                    entry_sent[f] = true;
+                  }
                 }
               }
               batches_sent++;
@@ -4689,6 +4754,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           for (int e = 0; e < num_entries; e++) {
             if (!entry_active[e]) continue;
             PreparedEviction* pe = &entries[e];
+            if (pe->location_kind == RemoteLocationArrayChunk) continue;
             size_t byte_size = pe->word_size * HeapWordSize;
             uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
             size_t legacy_edge_bytes = num_edges * 12;
@@ -4756,7 +4822,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 break;
               } else {
                 for (int f = batch_start_entry; f < e; f++) {
-                  if (entry_active[f]) entry_sent[f] = true;
+                  if (entry_active[f] &&
+                      entries[f].location_kind != RemoteLocationArrayChunk) {
+                    entry_sent[f] = true;
+                  }
                 }
               }
               batches_sent++;
@@ -4828,7 +4897,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               }
             } else {
               for (int f = batch_start_entry; f < num_entries; f++) {
-                if (entry_active[f]) entry_sent[f] = true;
+                if (entry_active[f] &&
+                    entries[f].location_kind != RemoteLocationArrayChunk) {
+                  entry_sent[f] = true;
+                }
               }
             }
             batches_sent++;
@@ -4838,6 +4910,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           for (int e = 0; e < num_entries; e++) {
             if (!entry_active[e]) continue;
             PreparedEviction* pe = &entries[e];
+            if (pe->location_kind == RemoteLocationArrayChunk) continue;
             size_t byte_size = pe->word_size * HeapWordSize;
             uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
             size_t edge_bytes = num_edges * 12;
@@ -4886,7 +4959,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 break;
               } else {
                 for (int f = batch_start_entry; f < e; f++) {
-                  if (entry_active[f]) entry_sent[f] = true;
+                  if (entry_active[f] &&
+                      entries[f].location_kind != RemoteLocationArrayChunk) {
+                    entry_sent[f] = true;
+                  }
                 }
               }
               batches_sent++;
@@ -4943,7 +5019,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               }
             } else {
               for (int f = batch_start_entry; f < num_entries; f++) {
-                if (entry_active[f]) entry_sent[f] = true;
+                if (entry_active[f] &&
+                    entries[f].location_kind != RemoteLocationArrayChunk) {
+                  entry_sent[f] = true;
+                }
               }
             }
             batches_sent++;
@@ -4964,6 +5043,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         for (int e = 0; e < num_entries; e++) {
           if (!entry_active[e]) continue;
           PreparedEviction* pe = &entries[e];
+          if (pe->location_kind == RemoteLocationArrayChunk) continue;
           uint32_t num_edges = (pe->edge_table != nullptr) ? pe->edge_table->_entry_count : 0;
           G1RemoteBackend::EdgeInfo* edge_infos = nullptr;
           if (num_edges > 0) {
@@ -5012,7 +5092,8 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         int rcount = region_count_arr[i];
         for (int e = start; e < start + rcount; e++) {
           if (entry_active[e]) {
-            if (entry_sent[e]) {
+            if (entry_sent[e] &&
+                entries[e].location_kind != RemoteLocationArrayChunk) {
               failed_localize_ids[failed_localize_count++] = (uintptr_t)entries[e].handle;
               send_failed_sent_entries++;
               entry_sent[e] = false;

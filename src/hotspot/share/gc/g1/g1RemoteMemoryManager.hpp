@@ -607,6 +607,11 @@ public:
   void publish_local_handle(RemoteHandle* h, void* local_addr);
   void publish_local_handles(RemoteHandle** handles, HeapWord** local_addrs, uint count);
   void make_handle_remote(RemoteHandle* h, uintptr_t remote_id);
+  void make_handle_remote_array_chunk(RemoteHandle* h,
+                                      uintptr_t array_id,
+                                      uintptr_t segment_id,
+                                      size_t byte_size,
+                                      uint32_t flags);
   void mark_handle_dead(RemoteHandle* h);
   size_t local_handle_count() const { return _local_handle_count; }
 
@@ -1333,6 +1338,9 @@ public:
     size_t        word_size;
     size_t        slot_id;
     ObjectEdgeTable* edge_table;
+    uint32_t      location_kind;
+    uint32_t      location_flags;
+    uintptr_t     segment_id;
   };
 
   // Prepare metadata: safety checks and handle lookup only. This is used before
