@@ -213,7 +213,6 @@ protected:
 
   static bool is_g1_pre_val_load(Node* n);
 public:
-  static const TypeFunc* handleify_old_oop_for_store_Type();
   virtual void* create_barrier_state(Arena* comp_arena) const;
   virtual void emit_stubs(CodeBuffer& cb) const;
   virtual int estimate_stub_size() const;

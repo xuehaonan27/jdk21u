@@ -224,19 +224,10 @@ static uint32_t g1_c2_register_semantic_access_site(C2Access& access,
                                               kit == nullptr ? nullptr : kit->method());
 }
 
-static bool g1_c2_remote_store_handleify_active() {
-  return false;
-}
-
-static bool g1_c2_store_base_is_class_mirror(C2Access& access) {
-  Node* base = access.base();
-  if (base == nullptr) {
-    return false;
-  }
-  const TypeOopPtr* oop_type = base->bottom_type()->isa_oopptr();
-  const TypeInstPtr* inst_type = oop_type == nullptr ? nullptr : oop_type->isa_instptr();
-  return inst_type != nullptr &&
-         inst_type->instance_klass() == Compile::current()->env()->Class_klass();
+static bool g1_c2_remote_pre_barrier_needs_runtime() {
+  return !UseCompressedOops &&
+         (LocalMemoryRatio < 100 || G1TagRefSites ||
+          G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0);
 }
 
 static Node* g1_c2_oop_value_as_raw(GraphKit* kit, Node* ctrl, Node* value) {
@@ -246,21 +237,6 @@ static Node* g1_c2_oop_value_as_raw(GraphKit* kit, Node* ctrl, Node* value) {
   PhaseGVN& gvn = kit->gvn();
   Node* raw_bits = gvn.transform(new CastP2XNode(ctrl, value));
   return gvn.transform(new CastX2PNode(raw_bits));
-}
-
-static Node* g1_c2_handleify_store_value(GraphKit* kit, Node* value) {
-  if (kit == nullptr || value == nullptr || !g1_c2_remote_store_handleify_active()) {
-    return value;
-  }
-  IdealKit ideal(kit, true);
-  Node* raw_value = g1_c2_oop_value_as_raw(kit, ideal.ctrl(), value);
-  Node* handled = ideal.make_leaf_call(
-      G1BarrierSetC2::handleify_old_oop_for_store_Type(),
-      CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::handleify_old_oop_for_store),
-      "handleify_old_oop_for_store",
-      raw_value);
-  kit->final_sync(ideal);
-  return handled;
 }
 
 const TypeFunc *G1BarrierSetC2::write_ref_field_pre_entry_Type() {
@@ -285,18 +261,6 @@ const TypeFunc *G1BarrierSetC2::write_ref_field_post_entry_Type() {
   // create result type (range)
   fields = TypeTuple::fields(0);
   const TypeTuple *range = TypeTuple::make(TypeFunc::Parms, fields);
-
-  return TypeFunc::make(domain, range);
-}
-
-const TypeFunc *G1BarrierSetC2::handleify_old_oop_for_store_Type() {
-  const Type **fields = TypeTuple::fields(1);
-  fields[TypeFunc::Parms+0] = TypeRawPtr::BOTTOM; // pointer-shaped oop/tagged value
-  const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+1, fields);
-
-  fields = TypeTuple::fields(1);
-  fields[TypeFunc::Parms+0] = TypeRawPtr::BOTTOM;
-  const TypeTuple *range = TypeTuple::make(TypeFunc::Parms+1, fields);
 
   return TypeFunc::make(domain, range);
 }
@@ -485,7 +449,7 @@ void G1BarrierSetC2::pre_barrier(GraphKit* kit,
 
     // if (pre_val != nullptr)
     __ if_then(pre_val, BoolTest::ne, kit->null()); {
-      if (g1_c2_remote_store_handleify_active()) {
+      if (g1_c2_remote_pre_barrier_needs_runtime()) {
         const TypeFunc *tf = write_ref_field_pre_entry_Type();
         Node* raw_pre_val = g1_c2_oop_value_as_raw(kit, __ ctrl(), pre_val);
         __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_pre_entry), "write_ref_field_pre_entry", raw_pre_val, tls);
@@ -835,12 +799,12 @@ void G1BarrierSetC2::insert_pre_barrier(GraphKit* kit, Node* base_oop, Node* off
 #undef __
 
 Node* G1BarrierSetC2::store_at_resolved(C2Access& access, C2AccessValue& val) const {
-  if (access.is_oop() && access.is_parse_access() &&
-      !g1_c2_store_base_is_class_mirror(access)) {
-    C2ParseAccess& parse_access = static_cast<C2ParseAccess&>(access);
-    Node* handled = g1_c2_handleify_store_value(parse_access.kit(), val.node());
-    val.set_node(handled);
-  }
+  // Do not insert per-store handleification into C2's mutator data path.
+  // A tagged/indirect remote handle is not a HotSpot oop, and modeling it as
+  // the value of a normal StoreP breaks C2's type, oop-map, and barrier
+  // invariants. C2 stores remain clean oop stores; promotion/eviction code is
+  // responsible for publishing handles and canonicalizing slots at GC
+  // boundaries.
   return ModRefBarrierSetC2::store_at_resolved(access, val);
 }
 
@@ -1344,9 +1308,6 @@ Node* G1BarrierSetC2::atomic_cmpxchg_val_at_resolved(C2AtomicParseAccess& access
     access.set_barrier_data(g1_barrier_data_with_access_hint(
         g1_remote_access_hint_for_c2(access.decorators(), true)));
   }
-  if (access.is_oop()) {
-    new_val = g1_c2_handleify_store_value(access.kit(), new_val);
-  }
   return CardTableBarrierSetC2::atomic_cmpxchg_val_at_resolved(access, expected_val, new_val, val_type);
 }
 
@@ -1356,9 +1317,6 @@ Node* G1BarrierSetC2::atomic_cmpxchg_bool_at_resolved(C2AtomicParseAccess& acces
     access.set_barrier_data(g1_barrier_data_with_access_hint(
         g1_remote_access_hint_for_c2(access.decorators(), true)));
   }
-  if (access.is_oop()) {
-    new_val = g1_c2_handleify_store_value(access.kit(), new_val);
-  }
   return CardTableBarrierSetC2::atomic_cmpxchg_bool_at_resolved(access, expected_val, new_val, value_type);
 }
 
@@ -1366,9 +1324,6 @@ Node* G1BarrierSetC2::atomic_xchg_at_resolved(C2AtomicParseAccess& access, Node*
   if (!UseCompressedOops && access.is_oop() && !(access.decorators() & C2_TIGHTLY_COUPLED_ALLOC)) {
     access.set_barrier_data(g1_barrier_data_with_access_hint(
         g1_remote_access_hint_for_c2(access.decorators(), true)));
-  }
-  if (access.is_oop()) {
-    new_val = g1_c2_handleify_store_value(access.kit(), new_val);
   }
   return CardTableBarrierSetC2::atomic_xchg_at_resolved(access, new_val, val_type);
 }
