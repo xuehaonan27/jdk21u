@@ -2622,7 +2622,8 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
   if (ok) {
     fetched_klass = cast_to_oop(dest)->klass_or_null_acquire();
     if (!remote_runtime_valid_klass(fetched_klass) ||
-        fetched_klass->is_array_klass() ||
+        (fetched_klass->is_array_klass() &&
+         !fetched_klass->is_objArray_klass()) ||
         cast_to_oop(dest)->size_given_klass(fetched_klass) != word_size) {
       log_warning(gc)("Object cluster fetch rejected invalid primary: handle="
                       PTR_FORMAT " segment=" UINT64_FORMAT " klass="
@@ -2658,7 +2659,8 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
           segment_dest + (member_loc->_offset / HeapWordSize);
       Klass* member_klass = cast_to_oop(member_dest)->klass_or_null_acquire();
       if (!remote_runtime_valid_klass(member_klass) ||
-          member_klass->is_array_klass() ||
+          (member_klass->is_array_klass() &&
+           !member_klass->is_objArray_klass()) ||
           cast_to_oop(member_dest)->size_given_klass(member_klass) !=
               member_word_size) {
         ok = false;
@@ -2764,7 +2766,8 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
 
       Klass* sibling_klass = cast_to_oop(sibling_dest)->klass_or_null_acquire();
       if (!remote_runtime_valid_klass(sibling_klass) ||
-          sibling_klass->is_array_klass() ||
+          (sibling_klass->is_array_klass() &&
+           !sibling_klass->is_objArray_klass()) ||
           cast_to_oop(sibling_dest)->size_given_klass(sibling_klass) !=
               sibling_word_size) {
         sibling->cas_fetching_to_remote();

@@ -2577,7 +2577,7 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
     out->location_kind = RemoteLocationArrayChunk;
     out->segment_id = array_chunk_segment_id_for(h);
   } else if (G1RemoteUseClusterObjectLocations &&
-             !klass->is_array_klass() &&
+             (!klass->is_array_klass() || klass->is_objArray_klass()) &&
              _backend != nullptr &&
              _backend->supports_segments()) {
     out->location_kind = RemoteLocationClusterObject;

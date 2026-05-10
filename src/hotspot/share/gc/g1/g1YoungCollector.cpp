@@ -84,6 +84,37 @@
 #include <string.h>
 #include <sys/mman.h>
 
+static bool g1_remote_prepared_is_segment_location(
+    const G1RemoteMemoryManager::PreparedEviction* pe) {
+  return pe != nullptr &&
+         (pe->location_kind == RemoteLocationArrayChunk ||
+          pe->location_kind == RemoteLocationClusterObject);
+}
+
+static int g1_remote_mark_failed_object_slot_entries(
+    G1CollectedHeap* g1h,
+    G1RemoteMemoryManager::PreparedEviction* entries,
+    const bool* entry_active,
+    int from,
+    int to,
+    bool* send_failed_regions,
+    uint num_regions) {
+  int failed = 0;
+  for (int f = from; f < to; f++) {
+    if (!entry_active[f]) continue;
+    G1RemoteMemoryManager::PreparedEviction* pe = &entries[f];
+    if (g1_remote_prepared_is_segment_location(pe)) continue;
+    HeapRegion* hr = g1h->heap_region_containing(pe->obj);
+    if (hr == nullptr) continue;
+    uint idx = hr->hrm_index();
+    if (idx < num_regions) {
+      send_failed_regions[idx] = true;
+    }
+    failed++;
+  }
+  return failed;
+}
+
 // GCTraceTime wrapper that constructs the message according to GC pause type and
 // GC cause.
 // The code relies on the fact that GCTraceTimeWrapper stores the string passed
@@ -4898,7 +4929,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                      G1RemoteClusterObjectGroupMaxObjects);
       }
 
-      if (num_entries > 0 && use_batch_evict && batch_buf_size > BATCH_HDR_SIZE) {
+      int object_slot_entries = 0;
+      for (int e = 0; e < num_entries; e++) {
+        if (!entry_active[e]) continue;
+        if (g1_remote_prepared_is_segment_location(&entries[e])) continue;
+        object_slot_entries++;
+      }
+
+      if (object_slot_entries > 0 && use_batch_evict && batch_buf_size > BATCH_HDR_SIZE) {
         uint8_t* batch_buf = (uint8_t*)os::malloc(batch_buf_size, mtGC);
         size_t batch_offset = BATCH_HDR_SIZE;
         int batch_count = 0;
@@ -4909,11 +4947,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           log_warning(gc)("Pre-E batch send skipped: failed to allocate " SIZE_FORMAT
                           "KB batch buffer; keeping prepared entries local",
                           batch_buf_size / K);
-          for (uint i = 0; i < num_regions; i++) {
-            if (eviction_candidates[i] && region_count_arr[i] > 0) {
-              send_failed_regions[i] = true;
-            }
-          }
+          send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+              _g1h, entries, entry_active, 0, num_entries,
+              send_failed_regions, num_regions);
         } else if (use_staged_homogeneous_evict) {
           static const uint64_t STAGED_REMOTE_OFFSET = 0;
           const size_t staged_data_buf_size = backend->max_staged_batch_data_size();
@@ -4927,11 +4963,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
             log_warning(gc)("Pre-E staged batch send skipped: failed to allocate "
                             SIZE_FORMAT "KB data buffer; keeping prepared entries local",
                             staged_data_buf_size / K);
-            for (uint i = 0; i < num_regions; i++) {
-              if (eviction_candidates[i] && region_count_arr[i] > 0) {
-                send_failed_regions[i] = true;
-              }
-            }
+            send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                _g1h, entries, entry_active, 0, num_entries,
+                send_failed_regions, num_regions);
           } else {
             for (int e = 0; e < num_entries; e++) {
               if (!entry_active[e]) continue;
@@ -4999,20 +5033,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                   "(" SIZE_FORMAT "KB metadata, " SIZE_FORMAT
                                   "KB data); keeping affected regions local",
                                   batch_count, batch_offset / K, batch_data_offset / K);
-                  for (int f = batch_start_entry; f < e; f++) {
-                    if (!entry_active[f]) continue;
-                    HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                    uint idx = hr->hrm_index();
-                    if (idx < num_regions) send_failed_regions[idx] = true;
-                    send_failed_entries++;
-                  }
-                  for (int f = e; f < num_entries; f++) {
-                    if (!entry_active[f]) continue;
-                    HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                    uint idx = hr->hrm_index();
-                    if (idx < num_regions) send_failed_regions[idx] = true;
-                    send_failed_entries++;
-                  }
+                  send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                      _g1h, entries, entry_active, batch_start_entry, e,
+                      send_failed_regions, num_regions);
+                  send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                      _g1h, entries, entry_active, e, num_entries,
+                      send_failed_regions, num_regions);
                   backend_send_failed = true;
                   break;
                 } else {
@@ -5105,13 +5131,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                                 "(" SIZE_FORMAT "KB metadata, " SIZE_FORMAT
                                 "KB data); keeping affected regions local",
                                 batch_count, batch_offset / K, batch_data_offset / K);
-                for (int f = batch_start_entry; f < num_entries; f++) {
-                  if (!entry_active[f]) continue;
-                  HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                  uint idx = hr->hrm_index();
-                  if (idx < num_regions) send_failed_regions[idx] = true;
-                  send_failed_entries++;
-                }
+                send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                    _g1h, entries, entry_active, batch_start_entry, num_entries,
+                    send_failed_regions, num_regions);
               } else {
                 for (int f = batch_start_entry; f < num_entries; f++) {
                   if (entry_active[f] &&
@@ -5192,20 +5214,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 log_warning(gc)("Pre-E batch send failed for %d objects (" SIZE_FORMAT "KB); "
                                 "keeping affected regions local",
                                 batch_count, batch_offset / K);
-                for (int f = batch_start_entry; f < e; f++) {
-                  if (!entry_active[f]) continue;
-                  HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                  uint idx = hr->hrm_index();
-                  if (idx < num_regions) send_failed_regions[idx] = true;
-                  send_failed_entries++;
-                }
-                for (int f = e; f < num_entries; f++) {
-                  if (!entry_active[f]) continue;
-                  HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                  uint idx = hr->hrm_index();
-                  if (idx < num_regions) send_failed_regions[idx] = true;
-                  send_failed_entries++;
-                }
+                send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                    _g1h, entries, entry_active, batch_start_entry, e,
+                    send_failed_regions, num_regions);
+                send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                    _g1h, entries, entry_active, e, num_entries,
+                    send_failed_regions, num_regions);
                 backend_send_failed = true;
                 break;
               } else {
@@ -5277,13 +5291,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               log_warning(gc)("Pre-E batch send failed for %d objects (" SIZE_FORMAT "KB); "
                               "keeping affected regions local",
                               batch_count, batch_offset / K);
-              for (int f = batch_start_entry; f < num_entries; f++) {
-                if (!entry_active[f]) continue;
-                HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                uint idx = hr->hrm_index();
-                if (idx < num_regions) send_failed_regions[idx] = true;
-                send_failed_entries++;
-              }
+              send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                  _g1h, entries, entry_active, batch_start_entry, num_entries,
+                  send_failed_regions, num_regions);
             } else {
               for (int f = batch_start_entry; f < num_entries; f++) {
                 if (entry_active[f] &&
@@ -5332,20 +5342,12 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                 log_warning(gc)("Pre-E batch send failed for %d objects (" SIZE_FORMAT "KB); "
                                 "keeping affected regions local",
                                 batch_count, batch_offset / K);
-                for (int f = batch_start_entry; f < e; f++) {
-                  if (!entry_active[f]) continue;
-                  HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                  uint idx = hr->hrm_index();
-                  if (idx < num_regions) send_failed_regions[idx] = true;
-                  send_failed_entries++;
-                }
-                for (int f = e; f < num_entries; f++) {
-                  if (!entry_active[f]) continue;
-                  HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                  uint idx = hr->hrm_index();
-                  if (idx < num_regions) send_failed_regions[idx] = true;
-                  send_failed_entries++;
-                }
+                send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                    _g1h, entries, entry_active, batch_start_entry, e,
+                    send_failed_regions, num_regions);
+                send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                    _g1h, entries, entry_active, e, num_entries,
+                    send_failed_regions, num_regions);
                 backend_send_failed = true;
                 break;
               } else {
@@ -5402,13 +5404,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               log_warning(gc)("Pre-E batch send failed for %d objects (" SIZE_FORMAT "KB); "
                               "keeping affected regions local",
                               batch_count, batch_offset / K);
-              for (int f = batch_start_entry; f < num_entries; f++) {
-                if (!entry_active[f]) continue;
-                HeapRegion* hr = _g1h->heap_region_containing(entries[f].obj);
-                uint idx = hr->hrm_index();
-                if (idx < num_regions) send_failed_regions[idx] = true;
-                send_failed_entries++;
-              }
+              send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+                  _g1h, entries, entry_active, batch_start_entry, num_entries,
+                  send_failed_regions, num_regions);
             } else {
               for (int f = batch_start_entry; f < num_entries; f++) {
                 if (entry_active[f] &&
@@ -5423,16 +5421,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
 
         os::free(batch_buf);
-      } else if (num_entries > 0 && use_batch_evict) {
+      } else if (object_slot_entries > 0 && use_batch_evict) {
         log_warning(gc)("Pre-E batch send skipped: backend batch message limit "
                         SIZE_FORMAT "B is too small; keeping prepared entries local",
                         batch_buf_size);
-        for (uint i = 0; i < num_regions; i++) {
-          if (eviction_candidates[i] && region_count_arr[i] > 0) {
-            send_failed_regions[i] = true;
-          }
-        }
-      } else if (num_entries > 0 && !use_batch_evict) {
+        send_failed_entries += g1_remote_mark_failed_object_slot_entries(
+            _g1h, entries, entry_active, 0, num_entries,
+            send_failed_regions, num_regions);
+      } else if (object_slot_entries > 0 && !use_batch_evict) {
         for (int e = 0; e < num_entries; e++) {
           if (!entry_active[e]) continue;
           PreparedEviction* pe = &entries[e];
