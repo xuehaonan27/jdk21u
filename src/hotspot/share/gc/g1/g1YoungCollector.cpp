@@ -4422,9 +4422,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
                          (int)pe->word_size == staged_word_size &&
                          num_edges == staged_num_edges;
             if (compatible && num_edges > 0) {
-              ObjectEdgeTable* template_edges =
+              G1RemoteMemoryManager::ObjectEdgeTable* template_edges =
                   staged_template == nullptr ? nullptr : staged_template->edge_table;
-              ObjectEdgeTable* current_edges = pe->edge_table;
+              G1RemoteMemoryManager::ObjectEdgeTable* current_edges = pe->edge_table;
               if (template_edges == nullptr || current_edges == nullptr) {
                 compatible = false;
               } else {
