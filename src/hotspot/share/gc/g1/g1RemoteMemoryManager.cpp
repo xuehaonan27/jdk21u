@@ -5417,7 +5417,13 @@ int G1RemoteMemoryManager::tag_refs_to_eviction_set_fast(
     for (auto id : EnumRange<OopStorageSet::WeakId>()) {
       OopStorageSet::storage(id)->oops_do(&root_cl);
     }
-    oops_do_remote_anchors(&root_cl);
+    // Do not scan remote anchors here.  They are not writable heap/root oop
+    // slots that need Phase-C tagging; they are HIT entries whose state is
+    // flipped from LOCAL to REMOTE by Phase E when their object is evicted.
+    // Treating them as ordinary non-heap roots makes every anchored dense or
+    // FCR candidate look untaggable and aborts the whole eviction batch after
+    // doing the expensive handle/tagging work.  Normal GC liveness and
+    // evacuation updates still process anchors via G1RootProcessor.
     {
       CLDToOopClosure cld_cl(&root_cl, ClassLoaderData::_claim_none);
       ClassLoaderDataGraph::cld_do(&cld_cl);
