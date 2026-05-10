@@ -8024,7 +8024,9 @@ class CSetRefFixupClosure : public BasicOopIterateClosure {
   int _invalid;
   int _invalid_nulled;
   int _rescue_failed;
+  int _direct_converted;
   bool _src_is_fcr;     // Set per object via set_src_is_fcr()
+  RemoteHandleAllocBuffer _hab;
 
   bool should_log_rescue() const {
     return _rescued < 16 || ((_rescued & (_rescued - 1)) == 0);
@@ -8058,13 +8060,24 @@ public:
   CSetRefFixupClosure(G1CollectedHeap* g1h, G1RemoteMemoryManager* rmm, bool allow_rescue)
     : _g1h(g1h), _rmm(rmm), _allow_rescue(allow_rescue),
       _fixed(0), _rescued(0), _skipped(0), _invalid(0), _invalid_nulled(0),
-      _rescue_failed(0), _src_is_fcr(false) {}
+      _rescue_failed(0), _direct_converted(0), _src_is_fcr(false), _hab() {}
 
   void set_src_is_fcr(bool v) { _src_is_fcr = v; }
 
   void store_forwardee(oop* p, uintptr_t tag_bits, oop fwd) {
     if (tag_bits != 0) {
-      *(uintptr_t*)p = tag_bits | (cast_from_oop<uintptr_t>(fwd) & G1_OOP_ADDR_MASK);
+      HeapRegion* fwd_hr = _g1h->heap_region_containing_or_null(fwd);
+      bool handle_managed =
+          fwd_hr != nullptr &&
+          (fwd_hr->is_old() || fwd_hr->is_starts_humongous() ||
+           fwd_hr->is_fetch_cache());
+      RemoteHandle* h = handle_managed ? _rmm->ensure_handle_for(fwd, &_hab) : nullptr;
+      if (h != nullptr) {
+        *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+        _direct_converted++;
+      } else {
+        RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
+      }
     } else {
       RawAccess<IS_NOT_NULL>::oop_store(p, fwd);
     }
@@ -8181,6 +8194,7 @@ public:
   int invalid() const { return _invalid; }
   int invalid_nulled() const { return _invalid_nulled; }
   int rescue_failed() const { return _rescue_failed; }
+  int direct_converted() const { return _direct_converted; }
   int updated() const { return _fixed + _rescued + _invalid_nulled; }
 };
 
@@ -8347,22 +8361,23 @@ int G1RemoteMemoryManager::fixup_stale_refs_in_old_regions(bool evacuation_faile
   double elapsed_ms = (Ticks::now() - start).seconds() * 1000.0;
   log_debug(gc)("Old/cset fixup DONE: scanned %d regions, %d objects, code %.1fms, "
                 "%d fixed, %d rescued, %d skipped, %d invalid, %d rescue-failed, "
-                "%d nmethods updated in %.1fms",
+                "%d direct-converted, %d nmethods updated in %.1fms",
                 regions_scanned, objects_scanned, code_ms,
                 cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(), cl.rescue_failed(),
-                code_cl.nmethods_updated(), elapsed_ms);
+                cl.direct_converted(), code_cl.nmethods_updated(), elapsed_ms);
 
   if (cl.fixed() > 0 || cl.rescued() > 0 || cl.skipped() > 0 ||
       cl.invalid() > 0 || cl.rescue_failed() > 0 ||
+      cl.direct_converted() > 0 ||
       code_cl.nmethods_updated() > 0) {
     log_warning(gc)("Old/humongous-region stale-ref fixup: %d fixed (forwardee), "
                     "%d rescued, %d skipped (unforwarded/in-place), %d invalid "
                     "(%d nulled), "
-                    "%d rescue-failed, %d nmethods updated; "
+                    "%d rescue-failed, %d direct-converted, %d nmethods updated; "
                     "FCR evac writes: %llu, previous FCR nulls: %llu",
                     cl.fixed(), cl.rescued(), cl.skipped(), cl.invalid(),
                     cl.invalid_nulled(), cl.rescue_failed(),
-                    code_cl.nmethods_updated(),
+                    cl.direct_converted(), code_cl.nmethods_updated(),
                     (unsigned long long)fcr_evac_writes(),
                     (unsigned long long)fcr_fixup_nulls());
   }
