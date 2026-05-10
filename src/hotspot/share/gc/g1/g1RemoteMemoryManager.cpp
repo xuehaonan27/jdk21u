@@ -5098,10 +5098,19 @@ static void release_dense_tagged_handle_ref(G1RemoteMemoryManager* rmm,
   }
 }
 
+static bool remote_handle_managed_local_oop(G1CollectedHeap* g1h, oop obj) {
+  if (g1h == nullptr || obj == nullptr) {
+    return false;
+  }
+  HeapRegion* hr = g1h->heap_region_containing_or_null(obj);
+  return hr != nullptr &&
+         (hr->is_old() || hr->is_starts_humongous() ||
+          hr->is_fetch_cache());
+}
+
 int G1RemoteMemoryManager::untag_recorded_local_refs() {
   int restored = 0;
   int direct_restored = 0;
-  int direct_retained = 0;
   int direct_converted = 0;
   int direct_nulled = 0;
   int dense_handle_retained = 0;
@@ -5109,6 +5118,7 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
   int removed = 0;
   int retained = 0;
   G1RemoteRollbackDirtyCards dirty_cards(_g1h);
+  RemoteHandleAllocBuffer hab;
 
   for (int i = 0; i < _tagged_field_count; i++) {
     TaggedFieldEntry entry = _tagged_fields[i];
@@ -5191,18 +5201,26 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
         continue;
       }
 
-      if (is_dense_segment_managed_addr(addr)) {
-        *(uintptr_t*)field_addr = 0;
+      oop target_oop = cast_to_oop((HeapWord*)addr);
+      RemoteHandle* direct_target = remote_handle_managed_local_oop(_g1h, target_oop)
+          ? ensure_handle_for(target_oop, &hab) : nullptr;
+      if (direct_target != nullptr) {
+        *(uintptr_t*)field_addr =
+            G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)direct_target;
         dirty_cards.dirty_field(field_addr);
-        direct_nulled++;
-        removed++;
-        continue;
+        TaggedFieldEntry handle_entry;
+        handle_entry._field_addr = field_addr;
+        handle_entry._handle = direct_target;
+        handle_entry._tagged_raw = 0;
+        handle_entry._kind = TaggedFieldHandle;
+        _tagged_fields[retained++] = handle_entry;
+        direct_converted++;
+      } else {
+        *(uintptr_t*)field_addr = addr;
+        dirty_cards.dirty_field(field_addr);
+        restored++;
+        direct_restored++;
       }
-
-      *(uintptr_t*)field_addr = addr;
-      dirty_cards.dirty_field(field_addr);
-      restored++;
-      direct_restored++;
       continue;
     }
 
@@ -5254,17 +5272,17 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
 
   dirty_cards.flush();
   _tagged_field_count = retained;
-  if (restored > 0 || direct_retained > 0 || direct_converted > 0 ||
+  if (restored > 0 || direct_converted > 0 ||
       direct_nulled > 0 || dense_handle_retained > 0 ||
       dense_handle_released > 0 || removed > 0 || dirty_cards.dirtied() > 0) {
     log_info(gc)("Recorded untag cleanup: restored %d local refs (%d direct), "
-                 "retained %d remote direct refs, converted %d stale direct refs, "
+                 "converted %d stale direct refs, "
                  "nulled %d invalid direct refs, retained %d dense handle refs, "
                  "released %d dense handle refs, removed %d stale entries, "
                  "%d remote-tag entries retained, dirtied %d cards",
-                 restored, direct_restored, direct_retained, direct_converted,
-                 direct_nulled, dense_handle_retained, dense_handle_released,
-                 removed, retained, dirty_cards.dirtied());
+                 restored, direct_restored, direct_converted, direct_nulled,
+                 dense_handle_retained, dense_handle_released, removed, retained,
+                 dirty_cards.dirtied());
   }
   return restored;
 }
@@ -5272,7 +5290,6 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
 int G1RemoteMemoryManager::cleanup_recorded_direct_refs_after_dense_phase() {
   int restored = 0;
   int dropped_remote = 0;
-  int retained_local = 0;
   int converted = 0;
   int nulled = 0;
   int dense_handle_retained = 0;
@@ -5280,6 +5297,7 @@ int G1RemoteMemoryManager::cleanup_recorded_direct_refs_after_dense_phase() {
   int removed = 0;
   int retained = 0;
   G1RemoteRollbackDirtyCards dirty_cards(_g1h);
+  RemoteHandleAllocBuffer hab;
 
   for (int i = 0; i < _tagged_field_count; i++) {
     TaggedFieldEntry entry = _tagged_fields[i];
@@ -5385,28 +5403,38 @@ int G1RemoteMemoryManager::cleanup_recorded_direct_refs_after_dense_phase() {
       continue;
     }
 
-    if (is_dense_segment_managed_addr(addr)) {
-      _tagged_fields[retained++] = entry;
-      retained_local++;
-      continue;
+    oop target_oop = cast_to_oop((HeapWord*)addr);
+    RemoteHandle* direct_target = remote_handle_managed_local_oop(_g1h, target_oop)
+        ? ensure_handle_for(target_oop, &hab) : nullptr;
+    if (direct_target != nullptr) {
+      *(uintptr_t*)field_addr =
+          G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)direct_target;
+      dirty_cards.dirty_field(field_addr);
+      TaggedFieldEntry handle_entry;
+      handle_entry._field_addr = field_addr;
+      handle_entry._handle = direct_target;
+      handle_entry._tagged_raw = 0;
+      handle_entry._kind = TaggedFieldHandle;
+      _tagged_fields[retained++] = handle_entry;
+      converted++;
+    } else {
+      *(uintptr_t*)field_addr = addr;
+      dirty_cards.dirty_field(field_addr);
+      restored++;
     }
-
-    *(uintptr_t*)field_addr = addr;
-    dirty_cards.dirty_field(field_addr);
-    restored++;
   }
 
   dirty_cards.flush();
   _tagged_field_count = retained;
-  if (restored > 0 || dropped_remote > 0 || retained_local > 0 ||
-      converted > 0 || nulled > 0 || dense_handle_retained > 0 ||
+  if (restored > 0 || dropped_remote > 0 || converted > 0 ||
+      nulled > 0 || dense_handle_retained > 0 ||
       dense_handle_released > 0 || removed > 0 || dirty_cards.dirtied() > 0) {
     log_info(gc)("Dense direct tagged-field cleanup: restored %d local refs, "
-                 "retained %d remote direct refs, retained %d local dense direct refs, "
+                 "dropped %d remote direct refs, "
                  "converted %d stale direct refs, nulled %d invalid direct refs, "
                  "retained %d dense handle refs, released %d dense handle refs, "
                  "removed %d stale entries, %d entries retained, dirtied %d cards",
-                 restored, dropped_remote, retained_local, converted, nulled,
+                 restored, dropped_remote, converted, nulled,
                  dense_handle_retained, dense_handle_released, removed, retained,
                  dirty_cards.dirtied());
   }
@@ -8066,12 +8094,8 @@ public:
 
   void store_forwardee(oop* p, uintptr_t tag_bits, oop fwd) {
     if (tag_bits != 0) {
-      HeapRegion* fwd_hr = _g1h->heap_region_containing_or_null(fwd);
-      bool handle_managed =
-          fwd_hr != nullptr &&
-          (fwd_hr->is_old() || fwd_hr->is_starts_humongous() ||
-           fwd_hr->is_fetch_cache());
-      RemoteHandle* h = handle_managed ? _rmm->ensure_handle_for(fwd, &_hab) : nullptr;
+      RemoteHandle* h = remote_handle_managed_local_oop(_g1h, fwd)
+          ? _rmm->ensure_handle_for(fwd, &_hab) : nullptr;
       if (h != nullptr) {
         *(uintptr_t*)p = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
         _direct_converted++;
