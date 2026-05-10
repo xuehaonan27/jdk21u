@@ -230,6 +230,17 @@ static bool g1_c2_remote_store_handleify_active() {
           G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0);
 }
 
+static bool g1_c2_store_base_is_class_mirror(C2Access& access) {
+  Node* base = access.base();
+  if (base == nullptr) {
+    return false;
+  }
+  const TypeOopPtr* oop_type = base->bottom_type()->isa_oopptr();
+  const TypeInstPtr* inst_type = oop_type == nullptr ? nullptr : oop_type->isa_instptr();
+  return inst_type != nullptr &&
+         inst_type->instance_klass() == Compile::current()->env()->Class_klass();
+}
+
 static Node* g1_c2_oop_value_as_raw(GraphKit* kit, Node* ctrl, Node* value) {
   if (kit == nullptr || value == nullptr) {
     return value;
@@ -826,7 +837,8 @@ void G1BarrierSetC2::insert_pre_barrier(GraphKit* kit, Node* base_oop, Node* off
 #undef __
 
 Node* G1BarrierSetC2::store_at_resolved(C2Access& access, C2AccessValue& val) const {
-  if (access.is_oop() && access.is_parse_access()) {
+  if (access.is_oop() && access.is_parse_access() &&
+      !g1_c2_store_base_is_class_mirror(access)) {
     C2ParseAccess& parse_access = static_cast<C2ParseAccess&>(access);
     Node* handled = g1_c2_handleify_store_value(parse_access.kit(), val.node());
     val.set_node(handled);
