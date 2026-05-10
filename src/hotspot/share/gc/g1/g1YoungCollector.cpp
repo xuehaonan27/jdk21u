@@ -4472,45 +4472,145 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
       uintptr_t* failed_localize_ids =
           NEW_C_HEAP_ARRAY(uintptr_t, FAILED_LOCALIZE_BATCH, mtGC);
 
-      int array_chunk_segments_sent = 0;
+      int array_chunk_groups_sent = 0;
+      int array_chunk_objects_sent = 0;
       int array_chunk_segment_failures = 0;
       size_t array_chunk_segment_bytes = 0;
       if (backend->supports_segments()) {
-        for (int e = 0; e < num_entries; e++) {
-          if (!entry_active[e]) continue;
-          PreparedEviction* pe = &entries[e];
-          if (pe->location_kind != RemoteLocationArrayChunk) continue;
+        size_t backend_segment_cap = backend->max_staged_batch_data_size();
+        size_t configured_group_cap = G1RemoteArrayChunkGroupMaxBytes;
+        uint configured_group_objects = G1RemoteArrayChunkGroupMaxObjects;
+        bool grouping_enabled = configured_group_cap > 0 &&
+                                configured_group_objects > 1;
+        size_t group_cap = grouping_enabled ? configured_group_cap : (size_t)-1;
+        if (backend_segment_cap > 0) {
+          group_cap = MIN2(group_cap, backend_segment_cap);
+        }
+        uint group_object_cap =
+            grouping_enabled ? configured_group_objects : 1u;
+        if (group_object_cap == 0) {
+          group_object_cap = 1;
+        }
 
-          size_t byte_size = pe->word_size * HeapWordSize;
-          Ticks seg_start = Ticks::now();
-          bool ok = backend->evict_segment((uint64_t)pe->segment_id,
-                                           (uintptr_t)pe->obj,
-                                           cast_from_oop<void*>(pe->obj),
-                                           byte_size,
-                                           pe->location_flags);
-          e2_backend_ms += (Ticks::now() - seg_start).seconds() * 1000.0;
-          if (ok) {
-            array_chunk_segments_sent++;
-            array_chunk_segment_bytes += byte_size;
-            e2_backend_objects++;
-            e2_backend_bytes += byte_size;
-          } else {
-            HeapRegion* hr = _g1h->heap_region_containing(pe->obj);
-            uint idx = hr->hrm_index();
-            if (idx < num_regions) {
-              send_failed_regions[idx] = true;
-            }
-            send_failed_entries++;
-            entry_active[e] = false;
-            array_chunk_segment_failures++;
+        for (uint region_idx = 0; region_idx < num_regions; region_idx++) {
+          if (!eviction_candidates[region_idx] ||
+              region_count_arr[region_idx] <= 0 ||
+              send_failed_regions[region_idx]) {
+            continue;
           }
+
+          int start = region_start[region_idx];
+          int rcount = region_count_arr[region_idx];
+          int* chunk_indices = NEW_C_HEAP_ARRAY(int, rcount, mtGC);
+          int chunk_count = 0;
+          for (int e = start; e < start + rcount; e++) {
+            if (!entry_active[e]) continue;
+            if (entries[e].location_kind != RemoteLocationArrayChunk) continue;
+            chunk_indices[chunk_count++] = e;
+          }
+
+          for (int p = 0; p < chunk_count;) {
+            int first = chunk_indices[p];
+            size_t first_size = entries[first].word_size * HeapWordSize;
+            if (backend_segment_cap > 0 && first_size > backend_segment_cap) {
+              send_failed_regions[region_idx] = true;
+              send_failed_entries++;
+              array_chunk_segment_failures++;
+              break;
+            }
+
+            size_t effective_group_cap = group_cap;
+            if (first_size > effective_group_cap) {
+              effective_group_cap = first_size;
+            }
+
+            int group_count = 0;
+            size_t group_bytes = 0;
+            while (p + group_count < chunk_count &&
+                   (uint)group_count < group_object_cap) {
+              int e = chunk_indices[p + group_count];
+              size_t byte_size = entries[e].word_size * HeapWordSize;
+              if (backend_segment_cap > 0 && byte_size > backend_segment_cap) {
+                send_failed_regions[region_idx] = true;
+                send_failed_entries++;
+                array_chunk_segment_failures++;
+                break;
+              }
+              if (group_count > 0 &&
+                  group_bytes + byte_size > effective_group_cap) {
+                break;
+              }
+              group_bytes += byte_size;
+              group_count++;
+            }
+
+            if (send_failed_regions[region_idx]) {
+              break;
+            }
+            if (group_count <= 0 || group_bytes == 0) {
+              send_failed_regions[region_idx] = true;
+              send_failed_entries++;
+              array_chunk_segment_failures++;
+              break;
+            }
+
+            uint8_t* group_buf = (uint8_t*)os::malloc(group_bytes, mtGC);
+            if (group_buf == nullptr) {
+              send_failed_regions[region_idx] = true;
+              send_failed_entries += group_count;
+              array_chunk_segment_failures++;
+              break;
+            }
+
+            uintptr_t segment_base = (uintptr_t)entries[first].obj;
+            uintptr_t segment_id = entries[first].segment_id;
+            size_t offset = 0;
+            for (int j = 0; j < group_count; j++) {
+              int e = chunk_indices[p + j];
+              PreparedEviction* pe = &entries[e];
+              size_t byte_size = pe->word_size * HeapWordSize;
+              memcpy(group_buf + offset, cast_from_oop<void*>(pe->obj), byte_size);
+              pe->segment_id = segment_id;
+              pe->segment_offset = offset;
+              pe->segment_byte_size = group_bytes;
+              offset += byte_size;
+            }
+
+            Ticks seg_start = Ticks::now();
+            bool ok = backend->evict_segment((uint64_t)segment_id,
+                                             segment_base,
+                                             group_buf,
+                                             group_bytes,
+                                             entries[first].location_flags);
+            e2_backend_ms += (Ticks::now() - seg_start).seconds() * 1000.0;
+            os::free(group_buf);
+
+            if (ok) {
+              array_chunk_groups_sent++;
+              array_chunk_objects_sent += group_count;
+              array_chunk_segment_bytes += group_bytes;
+              e2_backend_objects += group_count;
+              e2_backend_bytes += group_bytes;
+            } else {
+              send_failed_regions[region_idx] = true;
+              send_failed_entries += group_count;
+              array_chunk_segment_failures++;
+              break;
+            }
+            p += group_count;
+          }
+          FREE_C_HEAP_ARRAY(int, chunk_indices);
         }
       }
-      if (array_chunk_segments_sent > 0 || array_chunk_segment_failures > 0) {
-        log_info(gc)("Phase E2 array chunks: sent=%d failed=%d bytes="
-                     SIZE_FORMAT "KB",
-                     array_chunk_segments_sent, array_chunk_segment_failures,
-                     array_chunk_segment_bytes / K);
+      if (array_chunk_groups_sent > 0 || array_chunk_segment_failures > 0) {
+        log_info(gc)("Phase E2 array chunk groups: groups=%d objects=%d "
+                     "failed=%d bytes=" SIZE_FORMAT "KB max_group="
+                     SIZE_FORMAT "KB max_objects=%u",
+                     array_chunk_groups_sent, array_chunk_objects_sent,
+                     array_chunk_segment_failures,
+                     array_chunk_segment_bytes / K,
+                     G1RemoteArrayChunkGroupMaxBytes / K,
+                     G1RemoteArrayChunkGroupMaxObjects);
       }
 
       if (num_entries > 0 && use_batch_evict && batch_buf_size > BATCH_HDR_SIZE) {

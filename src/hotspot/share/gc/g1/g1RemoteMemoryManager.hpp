@@ -110,10 +110,22 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
   uint _local_handle_region_capacity;
   volatile int _local_handle_lock;
 
+  static const size_t ARRAY_CHUNK_SEGMENT_BUCKETS = 4096;
+  struct ArrayChunkSegmentEntry {
+    uint64_t _segment_id;
+    volatile uint32_t _refcount;
+    size_t _byte_size;
+    ArrayChunkSegmentEntry* _next;
+  };
+  ArrayChunkSegmentEntry* _array_chunk_segments[ARRAY_CHUNK_SEGMENT_BUCKETS];
+  volatile int _array_chunk_segment_lock;
+
   void table_lock()   { while (Atomic::cmpxchg(&_table_lock, 0, 1) != 0) { /* spin */ } }
   void table_unlock() { Atomic::release_store(&_table_lock, 0); }
   void local_handle_lock()   { while (Atomic::cmpxchg(&_local_handle_lock, 0, 1) != 0) { /* spin */ } }
   void local_handle_unlock() { Atomic::release_store(&_local_handle_lock, 0); }
+  void array_chunk_segment_lock() { while (Atomic::cmpxchg(&_array_chunk_segment_lock, 0, 1) != 0) { /* spin */ } }
+  void array_chunk_segment_unlock() { Atomic::release_store(&_array_chunk_segment_lock, 0); }
 
   bool ensure_local_handle_region_counts_locked();
   uint local_handle_region_index(uintptr_t addr) const;
@@ -608,10 +620,16 @@ public:
   void publish_local_handles(RemoteHandle** handles, HeapWord** local_addrs, uint count);
   void make_handle_remote(RemoteHandle* h, uintptr_t remote_id);
   void make_handle_remote_array_chunk(RemoteHandle* h,
-                                      uintptr_t array_id,
+                                      uintptr_t segment_base,
                                       uintptr_t segment_id,
+                                      size_t offset,
                                       size_t byte_size,
+                                      size_t segment_byte_size,
                                       uint32_t flags);
+  void register_array_chunk_segment(uint64_t segment_id,
+                                    uint32_t refcount,
+                                    size_t byte_size);
+  void release_array_chunk_segment(uint64_t segment_id);
   void mark_handle_dead(RemoteHandle* h);
   size_t local_handle_count() const { return _local_handle_count; }
 
@@ -1341,6 +1359,8 @@ public:
     uint32_t      location_kind;
     uint32_t      location_flags;
     uintptr_t     segment_id;
+    size_t        segment_offset;
+    size_t        segment_byte_size;
   };
 
   // Prepare metadata: safety checks and handle lookup only. This is used before

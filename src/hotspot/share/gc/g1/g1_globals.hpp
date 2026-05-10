@@ -468,6 +468,15 @@
           "as one-object remote slots and is the first array-aware remote "    \
           "location mode.")                                                   \
                                                                             \
+  product(size_t, G1RemoteArrayChunkGroupMaxBytes, 4*M, DIAGNOSTIC,           \
+          "Maximum remote segment size used to group primitive-array chunk "   \
+          "locations. A value of 0 disables grouping and keeps one segment "   \
+          "per primitive array.")                                             \
+                                                                            \
+  product(uint, G1RemoteArrayChunkGroupMaxObjects, 1024, DIAGNOSTIC,          \
+          "Maximum number of primitive arrays grouped into one remote "        \
+          "chunk segment.")                                                   \
+                                                                            \
   product(bool, G1RemoteUseFastPhaseC, false, DIAGNOSTIC,                    \
           "Use the bounded remote-eviction Phase C scanner: candidate "       \
           "regions, young regions, newly evacuated ranges, roots, and "       \

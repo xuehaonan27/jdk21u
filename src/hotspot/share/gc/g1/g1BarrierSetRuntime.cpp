@@ -2181,10 +2181,15 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
 
   size_t word_size = h->eviction_word_size();
   size_t byte_size = loc->_byte_size;
+  size_t segment_byte_size = loc->_segment_byte_size;
+  size_t segment_offset = loc->_offset;
   uint64_t segment_id = (uint64_t)loc->_secondary_id;
   uintptr_t expected_base = loc->_primary_id;
   uint32_t expected_flags = loc->_flags;
   if (segment_id == 0 || byte_size == 0 ||
+      segment_byte_size == 0 ||
+      segment_offset > segment_byte_size ||
+      byte_size > segment_byte_size - segment_offset ||
       word_size == 0 || word_size > SIZE_MAX / HeapWordSize ||
       byte_size != word_size * HeapWordSize) {
     return array_chunk_fetch_failed(rmm, h, fetch_attempts, out_retry,
@@ -2200,15 +2205,29 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
   }
   memset(dest, 0, byte_size);
 
+  void* fetch_dest = dest;
+  uint8_t* segment_buf = nullptr;
+  if (segment_offset != 0 || segment_byte_size != byte_size) {
+    segment_buf = (uint8_t*)os::malloc(segment_byte_size, mtGC);
+    if (segment_buf == nullptr) {
+      h->cas_fetching_to_remote();
+      rmm->record_fetch_retry();
+      *out_retry = true;
+      return nullptr;
+    }
+    fetch_dest = segment_buf;
+  }
+
   uintptr_t fetched_base = 0;
   size_t fetched_bytes = 0;
   uint32_t fetched_flags = 0;
   jlong fetch_start = os::elapsed_counter();
-  bool ok = backend->fetch_segment(segment_id, &fetched_base, dest,
-                                   byte_size, &fetched_bytes, &fetched_flags);
+  bool ok = backend->fetch_segment(segment_id, &fetched_base, fetch_dest,
+                                   segment_byte_size, &fetched_bytes,
+                                   &fetched_flags);
   jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
 
-  if (ok && (fetched_bytes != byte_size ||
+  if (ok && (fetched_bytes != segment_byte_size ||
              (expected_base != 0 && fetched_base != expected_base) ||
              fetched_flags != expected_flags)) {
     log_warning(gc)("Array chunk fetch metadata mismatch: handle=" PTR_FORMAT
@@ -2217,9 +2236,15 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
                     " actual_bytes=" SIZE_FORMAT " expected_flags=%u"
                     " actual_flags=%u",
                     p2i(h), segment_id, p2i((void*)expected_base),
-                    p2i((void*)fetched_base), byte_size, fetched_bytes,
+                    p2i((void*)fetched_base), segment_byte_size, fetched_bytes,
                     expected_flags, fetched_flags);
     ok = false;
+  }
+  if (ok && segment_buf != nullptr) {
+    memcpy(dest, segment_buf + segment_offset, byte_size);
+  }
+  if (segment_buf != nullptr) {
+    os::free(segment_buf);
   }
 
   Klass* fetched_klass = nullptr;
@@ -2235,7 +2260,7 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
     }
   }
 
-  rmm->record_fetch_result(word_size, fetch_elapsed, ok);
+  rmm->record_fetch_result(segment_byte_size / HeapWordSize, fetch_elapsed, ok);
   if (!ok) {
     return array_chunk_fetch_failed(rmm, h, fetch_attempts, out_retry,
                                     "backend-or-validation-failed");
@@ -2243,8 +2268,8 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
 
   oopDesc* result = finish_fetched_object(g1h, rmm, h, dest,
                                           fetched_klass, word_size);
-  backend->discard_segment(segment_id);
   rmm->publish_local_handle(h, dest);
+  rmm->release_array_chunk_segment(segment_id);
   return result;
 }
 

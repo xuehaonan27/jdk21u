@@ -57,7 +57,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _table_lock(0), _local_handles_head(nullptr), _local_handle_count(0),
     _local_handle_region_counts(nullptr), _local_handle_region_heads(nullptr),
     _local_handle_region_capacity(0),
-    _local_handle_lock(0), _alloc_lock(0),
+    _local_handle_lock(0), _array_chunk_segment_lock(0), _alloc_lock(0),
     _molecule_klass_profile(nullptr),
     _molecule_edge_profile(nullptr),
     _molecule_profile_capacity(0),
@@ -121,6 +121,7 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
   memset(_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
   memset(_eviction_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
   memset((void*)_stripe_locks, 0, sizeof(_stripe_locks));
+  memset(_array_chunk_segments, 0, sizeof(_array_chunk_segments));
   memset(_edge_buckets, 0, sizeof(_edge_buckets));
   memset((void*)_edge_bucket_locks, 0, sizeof(_edge_bucket_locks));
   memset(_hotness_stats, 0, sizeof(_hotness_stats));
@@ -436,9 +437,11 @@ void G1RemoteMemoryManager::make_handle_remote(RemoteHandle* h, uintptr_t remote
 }
 
 void G1RemoteMemoryManager::make_handle_remote_array_chunk(RemoteHandle* h,
-                                                           uintptr_t array_id,
+                                                           uintptr_t segment_base,
                                                            uintptr_t segment_id,
+                                                           size_t offset,
                                                            size_t byte_size,
+                                                           size_t segment_byte_size,
                                                            uint32_t flags) {
   if (h == nullptr) {
     return;
@@ -447,19 +450,108 @@ void G1RemoteMemoryManager::make_handle_remote_array_chunk(RemoteHandle* h,
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t old_addr = ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL)
       ? (sa & REMOTE_HANDLE_ADDR_MASK) : 0;
-  h->set_remote_array_chunk(array_id, segment_id, byte_size, flags);
+  h->set_remote_array_chunk(segment_base, segment_id, offset, byte_size,
+                            segment_byte_size, flags);
   unlink_local_handle_locked(h, old_addr);
   local_handle_unlock();
+}
+
+static size_t array_chunk_segment_hash(uint64_t segment_id) {
+  static const size_t ArrayChunkSegmentBuckets = 4096;
+  uint64_t x = segment_id;
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  return (size_t)x & (ArrayChunkSegmentBuckets - 1);
+}
+
+void G1RemoteMemoryManager::register_array_chunk_segment(uint64_t segment_id,
+                                                         uint32_t refcount,
+                                                         size_t byte_size) {
+  if (segment_id == 0 || refcount == 0 || byte_size == 0) {
+    return;
+  }
+
+  size_t idx = array_chunk_segment_hash(segment_id);
+  array_chunk_segment_lock();
+  for (ArrayChunkSegmentEntry* e = _array_chunk_segments[idx];
+       e != nullptr;
+       e = e->_next) {
+    if (e->_segment_id == segment_id) {
+      Atomic::add(&e->_refcount, refcount);
+      e->_byte_size = byte_size;
+      array_chunk_segment_unlock();
+      return;
+    }
+  }
+
+  ArrayChunkSegmentEntry* e =
+      (ArrayChunkSegmentEntry*)os::malloc(sizeof(ArrayChunkSegmentEntry), mtGC);
+  if (e == nullptr) {
+    array_chunk_segment_unlock();
+    log_warning(gc)("Array chunk segment registry allocation failed: segment="
+                    UINT64_FORMAT " refs=%u bytes=" SIZE_FORMAT,
+                    segment_id, refcount, byte_size);
+    return;
+  }
+  e->_segment_id = segment_id;
+  e->_refcount = refcount;
+  e->_byte_size = byte_size;
+  e->_next = _array_chunk_segments[idx];
+  _array_chunk_segments[idx] = e;
+  array_chunk_segment_unlock();
+}
+
+void G1RemoteMemoryManager::release_array_chunk_segment(uint64_t segment_id) {
+  if (segment_id == 0 || _backend == nullptr) {
+    return;
+  }
+
+  bool discard = false;
+  bool found = false;
+  size_t idx = array_chunk_segment_hash(segment_id);
+  array_chunk_segment_lock();
+  ArrayChunkSegmentEntry* prev = nullptr;
+  ArrayChunkSegmentEntry* cur = _array_chunk_segments[idx];
+  while (cur != nullptr) {
+    if (cur->_segment_id == segment_id) {
+      found = true;
+      uint32_t refs = Atomic::load(&cur->_refcount);
+      if (refs <= 1) {
+        if (prev == nullptr) {
+          _array_chunk_segments[idx] = cur->_next;
+        } else {
+          prev->_next = cur->_next;
+        }
+        discard = true;
+        os::free(cur);
+      } else {
+        Atomic::release_store(&cur->_refcount, refs - 1);
+      }
+      break;
+    }
+    prev = cur;
+    cur = cur->_next;
+  }
+  array_chunk_segment_unlock();
+
+  if (discard || !found) {
+    _backend->discard_segment(segment_id);
+  }
 }
 
 void G1RemoteMemoryManager::mark_handle_dead(RemoteHandle* h) {
   if (h == nullptr) {
     return;
   }
+  uintptr_t initial_sa = h->load_state_and_addr_acquire();
+  uintptr_t initial_state = initial_sa & REMOTE_HANDLE_STATE_MASK;
   if (h->_remote_location.is_array_chunk() &&
       _backend != nullptr &&
-      h->_remote_location._secondary_id != 0) {
-    _backend->discard_segment((uint64_t)h->_remote_location._secondary_id);
+      h->_remote_location._secondary_id != 0 &&
+      (initial_state == REMOTE_HANDLE_REMOTE ||
+       initial_state == REMOTE_HANDLE_FETCHING)) {
+    release_array_chunk_segment((uint64_t)h->_remote_location._secondary_id);
   }
   local_handle_lock();
   uintptr_t sa = h->load_state_and_addr_acquire();
@@ -732,6 +824,16 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     _local_handle_region_heads = nullptr;
   }
   _local_handle_region_capacity = 0;
+
+  for (size_t i = 0; i < ARRAY_CHUNK_SEGMENT_BUCKETS; i++) {
+    ArrayChunkSegmentEntry* e = _array_chunk_segments[i];
+    while (e != nullptr) {
+      ArrayChunkSegmentEntry* next = e->_next;
+      os::free(e);
+      e = next;
+    }
+    _array_chunk_segments[i] = nullptr;
+  }
 
   if (_eviction_backoff_until_epoch != nullptr) {
     FREE_C_HEAP_ARRAY(uint32_t, _eviction_backoff_until_epoch);
@@ -2376,6 +2478,8 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
   out->location_kind = RemoteLocationObjectSlot;
   out->location_flags = 0;
   out->segment_id = 0;
+  out->segment_offset = 0;
+  out->segment_byte_size = word_size * HeapWordSize;
   if (G1RemoteUseArrayChunkLocations &&
       klass->is_typeArray_klass() &&
       _backend != nullptr &&
@@ -2536,6 +2640,32 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
     return;
   }
 
+  for (int e = start; e < start + count; e++) {
+    PreparedEviction* entry = &entries[e];
+    if (entry->location_kind != RemoteLocationArrayChunk ||
+        entry->segment_id == 0 ||
+        entry->segment_byte_size == 0) {
+      continue;
+    }
+
+    bool first = true;
+    uint32_t refs = 0;
+    for (int f = start; f < start + count; f++) {
+      if (entries[f].location_kind == RemoteLocationArrayChunk &&
+          entries[f].segment_id == entry->segment_id) {
+        if (f < e) {
+          first = false;
+          break;
+        }
+        refs++;
+      }
+    }
+    if (first && refs > 0) {
+      register_array_chunk_segment((uint64_t)entry->segment_id, refs,
+                                   entry->segment_byte_size);
+    }
+  }
+
   local_handle_lock();
   for (int e = start; e < start + count; e++) {
     PreparedEviction* entry = &entries[e];
@@ -2545,9 +2675,11 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
     }
     h->set_eviction_word_size(entry->word_size);
     if (entry->location_kind == RemoteLocationArrayChunk) {
-      h->set_remote_array_chunk((uintptr_t)entry->obj,
+      h->set_remote_array_chunk((uintptr_t)entry->obj - entry->segment_offset,
                                 entry->segment_id,
+                                entry->segment_offset,
                                 entry->word_size * HeapWordSize,
+                                entry->segment_byte_size,
                                 entry->location_flags);
     } else {
       h->set_remote(entry->slot_id);

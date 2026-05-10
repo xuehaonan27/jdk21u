@@ -62,6 +62,7 @@ struct RemoteLocation {
   uintptr_t         _secondary_id;  // chunk id, cluster-local index, etc.
   size_t            _offset;
   size_t            _byte_size;
+  size_t            _segment_byte_size;
 
   void clear() {
     _kind = RemoteLocationNone;
@@ -70,6 +71,7 @@ struct RemoteLocation {
     _secondary_id = 0;
     _offset = 0;
     _byte_size = 0;
+    _segment_byte_size = 0;
   }
 
   void set_object_slot(uintptr_t slot_id, size_t byte_size) {
@@ -78,19 +80,22 @@ struct RemoteLocation {
     _secondary_id = 0;
     _offset = 0;
     _byte_size = byte_size;
+    _segment_byte_size = byte_size;
     Atomic::release_store(&_kind, (uint32_t)RemoteLocationObjectSlot);
   }
 
-  void set_array_chunk(uintptr_t array_id,
+  void set_array_chunk(uintptr_t segment_base,
                        uintptr_t segment_id,
                        size_t offset,
                        size_t byte_size,
+                       size_t segment_byte_size,
                        uint32_t flags) {
     _flags = flags;
-    _primary_id = array_id;
+    _primary_id = segment_base;
     _secondary_id = segment_id;
     _offset = offset;
     _byte_size = byte_size;
+    _segment_byte_size = segment_byte_size;
     Atomic::release_store(&_kind, (uint32_t)RemoteLocationArrayChunk);
   }
 
@@ -224,12 +229,15 @@ struct RemoteHandle {
       (uintptr_t)(REMOTE_HANDLE_REMOTE | (remote_id & REMOTE_HANDLE_ADDR_MASK)));
   }
 
-  void set_remote_array_chunk(uintptr_t array_id,
+  void set_remote_array_chunk(uintptr_t segment_base,
                               uintptr_t segment_id,
+                              size_t offset,
                               size_t byte_size,
+                              size_t segment_byte_size,
                               uint32_t flags) {
     _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
-    _remote_location.set_array_chunk(array_id, segment_id, 0, byte_size, flags);
+    _remote_location.set_array_chunk(segment_base, segment_id, offset,
+                                     byte_size, segment_byte_size, flags);
     Atomic::release_store(&_state_and_addr,
       (uintptr_t)(REMOTE_HANDLE_REMOTE | (segment_id & REMOTE_HANDLE_ADDR_MASK)));
   }
