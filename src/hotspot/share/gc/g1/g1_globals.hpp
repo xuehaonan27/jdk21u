@@ -477,6 +477,20 @@
           "Maximum number of primitive arrays grouped into one remote "        \
           "chunk segment.")                                                   \
                                                                             \
+  product(bool, G1RemoteUseClusterObjectLocations, true, DIAGNOSTIC,          \
+          "Store non-array object evictions as approximate locality "          \
+          "clusters in remote segment locations when the backend supports "    \
+          "segment operations. Object edge tables remain per-handle for "      \
+          "correct fetch-time patching.")                                      \
+                                                                            \
+  product(size_t, G1RemoteClusterObjectGroupMaxBytes, 1*M, DIAGNOSTIC,        \
+          "Maximum remote segment size used to group non-array object "        \
+          "cluster locations.")                                                \
+                                                                            \
+  product(uint, G1RemoteClusterObjectGroupMaxObjects, 1024, DIAGNOSTIC,       \
+          "Maximum number of non-array objects grouped into one remote "       \
+          "cluster segment.")                                                  \
+                                                                            \
   product(bool, G1RemoteUseFastPhaseC, false, DIAGNOSTIC,                    \
           "Use the bounded remote-eviction Phase C scanner: candidate "       \
           "regions, young regions, newly evacuated ranges, roots, and "       \

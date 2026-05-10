@@ -628,6 +628,13 @@ public:
                                       size_t byte_size,
                                       size_t segment_byte_size,
                                       uint32_t flags);
+  void make_handle_remote_cluster_object(RemoteHandle* h,
+                                         uintptr_t segment_base,
+                                         uintptr_t segment_id,
+                                         size_t offset,
+                                         size_t byte_size,
+                                         size_t segment_byte_size,
+                                         uint32_t flags);
   void register_array_chunk_segment(uint64_t segment_id,
                                     RemoteHandle** handles,
                                     uint32_t refcount,

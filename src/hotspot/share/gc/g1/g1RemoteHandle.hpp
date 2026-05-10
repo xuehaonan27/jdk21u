@@ -99,6 +99,21 @@ struct RemoteLocation {
     Atomic::release_store(&_kind, (uint32_t)RemoteLocationArrayChunk);
   }
 
+  void set_cluster_object(uintptr_t segment_base,
+                          uintptr_t segment_id,
+                          size_t offset,
+                          size_t byte_size,
+                          size_t segment_byte_size,
+                          uint32_t flags) {
+    _flags = flags;
+    _primary_id = segment_base;
+    _secondary_id = segment_id;
+    _offset = offset;
+    _byte_size = byte_size;
+    _segment_byte_size = segment_byte_size;
+    Atomic::release_store(&_kind, (uint32_t)RemoteLocationClusterObject);
+  }
+
   uint32_t kind_acquire() const {
     return Atomic::load_acquire(&_kind);
   }
@@ -109,6 +124,10 @@ struct RemoteLocation {
 
   bool is_array_chunk() const {
     return kind_acquire() == RemoteLocationArrayChunk;
+  }
+
+  bool is_cluster_object() const {
+    return kind_acquire() == RemoteLocationClusterObject;
   }
 };
 
@@ -238,6 +257,19 @@ struct RemoteHandle {
     _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
     _remote_location.set_array_chunk(segment_base, segment_id, offset,
                                      byte_size, segment_byte_size, flags);
+    Atomic::release_store(&_state_and_addr,
+      (uintptr_t)(REMOTE_HANDLE_REMOTE | (segment_id & REMOTE_HANDLE_ADDR_MASK)));
+  }
+
+  void set_remote_cluster_object(uintptr_t segment_base,
+                                 uintptr_t segment_id,
+                                 size_t offset,
+                                 size_t byte_size,
+                                 size_t segment_byte_size,
+                                 uint32_t flags) {
+    _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
+    _remote_location.set_cluster_object(segment_base, segment_id, offset,
+                                        byte_size, segment_byte_size, flags);
     Atomic::release_store(&_state_and_addr,
       (uintptr_t)(REMOTE_HANDLE_REMOTE | (segment_id & REMOTE_HANDLE_ADDR_MASK)));
   }

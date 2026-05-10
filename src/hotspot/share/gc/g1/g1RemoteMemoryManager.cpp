@@ -456,6 +456,26 @@ void G1RemoteMemoryManager::make_handle_remote_array_chunk(RemoteHandle* h,
   local_handle_unlock();
 }
 
+void G1RemoteMemoryManager::make_handle_remote_cluster_object(RemoteHandle* h,
+                                                              uintptr_t segment_base,
+                                                              uintptr_t segment_id,
+                                                              size_t offset,
+                                                              size_t byte_size,
+                                                              size_t segment_byte_size,
+                                                              uint32_t flags) {
+  if (h == nullptr) {
+    return;
+  }
+  local_handle_lock();
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  uintptr_t old_addr = ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL)
+      ? (sa & REMOTE_HANDLE_ADDR_MASK) : 0;
+  h->set_remote_cluster_object(segment_base, segment_id, offset, byte_size,
+                               segment_byte_size, flags);
+  unlink_local_handle_locked(h, old_addr);
+  local_handle_unlock();
+}
+
 static size_t array_chunk_segment_hash(uint64_t segment_id) {
   static const size_t ArrayChunkSegmentBuckets = 4096;
   uint64_t x = segment_id;
@@ -605,7 +625,8 @@ void G1RemoteMemoryManager::mark_handle_dead(RemoteHandle* h) {
   }
   uintptr_t initial_sa = h->load_state_and_addr_acquire();
   uintptr_t initial_state = initial_sa & REMOTE_HANDLE_STATE_MASK;
-  if (h->_remote_location.is_array_chunk() &&
+  if ((h->_remote_location.is_array_chunk() ||
+       h->_remote_location.is_cluster_object()) &&
       _backend != nullptr &&
       h->_remote_location._secondary_id != 0 &&
       (initial_state == REMOTE_HANDLE_REMOTE ||
@@ -2476,6 +2497,11 @@ static uintptr_t array_chunk_segment_id_for(RemoteHandle* h) {
          ((uintptr_t)h & ((((uintptr_t)1) << 60) - 1));
 }
 
+static uintptr_t cluster_object_segment_id_for(RemoteHandle* h) {
+  return ((uintptr_t)RemoteLocationClusterObject << 60) |
+         ((uintptr_t)h & ((((uintptr_t)1) << 60) - 1));
+}
+
 bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAllocBuffer* hab,
                                                       PreparedEviction* out) {
   if (obj == nullptr || out == nullptr) { Atomic::add(&_prep_fail_null, 1); return false; }
@@ -2550,6 +2576,12 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
       _backend->supports_segments()) {
     out->location_kind = RemoteLocationArrayChunk;
     out->segment_id = array_chunk_segment_id_for(h);
+  } else if (G1RemoteUseClusterObjectLocations &&
+             !klass->is_array_klass() &&
+             _backend != nullptr &&
+             _backend->supports_segments()) {
+    out->location_kind = RemoteLocationClusterObject;
+    out->segment_id = cluster_object_segment_id_for(h);
   }
   return true;
 }
@@ -2560,7 +2592,9 @@ bool G1RemoteMemoryManager::finish_prepared_eviction(PreparedEviction* entry,
     Atomic::add(&_prep_fail_null, 1);
     return false;
   }
-  if (entry->edge_table != nullptr && entry->slot_id != (size_t)-1) {
+  if (entry->edge_table != nullptr &&
+      (entry->slot_id != (size_t)-1 ||
+       entry->location_kind == RemoteLocationClusterObject)) {
     return true;
   }
 
@@ -2600,6 +2634,7 @@ bool G1RemoteMemoryManager::finish_prepared_eviction_edges(
     return false;
   }
   if (entry->location_kind != RemoteLocationArrayChunk &&
+      entry->location_kind != RemoteLocationClusterObject &&
       entry->slot_id == (size_t)-1) {
     Atomic::add(&_prep_fail_slot, 1);
     return false;
@@ -2704,15 +2739,16 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
     return;
   }
 
-  // Array chunk groups are produced by Phase E2 in entry order: all primitive
-  // array entries for a remote segment appear as one ordered run among array
-  // chunk entries, although non-array entries may be interleaved in the region
-  // entry array. Register those runs linearly. The old implementation scanned
-  // the whole region for every array entry and made E3 O(n^2) for Spark regions
-  // with hundreds of thousands of primitive arrays.
+  // Segment groups are produced by Phase E2 in entry order: all entries for a
+  // remote segment appear as one ordered run among segment-location entries,
+  // although other location kinds may be interleaved in the region entry array.
+  // Register those runs linearly. The old implementation scanned the whole
+  // region for every array entry and made E3 O(n^2) for Spark regions with
+  // hundreds of thousands of primitive arrays.
   for (int e = start; e < start + count;) {
     PreparedEviction* entry = &entries[e];
-    if (entry->location_kind != RemoteLocationArrayChunk ||
+    if ((entry->location_kind != RemoteLocationArrayChunk &&
+         entry->location_kind != RemoteLocationClusterObject) ||
         entry->segment_id == 0 ||
         entry->segment_byte_size == 0) {
       e++;
@@ -2725,7 +2761,8 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
     int run_end = e;
     while (run_end < start + count) {
       PreparedEviction* cur = &entries[run_end];
-      if (cur->location_kind == RemoteLocationArrayChunk &&
+      if ((cur->location_kind == RemoteLocationArrayChunk ||
+           cur->location_kind == RemoteLocationClusterObject) &&
           cur->segment_id != 0) {
         if (cur->segment_id != segment_id) {
           break;
@@ -2741,7 +2778,8 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
       if (handles != nullptr) {
         uint32_t n = 0;
         for (int f = e; f < run_end && n < refs; f++) {
-          if (entries[f].location_kind == RemoteLocationArrayChunk &&
+          if ((entries[f].location_kind == RemoteLocationArrayChunk ||
+               entries[f].location_kind == RemoteLocationClusterObject) &&
               entries[f].segment_id == segment_id) {
             handles[n++] = entries[f].handle;
           }
@@ -2776,6 +2814,16 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
                                 entry->word_size * HeapWordSize,
                                 entry->segment_byte_size,
                                 entry->location_flags);
+    } else if (entry->location_kind == RemoteLocationClusterObject) {
+      uintptr_t segment_base = entry->segment_base != 0
+          ? entry->segment_base
+          : (uintptr_t)entry->obj - entry->segment_offset;
+      h->set_remote_cluster_object(segment_base,
+                                   entry->segment_id,
+                                   entry->segment_offset,
+                                   entry->word_size * HeapWordSize,
+                                   entry->segment_byte_size,
+                                   entry->location_flags);
     } else {
       h->set_remote(entry->slot_id);
     }
@@ -2809,8 +2857,10 @@ void G1RemoteMemoryManager::abort_prepared_eviction(PreparedEviction* entry) {
     return;
   }
 
-  if (entry->location_kind == RemoteLocationArrayChunk &&
+  if ((entry->location_kind == RemoteLocationArrayChunk ||
+       entry->location_kind == RemoteLocationClusterObject) &&
       entry->segment_id != 0 &&
+      entry->segment_base != 0 &&
       _backend != nullptr) {
     _backend->discard_segment((uint64_t)entry->segment_id);
   }

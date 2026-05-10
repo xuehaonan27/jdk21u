@@ -2458,6 +2458,353 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
   return result;
 }
 
+static oopDesc* cluster_object_fetch_failed(G1RemoteMemoryManager* rmm,
+                                            RemoteHandle* h,
+                                            int& fetch_attempts,
+                                            bool* out_retry,
+                                            const char* reason) {
+  fetch_attempts++;
+  if (rmm != nullptr) {
+    rmm->record_fetch_retry();
+  }
+  if (fetch_attempts >= 3) {
+    if (rmm != nullptr) {
+      rmm->mark_handle_dead(h);
+    }
+    log_warning(gc)("Object cluster fetch failed %d times for handle " PTR_FORMAT
+                    " (%s) - marking DEAD",
+                    fetch_attempts, p2i(h), reason);
+    return nullptr;
+  }
+
+  h->cas_fetching_to_remote();
+  log_warning(gc)("Object cluster fetch failed for handle " PTR_FORMAT
+                  " (%s) - retry %d/3",
+                  p2i(h), reason, fetch_attempts);
+  *out_retry = true;
+  return nullptr;
+}
+
+static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
+                                                 int& fetch_attempts,
+                                                 bool* out_retry) {
+  *out_retry = false;
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  G1RemoteBackend* backend = rmm == nullptr ? nullptr : rmm->backend();
+  if (backend == nullptr || !backend->supports_segments()) {
+    return cluster_object_fetch_failed(rmm, h, fetch_attempts, out_retry,
+                                       "backend-has-no-segment-support");
+  }
+
+  RemoteLocation* loc = &h->_remote_location;
+  if (!loc->is_cluster_object()) {
+    return cluster_object_fetch_failed(rmm, h, fetch_attempts, out_retry,
+                                       "not-cluster-object");
+  }
+
+  size_t word_size = h->eviction_word_size();
+  size_t byte_size = loc->_byte_size;
+  size_t segment_byte_size = loc->_segment_byte_size;
+  size_t segment_offset = loc->_offset;
+  uint64_t segment_id = (uint64_t)loc->_secondary_id;
+  uintptr_t expected_base = loc->_primary_id;
+  uint32_t expected_flags = loc->_flags;
+  if (segment_id == 0 || byte_size == 0 ||
+      segment_byte_size == 0 ||
+      segment_offset > segment_byte_size ||
+      byte_size > segment_byte_size - segment_offset ||
+      word_size == 0 || word_size > SIZE_MAX / HeapWordSize ||
+      byte_size != word_size * HeapWordSize ||
+      !is_aligned(segment_offset, HeapWordSize) ||
+      !is_aligned(segment_byte_size, HeapWordSize)) {
+    return cluster_object_fetch_failed(rmm, h, fetch_attempts, out_retry,
+                                       "bad-cluster-metadata");
+  }
+
+  bool grouped_segment = segment_offset != 0 || segment_byte_size != byte_size;
+  RemoteHandle* segment_members[G1RemoteArrayChunkSiblingInstallHardCap];
+  uint segment_member_count = 0;
+  uint segment_member_total = 0;
+  size_t registry_bytes = 0;
+  if (grouped_segment) {
+    uint copy_limit = MIN2((uint)G1RemoteClusterObjectGroupMaxObjects,
+                           G1RemoteArrayChunkSiblingInstallHardCap);
+    if (copy_limit > 0) {
+      segment_member_count =
+          rmm->copy_array_chunk_segment_handles(segment_id,
+                                                segment_members,
+                                                copy_limit,
+                                                &registry_bytes,
+                                                &segment_member_total);
+    }
+  }
+
+  bool can_bulk_fcr =
+      grouped_segment &&
+      segment_member_count > 0 &&
+      segment_member_count == segment_member_total &&
+      registry_bytes == segment_byte_size;
+  size_t segment_word_size = segment_byte_size / HeapWordSize;
+  HeapWord* segment_dest = nullptr;
+  HeapWord* dest = nullptr;
+  void* fetch_dest = nullptr;
+
+  if (can_bulk_fcr) {
+    segment_dest = rmm->allocate_in_fcr(segment_word_size);
+    if (segment_dest != nullptr) {
+      memset(segment_dest, 0, segment_byte_size);
+      dest = segment_dest + (segment_offset / HeapWordSize);
+      fetch_dest = segment_dest;
+    } else {
+      can_bulk_fcr = false;
+    }
+  }
+
+  uint8_t* segment_buf = nullptr;
+  if (!can_bulk_fcr) {
+    dest = rmm->allocate_in_fcr(word_size);
+    if (dest == nullptr) {
+      h->cas_fetching_to_remote();
+      rmm->record_fetch_retry();
+      *out_retry = true;
+      return nullptr;
+    }
+    memset(dest, 0, byte_size);
+    fetch_dest = dest;
+  }
+
+  if (!can_bulk_fcr && grouped_segment) {
+    segment_buf = (uint8_t*)os::malloc(segment_byte_size, mtGC);
+    if (segment_buf == nullptr) {
+      h->cas_fetching_to_remote();
+      rmm->record_fetch_retry();
+      *out_retry = true;
+      return nullptr;
+    }
+    fetch_dest = segment_buf;
+  }
+
+  uintptr_t fetched_base = 0;
+  size_t fetched_bytes = 0;
+  uint32_t fetched_flags = 0;
+  jlong fetch_start = os::elapsed_counter();
+  bool ok = backend->fetch_segment(segment_id, &fetched_base, fetch_dest,
+                                   segment_byte_size, &fetched_bytes,
+                                   &fetched_flags);
+  jlong fetch_elapsed = os::elapsed_counter() - fetch_start;
+
+  if (ok && (fetched_bytes != segment_byte_size ||
+             (expected_base != 0 && fetched_base != expected_base) ||
+             fetched_flags != expected_flags)) {
+    log_warning(gc)("Object cluster fetch metadata mismatch: handle=" PTR_FORMAT
+                    " segment=" UINT64_FORMAT " expected_base=" PTR_FORMAT
+                    " actual_base=" PTR_FORMAT " expected_bytes=" SIZE_FORMAT
+                    " actual_bytes=" SIZE_FORMAT " expected_flags=%u"
+                    " actual_flags=%u",
+                    p2i(h), segment_id, p2i((void*)expected_base),
+                    p2i((void*)fetched_base), segment_byte_size, fetched_bytes,
+                    expected_flags, fetched_flags);
+    ok = false;
+  }
+  if (ok && segment_buf != nullptr) {
+    memcpy(dest, segment_buf + segment_offset, byte_size);
+  }
+
+  Klass* fetched_klass = nullptr;
+  if (ok) {
+    fetched_klass = cast_to_oop(dest)->klass_or_null_acquire();
+    if (!remote_runtime_valid_klass(fetched_klass) ||
+        fetched_klass->is_array_klass() ||
+        cast_to_oop(dest)->size_given_klass(fetched_klass) != word_size) {
+      log_warning(gc)("Object cluster fetch rejected invalid primary: handle="
+                      PTR_FORMAT " segment=" UINT64_FORMAT " klass="
+                      PTR_FORMAT " bytes=" SIZE_FORMAT,
+                      p2i(h), segment_id, p2i((void*)fetched_klass), byte_size);
+      ok = false;
+    }
+  }
+
+  if (ok && can_bulk_fcr) {
+    for (uint i = 0; i < segment_member_count; i++) {
+      RemoteHandle* member = segment_members[i];
+      if (member == nullptr) {
+        continue;
+      }
+      RemoteLocation* member_loc = &member->_remote_location;
+      if (!member_loc->is_cluster_object() ||
+          (uint64_t)member_loc->_secondary_id != segment_id ||
+          member_loc->_segment_byte_size != segment_byte_size ||
+          !is_aligned(member_loc->_offset, HeapWordSize)) {
+        ok = false;
+        break;
+      }
+      size_t member_word_size = member->eviction_word_size();
+      if (member_word_size == 0 ||
+          member_loc->_byte_size != member_word_size * HeapWordSize ||
+          member_loc->_offset > segment_byte_size ||
+          member_loc->_byte_size > segment_byte_size - member_loc->_offset) {
+        ok = false;
+        break;
+      }
+      HeapWord* member_dest =
+          segment_dest + (member_loc->_offset / HeapWordSize);
+      Klass* member_klass = cast_to_oop(member_dest)->klass_or_null_acquire();
+      if (!remote_runtime_valid_klass(member_klass) ||
+          member_klass->is_array_klass() ||
+          cast_to_oop(member_dest)->size_given_klass(member_klass) !=
+              member_word_size) {
+        ok = false;
+        break;
+      }
+    }
+  }
+
+  rmm->record_fetch_result(segment_byte_size / HeapWordSize, fetch_elapsed, ok);
+  if (!ok) {
+    if (segment_buf != nullptr) {
+      os::free(segment_buf);
+    }
+    return cluster_object_fetch_failed(rmm, h, fetch_attempts, out_retry,
+                                       "backend-or-validation-failed");
+  }
+
+  if (can_bulk_fcr) {
+    HeapRegion* fcr_hr = g1h->heap_region_containing_or_null(segment_dest);
+    if (fcr_hr != nullptr) {
+      for (uint i = 0; i < segment_member_count; i++) {
+        RemoteHandle* member = segment_members[i];
+        if (member == nullptr) {
+          continue;
+        }
+        RemoteLocation* member_loc = &member->_remote_location;
+        if (!member_loc->is_cluster_object() ||
+            (uint64_t)member_loc->_secondary_id != segment_id ||
+            member_loc->_segment_byte_size != segment_byte_size ||
+            !is_aligned(member_loc->_offset, HeapWordSize)) {
+          continue;
+        }
+        HeapWord* member_dest =
+            segment_dest + (member_loc->_offset / HeapWordSize);
+        fcr_hr->update_bot_for_obj(member_dest, member->eviction_word_size());
+      }
+    }
+  }
+
+  RemoteHandle* publish_handles[G1RemoteArrayChunkSiblingInstallHardCap];
+  HeapWord* publish_dests[G1RemoteArrayChunkSiblingInstallHardCap];
+  uint publish_count = 0;
+  size_t sibling_installed = 0;
+  size_t sibling_raced = 0;
+  size_t sibling_failed = 0;
+  size_t sibling_words = 0;
+
+  oopDesc* result = finish_fetched_object(g1h, rmm, h, dest,
+                                          fetched_klass, word_size);
+  publish_handles[publish_count] = h;
+  publish_dests[publish_count] = dest;
+  publish_count++;
+
+  if ((can_bulk_fcr || segment_buf != nullptr) && segment_member_count > 1) {
+    for (uint i = 0;
+         i < segment_member_count &&
+         publish_count < G1RemoteArrayChunkSiblingInstallHardCap;
+         i++) {
+      RemoteHandle* sibling = segment_members[i];
+      if (sibling == nullptr || sibling == h) {
+        continue;
+      }
+
+      RemoteLocation* sibling_loc = &sibling->_remote_location;
+      if (!sibling_loc->is_cluster_object() ||
+          (uint64_t)sibling_loc->_secondary_id != segment_id ||
+          sibling_loc->_segment_byte_size != segment_byte_size ||
+          sibling_loc->_byte_size == 0 ||
+          sibling_loc->_offset > segment_byte_size ||
+          sibling_loc->_byte_size > segment_byte_size - sibling_loc->_offset) {
+        sibling_failed++;
+        continue;
+      }
+
+      size_t sibling_word_size = sibling->eviction_word_size();
+      if (sibling_word_size == 0 ||
+          sibling_word_size > SIZE_MAX / HeapWordSize ||
+          sibling_loc->_byte_size != sibling_word_size * HeapWordSize) {
+        sibling_failed++;
+        continue;
+      }
+
+      if (!sibling->try_remote_to_fetching(segment_id)) {
+        sibling_raced++;
+        continue;
+      }
+
+      size_t sibling_byte_size = sibling_loc->_byte_size;
+      HeapWord* sibling_dest = nullptr;
+      if (can_bulk_fcr) {
+        sibling_dest = segment_dest + (sibling_loc->_offset / HeapWordSize);
+      } else {
+        sibling_dest = rmm->allocate_in_fcr(sibling_word_size);
+        if (sibling_dest == nullptr) {
+          sibling->cas_fetching_to_remote();
+          sibling_failed++;
+          break;
+        }
+        memset(sibling_dest, 0, sibling_byte_size);
+        memcpy(sibling_dest, segment_buf + sibling_loc->_offset,
+               sibling_byte_size);
+      }
+
+      Klass* sibling_klass = cast_to_oop(sibling_dest)->klass_or_null_acquire();
+      if (!remote_runtime_valid_klass(sibling_klass) ||
+          sibling_klass->is_array_klass() ||
+          cast_to_oop(sibling_dest)->size_given_klass(sibling_klass) !=
+              sibling_word_size) {
+        sibling->cas_fetching_to_remote();
+        sibling_failed++;
+        continue;
+      }
+
+      finish_fetched_object(g1h, rmm, sibling, sibling_dest,
+                            sibling_klass, sibling_word_size);
+      publish_handles[publish_count] = sibling;
+      publish_dests[publish_count] = sibling_dest;
+      publish_count++;
+      sibling_installed++;
+      sibling_words += sibling_word_size;
+    }
+  }
+
+  if (segment_buf != nullptr) {
+    os::free(segment_buf);
+  }
+
+  rmm->publish_local_handles(publish_handles, publish_dests, publish_count);
+  for (uint i = 0; i < publish_count; i++) {
+    rmm->release_array_chunk_segment(segment_id);
+  }
+  if (segment_member_count > 1 || sibling_installed > 0 ||
+      sibling_raced > 0 || sibling_failed > 0) {
+    rmm->record_fetch_batch_result(segment_member_count,
+                                   segment_member_count,
+                                   publish_count,
+                                   sibling_installed,
+                                   sibling_raced,
+                                   sibling_failed,
+                                   sibling_words,
+                                   fetch_elapsed);
+    log_debug(gc)("Object cluster sibling install: segment=" UINT64_FORMAT
+                  " bytes=" SIZE_FORMAT " registry_bytes=" SIZE_FORMAT
+                  " members=%u installed=" SIZE_FORMAT
+                  " raced=" SIZE_FORMAT " failed=" SIZE_FORMAT
+                  " bulk_fcr=%d",
+                  segment_id, segment_byte_size, registry_bytes,
+                  segment_member_count, sibling_installed,
+                  sibling_raced, sibling_failed, can_bulk_fcr ? 1 : 0);
+  }
+  return result;
+}
+
 // Fetch a REMOTE object, install it locally, and publish the Handle as LOCAL.
 // Caller must have already CAS'd the Handle to FETCHING.
 // Returns the local oop on success, nullptr on failure (Handle set to DEAD
@@ -2473,6 +2820,9 @@ static oopDesc* fetch_and_install(RemoteHandle* h, int& fetch_attempts,
   size_t word_size = h->eviction_word_size();
   if (h->_remote_location.is_array_chunk()) {
     return fetch_and_install_array_chunk(h, fetch_attempts, out_retry);
+  }
+  if (h->_remote_location.is_cluster_object()) {
+    return fetch_and_install_cluster_object(h, fetch_attempts, out_retry);
   }
   if (!h->_remote_location.is_object_slot()) {
     log_warning(gc)("Remote fetch rejected unsupported location kind: handle="
