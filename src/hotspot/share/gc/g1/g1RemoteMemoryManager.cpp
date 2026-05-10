@@ -520,9 +520,13 @@ void G1RemoteMemoryManager::register_array_chunk_segment(uint64_t segment_id,
 uint G1RemoteMemoryManager::copy_array_chunk_segment_handles(uint64_t segment_id,
                                                              RemoteHandle** out,
                                                              uint max_handles,
-                                                             size_t* byte_size_out) {
+                                                             size_t* byte_size_out,
+                                                             uint* total_handles_out) {
   if (byte_size_out != nullptr) {
     *byte_size_out = 0;
+  }
+  if (total_handles_out != nullptr) {
+    *total_handles_out = 0;
   }
   if (segment_id == 0 || out == nullptr || max_handles == 0) {
     return 0;
@@ -537,6 +541,9 @@ uint G1RemoteMemoryManager::copy_array_chunk_segment_handles(uint64_t segment_id
     if (e->_segment_id == segment_id) {
       if (byte_size_out != nullptr) {
         *byte_size_out = e->_byte_size;
+      }
+      if (total_handles_out != nullptr) {
+        *total_handles_out = e->_handle_count;
       }
       uint limit = MIN2(e->_handle_count, max_handles);
       for (uint i = 0; i < limit; i++) {

@@ -2198,18 +2198,61 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
                                     "bad-array-chunk-metadata");
   }
 
-  HeapWord* dest = rmm->allocate_in_fcr(word_size);
-  if (dest == nullptr) {
-    h->cas_fetching_to_remote();
-    rmm->record_fetch_retry();
-    *out_retry = true;
-    return nullptr;
+  bool grouped_segment = segment_offset != 0 || segment_byte_size != byte_size;
+  RemoteHandle* segment_members[G1RemoteArrayChunkSiblingInstallHardCap];
+  uint segment_member_count = 0;
+  uint segment_member_total = 0;
+  size_t registry_bytes = 0;
+  if (grouped_segment) {
+    uint copy_limit = MIN2((uint)G1RemoteArrayChunkGroupMaxObjects,
+                           G1RemoteArrayChunkSiblingInstallHardCap);
+    if (copy_limit > 0) {
+      segment_member_count =
+          rmm->copy_array_chunk_segment_handles(segment_id,
+                                                segment_members,
+                                                copy_limit,
+                                                &registry_bytes,
+                                                &segment_member_total);
+    }
   }
-  memset(dest, 0, byte_size);
 
-  void* fetch_dest = dest;
+  bool can_bulk_fcr =
+      grouped_segment &&
+      segment_member_count > 0 &&
+      segment_member_count == segment_member_total &&
+      registry_bytes == segment_byte_size &&
+      is_aligned(segment_offset, HeapWordSize) &&
+      is_aligned(segment_byte_size, HeapWordSize);
+  size_t segment_word_size = segment_byte_size / HeapWordSize;
+  HeapWord* segment_dest = nullptr;
+  HeapWord* dest = nullptr;
+  void* fetch_dest = nullptr;
+
+  if (can_bulk_fcr) {
+    segment_dest = rmm->allocate_in_fcr(segment_word_size);
+    if (segment_dest != nullptr) {
+      memset(segment_dest, 0, segment_byte_size);
+      dest = segment_dest + (segment_offset / HeapWordSize);
+      fetch_dest = segment_dest;
+    } else {
+      can_bulk_fcr = false;
+    }
+  }
+
   uint8_t* segment_buf = nullptr;
-  if (segment_offset != 0 || segment_byte_size != byte_size) {
+  if (!can_bulk_fcr) {
+    dest = rmm->allocate_in_fcr(word_size);
+    if (dest == nullptr) {
+      h->cas_fetching_to_remote();
+      rmm->record_fetch_retry();
+      *out_retry = true;
+      return nullptr;
+    }
+    memset(dest, 0, byte_size);
+    fetch_dest = dest;
+  }
+
+  if (!can_bulk_fcr && grouped_segment) {
     segment_buf = (uint8_t*)os::malloc(segment_byte_size, mtGC);
     if (segment_buf == nullptr) {
       h->cas_fetching_to_remote();
@@ -2268,18 +2311,33 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
                                     "backend-or-validation-failed");
   }
 
-  RemoteHandle* segment_members[G1RemoteArrayChunkSiblingInstallHardCap];
-  uint segment_member_count = 0;
-  size_t registry_bytes = 0;
-  if (segment_buf != nullptr) {
-    uint copy_limit = MIN2((uint)G1RemoteArrayChunkGroupMaxObjects,
-                           G1RemoteArrayChunkSiblingInstallHardCap);
-    if (copy_limit > 0) {
-      segment_member_count =
-          rmm->copy_array_chunk_segment_handles(segment_id,
-                                                segment_members,
-                                                copy_limit,
-                                                &registry_bytes);
+  if (can_bulk_fcr) {
+    HeapRegion* fcr_hr = g1h->heap_region_containing_or_null(segment_dest);
+    if (fcr_hr != nullptr) {
+      fcr_hr->update_bot_for_obj(dest, word_size);
+      for (uint i = 0; i < segment_member_count; i++) {
+        RemoteHandle* member = segment_members[i];
+        if (member == nullptr) {
+          continue;
+        }
+        RemoteLocation* member_loc = &member->_remote_location;
+        if (!member_loc->is_array_chunk() ||
+            (uint64_t)member_loc->_secondary_id != segment_id ||
+            member_loc->_segment_byte_size != segment_byte_size ||
+            !is_aligned(member_loc->_offset, HeapWordSize)) {
+          continue;
+        }
+        size_t member_word_size = member->eviction_word_size();
+        if (member_word_size == 0 ||
+            member_loc->_byte_size != member_word_size * HeapWordSize ||
+            member_loc->_offset > segment_byte_size ||
+            member_loc->_byte_size > segment_byte_size - member_loc->_offset) {
+          continue;
+        }
+        HeapWord* member_dest =
+            segment_dest + (member_loc->_offset / HeapWordSize);
+        fcr_hr->update_bot_for_obj(member_dest, member_word_size);
+      }
     }
   }
 
@@ -2297,7 +2355,7 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
   publish_dests[publish_count] = dest;
   publish_count++;
 
-  if (segment_buf != nullptr && segment_member_count > 1) {
+  if ((can_bulk_fcr || segment_buf != nullptr) && segment_member_count > 1) {
     for (uint i = 0;
          i < segment_member_count &&
          publish_count < G1RemoteArrayChunkSiblingInstallHardCap;
@@ -2331,17 +2389,26 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
         continue;
       }
 
-      HeapWord* sibling_dest = rmm->allocate_in_fcr(sibling_word_size);
-      if (sibling_dest == nullptr) {
-        sibling->cas_fetching_to_remote();
-        sibling_failed++;
-        break;
-      }
-
       size_t sibling_byte_size = sibling_loc->_byte_size;
-      memset(sibling_dest, 0, sibling_byte_size);
-      memcpy(sibling_dest, segment_buf + sibling_loc->_offset,
-             sibling_byte_size);
+      HeapWord* sibling_dest = nullptr;
+      if (can_bulk_fcr) {
+        if (!is_aligned(sibling_loc->_offset, HeapWordSize)) {
+          sibling->cas_fetching_to_remote();
+          sibling_failed++;
+          continue;
+        }
+        sibling_dest = segment_dest + (sibling_loc->_offset / HeapWordSize);
+      } else {
+        sibling_dest = rmm->allocate_in_fcr(sibling_word_size);
+        if (sibling_dest == nullptr) {
+          sibling->cas_fetching_to_remote();
+          sibling_failed++;
+          break;
+        }
+        memset(sibling_dest, 0, sibling_byte_size);
+        memcpy(sibling_dest, segment_buf + sibling_loc->_offset,
+               sibling_byte_size);
+      }
 
       Klass* sibling_klass = cast_to_oop(sibling_dest)->klass_or_null_acquire();
       if (!remote_runtime_valid_klass(sibling_klass) ||
@@ -2382,10 +2449,11 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
     log_debug(gc)("Array chunk sibling install: segment=" UINT64_FORMAT
                   " bytes=" SIZE_FORMAT " registry_bytes=" SIZE_FORMAT
                   " members=%u installed=" SIZE_FORMAT
-                  " raced=" SIZE_FORMAT " failed=" SIZE_FORMAT,
+                  " raced=" SIZE_FORMAT " failed=" SIZE_FORMAT
+                  " bulk_fcr=%d",
                   segment_id, segment_byte_size, registry_bytes,
                   segment_member_count, sibling_installed,
-                  sibling_raced, sibling_failed);
+                  sibling_raced, sibling_failed, can_bulk_fcr ? 1 : 0);
   }
   return result;
 }

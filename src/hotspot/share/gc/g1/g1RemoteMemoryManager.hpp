@@ -635,7 +635,8 @@ public:
   uint copy_array_chunk_segment_handles(uint64_t segment_id,
                                         RemoteHandle** out,
                                         uint max_handles,
-                                        size_t* byte_size_out = nullptr);
+                                        size_t* byte_size_out = nullptr,
+                                        uint* total_handles_out = nullptr);
   void release_array_chunk_segment(uint64_t segment_id);
   void mark_handle_dead(RemoteHandle* h);
   size_t local_handle_count() const { return _local_handle_count; }
