@@ -28,6 +28,7 @@
 #include "ci/ciObjArray.hpp"
 #include "asm/register.hpp"
 #include "compiler/compileLog.hpp"
+#include "gc/g1/g1_globals.hpp"
 #include "gc/shared/barrierSet.hpp"
 #include "gc/shared/c2/barrierSetC2.hpp"
 #include "interpreter/interpreter.hpp"
@@ -4208,6 +4209,11 @@ void GraphKit::inflate_string_slow(Node* src, Node* dst, Node* start, Node* coun
 Node* GraphKit::make_constant_from_field(ciField* field, Node* obj) {
   if (!field->is_constant()) {
     return nullptr; // Field not marked as constant.
+  }
+  if (UseG1GC && is_reference_type(field->layout_type()) && !UseCompressedOops &&
+      (LocalMemoryRatio < 100 || G1TagRefSites ||
+       G1SimulateRemoteEviction || G1RemoteEvictionThreshold > 0)) {
+    return nullptr;
   }
   ciInstance* holder = nullptr;
   if (!field->is_static()) {
