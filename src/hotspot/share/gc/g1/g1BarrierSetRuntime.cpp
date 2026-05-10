@@ -773,13 +773,22 @@ static bool remote_prefetch_budget_allows_eager_install() {
 }
 
 static bool remote_object_cluster_sibling_install_allowed() {
-  return remote_prefetch_sample_pressure_level() <
-         RemotePrefetchPressureOverTarget;
+  // Cluster locations are not speculative prefetch: the runtime has already
+  // paid to fetch the whole remote segment.  Suppressing sibling install under
+  // the normal local-memory pressure policy turns a locality cluster into
+  // repeated segment fetches for adjacent objects, which is exactly the Spark
+  // NB fetch-storm pattern.  Keep pressure gating for ordinary around-prefetch,
+  // but always consume fetched cluster payloads here; GC/FCR reclaim controls
+  // the resident set at region granularity.
+  return true;
 }
 
 static bool remote_array_chunk_sibling_install_allowed() {
-  return remote_prefetch_sample_pressure_level() <
-         RemotePrefetchPressureOverTier2;
+  // Same rationale as object clusters.  Primitive-array chunk groups are
+  // bounded by G1RemoteArrayChunkGroupMaxBytes/Objects and have no oop fields,
+  // so installing fetched siblings is the cheapest way to preserve sequential
+  // array locality without repeated RDMA reads of the same segment.
+  return true;
 }
 
 static size_t remote_prefetch_cache_cap_for_pressure(int pressure_level,
@@ -2171,7 +2180,7 @@ static oopDesc* array_chunk_fetch_failed(G1RemoteMemoryManager* rmm,
   return nullptr;
 }
 
-static const uint G1RemoteArrayChunkSiblingInstallHardCap = 1024;
+static const uint G1RemoteArrayChunkSiblingInstallHardCap = 4096;
 
 static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
                                               int& fetch_attempts,

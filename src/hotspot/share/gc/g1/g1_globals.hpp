@@ -473,7 +473,7 @@
           "locations. A value of 0 disables grouping and keeps one segment "   \
           "per primitive array.")                                             \
                                                                             \
-  product(uint, G1RemoteArrayChunkGroupMaxObjects, 1024, DIAGNOSTIC,          \
+  product(uint, G1RemoteArrayChunkGroupMaxObjects, 4096, DIAGNOSTIC,          \
           "Maximum number of primitive arrays grouped into one remote "        \
           "chunk segment.")                                                   \
                                                                             \
@@ -487,7 +487,7 @@
           "Maximum remote segment size used to group non-array object "        \
           "cluster locations.")                                                \
                                                                             \
-  product(uint, G1RemoteClusterObjectGroupMaxObjects, 1024, DIAGNOSTIC,       \
+  product(uint, G1RemoteClusterObjectGroupMaxObjects, 4096, DIAGNOSTIC,       \
           "Maximum number of non-array objects grouped into one remote "       \
           "cluster segment.")                                                  \
                                                                             \
