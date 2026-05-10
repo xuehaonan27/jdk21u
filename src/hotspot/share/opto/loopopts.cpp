@@ -1236,8 +1236,15 @@ bool PhaseIdealLoop::identical_backtoback_ifs(Node *n) {
     return false;
   }
   IfNode* dom_if = dom->as_If();
-  Node* proj_true = dom_if->proj_out(1);
-  Node* proj_false = dom_if->proj_out(0);
+  if (n->as_If()->proj_out_or_null(0) == nullptr ||
+      n->as_If()->proj_out_or_null(1) == nullptr) {
+    return false;
+  }
+  Node* proj_true = dom_if->proj_out_or_null(1);
+  Node* proj_false = dom_if->proj_out_or_null(0);
+  if (proj_true == nullptr || proj_false == nullptr) {
+    return false;
+  }
 
   for (uint i = 1; i < region->req(); i++) {
     if (is_dominator(proj_true, region->in(i))) {
@@ -1492,13 +1499,24 @@ bool PhaseIdealLoop::try_merge_identical_ifs(Node* n) {
   if (identical_backtoback_ifs(n) && can_split_if(n->in(0))) {
     Node *n_ctrl = n->in(0);
     IfNode* dom_if = idom(n_ctrl)->as_If();
-    ProjNode* dom_proj_true = dom_if->proj_out(1);
-    ProjNode* dom_proj_false = dom_if->proj_out(0);
+    IfNode* iff = n->as_If();
+    if (iff->proj_out_or_null(0) == nullptr ||
+        iff->proj_out_or_null(1) == nullptr) {
+      return false;
+    }
+    ProjNode* dom_proj_true = dom_if->proj_out_or_null(1);
+    ProjNode* dom_proj_false = dom_if->proj_out_or_null(0);
+    if (dom_proj_true == nullptr || dom_proj_false == nullptr) {
+      return false;
+    }
 
     // Now split the IF
-    RegionNode* new_false_region;
-    RegionNode* new_true_region;
+    RegionNode* new_false_region = nullptr;
+    RegionNode* new_true_region = nullptr;
     do_split_if(n, &new_false_region, &new_true_region);
+    if (new_false_region == nullptr || new_true_region == nullptr) {
+      return true;
+    }
     assert(new_false_region->req() == new_true_region->req(), "");
 #ifdef ASSERT
     for (uint i = 1; i < new_false_region->req(); ++i) {
