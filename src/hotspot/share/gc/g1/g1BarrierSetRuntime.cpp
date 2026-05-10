@@ -2161,6 +2161,8 @@ static oopDesc* array_chunk_fetch_failed(G1RemoteMemoryManager* rmm,
   return nullptr;
 }
 
+static const uint G1RemoteArrayChunkSiblingInstallHardCap = 1024;
+
 static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
                                               int& fetch_attempts,
                                               bool* out_retry) {
@@ -2243,9 +2245,6 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
   if (ok && segment_buf != nullptr) {
     memcpy(dest, segment_buf + segment_offset, byte_size);
   }
-  if (segment_buf != nullptr) {
-    os::free(segment_buf);
-  }
 
   Klass* fetched_klass = nullptr;
   if (ok) {
@@ -2262,14 +2261,132 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
 
   rmm->record_fetch_result(segment_byte_size / HeapWordSize, fetch_elapsed, ok);
   if (!ok) {
+    if (segment_buf != nullptr) {
+      os::free(segment_buf);
+    }
     return array_chunk_fetch_failed(rmm, h, fetch_attempts, out_retry,
                                     "backend-or-validation-failed");
   }
 
+  RemoteHandle* segment_members[G1RemoteArrayChunkSiblingInstallHardCap];
+  uint segment_member_count = 0;
+  size_t registry_bytes = 0;
+  if (segment_buf != nullptr) {
+    uint copy_limit = MIN2((uint)G1RemoteArrayChunkGroupMaxObjects,
+                           G1RemoteArrayChunkSiblingInstallHardCap);
+    if (copy_limit > 0) {
+      segment_member_count =
+          rmm->copy_array_chunk_segment_handles(segment_id,
+                                                segment_members,
+                                                copy_limit,
+                                                &registry_bytes);
+    }
+  }
+
+  RemoteHandle* publish_handles[G1RemoteArrayChunkSiblingInstallHardCap];
+  HeapWord* publish_dests[G1RemoteArrayChunkSiblingInstallHardCap];
+  uint publish_count = 0;
+  size_t sibling_installed = 0;
+  size_t sibling_raced = 0;
+  size_t sibling_failed = 0;
+  size_t sibling_words = 0;
+
   oopDesc* result = finish_fetched_object(g1h, rmm, h, dest,
                                           fetched_klass, word_size);
-  rmm->publish_local_handle(h, dest);
-  rmm->release_array_chunk_segment(segment_id);
+  publish_handles[publish_count] = h;
+  publish_dests[publish_count] = dest;
+  publish_count++;
+
+  if (segment_buf != nullptr && segment_member_count > 1) {
+    for (uint i = 0;
+         i < segment_member_count &&
+         publish_count < G1RemoteArrayChunkSiblingInstallHardCap;
+         i++) {
+      RemoteHandle* sibling = segment_members[i];
+      if (sibling == nullptr || sibling == h) {
+        continue;
+      }
+
+      RemoteLocation* sibling_loc = &sibling->_remote_location;
+      if (!sibling_loc->is_array_chunk() ||
+          (uint64_t)sibling_loc->_secondary_id != segment_id ||
+          sibling_loc->_segment_byte_size != segment_byte_size ||
+          sibling_loc->_byte_size == 0 ||
+          sibling_loc->_offset > segment_byte_size ||
+          sibling_loc->_byte_size > segment_byte_size - sibling_loc->_offset) {
+        sibling_failed++;
+        continue;
+      }
+
+      size_t sibling_word_size = sibling->eviction_word_size();
+      if (sibling_word_size == 0 ||
+          sibling_word_size > SIZE_MAX / HeapWordSize ||
+          sibling_loc->_byte_size != sibling_word_size * HeapWordSize) {
+        sibling_failed++;
+        continue;
+      }
+
+      if (!sibling->try_remote_to_fetching(segment_id)) {
+        sibling_raced++;
+        continue;
+      }
+
+      HeapWord* sibling_dest = rmm->allocate_in_fcr(sibling_word_size);
+      if (sibling_dest == nullptr) {
+        sibling->cas_fetching_to_remote();
+        sibling_failed++;
+        break;
+      }
+
+      size_t sibling_byte_size = sibling_loc->_byte_size;
+      memset(sibling_dest, 0, sibling_byte_size);
+      memcpy(sibling_dest, segment_buf + sibling_loc->_offset,
+             sibling_byte_size);
+
+      Klass* sibling_klass = cast_to_oop(sibling_dest)->klass_or_null_acquire();
+      if (!remote_runtime_valid_klass(sibling_klass) ||
+          !sibling_klass->is_typeArray_klass()) {
+        sibling->cas_fetching_to_remote();
+        sibling_failed++;
+        continue;
+      }
+
+      finish_fetched_object(g1h, rmm, sibling, sibling_dest,
+                            sibling_klass, sibling_word_size);
+      publish_handles[publish_count] = sibling;
+      publish_dests[publish_count] = sibling_dest;
+      publish_count++;
+      sibling_installed++;
+      sibling_words += sibling_word_size;
+    }
+  }
+
+  if (segment_buf != nullptr) {
+    os::free(segment_buf);
+  }
+
+  rmm->publish_local_handles(publish_handles, publish_dests, publish_count);
+  for (uint i = 0; i < publish_count; i++) {
+    rmm->release_array_chunk_segment(segment_id);
+  }
+  if (segment_member_count > 1 || sibling_installed > 0 ||
+      sibling_raced > 0 || sibling_failed > 0) {
+    rmm->record_fetch_batch_result(segment_member_count,
+                                   segment_member_count,
+                                   publish_count,
+                                   sibling_installed,
+                                   sibling_raced,
+                                   sibling_failed,
+                                   sibling_words,
+                                   fetch_elapsed);
+    log_debug(gc)("Array chunk sibling install: segment=" UINT64_FORMAT
+                  " bytes=" SIZE_FORMAT " registry_bytes=" SIZE_FORMAT
+                  " members=%u installed=" SIZE_FORMAT
+                  " raced=" SIZE_FORMAT " failed=" SIZE_FORMAT,
+                  segment_id, segment_byte_size, registry_bytes,
+                  segment_member_count, sibling_installed,
+                  sibling_raced, sibling_failed);
+  }
   return result;
 }
 

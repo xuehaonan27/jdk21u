@@ -115,6 +115,8 @@ class G1RemoteMemoryManager : public CHeapObj<mtGC> {
     uint64_t _segment_id;
     volatile uint32_t _refcount;
     size_t _byte_size;
+    RemoteHandle** _handles;
+    uint32_t _handle_count;
     ArrayChunkSegmentEntry* _next;
   };
   ArrayChunkSegmentEntry* _array_chunk_segments[ARRAY_CHUNK_SEGMENT_BUCKETS];
@@ -627,8 +629,13 @@ public:
                                       size_t segment_byte_size,
                                       uint32_t flags);
   void register_array_chunk_segment(uint64_t segment_id,
+                                    RemoteHandle** handles,
                                     uint32_t refcount,
                                     size_t byte_size);
+  uint copy_array_chunk_segment_handles(uint64_t segment_id,
+                                        RemoteHandle** out,
+                                        uint max_handles,
+                                        size_t* byte_size_out = nullptr);
   void release_array_chunk_segment(uint64_t segment_id);
   void mark_handle_dead(RemoteHandle* h);
   size_t local_handle_count() const { return _local_handle_count; }

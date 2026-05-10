@@ -466,9 +466,13 @@ static size_t array_chunk_segment_hash(uint64_t segment_id) {
 }
 
 void G1RemoteMemoryManager::register_array_chunk_segment(uint64_t segment_id,
+                                                         RemoteHandle** handles,
                                                          uint32_t refcount,
                                                          size_t byte_size) {
   if (segment_id == 0 || refcount == 0 || byte_size == 0) {
+    if (handles != nullptr) {
+      os::free(handles);
+    }
     return;
   }
 
@@ -480,6 +484,12 @@ void G1RemoteMemoryManager::register_array_chunk_segment(uint64_t segment_id,
     if (e->_segment_id == segment_id) {
       Atomic::add(&e->_refcount, refcount);
       e->_byte_size = byte_size;
+      if (e->_handles == nullptr && handles != nullptr) {
+        e->_handles = handles;
+        e->_handle_count = refcount;
+      } else if (handles != nullptr) {
+        os::free(handles);
+      }
       array_chunk_segment_unlock();
       return;
     }
@@ -489,6 +499,9 @@ void G1RemoteMemoryManager::register_array_chunk_segment(uint64_t segment_id,
       (ArrayChunkSegmentEntry*)os::malloc(sizeof(ArrayChunkSegmentEntry), mtGC);
   if (e == nullptr) {
     array_chunk_segment_unlock();
+    if (handles != nullptr) {
+      os::free(handles);
+    }
     log_warning(gc)("Array chunk segment registry allocation failed: segment="
                     UINT64_FORMAT " refs=%u bytes=" SIZE_FORMAT,
                     segment_id, refcount, byte_size);
@@ -497,9 +510,43 @@ void G1RemoteMemoryManager::register_array_chunk_segment(uint64_t segment_id,
   e->_segment_id = segment_id;
   e->_refcount = refcount;
   e->_byte_size = byte_size;
+  e->_handles = handles;
+  e->_handle_count = handles == nullptr ? 0 : refcount;
   e->_next = _array_chunk_segments[idx];
   _array_chunk_segments[idx] = e;
   array_chunk_segment_unlock();
+}
+
+uint G1RemoteMemoryManager::copy_array_chunk_segment_handles(uint64_t segment_id,
+                                                             RemoteHandle** out,
+                                                             uint max_handles,
+                                                             size_t* byte_size_out) {
+  if (byte_size_out != nullptr) {
+    *byte_size_out = 0;
+  }
+  if (segment_id == 0 || out == nullptr || max_handles == 0) {
+    return 0;
+  }
+
+  uint copied = 0;
+  size_t idx = array_chunk_segment_hash(segment_id);
+  array_chunk_segment_lock();
+  for (ArrayChunkSegmentEntry* e = _array_chunk_segments[idx];
+       e != nullptr;
+       e = e->_next) {
+    if (e->_segment_id == segment_id) {
+      if (byte_size_out != nullptr) {
+        *byte_size_out = e->_byte_size;
+      }
+      uint limit = MIN2(e->_handle_count, max_handles);
+      for (uint i = 0; i < limit; i++) {
+        out[copied++] = e->_handles == nullptr ? nullptr : e->_handles[i];
+      }
+      break;
+    }
+  }
+  array_chunk_segment_unlock();
+  return copied;
 }
 
 void G1RemoteMemoryManager::release_array_chunk_segment(uint64_t segment_id) {
@@ -524,6 +571,11 @@ void G1RemoteMemoryManager::release_array_chunk_segment(uint64_t segment_id) {
           prev->_next = cur->_next;
         }
         discard = true;
+        if (cur->_handles != nullptr) {
+          os::free(cur->_handles);
+          cur->_handles = nullptr;
+          cur->_handle_count = 0;
+        }
         os::free(cur);
       } else {
         Atomic::release_store(&cur->_refcount, refs - 1);
@@ -829,6 +881,10 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     ArrayChunkSegmentEntry* e = _array_chunk_segments[i];
     while (e != nullptr) {
       ArrayChunkSegmentEntry* next = e->_next;
+      if (e->_handles != nullptr) {
+        os::free(e->_handles);
+        e->_handles = nullptr;
+      }
       os::free(e);
       e = next;
     }
@@ -2661,8 +2717,24 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
       }
     }
     if (first && refs > 0) {
-      register_array_chunk_segment((uint64_t)entry->segment_id, refs,
-                                   entry->segment_byte_size);
+      RemoteHandle** handles =
+          (RemoteHandle**)os::malloc(sizeof(RemoteHandle*) * refs, mtGC);
+      if (handles != nullptr) {
+        uint32_t n = 0;
+        for (int f = start; f < start + count && n < refs; f++) {
+          if (entries[f].location_kind == RemoteLocationArrayChunk &&
+              entries[f].segment_id == entry->segment_id) {
+            handles[n++] = entries[f].handle;
+          }
+        }
+        refs = n;
+      } else {
+        log_warning(gc)("Array chunk segment registry member allocation failed: "
+                        "segment=" UINT64_FORMAT " refs=%u",
+                        (uint64_t)entry->segment_id, refs);
+      }
+      register_array_chunk_segment((uint64_t)entry->segment_id, handles,
+                                   refs, entry->segment_byte_size);
     }
   }
 
