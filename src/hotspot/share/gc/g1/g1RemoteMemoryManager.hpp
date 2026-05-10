@@ -1366,6 +1366,7 @@ public:
     ObjectEdgeTable* edge_table;
     uint32_t      location_kind;
     uint32_t      location_flags;
+    uintptr_t     segment_base;
     uintptr_t     segment_id;
     size_t        segment_offset;
     size_t        segment_byte_size;

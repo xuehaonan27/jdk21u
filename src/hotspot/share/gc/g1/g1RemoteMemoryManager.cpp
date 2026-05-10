@@ -2540,6 +2540,7 @@ bool G1RemoteMemoryManager::prepare_eviction_metadata(oop obj, RemoteHandleAlloc
   out->edge_table = nullptr;
   out->location_kind = RemoteLocationObjectSlot;
   out->location_flags = 0;
+  out->segment_base = 0;
   out->segment_id = 0;
   out->segment_offset = 0;
   out->segment_byte_size = word_size * HeapWordSize;
@@ -2754,7 +2755,10 @@ void G1RemoteMemoryManager::finalize_evictions(PreparedEviction* entries,
     }
     h->set_eviction_word_size(entry->word_size);
     if (entry->location_kind == RemoteLocationArrayChunk) {
-      h->set_remote_array_chunk((uintptr_t)entry->obj - entry->segment_offset,
+      uintptr_t segment_base = entry->segment_base != 0
+          ? entry->segment_base
+          : (uintptr_t)entry->obj - entry->segment_offset;
+      h->set_remote_array_chunk(segment_base,
                                 entry->segment_id,
                                 entry->segment_offset,
                                 entry->word_size * HeapWordSize,

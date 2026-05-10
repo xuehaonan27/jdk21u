@@ -4570,6 +4570,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
               PreparedEviction* pe = &entries[e];
               size_t byte_size = pe->word_size * HeapWordSize;
               memcpy(group_buf + offset, cast_from_oop<void*>(pe->obj), byte_size);
+              pe->segment_base = segment_base;
               pe->segment_id = segment_id;
               pe->segment_offset = offset;
               pe->segment_byte_size = group_bytes;
