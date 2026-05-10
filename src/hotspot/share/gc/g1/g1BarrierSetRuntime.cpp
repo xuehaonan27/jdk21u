@@ -376,7 +376,7 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
     }
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
-    if (rmm != nullptr && state != REMOTE_HANDLE_LOCAL) {
+    if (rmm != nullptr) {
       rmm->record_resolve_fast_state(state);
     }
     if (state == REMOTE_HANDLE_LOCAL) {
@@ -3132,6 +3132,9 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
   }
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+  if (rmm != nullptr) {
+    rmm->record_resolve_fast_state(state);
+  }
   if (state == REMOTE_HANDLE_LOCAL) {
     RemoteHandle* redirect = nullptr;
     oopDesc* resolved = resolve_local_handle_addr(h, sa & REMOTE_HANDLE_ADDR_MASK,

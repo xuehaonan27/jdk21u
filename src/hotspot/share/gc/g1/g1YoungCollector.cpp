@@ -3309,11 +3309,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         }
 
         int remote_anchor_pinned = 0;
+        int remote_anchor_allowed = 0;
         for (uint idx = 0; idx < num_regions; idx++) {
           if (remote_anchor_regions[idx] && eviction_candidates[idx]) {
             HeapRegion* hr = _g1h->region_at_or_null(idx);
             if (hr == nullptr) continue;
-            if (hr->is_fetch_cache()) {
+            if (hr->is_fetch_cache() ||
+                (dense_deferred_candidates != nullptr &&
+                 dense_deferred_candidates[idx])) {
+              remote_anchor_allowed++;
               continue;
             }
             eviction_candidates[idx] = false;
@@ -3328,6 +3332,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
         FREE_C_HEAP_ARRAY(bool, remote_anchor_regions);
+
+        if (remote_anchor_allowed > 0) {
+          log_info(gc)("Root guard: allowed %d dense/FCR candidate regions "
+                       "with remote anchors through cascade path; late "
+                       "complete-region/local-handle guards will decide",
+                       remote_anchor_allowed);
+        }
 
         int root_guarded = root_pin_cl.regions_guarded() + remote_anchor_pinned;
         if (root_guarded > 0) {
