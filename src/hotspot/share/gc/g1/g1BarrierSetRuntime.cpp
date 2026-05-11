@@ -165,6 +165,25 @@ static oopDesc* resolve_local_handle_addr(RemoteHandle* h, uintptr_t addr,
   }
 
   G1RemoteMemoryManager* rmm = g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  uintptr_t dense_addr = 0;
+  if (rmm != nullptr &&
+      rmm->local_handle_points_to_dense_segment(h, &dense_addr) &&
+      dense_addr == addr) {
+    if (rmm->localize_dense_segment_for_addr(dense_addr)) {
+      hr = g1h->heap_region_containing_or_null((void*)addr);
+      if (!local_handle_addr_is_stale(g1h, addr, &hr)) {
+        log_debug(gc)("%s: localized dense segment for stale LOCAL handle "
+                      PTR_FORMAT " addr=" PTR_FORMAT,
+                      caller, p2i(h), p2i((void*)addr));
+        return (oopDesc*)addr;
+      }
+    }
+    log_warning(gc)("%s: stale LOCAL handle " PTR_FORMAT " addr=" PTR_FORMAT
+                    " points into dense segment but localization failed",
+                    caller, p2i(h), p2i((void*)addr));
+    return nullptr;
+  }
+
   RemoteHandle* alt = rmm == nullptr ? nullptr : rmm->handle_for_addr_any_state(addr);
   if (alt != nullptr && alt != h) {
     uintptr_t alt_sa = alt->load_state_and_addr_acquire();

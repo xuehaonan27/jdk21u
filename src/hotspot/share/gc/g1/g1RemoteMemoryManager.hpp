@@ -1228,6 +1228,8 @@ public:
   bool is_dense_segment_remote_addr(uintptr_t addr) const;
   bool is_dense_segment_managed_addr(uintptr_t addr) const;
   bool is_dense_segment_managed_region(HeapRegion* hr) const;
+  bool local_handle_points_to_dense_segment(RemoteHandle* h,
+                                            uintptr_t* addr_out = nullptr) const;
   bool localize_dense_segment_for_addr(uintptr_t addr);
   size_t dense_segment_remote_bytes() const {
     return (size_t)Atomic::load(&_dense_segment_remote_bytes);

@@ -1415,10 +1415,17 @@ bool G1RemoteMemoryManager::can_evict_dense_segment_region(HeapRegion* hr,
     return false;
   }
 
+  // Dense segments preserve the original region address and localize the whole
+  // region on the first direct or handle-based access.  LOCAL handles into the
+  // region are therefore access triggers, not pins.  Treating them as pins made
+  // Spark's dense cached partitions effectively unevictable under cgroup
+  // pressure.
   int local_handles = count_local_handles_in_region(hr, 0);
   if (local_handles > 0) {
-    if (reason != nullptr) *reason = "local-handles";
-    return false;
+    log_debug(gc)("Dense segment candidate region %u has %d LOCAL handles; "
+                  "allowing eviction because LOCAL handle resolution can "
+                  "localize the segment",
+                  hr->hrm_index(), local_handles);
   }
 
   size_t objects = 0;
@@ -1470,8 +1477,8 @@ bool G1RemoteMemoryManager::evict_dense_segment_region(HeapRegion* hr,
 
   int local_handles = count_local_handles_in_region(hr, 0);
   if (local_handles > 0) {
-    if (out_reason != nullptr) *out_reason = "local-handles";
-    return false;
+    log_debug(gc)("Dense segment evict region %u with %d LOCAL handles",
+                  hr->hrm_index(), local_handles);
   }
 
   if (!ensure_dense_segment_capacity(hr->hrm_index() + 1)) {
@@ -1605,6 +1612,25 @@ bool G1RemoteMemoryManager::is_dense_segment_managed_region(HeapRegion* hr) cons
   return entry->segment_id != 0 &&
          state != DenseSegmentNone &&
          entry->base == (uintptr_t)hr->bottom();
+}
+
+bool G1RemoteMemoryManager::local_handle_points_to_dense_segment(
+    RemoteHandle* h, uintptr_t* addr_out) const {
+  if (addr_out != nullptr) {
+    *addr_out = 0;
+  }
+  if (h == nullptr) {
+    return false;
+  }
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
+    return false;
+  }
+  uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
+  if (addr_out != nullptr) {
+    *addr_out = addr;
+  }
+  return is_dense_segment_remote_addr(addr);
 }
 
 static bool rebuild_dense_segment_bot(HeapRegion* hr, size_t byte_size) {
@@ -6799,6 +6825,16 @@ bool G1RemoteMemoryManager::validate_local_handle_addr(RemoteHandle* h,
   } else if (!_g1h->is_in_reserved((void*)addr)) {
     reason = "NOT IN HEAP";
   } else {
+    uintptr_t dense_addr = 0;
+    if (local_handle_points_to_dense_segment(h, &dense_addr) &&
+        dense_addr == addr) {
+      log_debug(gc)("%s: LOCAL handle=" PTR_FORMAT " addr=" PTR_FORMAT
+                    " points into a remote dense segment; skipping local "
+                    "root validation without marking DEAD",
+                    context == nullptr ? "DENSE-REMOTE-HANDLE" : context,
+                    p2i(h), p2i((void*)addr));
+      return false;
+    }
     hr = _g1h->heap_region_containing_or_null((void*)addr);
     if (hr == nullptr) {
       reason = "NO REGION";
