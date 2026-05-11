@@ -1592,6 +1592,21 @@ bool G1RemoteMemoryManager::is_dense_segment_managed_addr(uintptr_t addr) const 
          addr < entry->base + entry->byte_size;
 }
 
+bool G1RemoteMemoryManager::is_dense_segment_managed_region(HeapRegion* hr) const {
+  if (!G1RemoteUseDenseSegments || _dense_segments == nullptr || hr == nullptr) {
+    return false;
+  }
+  uint idx = hr->hrm_index();
+  if (idx >= _dense_segment_capacity) {
+    return false;
+  }
+  const DenseSegmentEntry* entry = &_dense_segments[idx];
+  uint32_t state = Atomic::load(&entry->state);
+  return entry->segment_id != 0 &&
+         state != DenseSegmentNone &&
+         entry->base == (uintptr_t)hr->bottom();
+}
+
 static bool rebuild_dense_segment_bot(HeapRegion* hr, size_t byte_size) {
   HeapWord* p = hr->bottom();
   HeapWord* top = hr->bottom() + byte_size / HeapWordSize;

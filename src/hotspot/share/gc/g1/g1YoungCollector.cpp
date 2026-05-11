@@ -3745,6 +3745,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           dense_evicted_regions++;
           dense_evicted_bytes += region_used;
           total_freed_bytes += region_used;
+          if (_g1h->collector_state()->mark_or_rebuild_in_progress()) {
+            _g1h->concurrent_mark()->clear_statistics(hr);
+          }
           hr->clear_cardtable();
           hr->clear_cold_destination();
           hr->clear_root_pinned();
@@ -5079,6 +5082,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           total_freed_bytes += region_used;
           total_summary_freed_bytes += region_used;
           rmm->invalidate_fcr_if_freed(hr);
+          if (_g1h->collector_state()->mark_or_rebuild_in_progress()) {
+            _g1h->concurrent_mark()->clear_statistics(hr);
+          }
           log_info(gc)("Evicted region %u (%d objects, " SIZE_FORMAT "KB) "
                        "[" PTR_FORMAT ", " PTR_FORMAT ")",
                        hr->hrm_index(), rcount, region_used / K,

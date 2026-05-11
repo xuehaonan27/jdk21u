@@ -28,6 +28,8 @@
 
 #include "gc/g1/g1ConcurrentMark.inline.hpp"
 #include "gc/g1/g1ConcurrentMarkBitMap.inline.hpp"
+#include "gc/g1/g1CollectedHeap.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/g1_globals.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
 #include "gc/g1/heapRegionManager.inline.hpp"
@@ -106,6 +108,20 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
       return _cm->top_at_rebuild_start(hr->hrm_index()) != nullptr;
     }
 
+    bool region_still_resident_for_rebuild(HeapRegion* hr) const {
+      return !hr->is_empty() &&
+             !hr->is_free() &&
+             !hr->is_evict_guarded() &&
+             should_rebuild_or_scrub(hr);
+    }
+
+    bool is_dense_segment_managed_region(HeapRegion* hr) const {
+      G1CollectedHeap* g1h = G1CollectedHeap::heap();
+      G1RemoteMemoryManager* rmm =
+          g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+      return rmm != nullptr && rmm->is_dense_segment_managed_region(hr);
+    }
+
     // Helper used by both humongous objects and when chunking an object larger than the
     // G1RebuildRemSetChunkSize. The heap region is needed to ensure a humongous object
     // is not eagerly reclaimed during yielding.
@@ -123,10 +139,12 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
         bool mark_aborted = yield_if_necessary();
         if (mark_aborted) {
           return true;
-        } else if (!should_rebuild_or_scrub(hr)) {
-          // We need to check should_rebuild_or_scrub() again (for humongous objects)
-          // because the region might have been eagerly reclaimed during the yield.
-          log_trace(gc, marking)("Rebuild aborted for eagerly reclaimed humongous region: %u", hr->hrm_index());
+        } else if (!region_still_resident_for_rebuild(hr)) {
+          // We need to check again after every suspendible yield: a safepoint may
+          // have reclaimed a humongous object or remote-evicted and guarded an old
+          // region while this concurrent worker was stopped.
+          log_trace(gc, marking)("Rebuild aborted for reclaimed or remote-evicted region: %u",
+                                 hr->hrm_index());
           return false;
         }
 
@@ -139,6 +157,10 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
     // Scan for references into regions that need remembered set update for the given
     // live object. Returns the offset to the next object.
     size_t scan_object(HeapRegion* hr, HeapWord* current) {
+      if (!region_still_resident_for_rebuild(hr)) {
+        return 0;
+      }
+
       oop obj = cast_to_oop(current);
       size_t obj_size = obj->size();
 
@@ -179,9 +201,17 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
     bool scan_and_scrub_to_pb(HeapRegion* hr, HeapWord* start, HeapWord* const limit) {
 
       while (start < limit) {
+        if (!region_still_resident_for_rebuild(hr)) {
+          return false;
+        }
+
         if (_bitmap->is_marked(start)) {
           //  Live object, need to scan to rebuild remembered sets for this object.
-          start += scan_object(hr, start);
+          size_t obj_size = scan_object(hr, start);
+          if (obj_size == 0) {
+            return false;
+          }
+          start += obj_size;
         } else {
           // Found dead object (which klass has potentially been unloaded). Scrub to next
           // marked object and continue.
@@ -201,7 +231,15 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
     bool scan_from_pb_to_tars(HeapRegion* hr, HeapWord* start, HeapWord* const limit) {
 
       while (start < limit) {
-        start += scan_object(hr, start);
+        if (!region_still_resident_for_rebuild(hr)) {
+          return false;
+        }
+
+        size_t obj_size = scan_object(hr, start);
+        if (obj_size == 0) {
+          return false;
+        }
+        start += obj_size;
         // Avoid stalling safepoints and stop iteration if mark cycle has been aborted.
         bool mark_aborted = yield_if_necessary();
         if (mark_aborted) {
@@ -222,6 +260,12 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
       if (scan_and_scrub_to_pb(hr, hr->bottom(), pb)) {
         log_trace(gc, marking)("Scan and scrub aborted for region: %u", hr->hrm_index());
         return true;
+      }
+
+      if (!region_still_resident_for_rebuild(hr)) {
+        log_trace(gc, marking)("Scan and scrub stopped for reclaimed or remote-evicted region: %u",
+                               hr->hrm_index());
+        return false;
       }
 
       // Scrubbing completed for this region - notify that we are done with it, resetting
@@ -287,6 +331,14 @@ class G1RebuildRSAndScrubTask : public WorkerTask {
       // Skip nonresident/quarantined regions. The rebuild snapshot may predate
       // remote eviction, and guarded dense regions are intentionally unparsable.
       if (hr->is_empty() || hr->is_free() || hr->is_evict_guarded()) {
+        return false;
+      }
+
+      // Dense segments are scanned, moved, and localized through the remote
+      // manager's edge tables. A normal G1 concurrent rebuild/scrub cycle may
+      // have missed them while they were guarded remotely; treating unmarked
+      // objects as dead here exposes FillerElement objects to Java.
+      if (is_dense_segment_managed_region(hr)) {
         return false;
       }
 

@@ -39,6 +39,7 @@
 #include "gc/shared/barrierSet.hpp"
 #include "gc/shared/collectedHeap.hpp"
 #include "gc/shared/gcLocker.inline.hpp"
+#include "interpreter/bytecode.hpp"
 #include "interpreter/interpreter.hpp"
 #include "interpreter/interpreterRuntime.hpp"
 #include "jvm.h"
@@ -2154,19 +2155,65 @@ JRT_END
 
 // The caller of generate_class_cast_message() (or one of its callers)
 // must use a ResourceMark in order to correctly free the result.
+static char* generate_class_cast_message_fallback(Klass* caster_klass) {
+  const char* caster_name =
+      caster_klass == nullptr ? "unknown" : caster_klass->external_name();
+  const char* suffix = " cannot be cast to requested class";
+  size_t msglen = strlen("class ") + strlen(caster_name) + strlen(suffix) + 1;
+  char* message = NEW_RESOURCE_ARRAY_RETURN_NULL(char, msglen);
+  if (message == nullptr) {
+    return const_cast<char*>(caster_name);
+  }
+  jio_snprintf(message, msglen, "class %s%s", caster_name, suffix);
+  return message;
+}
+
 char* SharedRuntime::generate_class_cast_message(
     JavaThread* thread, Klass* caster_klass) {
 
   // Get target class name from the checkcast instruction
   vframeStream vfst(thread, true);
   assert(!vfst.at_end(), "Java frame must exist");
-  Bytecode_checkcast cc(vfst.method(), vfst.method()->bcp_from(vfst.bci()));
-  constantPoolHandle cpool(thread, vfst.method()->constants());
-  Klass* target_klass = ConstantPool::klass_at_if_loaded(cpool, cc.index());
+  if (vfst.at_end() || vfst.method() == nullptr) {
+    return generate_class_cast_message_fallback(caster_klass);
+  }
+
+  Method* method = vfst.method();
+  int bci = vfst.bci();
+  if (bci < 0 || method->validate_bci(bci) < 0) {
+    log_warning(exceptions)("ClassCastException message fallback: invalid bci %d in %s",
+                            bci, method->name_and_sig_as_C_string());
+    return generate_class_cast_message_fallback(caster_klass);
+  }
+
+  address bcp = method->bcp_from(bci);
+  if (Bytecodes::java_code_at(method, bcp) != Bytecodes::_checkcast) {
+    log_warning(exceptions)("ClassCastException message fallback: top bci %d is %s in %s",
+                            bci,
+                            Bytecodes::name(Bytecodes::java_code_at(method, bcp)),
+                            method->name_and_sig_as_C_string());
+    return generate_class_cast_message_fallback(caster_klass);
+  }
+
+  Bytecode_checkcast cc(method, bcp);
+  constantPoolHandle cpool(thread, method->constants());
+  int target_index = (int)cc.index();
+  if (!cpool->is_within_bounds(target_index) ||
+      !(cpool->tag_at(target_index).is_unresolved_klass() ||
+        cpool->tag_at(target_index).is_klass())) {
+    log_warning(exceptions)("ClassCastException message fallback: bad checkcast cp index %d in %s",
+                            target_index, method->name_and_sig_as_C_string());
+    return generate_class_cast_message_fallback(caster_klass);
+  }
+
+  Klass* target_klass = ConstantPool::klass_at_if_loaded(cpool, target_index);
   Symbol* target_klass_name = nullptr;
   if (target_klass == nullptr) {
     // This klass should be resolved, but just in case, get the name in the klass slot.
-    target_klass_name = cpool->klass_name_at(cc.index());
+    target_klass_name = cpool->klass_name_at(target_index);
+    if (target_klass_name == nullptr) {
+      return generate_class_cast_message_fallback(caster_klass);
+    }
   }
   return generate_class_cast_message(caster_klass, target_klass, target_klass_name);
 }

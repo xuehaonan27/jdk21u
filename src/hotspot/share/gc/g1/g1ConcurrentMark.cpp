@@ -1382,6 +1382,10 @@ class G1ReclaimEmptyRegionsTask : public WorkerTask {
       if (hr->is_evict_guarded()) {
         return false;
       }
+      G1RemoteMemoryManager* rmm = _g1h->remote_memory_manager();
+      if (rmm != nullptr && rmm->is_dense_segment_managed_region(hr)) {
+        return false;
+      }
       if (hr->used() > 0 && hr->live_bytes() == 0 && !hr->is_young()) {
         log_trace(gc)("Reclaimed empty old gen region %u (%s) bot " PTR_FORMAT,
                       hr->hrm_index(), hr->get_short_type_str(), p2i(hr->bottom()));
