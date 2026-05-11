@@ -685,7 +685,8 @@ bool G1RemoteMemoryManager::make_handle_remote_from_retained_backing(RemoteHandl
   return true;
 }
 
-void G1RemoteMemoryManager::mark_backed_local_dirty(void* addr) {
+void G1RemoteMemoryManager::mark_backed_local_dirty_oop(oop obj) {
+  void* addr = cast_from_oop<void*>(obj);
   if (addr == nullptr || _g1h == nullptr || !_g1h->is_in_reserved(addr)) {
     return;
   }
@@ -696,15 +697,8 @@ void G1RemoteMemoryManager::mark_backed_local_dirty(void* addr) {
     return;
   }
 
-  HeapWord* obj_addr = hr->block_start(addr);
-  if (obj_addr == nullptr || obj_addr < hr->bottom() ||
-      obj_addr >= hr->top()) {
-    return;
-  }
-
-  oop obj = cast_to_oop(obj_addr);
-  Klass* klass = obj->klass_or_null();
-  if (klass == nullptr || G1CollectedHeap::is_obj_filler(obj)) {
+  HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
+  if (obj_addr < hr->bottom() || obj_addr >= hr->top()) {
     return;
   }
 

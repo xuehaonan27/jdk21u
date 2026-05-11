@@ -686,7 +686,7 @@ public:
   void release_retained_segment_backing(RemoteHandle* h);
   bool make_handle_remote_from_retained_backing(RemoteHandle* h);
   void mark_handle_dead(RemoteHandle* h);
-  void mark_backed_local_dirty(void* addr);
+  void mark_backed_local_dirty_oop(oop obj);
   size_t local_handle_count() const { return _local_handle_count; }
 
   // ============================================================

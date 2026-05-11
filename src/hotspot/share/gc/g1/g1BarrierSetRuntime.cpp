@@ -57,14 +57,6 @@ void G1BarrierSetRuntime::write_ref_array_pre_narrow_oop_entry(narrowOop* dst, s
 }
 
 void G1BarrierSetRuntime::write_ref_array_post_entry(HeapWord* dst, size_t length) {
-  if (remote_resolve_enabled() && dst != nullptr && length > 0) {
-    G1CollectedHeap* g1h = G1CollectedHeap::heap();
-    G1RemoteMemoryManager* rmm =
-        g1h == nullptr ? nullptr : g1h->remote_memory_manager();
-    if (rmm != nullptr) {
-      rmm->mark_backed_local_dirty(dst);
-    }
-  }
   G1BarrierSet *bs = barrier_set_cast<G1BarrierSet>(BarrierSet::barrier_set());
   bs->G1BarrierSet::write_ref_array(dst, length);
 }
@@ -103,17 +95,6 @@ JRT_END
 JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_post_entry(volatile G1CardTable::CardValue* card_addr,
                                                                JavaThread* thread))
   assert(thread == JavaThread::current(), "pre-condition");
-  if (remote_resolve_enabled()) {
-    G1CollectedHeap* g1h = G1CollectedHeap::heap();
-    G1RemoteMemoryManager* rmm =
-        g1h == nullptr ? nullptr : g1h->remote_memory_manager();
-    if (rmm != nullptr) {
-      const G1CardTable::CardValue* clean_card =
-          const_cast<G1CardTable::CardValue*>(card_addr);
-      HeapWord* card_start = g1h->card_table()->addr_for(clean_card);
-      rmm->mark_backed_local_dirty(card_start);
-    }
-  }
   G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(thread);
   G1BarrierSet::dirty_card_queue_set().enqueue(queue, card_addr);
 JRT_END
