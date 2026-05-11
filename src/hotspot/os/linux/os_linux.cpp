@@ -1022,10 +1022,12 @@ int os::Linux::apth_class_for(os::ThreadType thr_type) {
   case os::compiler_thread:
   case os::vm_thread:
   case os::os_thread:
-    return APTH_CLASS_CPU_BOUND;
   case os::watcher_thread:
   case os::asynclog_thread:
-    return APTH_CLASS_IO_BOUND;
+    // These are HotSpot control-plane threads.  Keeping them 1:1 avoids making
+    // safepoint coordination, attach/logging, and compiler service progress
+    // depend on the user-space scheduler that mutators/GC are themselves using.
+    return APTH_CLASS_DEDICATED;
   default:
     return APTH_CLASS_DEFAULT;
   }
