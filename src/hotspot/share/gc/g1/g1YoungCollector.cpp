@@ -2988,6 +2988,46 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     int total_candidates = path1_candidates + path2_candidates;
 
+    // FCR is a remote-object cache, not primary object ownership.  Under
+    // cgroup pressure, keep it on the same guarded path as old-region eviction
+    // so raw stack/root references can veto reclaim, but do not let backoff or
+    // old-region target filling hide clean FCR pages from STW cache drop.  The
+    // later fast-invalidate pass will reclaim only ProtectedClean FCR regions
+    // and remove dirty/unbacked FCR candidates before Phase B/E.
+    if (path2_requested_evict_bytes > 0 && rmm != nullptr) {
+      int fcr_forced_candidates = 0;
+      int fcr_forced_backoff_overrides = 0;
+      int fcr_forced_existing = 0;
+      size_t fcr_forced_bytes = 0;
+      for (uint i = 0; i < num_regions; i++) {
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr || !hr->is_fetch_cache()) continue;
+        if (hr->is_free() || hr->is_empty() || hr->is_humongous() ||
+            hr->is_evict_guarded()) {
+          continue;
+        }
+        if (eviction_candidates[i]) {
+          fcr_forced_existing++;
+          continue;
+        }
+        if (rmm->is_region_in_eviction_backoff(i)) {
+          fcr_forced_backoff_overrides++;
+        }
+        hr->set_cold_destination();
+        eviction_candidates[i] = true;
+        path2_candidates++;
+        total_candidates++;
+        fcr_forced_candidates++;
+        fcr_forced_bytes += hr->used();
+      }
+      if (fcr_forced_candidates > 0 || fcr_forced_existing > 0) {
+        log_info(gc)("FCR pressure candidate injection: added %d regions ("
+                     SIZE_FORMAT "MB), existing=%d, backoff_overrides=%d",
+                     fcr_forced_candidates, fcr_forced_bytes / M,
+                     fcr_forced_existing, fcr_forced_backoff_overrides);
+      }
+    }
+
     if (total_candidates > 0 && use_whole_region_dense_segments) {
       int dense_prefilter_removed = 0;
       int dense_prefilter_kept = 0;
@@ -2996,6 +3036,10 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
         if (!eviction_candidates[i]) continue;
         HeapRegion* hr = _g1h->region_at_or_null(i);
         const char* reason = nullptr;
+        if (hr != nullptr && hr->is_fetch_cache()) {
+          dense_prefilter_kept++;
+          continue;
+        }
         if (hr == nullptr ||
             !rmm->can_evict_dense_segment_region(hr, &reason)) {
           eviction_candidates[i] = false;
@@ -3421,6 +3465,14 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           fcr_cache_skipped++;
           log_debug(gc)("FCR cache fast invalidate skipped region %u: %s",
                         hr->hrm_index(), reason != nullptr ? reason : "unknown");
+          eviction_candidates[i] = false;
+          hr->clear_cold_destination();
+          if (total_candidates > 0) {
+            total_candidates--;
+          }
+          if (path2_candidates > 0) {
+            path2_candidates--;
+          }
           continue;
         }
 
