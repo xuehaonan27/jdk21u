@@ -37,6 +37,10 @@
 
 #include "sun_nio_ch_EPoll.h"
 
+#ifdef USE_LIBAPTH
+#include <apth_io.h>
+#endif
+
 JNIEXPORT jint JNICALL
 Java_sun_nio_ch_EPoll_eventSize(JNIEnv* env, jclass clazz)
 {
@@ -83,7 +87,11 @@ Java_sun_nio_ch_EPoll_wait(JNIEnv *env, jclass clazz, jint epfd,
                            jlong address, jint numfds, jint timeout)
 {
     struct epoll_event *events = jlong_to_ptr(address);
+#ifdef USE_LIBAPTH
+    int res = apth_io_epoll_wait(epfd, events, numfds, timeout);
+#else
     int res = epoll_wait(epfd, events, numfds, timeout);
+#endif
     if (res < 0) {
         if (errno == EINTR) {
             return IOS_INTERRUPTED;
