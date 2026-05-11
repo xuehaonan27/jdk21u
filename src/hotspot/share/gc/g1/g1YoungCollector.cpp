@@ -760,6 +760,65 @@ class G1EvacuateRegionsTask : public G1EvacuateRegionsBaseTask {
           }
         }
       }
+
+      int dense_edge_roots = rmm == nullptr ? 0 :
+          rmm->collect_dense_segment_edge_handles_in_collection_set(nullptr, 0, nullptr);
+      if (rmm != nullptr && dense_edge_roots > 0) {
+        ResourceMark rm;
+        RemoteHandle** dense_handles =
+            NEW_RESOURCE_ARRAY(RemoteHandle*, dense_edge_roots);
+        bool overflow = false;
+        int dense_count =
+            rmm->collect_dense_segment_edge_handles_in_collection_set(
+                dense_handles, dense_edge_roots, &overflow);
+        int limit = MIN2(dense_count, dense_edge_roots);
+        int evacuated = 0;
+        int skipped = 0;
+
+        for (int i = 0; i < limit; i++) {
+          RemoteHandle* h = dense_handles[i];
+          if (h == nullptr) {
+            skipped++;
+            continue;
+          }
+
+          uintptr_t sa = h->load_state_and_addr_acquire();
+          uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
+          if (state != REMOTE_HANDLE_LOCAL) {
+            skipped++;
+            continue;
+          }
+
+          oop target = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+          if (target == nullptr || !_g1h->is_in(target)) {
+            skipped++;
+            continue;
+          }
+
+          const G1HeapRegionAttr region_attr = _g1h->region_attr(target);
+          if (!region_attr.is_in_cset()) {
+            skipped++;
+            continue;
+          }
+
+          markWord m = target->mark();
+          oop forwardee;
+          if (m.is_marked()) {
+            forwardee = cast_to_oop(m.decode_pointer());
+          } else {
+            forwardee = pss->copy_to_survivor_space(region_attr, target, m);
+          }
+          if (forwardee != nullptr) {
+            rmm->update_handle_for_evacuation(h, target, forwardee);
+            evacuated++;
+          } else {
+            skipped++;
+          }
+        }
+
+        log_info(gc)("Dense segment edge root scan: handles=%d evacuated=%d skipped=%d%s",
+                     dense_count, evacuated, skipped, overflow ? " overflow" : "");
+      }
     }
 
     // There are no optional roots to scan right now.

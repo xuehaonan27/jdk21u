@@ -1099,6 +1099,58 @@ void G1RemoteMemoryManager::release_dense_segment_edges(DenseSegmentEdge* edges,
   FREE_C_HEAP_ARRAY(DenseSegmentEdge, edges);
 }
 
+int G1RemoteMemoryManager::collect_dense_segment_edge_handles_in_collection_set(
+    RemoteHandle** handles, int max_handles, bool* overflow) {
+  if (overflow != nullptr) {
+    *overflow = false;
+  }
+  if (!G1RemoteUseDenseSegments || _dense_segments == nullptr ||
+      _g1h == nullptr || max_handles < 0) {
+    return 0;
+  }
+
+  int count = 0;
+  dense_segment_lock();
+  for (uint idx = 0; idx < _dense_segment_capacity; idx++) {
+    DenseSegmentEntry* entry = &_dense_segments[idx];
+    uint32_t state = Atomic::load(&entry->state);
+    if (entry->segment_id == 0 ||
+        (state != DenseSegmentRemote && state != DenseSegmentFetching) ||
+        entry->edges == nullptr || entry->edge_count == 0) {
+      continue;
+    }
+
+    for (uint32_t i = 0; i < entry->edge_count; i++) {
+      DenseSegmentEdge* edge = &entry->edges[i];
+      if (edge->kind != DenseSegmentEdgeHandle || edge->target_handle == nullptr) {
+        continue;
+      }
+      RemoteHandle* h = edge->target_handle;
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
+        continue;
+      }
+      oop target = cast_to_oop(sa & REMOTE_HANDLE_ADDR_MASK);
+      if (target == nullptr || !_g1h->is_in(target)) {
+        continue;
+      }
+      if (!_g1h->region_attr(target).is_in_cset()) {
+        continue;
+      }
+
+      if (handles != nullptr && count < max_handles) {
+        handles[count] = h;
+      } else if (handles != nullptr && overflow != nullptr) {
+        *overflow = true;
+      }
+      count++;
+    }
+  }
+  dense_segment_unlock();
+
+  return count;
+}
+
 bool G1RemoteMemoryManager::scan_dense_segment_region(HeapRegion* hr,
                                                       bool build_edges,
                                                       DenseSegmentEdge** out_edges,
