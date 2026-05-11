@@ -1010,12 +1010,24 @@ static void init_adjust_stacksize_for_guard_pages() {
 #ifdef USE_LIBAPTH
 int os::Linux::apth_class_for(os::ThreadType thr_type) {
   switch (thr_type) {
-  case os::java_thread:     return APTH_CLASS_DEDICATED;
-  case os::gc_thread:       return APTH_CLASS_DEDICATED;
-  case os::compiler_thread: return APTH_CLASS_DEDICATED;
-  case os::vm_thread:       return APTH_CLASS_DEDICATED;
-  case os::watcher_thread:  return APTH_CLASS_DEDICATED;
-  default:                  return APTH_CLASS_DEDICATED;
+  case os::java_thread:
+    // Java mutators are the threads most likely to block on remote object
+    // fetches. Keep them in the M:N scheduler and prioritize wakeup latency.
+    return APTH_CLASS_IO_BOUND;
+  case os::gc_thread:
+    // GC workers and concurrent GC threads should run as user-space threads so
+    // they can fill mutator RDMA wait gaps. DISTRIBUTED spreads them across
+    // libapth workers and matches the safepoint preferred-class policy.
+    return APTH_CLASS_DISTRIBUTED;
+  case os::compiler_thread:
+  case os::vm_thread:
+  case os::os_thread:
+    return APTH_CLASS_CPU_BOUND;
+  case os::watcher_thread:
+  case os::asynclog_thread:
+    return APTH_CLASS_IO_BOUND;
+  default:
+    return APTH_CLASS_DEFAULT;
   }
 }
 #endif
@@ -1043,11 +1055,12 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
     // Calculate stack size if it's not specified by caller.
     size_t stack_size = os::Posix::get_initial_stack_size(thr_type, req_stack_size);
 
+    int apth_class = os::Linux::apth_class_for(thr_type);
     apth_t tid;
     apth_attr_t apth_attr;
     apth_attr_init(&apth_attr);
     apth_attr_setstacksize(&apth_attr, stack_size);
-    apth_attr_setclass_np(&apth_attr, os::Linux::apth_class_for(thr_type));
+    apth_attr_setclass_np(&apth_attr, apth_class);
     apth_attr_setdetachstate(&apth_attr, APTH_CREATE_DETACHED);
 
     int ret = apth_create(&tid, &apth_attr, (void* (*)(void*)) thread_native_entry, thread);
@@ -1062,6 +1075,8 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
     }
 
     osthread->set_apth_id(tid);
+    log_info(os, thread)("Created LIBAPTH thread \"%s\" type=%d class=%d stack=" SIZE_FORMAT,
+                         thread->name(), (int)thr_type, apth_class, stack_size);
     // pthread_id is set from inside the child thread (thread_native_entry),
     // not here in the parent, so it reflects the correct backing pthread.
 

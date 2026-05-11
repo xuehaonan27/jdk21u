@@ -44,7 +44,9 @@
     _thread_type = type;
   }
 
-  // _pthread_id is the pthread id, which is used by library calls
+  // _pthread_id is the backing pthread id. With USE_LIBAPTH it is diagnostic only;
+  // thread signaling uses the apth id because M:N threads can migrate across workers.
+  // Without USE_LIBAPTH it is used by library calls
   // (e.g. pthread_kill).
   pthread_t _pthread_id;
 #ifdef USE_LIBAPTH

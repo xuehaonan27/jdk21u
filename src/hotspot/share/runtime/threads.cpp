@@ -441,7 +441,9 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   {
     static apth_t _main_apth_handle;
     // 0 = auto-detect: uses sched_getaffinity to get available CPUs
-    // (respects cgroup cpuset), then reserves 2 for DEDICATED threads.
+    // (respects cgroup cpuset). HotSpot-created mutator and GC threads
+    // are scheduled as M:N apths; only externally attached pthreads stay
+    // dedicated because they were not created by libapth.
     if (apth_init_library(0) != 0) return JNI_ERR;
     if (apth_attach_self_as_dedicated(&_main_apth_handle) != 0) {
       apth_drop();
