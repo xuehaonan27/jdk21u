@@ -321,8 +321,12 @@ public:
     // A REMOTE/DEAD handle at this address belongs to a previously evicted object.
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr && e->_handle->is_local()) {
-        RemoteHandle* existing = e->_handle;
+      if (e->_obj_addr == addr) {
+        RemoteHandle* existing = follow_forwarded_handle(e->_handle);
+        if (existing == nullptr || !existing->is_local()) {
+          e = e->_next;
+          continue;
+        }
         table_unlock();
         return existing;
       }
@@ -356,8 +360,12 @@ public:
     stripe_lock(idx);
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr && e->_handle->is_local()) {
-        RemoteHandle* existing = e->_handle;
+      if (e->_obj_addr == addr) {
+        RemoteHandle* existing = follow_forwarded_handle(e->_handle);
+        if (existing == nullptr || !existing->is_local()) {
+          e = e->_next;
+          continue;
+        }
         stripe_unlock(idx);
         return existing;
       }
@@ -391,8 +399,12 @@ public:
     table_lock();
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr && e->_handle->is_local()) {
-        RemoteHandle* existing = e->_handle;
+      if (e->_obj_addr == addr) {
+        RemoteHandle* existing = follow_forwarded_handle(e->_handle);
+        if (existing == nullptr || !existing->is_local()) {
+          e = e->_next;
+          continue;
+        }
         existing->set_dormant();
         table_unlock();
         return existing;
@@ -421,8 +433,12 @@ public:
     stripe_lock(idx);
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr && e->_handle->is_local()) {
-        RemoteHandle* existing = e->_handle;
+      if (e->_obj_addr == addr) {
+        RemoteHandle* existing = follow_forwarded_handle(e->_handle);
+        if (existing == nullptr || !existing->is_local()) {
+          e = e->_next;
+          continue;
+        }
         existing->set_dormant();
         stripe_unlock(idx);
         return existing;
@@ -461,6 +477,17 @@ public:
                                         int* marked_regions2 = nullptr,
                                         int* anchors_seen2 = nullptr);
 
+  static RemoteHandle* follow_forwarded_handle(RemoteHandle* h) {
+    for (int depth = 0; h != nullptr && h->is_forwarder() && depth < 8; depth++) {
+      RemoteHandle* next = h->forwardee();
+      if (next == nullptr || next == h) {
+        return nullptr;
+      }
+      h = next;
+    }
+    return h != nullptr && h->is_forwarder() ? nullptr : h;
+  }
+
   // Legacy API: create_handle_for (delegates to ensure_handle_for).
   // Kept for backward compatibility with existing eviction/classification code.
   RemoteHandle* create_handle_for(oop obj, RemoteHandleAllocBuffer* hab) {
@@ -475,7 +502,10 @@ public:
 
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr && e->_handle->is_local()) return e->_handle;
+      if (e->_obj_addr == addr) {
+        RemoteHandle* h = follow_forwarded_handle(e->_handle);
+        if (h != nullptr && h->is_local()) return h;
+      }
       e = e->_next;
     }
     return nullptr;
@@ -490,11 +520,13 @@ public:
 
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
-      if (e->_obj_addr == addr) return e->_handle;
+      if (e->_obj_addr == addr) {
+        return follow_forwarded_handle(e->_handle);
+      }
       e = e->_next;
     }
 
-    return handle_for_eviction_addr(addr);
+    return follow_forwarded_handle(handle_for_eviction_addr(addr));
   }
 
   RemoteHandle* handle_for_stale_eviction_addr(uintptr_t addr) const {
@@ -503,17 +535,22 @@ public:
     HandleEntry* e = _table[idx];
     while (e != nullptr) {
       if (e->_obj_addr == addr) {
-        uintptr_t state = e->_handle->load_state_and_addr_acquire() &
+        RemoteHandle* h = follow_forwarded_handle(e->_handle);
+        if (h == nullptr) {
+          e = e->_next;
+          continue;
+        }
+        uintptr_t state = h->load_state_and_addr_acquire() &
                           REMOTE_HANDLE_STATE_MASK;
         if (state == REMOTE_HANDLE_REMOTE ||
             state == REMOTE_HANDLE_FETCHING) {
-          return e->_handle;
+          return h;
         }
       }
       e = e->_next;
     }
 
-    RemoteHandle* alias = handle_for_eviction_addr(addr);
+    RemoteHandle* alias = follow_forwarded_handle(handle_for_eviction_addr(addr));
     if (alias != nullptr) {
       uintptr_t state = alias->load_state_and_addr_acquire() &
                         REMOTE_HANDLE_STATE_MASK;
@@ -635,6 +672,7 @@ public:
                                          size_t byte_size,
                                          size_t segment_byte_size,
                                          uint32_t flags);
+  void mark_handle_forwarded(RemoteHandle* h, RemoteHandle* target);
   void register_array_chunk_segment(uint64_t segment_id,
                                     RemoteHandle** handles,
                                     uint32_t refcount,
@@ -1011,6 +1049,10 @@ public:
 
 public:
   void defer_refcount_decrement(RemoteHandle* h) {
+    h = follow_forwarded_handle(h);
+    if (h == nullptr) {
+      return;
+    }
     if (_deferred_decrement_count < MAX_DEFERRED_DECREMENTS) {
       _deferred_decrements[_deferred_decrement_count++] = h;
     }
@@ -1019,7 +1061,10 @@ public:
   // Apply all deferred decrements. Called after remark (STW).
   void apply_deferred_decrements() {
     for (int i = 0; i < _deferred_decrement_count; i++) {
-      _deferred_decrements[i]->decrement_remote_refcount();
+      RemoteHandle* h = follow_forwarded_handle(_deferred_decrements[i]);
+      if (h != nullptr) {
+        h->decrement_remote_refcount();
+      }
     }
     if (_deferred_decrement_count > 0) {
       log_info(gc)("Applied %d deferred remote_refcount decrements", _deferred_decrement_count);
@@ -1563,7 +1608,11 @@ void G1RemoteMemoryManager::oops_do_remote_anchors(OopClosureType* cl) {
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
-      if (h->remote_refcount() == 0 && h->eviction_word_size() == 0) return;
+      bool forced_by_forwarded_rc = h->is_forwarder() && h->remote_refcount() > 0;
+      h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+      if (h == nullptr) return;
+      if (!forced_by_forwarded_rc &&
+          h->remote_refcount() == 0 && h->eviction_word_size() == 0) return;
 
       uintptr_t sa = h->load_state_and_addr_acquire();
       if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) return;
@@ -1603,6 +1652,7 @@ void G1RemoteMemoryManager::oops_do_remote_cross_roots(OopClosureType* cl) {
 
   for (int i = 0; i < _cross_roots_count; i++) {
     RemoteHandle* h = _cross_roots[i];
+    h = G1RemoteMemoryManager::follow_forwarded_handle(h);
     if (h == nullptr || !h->is_local()) continue;
     if (!validate_local_handle_addr(h, "STALE-CROSS-ROOT",
                                     &stale_cross_roots, 16)) {

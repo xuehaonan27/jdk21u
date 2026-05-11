@@ -47,6 +47,7 @@ const uintptr_t REMOTE_HANDLE_DEAD          = uintptr_t(3) << REMOTE_HANDLE_STAT
 
 // Handle flags (stored in _flags field)
 const uint32_t REMOTE_HANDLE_FLAG_DORMANT   = 0x1;  // Dormant anchor (local obj referenced by remote)
+const uint32_t REMOTE_HANDLE_FLAG_FORWARDER = 0x2;  // Alias handle forwarding to a canonical Handle
 
 enum RemoteLocationKind : uint32_t {
   RemoteLocationNone          = 0,
@@ -157,7 +158,15 @@ struct RemoteHandle {
   bool is_remote()   const { return state() == REMOTE_HANDLE_REMOTE; }
   bool is_fetching() const { return state() == REMOTE_HANDLE_FETCHING; }
   bool is_dead()     const { return state() == REMOTE_HANDLE_DEAD; }
-  bool is_dormant()  const { return (_flags & REMOTE_HANDLE_FLAG_DORMANT) != 0; }
+  bool is_dormant()  const {
+    return (Atomic::load_acquire(&_flags) & REMOTE_HANDLE_FLAG_DORMANT) != 0;
+  }
+  bool is_forwarder() const {
+    return (Atomic::load_acquire(&_flags) & REMOTE_HANDLE_FLAG_FORWARDER) != 0;
+  }
+  RemoteHandle* forwardee() const {
+    return is_forwarder() ? (RemoteHandle*)_eviction_addr : nullptr;
+  }
 
   // Atomic state queries (for concurrent access)
   uintptr_t load_state_and_addr_acquire() const {
@@ -282,13 +291,22 @@ struct RemoteHandle {
   // Set to dead (used when referent object dies)
   void set_dead() {
     _remote_location.clear();
-    _state_and_addr = REMOTE_HANDLE_DEAD;
+    Atomic::release_store(&_flags, (uint32_t)0);
+    Atomic::release_store(&_state_and_addr, REMOTE_HANDLE_DEAD);
   }
 
   // Remote refcount: tracks how many oop fields in remote objects reference this Handle.
   // Used to determine when de-handleification is safe (refcount == 0 → no remote refs).
   void increment_remote_refcount() {
     Atomic::inc(&_remote_refcount);
+  }
+  void add_remote_refcount(uint32_t value) {
+    if (value != 0) {
+      Atomic::add(&_remote_refcount, value);
+    }
+  }
+  uint32_t take_remote_refcount() {
+    return Atomic::xchg(&_remote_refcount, (uint32_t)0);
   }
   void decrement_remote_refcount() {
     uint32_t cur = Atomic::load_acquire(&_remote_refcount);
@@ -313,6 +331,24 @@ struct RemoteHandle {
     uint32_t cur = Atomic::load_acquire(&_flags);
     while (true) {
       uint32_t next = cur & ~REMOTE_HANDLE_FLAG_DORMANT;
+      uint32_t observed = Atomic::cmpxchg(&_flags, cur, next);
+      if (observed == cur) {
+        return;
+      }
+      cur = observed;
+    }
+  }
+
+  void set_forwarder(RemoteHandle* target) {
+    assert(target != nullptr, "forwarder target must exist");
+    assert(target != this, "cannot forward handle to itself");
+    _remote_location.clear();
+    _eviction_addr = (uintptr_t)target;
+    Atomic::release_store(&_state_and_addr, REMOTE_HANDLE_DEAD);
+    uint32_t cur = Atomic::load_acquire(&_flags);
+    while (true) {
+      uint32_t next = (cur | REMOTE_HANDLE_FLAG_FORWARDER) &
+                      ~REMOTE_HANDLE_FLAG_DORMANT;
       uint32_t observed = Atomic::cmpxchg(&_flags, cur, next);
       if (observed == cur) {
         return;

@@ -140,6 +140,18 @@ inline bool g1_remote_handle_pointer_is_plausible(uintptr_t handle_addr) {
   return os::is_readable_range(h, h + 1);
 }
 
+inline RemoteHandle* g1_remote_follow_forwarders(RemoteHandle* h) {
+  for (int depth = 0; h != nullptr && h->is_forwarder() && depth < 8; depth++) {
+    RemoteHandle* next = h->forwardee();
+    if (next == nullptr || next == h ||
+        !g1_remote_handle_pointer_is_plausible((uintptr_t)next)) {
+      return nullptr;
+    }
+    h = next;
+  }
+  return h != nullptr && h->is_forwarder() ? nullptr : h;
+}
+
 inline oop resolve_oop_raw(oop tagged) {
   uintptr_t v = cast_from_oop<uintptr_t>(tagged);
   if ((v & G1_OOP_TAG_MASK) == 0) {
@@ -157,6 +169,10 @@ inline oop resolve_oop_raw(oop tagged) {
       return nullptr;
     }
     RemoteHandle* h = (RemoteHandle*)handle_addr;
+    h = g1_remote_follow_forwarders(h);
+    if (h == nullptr) {
+      return nullptr;
+    }
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
     if (state == REMOTE_HANDLE_LOCAL) {

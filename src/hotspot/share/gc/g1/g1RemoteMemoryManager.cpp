@@ -642,6 +642,27 @@ void G1RemoteMemoryManager::mark_handle_dead(RemoteHandle* h) {
   local_handle_unlock();
 }
 
+void G1RemoteMemoryManager::mark_handle_forwarded(RemoteHandle* h,
+                                                  RemoteHandle* target) {
+  if (h == nullptr || target == nullptr || h == target) {
+    return;
+  }
+  target = follow_forwarded_handle(target);
+  if (target == nullptr || target == h) {
+    return;
+  }
+
+  local_handle_lock();
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  uintptr_t old_addr = ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL)
+      ? (sa & REMOTE_HANDLE_ADDR_MASK) : 0;
+  uint32_t transferred_rc = h->take_remote_refcount();
+  target->add_remote_refcount(transferred_rc);
+  h->set_forwarder(target);
+  unlink_local_handle_locked(h, old_addr);
+  local_handle_unlock();
+}
+
 bool G1RemoteMemoryManager::concurrent_marking_active() const {
   return _g1h->collector_state()->mark_or_rebuild_in_progress();
 }
@@ -841,6 +862,7 @@ size_t G1RemoteMemoryManager::rebuild_handle_table_from_handles() {
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
+      if (h->is_forwarder()) return;
 
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
@@ -1358,7 +1380,10 @@ void G1RemoteMemoryManager::release_dense_segment_edges(DenseSegmentEdge* edges,
   for (uint32_t i = 0; i < count; i++) {
     if (edges[i].kind == DenseSegmentEdgeHandle &&
         edges[i].target_handle != nullptr) {
-      edges[i].target_handle->decrement_remote_refcount();
+      RemoteHandle* target = follow_forwarded_handle(edges[i].target_handle);
+      if (target != nullptr) {
+        target->decrement_remote_refcount();
+      }
     }
   }
   FREE_C_HEAP_ARRAY(DenseSegmentEdge, edges);
@@ -1434,6 +1459,10 @@ bool G1RemoteMemoryManager::scan_dense_segment_region(HeapRegion* hr,
 
     void add_handle_edge(oop* field, RemoteHandle* h) {
       if (!_ok || h == nullptr) {
+        return;
+      }
+      h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+      if (h == nullptr) {
         return;
       }
       if (_build_edges && !ensure_capacity()) {
@@ -1524,6 +1553,11 @@ bool G1RemoteMemoryManager::scan_dense_segment_region(HeapRegion* hr,
       if ((raw & (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) ==
           (G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT)) {
         RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+        h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+        if (h == nullptr) {
+          fail("bad-forwarded-handle-ref");
+          return;
+        }
         uintptr_t sa = h->load_state_and_addr_acquire();
         uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
         if (state == REMOTE_HANDLE_LOCAL) {
@@ -1977,6 +2011,7 @@ void G1RemoteMemoryManager::patch_dense_segment_boundary_edges(DenseSegmentEntry
     }
 
     RemoteHandle* target = edge->target_handle;
+    target = follow_forwarded_handle(target);
     if (target == nullptr) {
       *field = 0;
       nulled++;
@@ -2391,6 +2426,10 @@ public:
       if (raw & G1_OOP_INDIRECT_BIT) {
         // Shared OOP → already points to a Handle
         RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+        h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+        if (h == nullptr) {
+          return;
+        }
         uint32_t offset = (uint32_t)((uintptr_t)p - cast_from_oop<uintptr_t>(_base_obj));
         append(offset, h);
         h->increment_remote_refcount();
@@ -2871,7 +2910,7 @@ void G1RemoteMemoryManager::abort_prepared_eviction(PreparedEviction* entry) {
 
   ObjectEdgeTable* et = entry->edge_table;
   for (uint32_t i = 0; i < et->_entry_count; i++) {
-    RemoteHandle* target = et->_entries[i]._target_handle;
+    RemoteHandle* target = follow_forwarded_handle(et->_entries[i]._target_handle);
     if (target != nullptr) {
       target->decrement_remote_refcount();
     }
@@ -2945,13 +2984,12 @@ static RemoteHandle* prepared_entries_handle_for_addr(
   return nullptr;
 }
 
-static bool can_prune_duplicate_local_handle(RemoteHandle* h,
-                                             RemoteHandle* prepared) {
+static bool can_forward_duplicate_local_handle(RemoteHandle* h,
+                                               RemoteHandle* prepared) {
   return h != nullptr &&
          prepared != nullptr &&
          h != prepared &&
-         !h->is_dormant() &&
-         h->remote_refcount() == 0;
+         !h->is_forwarder();
 }
 
 int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
@@ -2989,6 +3027,7 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
+      if (h->is_forwarder()) return;
 
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
@@ -2998,16 +3037,17 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
             !prepared_entries_contain_handle(_entries, _start, _count, addr, h)) {
           RemoteHandle* prepared =
               prepared_entries_handle_for_addr(_entries, _start, _count, addr);
-          if (can_prune_duplicate_local_handle(h, prepared)) {
+          if (can_forward_duplicate_local_handle(h, prepared)) {
             _pruned++;
             if (_pruned <= _log_limit) {
-              log_info(gc)("Pre-E local-handle guard: pruned duplicate "
-                           "unreferenced LOCAL handle in region=%u handle="
-                           PTR_FORMAT " canonical=" PTR_FORMAT " local="
-                           PTR_FORMAT,
-                           _hr->hrm_index(), p2i(h), p2i(prepared), addr);
+              log_info(gc)("Pre-E local-handle guard: forwarded duplicate "
+                           "LOCAL handle in region=%u handle=" PTR_FORMAT
+                           " canonical=" PTR_FORMAT " local=" PTR_FORMAT
+                           " dormant=%d rc=%u",
+                           _hr->hrm_index(), p2i(h), p2i(prepared), addr,
+                           h->is_dormant() ? 1 : 0, h->remote_refcount());
             }
-            _rmm->mark_handle_dead(h);
+            _rmm->mark_handle_forwarded(h, prepared);
             return;
           }
           _blockers++;
@@ -3030,8 +3070,8 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
   SingleRegionUnpreparedLocalHandleClosure cl(this, hr, entries, start, count, log_limit);
   _handle_allocator.handles_do(&cl);
   if (cl.pruned() > 0) {
-    log_info(gc)("Pre-E local-handle guard: pruned %d duplicate "
-                 "unreferenced LOCAL handles in region %u",
+    log_info(gc)("Pre-E local-handle guard: forwarded %d duplicate "
+                 "LOCAL handles in region %u",
                  cl.pruned(), hr->hrm_index());
   }
   return cl.blockers();
@@ -3102,16 +3142,17 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
                                                    _region_start[ridx],
                                                    _region_count[ridx],
                                                    addr);
-              if (can_prune_duplicate_local_handle(h, prepared)) {
+              if (can_forward_duplicate_local_handle(h, prepared)) {
                 _total_pruned++;
                 if (_total_pruned <= _log_limit) {
-                  log_info(gc)("Pre-E local-handle guard: pruned duplicate "
-                               "unreferenced LOCAL handle in region=%u "
+                  log_info(gc)("Pre-E local-handle guard: forwarded duplicate "
+                               "LOCAL handle in region=%u "
                                "handle=" PTR_FORMAT " canonical=" PTR_FORMAT
-                               " local=" PTR_FORMAT,
-                               ridx, p2i(h), p2i(prepared), addr);
+                               " local=" PTR_FORMAT " dormant=%d rc=%u",
+                               ridx, p2i(h), p2i(prepared), addr,
+                               h->is_dormant() ? 1 : 0, h->remote_refcount());
                 }
-                _rmm->mark_handle_dead(h);
+                _rmm->mark_handle_forwarded(h, prepared);
                 return;
               }
               int blockers = ++_blockers_by_region[ridx];
@@ -3139,8 +3180,8 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
                                   entries, blockers_by_region, log_limit);
   _handle_allocator.handles_do(&cl);
   if (cl.total_pruned() > 0) {
-    log_info(gc)("Pre-E local-handle guard: pruned %d duplicate "
-                 "unreferenced LOCAL handles before backend send",
+    log_info(gc)("Pre-E local-handle guard: forwarded %d duplicate "
+                 "LOCAL handles before backend send",
                  cl.total_pruned());
   }
   return cl.total_blockers();
@@ -3241,7 +3282,10 @@ int G1RemoteMemoryManager::collect_remote_anchor_addrs_in_regions(const bool* re
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
-      if (!h->is_local() || h->remote_refcount() == 0) return;
+      bool forced_by_forwarded_rc = h->is_forwarder() && h->remote_refcount() > 0;
+      h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+      if (h == nullptr || !h->is_local() ||
+          (!forced_by_forwarded_rc && h->remote_refcount() == 0)) return;
 
       if (!_rmm->validate_local_handle_addr(h, "ANCHOR-COLLECT",
                                             &_stale_handles, 8)) {
@@ -3456,7 +3500,10 @@ int G1RemoteMemoryManager::mark_remote_anchor_regions_in_set(const bool* region_
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
-      if (!h->is_local() || h->remote_refcount() == 0) return;
+      bool forced_by_forwarded_rc = h->is_forwarder() && h->remote_refcount() > 0;
+      h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+      if (h == nullptr || !h->is_local() ||
+          (!forced_by_forwarded_rc && h->remote_refcount() == 0)) return;
 
       if (!_rmm->validate_local_handle_addr(h, "ANCHOR-MARK",
                                             &_stale_handles, 8)) {
@@ -5591,10 +5638,14 @@ static void release_dense_tagged_handle_ref(G1RemoteMemoryManager* rmm,
   if (rmm == nullptr || !entry.is_dense_handle() || entry._handle == nullptr) {
     return;
   }
+  RemoteHandle* h = G1RemoteMemoryManager::follow_forwarded_handle(entry._handle);
+  if (h == nullptr) {
+    return;
+  }
   if (rmm->concurrent_marking_active()) {
-    rmm->defer_refcount_decrement(entry._handle);
+    rmm->defer_refcount_decrement(h);
   } else {
-    entry._handle->decrement_remote_refcount();
+    h->decrement_remote_refcount();
   }
 }
 
@@ -5752,6 +5803,25 @@ int G1RemoteMemoryManager::untag_recorded_local_refs() {
         dense_handle_released++;
       }
       removed++;
+      continue;
+    }
+
+    RemoteHandle* canonical = follow_forwarded_handle(h);
+    if (canonical == nullptr) {
+      *(uintptr_t*)field_addr = 0;
+      dirty_cards.dirty_field(field_addr);
+      removed++;
+      direct_nulled++;
+      continue;
+    }
+    if (canonical != h) {
+      *(uintptr_t*)field_addr =
+          G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)canonical;
+      dirty_cards.dirty_field(field_addr);
+      TaggedFieldEntry handle_entry = _tagged_fields[i];
+      handle_entry._handle = canonical;
+      _tagged_fields[retained++] = handle_entry;
+      direct_converted++;
       continue;
     }
 
@@ -5969,6 +6039,23 @@ int G1RemoteMemoryManager::untag_all_heap_refs(WorkerThreads* workers, uint num_
 
       if (shared) {
         RemoteHandle* h = (RemoteHandle*)(raw & G1_OOP_ADDR_MASK);
+        h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+        if (h == nullptr) {
+          *(uintptr_t*)p = 0;
+          if (_dirty_cards != nullptr) {
+            _dirty_cards->dirty_field(p);
+          }
+          _nulled++;
+          return;
+        }
+        if ((RemoteHandle*)(raw & G1_OOP_ADDR_MASK) != h) {
+          *(uintptr_t*)p =
+              G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h;
+          if (_dirty_cards != nullptr) {
+            _dirty_cards->dirty_field(p);
+          }
+          _converted++;
+        }
         uintptr_t sa = h->load_state_and_addr_acquire();
         uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
         if (state != REMOTE_HANDLE_LOCAL) return;
@@ -7448,6 +7535,7 @@ int G1RemoteMemoryManager::count_local_handles_in_region(HeapRegion* hr, int log
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
+      if (h->is_forwarder()) return;
 
       uintptr_t sa = h->load_state_and_addr_acquire();
       uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
@@ -7518,6 +7606,7 @@ int G1RemoteMemoryManager::count_local_handles_in_regions(
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
+      if (h->is_forwarder()) return;
 
       uintptr_t sa = h->load_state_and_addr_acquire();
       if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
@@ -7635,7 +7724,7 @@ void G1RemoteMemoryManager::patch_fetched_fields(RemoteHandle* source_handle, He
               "Edge table offset %u + %zu overflows object of %zu bytes",
               edge._field_offset, sizeof(uintptr_t), obj_byte_size);
     uintptr_t* field_addr = (uintptr_t*)(base + edge._field_offset);
-    RemoteHandle* target = edge._target_handle;
+    RemoteHandle* target = follow_forwarded_handle(edge._target_handle);
     if (target == nullptr) {
       *field_addr = 0;
       patched++;
@@ -7744,7 +7833,7 @@ void G1RemoteMemoryManager::update_handles_for_full_gc() {
       HandleEntry* next = e->_next;
       RemoteHandle* h = e->_handle;
 
-      if (h != nullptr) {
+      if (h != nullptr && !h->is_forwarder()) {
         uintptr_t sa = h->load_state_and_addr_acquire();
         if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
           e = next;
@@ -7952,7 +8041,7 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
   Ticks tagged_start = Ticks::now();
   int phase_c_added = 0;
   for (int i = 0; i < _tagged_field_count; i++) {
-    RemoteHandle* h = _tagged_fields[i]._handle;
+    RemoteHandle* h = follow_forwarded_handle(_tagged_fields[i]._handle);
     if (h != nullptr && h->is_remote()) {
       uintptr_t id = (uintptr_t)h;
       if (insert_remote_root_id(dedup_set, set_mask, id)) {
@@ -8032,7 +8121,7 @@ size_t G1RemoteMemoryManager::collect_dead_remote_objects() {
     for (size_t i = 0; i < num_cross && _cross_roots_count < MAX_CROSS_ROOTS; i++) {
       uintptr_t local_handle_id = cross_tgt[i];
       // Find the RemoteHandle by handle_id (address of Handle)
-      RemoteHandle* h = (RemoteHandle*)local_handle_id;
+      RemoteHandle* h = follow_forwarded_handle((RemoteHandle*)local_handle_id);
       if (h != nullptr && h->is_local()) {
         _cross_roots[_cross_roots_count++] = h;
       }
@@ -8213,6 +8302,24 @@ int G1RemoteMemoryManager::fixup_tagged_field_handles() {
       }
       removed++;
       continue;
+    }
+
+    RemoteHandle* canonical = follow_forwarded_handle(h);
+    if (canonical == nullptr) {
+      *(uintptr_t*)field_addr = 0;
+      dirty_cards.dirty_field(field_addr);
+      removed++;
+      direct_nulled++;
+      continue;
+    }
+    if (canonical != h) {
+      *(uintptr_t*)field_addr =
+          G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)canonical;
+      dirty_cards.dirty_field(field_addr);
+      entry._handle = canonical;
+      h = canonical;
+      raw = *(uintptr_t*)field_addr;
+      direct_converted++;
     }
 
     uintptr_t sa = h->load_state_and_addr_acquire();

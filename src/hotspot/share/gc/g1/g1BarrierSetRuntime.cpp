@@ -374,6 +374,12 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
                       (unsigned long)v);
       return nullptr;
     }
+    h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+    if (h == nullptr || !valid_remote_handle_pointer(rmm, h)) {
+      log_warning(gc)("resolve_tagged_oop: invalid forwarded handle payload raw=0x%lx",
+                      (unsigned long)v);
+      return nullptr;
+    }
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
     if (rmm != nullptr) {
@@ -395,10 +401,10 @@ JRT_LEAF(oopDesc*, G1BarrierSetRuntime::resolve_tagged_oop(oopDesc* tagged))
 
       return resolved;
     }
-    // REMOTE or FETCHING: return tagged oop unchanged for slow path.
+    // REMOTE or FETCHING: return tagged oop for slow path.
     // This is normal when remote eviction/tagged refs are active.
     // The slow path (resolve_tagged_oop_slow) handles REMOTE fetch.
-    return tagged;
+    return (oopDesc*)(G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)h);
   }
 
   // Unique/Direct: strip tags
@@ -1936,6 +1942,10 @@ static bool remote_semantic_find_remote_handle(G1RemoteMemoryManager* rmm,
       return false;
     }
   }
+  h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+  if (h == nullptr) {
+    return false;
+  }
 
   uintptr_t sa = h->load_state_and_addr_acquire();
   if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_REMOTE) {
@@ -3250,6 +3260,12 @@ static oopDesc* resolve_fast_checks(oopDesc* tagged, RemoteHandle** handle_out) 
                     (unsigned long)v);
     return nullptr;
   }
+  h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+  if (h == nullptr || !valid_remote_handle_pointer(rmm, h)) {
+    log_warning(gc)("resolve_fast_checks: invalid forwarded handle payload raw=0x%lx",
+                    (unsigned long)v);
+    return nullptr;
+  }
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
   if (rmm != nullptr) {
@@ -3320,6 +3336,10 @@ static oopDesc* resolve_tagged_oop_no_safepoint_impl(oopDesc* tagged,
 
   int fetch_attempts = 0;
   while (true) {
+    h = G1RemoteMemoryManager::follow_forwarded_handle(h);
+    if (h == nullptr) {
+      return nullptr;
+    }
     uintptr_t sa = h->load_state_and_addr_acquire();
     uintptr_t state = sa & REMOTE_HANDLE_STATE_MASK;
 
