@@ -427,6 +427,7 @@ void G1RemoteMemoryManager::make_handle_remote(RemoteHandle* h, uintptr_t remote
   if (h == nullptr) {
     return;
   }
+  release_retained_segment_backing(h);
   local_handle_lock();
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t old_addr = ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL)
@@ -446,6 +447,7 @@ void G1RemoteMemoryManager::make_handle_remote_array_chunk(RemoteHandle* h,
   if (h == nullptr) {
     return;
   }
+  release_retained_segment_backing(h);
   local_handle_lock();
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t old_addr = ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL)
@@ -466,6 +468,7 @@ void G1RemoteMemoryManager::make_handle_remote_cluster_object(RemoteHandle* h,
   if (h == nullptr) {
     return;
   }
+  release_retained_segment_backing(h);
   local_handle_lock();
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t old_addr = ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL)
@@ -619,6 +622,203 @@ void G1RemoteMemoryManager::release_array_chunk_segment(uint64_t segment_id) {
   }
 }
 
+void G1RemoteMemoryManager::release_retained_segment_backing(RemoteHandle* h) {
+  if (h == nullptr || (!h->is_backed_clean() && !h->is_backed_dirty())) {
+    return;
+  }
+
+  uint32_t kind = h->_remote_location.kind_acquire();
+  uint64_t segment_id = (uint64_t)h->_remote_location._secondary_id;
+  if ((kind == RemoteLocationArrayChunk ||
+       kind == RemoteLocationClusterObject) &&
+      segment_id != 0) {
+    release_array_chunk_segment(segment_id);
+  }
+  h->clear_backing_flags();
+}
+
+bool G1RemoteMemoryManager::make_handle_remote_from_retained_backing(RemoteHandle* h) {
+  if (h == nullptr || h->is_forwarder() || !h->is_backed_clean()) {
+    return false;
+  }
+
+  uint32_t kind = h->_remote_location.kind_acquire();
+  if (kind != RemoteLocationArrayChunk &&
+      kind != RemoteLocationClusterObject) {
+    return false;
+  }
+
+  local_handle_lock();
+  uintptr_t sa = h->load_state_and_addr_acquire();
+  if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL ||
+      !h->is_backed_clean()) {
+    local_handle_unlock();
+    return false;
+  }
+
+  kind = h->_remote_location.kind_acquire();
+  uintptr_t segment_base = h->_remote_location._primary_id;
+  uintptr_t segment_id = h->_remote_location._secondary_id;
+  size_t offset = h->_remote_location._offset;
+  size_t byte_size = h->_remote_location._byte_size;
+  size_t segment_byte_size = h->_remote_location._segment_byte_size;
+  uint32_t flags = h->_remote_location._flags;
+  if ((kind != RemoteLocationArrayChunk &&
+       kind != RemoteLocationClusterObject) ||
+      segment_id == 0 || byte_size == 0 || segment_byte_size == 0 ||
+      offset > segment_byte_size ||
+      byte_size > segment_byte_size - offset) {
+    local_handle_unlock();
+    return false;
+  }
+
+  uintptr_t old_addr = sa & REMOTE_HANDLE_ADDR_MASK;
+  if (kind == RemoteLocationArrayChunk) {
+    h->set_remote_array_chunk(segment_base, segment_id, offset, byte_size,
+                              segment_byte_size, flags);
+  } else {
+    h->set_remote_cluster_object(segment_base, segment_id, offset, byte_size,
+                                 segment_byte_size, flags);
+  }
+  unlink_local_handle_locked(h, old_addr);
+  local_handle_unlock();
+  return true;
+}
+
+void G1RemoteMemoryManager::mark_backed_local_dirty(void* addr) {
+  if (addr == nullptr || _g1h == nullptr || !_g1h->is_in_reserved(addr)) {
+    return;
+  }
+
+  HeapRegion* hr = _g1h->heap_region_containing_or_null(addr);
+  if (hr == nullptr || !hr->is_fetch_cache() || hr->is_free() ||
+      hr->is_empty() || hr->is_evict_guarded()) {
+    return;
+  }
+
+  HeapWord* obj_addr = hr->block_start(addr);
+  if (obj_addr == nullptr || obj_addr < hr->bottom() ||
+      obj_addr >= hr->top()) {
+    return;
+  }
+
+  oop obj = cast_to_oop(obj_addr);
+  Klass* klass = obj->klass_or_null();
+  if (klass == nullptr || G1CollectedHeap::is_obj_filler(obj)) {
+    return;
+  }
+
+  RemoteHandle* h = handle_for(obj);
+  if (h != nullptr && h->is_local() && h->is_backed_clean()) {
+    h->set_backed_dirty();
+  }
+}
+
+int G1RemoteMemoryManager::invalidate_clean_fcr_cache_region(HeapRegion* hr,
+                                                             const char** reason,
+                                                             size_t* bytes) {
+  if (reason != nullptr) {
+    *reason = nullptr;
+  }
+  if (bytes != nullptr) {
+    *bytes = 0;
+  }
+  if (hr == nullptr) {
+    if (reason != nullptr) *reason = "null-region";
+    return -1;
+  }
+  if (!hr->is_fetch_cache()) {
+    if (reason != nullptr) *reason = "not-fcr";
+    return -1;
+  }
+  if (hr->is_free() || hr->is_empty() || hr->is_evict_guarded() ||
+      hr->is_humongous()) {
+    if (reason != nullptr) *reason = "bad-region-state";
+    return -1;
+  }
+  if (hr->rem_set()->occupied() != 0) {
+    if (reason != nullptr) *reason = "inbound-remset";
+    return -1;
+  }
+
+  int handles = 0;
+  HeapWord* region_end = hr->end();
+  for (int pass = 0; pass < 2; pass++) {
+    HeapWord* p = hr->bottom();
+    int pass_handles = 0;
+    while (p < hr->top()) {
+      if (p < hr->bottom() || p >= region_end) {
+        if (reason != nullptr) *reason = "cursor-out-of-region";
+        return -1;
+      }
+      oop obj = cast_to_oop(p);
+      Klass* klass = obj->klass_or_null();
+      if (klass == nullptr) {
+        if (reason != nullptr) *reason = "null-klass";
+        return -1;
+      }
+      size_t obj_size = obj->size_given_klass(klass);
+      if (obj_size == 0 || obj_size > (size_t)(region_end - p)) {
+        if (reason != nullptr) *reason = "bad-size";
+        return -1;
+      }
+      if (G1CollectedHeap::is_obj_filler(obj)) {
+        p += obj_size;
+        continue;
+      }
+
+      RemoteHandle* h = handle_for(obj);
+      if (h == nullptr || h->is_forwarder() || !h->is_local()) {
+        if (reason != nullptr) *reason = "missing-local-handle";
+        return -1;
+      }
+      uintptr_t sa = h->load_state_and_addr_acquire();
+      if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL ||
+          (sa & REMOTE_HANDLE_ADDR_MASK) != (uintptr_t)p) {
+        if (reason != nullptr) *reason = "handle-address-mismatch";
+        return -1;
+      }
+      if (!h->is_backed_clean()) {
+        if (reason != nullptr) *reason = h->is_backed_dirty() ? "dirty" : "unbacked";
+        return -1;
+      }
+      uint32_t kind = h->_remote_location.kind_acquire();
+      if (kind != RemoteLocationArrayChunk &&
+          kind != RemoteLocationClusterObject) {
+        if (reason != nullptr) *reason = "unsupported-backing";
+        return -1;
+      }
+      if (h->_remote_location._secondary_id == 0 ||
+          h->_remote_location._byte_size == 0 ||
+          h->_remote_location._segment_byte_size == 0) {
+        if (reason != nullptr) *reason = "bad-backing";
+        return -1;
+      }
+
+      if (pass == 1 &&
+          !make_handle_remote_from_retained_backing(h)) {
+        if (reason != nullptr) *reason = "remote-transition-failed";
+        return -1;
+      }
+      pass_handles++;
+      p += obj_size;
+    }
+
+    if (pass == 0) {
+      if (pass_handles == 0) {
+        if (reason != nullptr) *reason = "no-objects";
+        return 0;
+      }
+      handles = pass_handles;
+    }
+  }
+
+  if (bytes != nullptr) {
+    *bytes = hr->used();
+  }
+  return handles;
+}
+
 void G1RemoteMemoryManager::mark_handle_dead(RemoteHandle* h) {
   if (h == nullptr) {
     return;
@@ -630,7 +830,9 @@ void G1RemoteMemoryManager::mark_handle_dead(RemoteHandle* h) {
       _backend != nullptr &&
       h->_remote_location._secondary_id != 0 &&
       (initial_state == REMOTE_HANDLE_REMOTE ||
-       initial_state == REMOTE_HANDLE_FETCHING)) {
+       initial_state == REMOTE_HANDLE_FETCHING ||
+       ((initial_state == REMOTE_HANDLE_LOCAL) &&
+        (h->is_backed_clean() || h->is_backed_dirty())))) {
     release_array_chunk_segment((uint64_t)h->_remote_location._secondary_id);
   }
   local_handle_lock();
@@ -652,6 +854,7 @@ void G1RemoteMemoryManager::mark_handle_forwarded(RemoteHandle* h,
     return;
   }
 
+  release_retained_segment_backing(h);
   local_handle_lock();
   uintptr_t sa = h->load_state_and_addr_acquire();
   uintptr_t old_addr = ((sa & REMOTE_HANDLE_STATE_MASK) == REMOTE_HANDLE_LOCAL)

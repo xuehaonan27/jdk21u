@@ -48,6 +48,8 @@ const uintptr_t REMOTE_HANDLE_DEAD          = uintptr_t(3) << REMOTE_HANDLE_STAT
 // Handle flags (stored in _flags field)
 const uint32_t REMOTE_HANDLE_FLAG_DORMANT   = 0x1;  // Dormant anchor (local obj referenced by remote)
 const uint32_t REMOTE_HANDLE_FLAG_FORWARDER = 0x2;  // Alias handle forwarding to a canonical Handle
+const uint32_t REMOTE_HANDLE_FLAG_BACKED_CLEAN = 0x4; // LOCAL copy has retained remote backing
+const uint32_t REMOTE_HANDLE_FLAG_BACKED_DIRTY = 0x8; // LOCAL copy diverged from retained backing
 
 enum RemoteLocationKind : uint32_t {
   RemoteLocationNone          = 0,
@@ -164,6 +166,14 @@ struct RemoteHandle {
   bool is_forwarder() const {
     return (Atomic::load_acquire(&_flags) & REMOTE_HANDLE_FLAG_FORWARDER) != 0;
   }
+  bool is_backed_clean() const {
+    uint32_t flags = Atomic::load_acquire(&_flags);
+    return (flags & REMOTE_HANDLE_FLAG_BACKED_CLEAN) != 0 &&
+           (flags & REMOTE_HANDLE_FLAG_BACKED_DIRTY) == 0;
+  }
+  bool is_backed_dirty() const {
+    return (Atomic::load_acquire(&_flags) & REMOTE_HANDLE_FLAG_BACKED_DIRTY) != 0;
+  }
   RemoteHandle* forwardee() const {
     return is_forwarder() ? (RemoteHandle*)_eviction_addr : nullptr;
   }
@@ -251,6 +261,7 @@ struct RemoteHandle {
   // are visible to readers who see REMOTE via load_state_and_addr_acquire.
   void set_remote(uintptr_t remote_id) {
     _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
+    clear_backing_flags();
     _remote_location.set_object_slot(remote_id,
       _eviction_word_size > 0 ? _eviction_word_size * HeapWordSize : 0);
     Atomic::release_store(&_state_and_addr,
@@ -264,6 +275,7 @@ struct RemoteHandle {
                               size_t segment_byte_size,
                               uint32_t flags) {
     _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
+    clear_backing_flags();
     _remote_location.set_array_chunk(segment_base, segment_id, offset,
                                      byte_size, segment_byte_size, flags);
     Atomic::release_store(&_state_and_addr,
@@ -277,6 +289,7 @@ struct RemoteHandle {
                                  size_t segment_byte_size,
                                  uint32_t flags) {
     _eviction_addr = _state_and_addr & REMOTE_HANDLE_ADDR_MASK;
+    clear_backing_flags();
     _remote_location.set_cluster_object(segment_base, segment_id, offset,
                                         byte_size, segment_byte_size, flags);
     Atomic::release_store(&_state_and_addr,
@@ -327,6 +340,33 @@ struct RemoteHandle {
 
   // Flags
   void set_dormant()   { Atomic::fetch_then_or(&_flags, REMOTE_HANDLE_FLAG_DORMANT); }
+  void set_backed_clean() {
+    uint32_t cur = Atomic::load_acquire(&_flags);
+    while (true) {
+      uint32_t next = (cur | REMOTE_HANDLE_FLAG_BACKED_CLEAN) &
+                      ~REMOTE_HANDLE_FLAG_BACKED_DIRTY;
+      uint32_t observed = Atomic::cmpxchg(&_flags, cur, next);
+      if (observed == cur) {
+        return;
+      }
+      cur = observed;
+    }
+  }
+  void set_backed_dirty() {
+    Atomic::fetch_then_or(&_flags, REMOTE_HANDLE_FLAG_BACKED_DIRTY);
+  }
+  void clear_backing_flags() {
+    uint32_t cur = Atomic::load_acquire(&_flags);
+    while (true) {
+      uint32_t next = cur & ~(REMOTE_HANDLE_FLAG_BACKED_CLEAN |
+                              REMOTE_HANDLE_FLAG_BACKED_DIRTY);
+      uint32_t observed = Atomic::cmpxchg(&_flags, cur, next);
+      if (observed == cur) {
+        return;
+      }
+      cur = observed;
+    }
+  }
   void clear_dormant() {
     uint32_t cur = Atomic::load_acquire(&_flags);
     while (true) {

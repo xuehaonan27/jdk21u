@@ -683,7 +683,10 @@ public:
                                         size_t* byte_size_out = nullptr,
                                         uint* total_handles_out = nullptr);
   void release_array_chunk_segment(uint64_t segment_id);
+  void release_retained_segment_backing(RemoteHandle* h);
+  bool make_handle_remote_from_retained_backing(RemoteHandle* h);
   void mark_handle_dead(RemoteHandle* h);
+  void mark_backed_local_dirty(void* addr);
   size_t local_handle_count() const { return _local_handle_count; }
 
   // ============================================================
@@ -1371,6 +1374,9 @@ public:
       _current_fcr = nullptr;
     }
   }
+  int invalidate_clean_fcr_cache_region(HeapRegion* hr,
+                                        const char** reason,
+                                        size_t* bytes);
 
   // ============================================================
   // Remote Collection — "Garbage Never Crosses the Network"

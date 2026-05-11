@@ -2411,6 +2411,7 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     bool* eviction_candidates = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
     memset(eviction_candidates, 0, num_regions * sizeof(bool));
     bool* dense_segment_evicted_regions = nullptr;
+    bool* fcr_cache_evicted_regions = nullptr;
     bool* dense_deferred_candidates = nullptr;
     bool* raw_stack_guarded_regions = nullptr;
     bool* raw_stack_backoff_regions = nullptr;
@@ -3397,6 +3398,66 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
 
     if (dense_deferred_candidates != nullptr) {
       FREE_C_HEAP_ARRAY(bool, dense_deferred_candidates);
+    }
+
+    if (total_candidates > 0) {
+      Ticks fcr_cache_start = Ticks::now();
+      int fcr_cache_regions = 0;
+      int fcr_cache_handles = 0;
+      int fcr_cache_skipped = 0;
+      size_t fcr_cache_bytes = 0;
+
+      for (uint i = 0; i < num_regions; i++) {
+        if (!eviction_candidates[i]) continue;
+        HeapRegion* hr = _g1h->region_at_or_null(i);
+        if (hr == nullptr || !hr->is_fetch_cache()) continue;
+
+        const char* reason = nullptr;
+        size_t region_bytes = 0;
+        int handles = rmm->invalidate_clean_fcr_cache_region(hr,
+                                                             &reason,
+                                                             &region_bytes);
+        if (handles <= 0) {
+          fcr_cache_skipped++;
+          log_debug(gc)("FCR cache fast invalidate skipped region %u: %s",
+                        hr->hrm_index(), reason != nullptr ? reason : "unknown");
+          continue;
+        }
+
+        if (fcr_cache_evicted_regions == nullptr) {
+          fcr_cache_evicted_regions = NEW_C_HEAP_ARRAY(bool, num_regions, mtGC);
+          memset(fcr_cache_evicted_regions, 0, num_regions * sizeof(bool));
+        }
+
+        total_evicted += handles;
+        regions_evicted++;
+        fcr_cache_regions++;
+        fcr_cache_handles += handles;
+        fcr_cache_bytes += region_bytes;
+        total_freed_bytes += region_bytes;
+        fcr_cache_evicted_regions[i] = true;
+        eviction_candidates[i] = false;
+        total_candidates--;
+        if (path2_candidates > 0) {
+          path2_candidates--;
+        }
+        rmm->invalidate_fcr_if_freed(hr);
+        hr->clear_cardtable();
+        hr->clear_cold_destination();
+        hr->clear_root_pinned();
+        ::madvise((char*)hr->bottom(), HeapRegion::GrainBytes, MADV_DONTNEED);
+        bool guarded = os::guard_memory((char*)hr->bottom(), HeapRegion::GrainBytes);
+        guarantee(guarded, "FCR cache invalidation must guard non-resident region");
+        hr->set_evict_guarded();
+      }
+
+      if (fcr_cache_regions > 0 || fcr_cache_skipped > 0) {
+        double fcr_cache_ms = (Ticks::now() - fcr_cache_start).seconds() * 1000.0;
+        log_info(gc)("FCR cache fast invalidate: %.1fms (%d regions, %d handles, "
+                     SIZE_FORMAT "KB dropped, %d skipped)",
+                     fcr_cache_ms, fcr_cache_regions, fcr_cache_handles,
+                     fcr_cache_bytes / K, fcr_cache_skipped);
+      }
     }
 
     if (path2_requested_evict_bytes > 0) {
@@ -5721,6 +5782,13 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
           }
         }
       }
+      if (fcr_cache_evicted_regions != nullptr) {
+        for (uint i = 0; i < num_regions; i++) {
+          if (fcr_cache_evicted_regions[i]) {
+            eviction_candidates[i] = true;
+          }
+        }
+      }
       class VerifyNoRootToFreedClosure : public OopClosure {
         G1CollectedHeap* _g1h;
         bool* _freed_set;
@@ -5793,6 +5861,9 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
     FREE_C_HEAP_ARRAY(bool, eviction_candidates);
     if (dense_segment_evicted_regions != nullptr) {
       FREE_C_HEAP_ARRAY(bool, dense_segment_evicted_regions);
+    }
+    if (fcr_cache_evicted_regions != nullptr) {
+      FREE_C_HEAP_ARRAY(bool, fcr_cache_evicted_regions);
     }
 
     // Return freed regions to the free pool

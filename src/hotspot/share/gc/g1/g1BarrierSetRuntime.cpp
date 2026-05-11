@@ -43,6 +43,9 @@
 #include "runtime/threadWXSetters.inline.hpp"
 #include "utilities/macros.hpp"
 
+static bool remote_resolve_enabled();
+static bool g1_remote_resolved_oop_is_usable(G1CollectedHeap* g1h, uintptr_t v);
+
 void G1BarrierSetRuntime::write_ref_array_pre_oop_entry(oop* dst, size_t length) {
   G1BarrierSet *bs = barrier_set_cast<G1BarrierSet>(BarrierSet::barrier_set());
   bs->write_ref_array_pre(dst, length, false);
@@ -54,12 +57,17 @@ void G1BarrierSetRuntime::write_ref_array_pre_narrow_oop_entry(narrowOop* dst, s
 }
 
 void G1BarrierSetRuntime::write_ref_array_post_entry(HeapWord* dst, size_t length) {
+  if (remote_resolve_enabled() && dst != nullptr && length > 0) {
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    G1RemoteMemoryManager* rmm =
+        g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      rmm->mark_backed_local_dirty(dst);
+    }
+  }
   G1BarrierSet *bs = barrier_set_cast<G1BarrierSet>(BarrierSet::barrier_set());
   bs->G1BarrierSet::write_ref_array(dst, length);
 }
-
-static bool remote_resolve_enabled();
-static bool g1_remote_resolved_oop_is_usable(G1CollectedHeap* g1h, uintptr_t v);
 
 // G1 pre write barrier slowpath
 JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_pre_entry(oopDesc* orig, JavaThread* thread))
@@ -95,6 +103,17 @@ JRT_END
 JRT_LEAF(void, G1BarrierSetRuntime::write_ref_field_post_entry(volatile G1CardTable::CardValue* card_addr,
                                                                JavaThread* thread))
   assert(thread == JavaThread::current(), "pre-condition");
+  if (remote_resolve_enabled()) {
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    G1RemoteMemoryManager* rmm =
+        g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+    if (rmm != nullptr) {
+      const G1CardTable::CardValue* clean_card =
+          const_cast<G1CardTable::CardValue*>(card_addr);
+      HeapWord* card_start = g1h->card_table()->addr_for(clean_card);
+      rmm->mark_backed_local_dirty(card_start);
+    }
+  }
   G1DirtyCardQueue& queue = G1ThreadLocalData::dirty_card_queue(thread);
   G1BarrierSet::dirty_card_queue_set().enqueue(queue, card_addr);
 JRT_END
@@ -2382,8 +2401,8 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
     os::free(cached_bytes);
     oopDesc* result = finish_fetched_object(g1h, rmm, h, cached_dest,
                                             cached_klass, cached_word_size);
+    h->set_backed_clean();
     rmm->publish_local_handle(h, cached_dest);
-    rmm->release_array_chunk_segment(segment_id);
     jlong cache_elapsed = os::elapsed_counter() - cache_start;
     rmm->record_fetch_result(cached_word_size, cache_elapsed, true);
     return result;
@@ -2683,10 +2702,10 @@ static oopDesc* fetch_and_install_array_chunk(RemoteHandle* h,
     os::free(segment_buf);
   }
 
-  rmm->publish_local_handles(publish_handles, publish_dests, publish_count);
   for (uint i = 0; i < publish_count; i++) {
-    rmm->release_array_chunk_segment(segment_id);
+    publish_handles[i]->set_backed_clean();
   }
+  rmm->publish_local_handles(publish_handles, publish_dests, publish_count);
   if (segment_member_count > 1 || sibling_installed > 0 ||
       sibling_raced > 0 || sibling_failed > 0) {
     size_t returned_count = use_partial_segment_fetch && segment_buf == nullptr
@@ -2838,8 +2857,8 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
     os::free(cached_bytes);
     oopDesc* result = finish_fetched_object(g1h, rmm, h, cached_dest,
                                             cached_klass, cached_word_size);
+    h->set_backed_clean();
     rmm->publish_local_handle(h, cached_dest);
-    rmm->release_array_chunk_segment(segment_id);
     jlong cache_elapsed = os::elapsed_counter() - cache_start;
     rmm->record_fetch_result(cached_word_size, cache_elapsed, true);
     return result;
@@ -3172,10 +3191,10 @@ static oopDesc* fetch_and_install_cluster_object(RemoteHandle* h,
     os::free(segment_buf);
   }
 
-  rmm->publish_local_handles(publish_handles, publish_dests, publish_count);
   for (uint i = 0; i < publish_count; i++) {
-    rmm->release_array_chunk_segment(segment_id);
+    publish_handles[i]->set_backed_clean();
   }
+  rmm->publish_local_handles(publish_handles, publish_dests, publish_count);
   if (segment_member_count > 1 || sibling_installed > 0 ||
       sibling_raced > 0 || sibling_failed > 0) {
     size_t returned_count = use_partial_segment_fetch && segment_buf == nullptr

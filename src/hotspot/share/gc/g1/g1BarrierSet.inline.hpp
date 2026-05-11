@@ -90,6 +90,18 @@ static inline oop g1_handleify_old_oop_for_store_if_needed(oop value) {
   return cast_to_oop(G1BarrierSetRuntime::handleify_old_oop_for_store((oopDesc*)value));
 }
 
+static inline void g1_mark_backed_local_dirty_if_needed(void* addr) {
+  if (addr == nullptr || !g1_remote_mode_active()) {
+    return;
+  }
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  G1RemoteMemoryManager* rmm =
+      g1h == nullptr ? nullptr : g1h->remote_memory_manager();
+  if (rmm != nullptr) {
+    rmm->mark_backed_local_dirty(addr);
+  }
+}
+
 inline void G1BarrierSet::enqueue_preloaded(oop pre_val) {
   // Nulls should have been already filtered.
   oop resolved = resolve_oop_raw(pre_val);
@@ -142,6 +154,7 @@ inline void G1BarrierSet::write_ref_field_pre(T* field) {
     }
   }
 
+  g1_mark_backed_local_dirty_if_needed((void*)field);
   enqueue(field);
 }
 
@@ -319,6 +332,7 @@ template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline void G1BarrierSet::AccessBarrier<decorators, BarrierSetT>::
 oop_store_in_heap(T* addr, oop new_value) {
+  g1_mark_backed_local_dirty_if_needed((void*)addr);
   new_value = g1_resolve_remote_oop_if_needed(new_value, G1RemoteAccessHintField);
   new_value = g1_handleify_old_oop_for_store_if_needed(new_value);
   ModRef::oop_store_in_heap(addr, new_value);
@@ -334,6 +348,7 @@ oop_store_in_heap_at(oop base, ptrdiff_t offset, oop new_value) {
       return;
     }
   }
+  g1_mark_backed_local_dirty_if_needed(cast_from_oop<void*>(base));
   new_value = g1_handleify_old_oop_for_store_if_needed(new_value);
   ModRef::oop_store_in_heap_at(base, offset, new_value);
 }
