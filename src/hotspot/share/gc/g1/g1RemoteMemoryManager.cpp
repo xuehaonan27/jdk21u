@@ -2886,6 +2886,10 @@ static bool prepared_entries_contain_handle(const G1RemoteMemoryManager::Prepare
                                             int count,
                                             uintptr_t addr,
                                             RemoteHandle* h) {
+  if (entries == nullptr || count <= 0 || h == nullptr) {
+    return false;
+  }
+
   int lo = start;
   int hi = start + count - 1;
   while (lo <= hi) {
@@ -2909,6 +2913,47 @@ static bool prepared_entries_contain_handle(const G1RemoteMemoryManager::Prepare
   return false;
 }
 
+static RemoteHandle* prepared_entries_handle_for_addr(
+    const G1RemoteMemoryManager::PreparedEviction* entries,
+    int start,
+    int count,
+    uintptr_t addr) {
+  if (entries == nullptr || count <= 0) {
+    return nullptr;
+  }
+
+  int lo = start;
+  int hi = start + count - 1;
+  while (lo <= hi) {
+    int mid = lo + ((hi - lo) >> 1);
+    uintptr_t cur = cast_from_oop<uintptr_t>(entries[mid].obj);
+    if (cur == addr) {
+      for (int i = mid; i >= start && cast_from_oop<uintptr_t>(entries[i].obj) == addr; i--) {
+        if (entries[i].handle != nullptr) return entries[i].handle;
+      }
+      for (int i = mid + 1; i < start + count && cast_from_oop<uintptr_t>(entries[i].obj) == addr; i++) {
+        if (entries[i].handle != nullptr) return entries[i].handle;
+      }
+      return nullptr;
+    }
+    if (cur < addr) {
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return nullptr;
+}
+
+static bool can_prune_duplicate_local_handle(RemoteHandle* h,
+                                             RemoteHandle* prepared) {
+  return h != nullptr &&
+         prepared != nullptr &&
+         h != prepared &&
+         !h->is_dormant() &&
+         h->remote_refcount() == 0;
+}
+
 int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
     HeapRegion* hr,
     const PreparedEviction* entries,
@@ -2920,6 +2965,7 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
   }
 
   class SingleRegionUnpreparedLocalHandleClosure {
+    G1RemoteMemoryManager* _rmm;
     HeapRegion* _hr;
     const PreparedEviction* _entries;
     int _start;
@@ -2928,16 +2974,18 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
     uintptr_t _bottom;
     uintptr_t _end;
     int _blockers;
+    int _pruned;
 
   public:
-    SingleRegionUnpreparedLocalHandleClosure(HeapRegion* hr,
+    SingleRegionUnpreparedLocalHandleClosure(G1RemoteMemoryManager* rmm,
+                                             HeapRegion* hr,
                                              const PreparedEviction* entries,
                                              int start,
                                              int count,
                                              int log_limit)
-      : _hr(hr), _entries(entries), _start(start), _count(count),
+      : _rmm(rmm), _hr(hr), _entries(entries), _start(start), _count(count),
         _log_limit(log_limit), _bottom((uintptr_t)hr->bottom()),
-        _end((uintptr_t)hr->end()), _blockers(0) {}
+        _end((uintptr_t)hr->end()), _blockers(0), _pruned(0) {}
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
@@ -2948,6 +2996,20 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
         uintptr_t addr = sa & REMOTE_HANDLE_ADDR_MASK;
         if (addr >= _bottom && addr < _end &&
             !prepared_entries_contain_handle(_entries, _start, _count, addr, h)) {
+          RemoteHandle* prepared =
+              prepared_entries_handle_for_addr(_entries, _start, _count, addr);
+          if (can_prune_duplicate_local_handle(h, prepared)) {
+            _pruned++;
+            if (_pruned <= _log_limit) {
+              log_info(gc)("Pre-E local-handle guard: pruned duplicate "
+                           "unreferenced LOCAL handle in region=%u handle="
+                           PTR_FORMAT " canonical=" PTR_FORMAT " local="
+                           PTR_FORMAT,
+                           _hr->hrm_index(), p2i(h), p2i(prepared), addr);
+            }
+            _rmm->mark_handle_dead(h);
+            return;
+          }
           _blockers++;
           if (_blockers <= _log_limit) {
             log_warning(gc)("Pre-E local-handle guard: region=%u blocker handle="
@@ -2962,10 +3024,16 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_region(
     }
 
     int blockers() const { return _blockers; }
+    int pruned() const { return _pruned; }
   };
 
-  SingleRegionUnpreparedLocalHandleClosure cl(hr, entries, start, count, log_limit);
+  SingleRegionUnpreparedLocalHandleClosure cl(this, hr, entries, start, count, log_limit);
   _handle_allocator.handles_do(&cl);
+  if (cl.pruned() > 0) {
+    log_info(gc)("Pre-E local-handle guard: pruned %d duplicate "
+                 "unreferenced LOCAL handles in region %u",
+                 cl.pruned(), hr->hrm_index());
+  }
   return cl.blockers();
 }
 
@@ -2996,6 +3064,7 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
     int* _blockers_by_region;
     int _log_limit;
     int _total_blockers;
+    int _total_pruned;
 
   public:
     UnpreparedLocalHandleClosure(G1RemoteMemoryManager* rmm,
@@ -3011,7 +3080,7 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
         _region_complete(region_complete), _region_start(region_start),
         _region_count(region_count), _num_regions(num_regions),
         _entries(entries), _blockers_by_region(blockers_by_region),
-        _log_limit(log_limit), _total_blockers(0) {}
+        _log_limit(log_limit), _total_blockers(0), _total_pruned(0) {}
 
     void do_handle(RemoteHandle* h) {
       if (h == nullptr) return;
@@ -3028,6 +3097,23 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
                 _region_complete[ridx] && _region_count[ridx] > 0 &&
                 !prepared_entries_contain_handle(_entries, _region_start[ridx],
                                                  _region_count[ridx], addr, h)) {
+              RemoteHandle* prepared =
+                  prepared_entries_handle_for_addr(_entries,
+                                                   _region_start[ridx],
+                                                   _region_count[ridx],
+                                                   addr);
+              if (can_prune_duplicate_local_handle(h, prepared)) {
+                _total_pruned++;
+                if (_total_pruned <= _log_limit) {
+                  log_info(gc)("Pre-E local-handle guard: pruned duplicate "
+                               "unreferenced LOCAL handle in region=%u "
+                               "handle=" PTR_FORMAT " canonical=" PTR_FORMAT
+                               " local=" PTR_FORMAT,
+                               ridx, p2i(h), p2i(prepared), addr);
+                }
+                _rmm->mark_handle_dead(h);
+                return;
+              }
               int blockers = ++_blockers_by_region[ridx];
               _total_blockers++;
               if (blockers <= _log_limit) {
@@ -3045,12 +3131,18 @@ int G1RemoteMemoryManager::count_unprepared_local_handles_in_regions(
     }
 
     int total_blockers() const { return _total_blockers; }
+    int total_pruned() const { return _total_pruned; }
   };
 
   UnpreparedLocalHandleClosure cl(this, eviction_candidates, region_complete,
                                   region_start, region_count, num_regions,
                                   entries, blockers_by_region, log_limit);
   _handle_allocator.handles_do(&cl);
+  if (cl.total_pruned() > 0) {
+    log_info(gc)("Pre-E local-handle guard: pruned %d duplicate "
+                 "unreferenced LOCAL handles before backend send",
+                 cl.total_pruned());
+  }
   return cl.total_blockers();
 }
 
