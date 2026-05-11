@@ -54,6 +54,7 @@
 #include "utilities/events.hpp"
 #include "utilities/vmError.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1RemoteMemoryManager.hpp"
 #include "gc/g1/heapRegion.hpp"
 
 // put OS-includes here
@@ -251,6 +252,12 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
       G1CollectedHeap* g1h = G1CollectedHeap::heap();
       if (g1h != nullptr && g1h->is_in(fault_addr)) {
         HeapRegion* hr = g1h->heap_region_containing_or_null(fault_addr);
+        if (hr != nullptr && hr->is_fetch_cache() && !hr->is_evict_guarded()) {
+          G1RemoteMemoryManager* rmm = g1h->remote_memory_manager();
+          if (rmm != nullptr && rmm->handle_fcr_write_fault(fault_addr)) {
+            return true;
+          }
+        }
         if (hr != nullptr && hr->is_evict_guarded()) {
           tty->print_cr("FATAL: SIGSEGV on evict-guarded region %u at " PTR_FORMAT
                         " (pc=" PTR_FORMAT ")", hr->hrm_index(),

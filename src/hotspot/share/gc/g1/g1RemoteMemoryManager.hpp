@@ -24,6 +24,7 @@
 #include "utilities/globalDefinitions.hpp"
 
 class G1CollectedHeap;
+class G1RemoteFCRWritebackThread;
 class HeapRegion;
 class Klass;
 class WorkerThreads;
@@ -687,6 +688,9 @@ public:
   bool make_handle_remote_from_retained_backing(RemoteHandle* h);
   void mark_handle_dead(RemoteHandle* h);
   void mark_backed_local_dirty_oop(oop obj);
+  bool handle_fcr_write_fault(void* addr);
+  bool drain_fcr_writeback_once();
+  void request_fcr_writeback_scan();
   size_t local_handle_count() const { return _local_handle_count; }
 
   // ============================================================
@@ -1350,11 +1354,40 @@ public:
   // FCR regions participate in GC like Old regions (marking, evacuation).
   // Uses par_allocate() (CAS-based bump pointer) for thread-safe allocation.
 private:
+  enum FCRRegionState {
+    FCRRegionUntracked      = 0,
+    FCRRegionDirty          = 1,
+    FCRRegionWriteback      = 2,
+    FCRRegionProtectedClean = 3,
+    FCRRegionUnsupported    = 4
+  };
+
   HeapRegion* _current_fcr;       // Current FCR region for fetch allocation
   volatile int _fcr_lock;         // Spinlock for FCR region creation
+  G1RemoteFCRWritebackThread* _fcr_writeback_thread;
+  volatile int _fcr_writeback_lock;
+  uint _fcr_writeback_cursor;
+  int* _fcr_region_states;
+  uint _fcr_region_state_capacity;
+  volatile uint64_t _fcr_writeback_success;
+  volatile uint64_t _fcr_writeback_failures;
+  volatile uint64_t _fcr_writeback_bytes;
+  volatile uint64_t _fcr_writeback_segments;
 
   bool try_fcr_lock() { return Atomic::cmpxchg(&_fcr_lock, 0, 1) == 0; }
   void fcr_unlock()   { Atomic::release_store(&_fcr_lock, 0); }
+  bool try_fcr_writeback_lock() { return Atomic::cmpxchg(&_fcr_writeback_lock, 0, 1) == 0; }
+  void fcr_writeback_unlock()   { Atomic::release_store(&_fcr_writeback_lock, 0); }
+
+  bool ensure_fcr_region_states();
+  int fcr_region_state(HeapRegion* hr) const;
+  void set_fcr_region_state(HeapRegion* hr, int state);
+  bool cas_fcr_region_state(HeapRegion* hr, int old_state, int new_state);
+  void mark_fcr_region_dirty(HeapRegion* hr);
+  bool writeback_fcr_segment_region(HeapRegion* hr,
+                                    const char** reason,
+                                    size_t* bytes,
+                                    uint* segments);
 
   // Allocate a new FCR region from the free region pool.
   // Must NOT be called from JRT_LEAF (needs Heap_lock).
@@ -1373,6 +1406,7 @@ public:
     if (_current_fcr == freed_hr) {
       _current_fcr = nullptr;
     }
+    set_fcr_region_state(freed_hr, FCRRegionUntracked);
   }
   int invalidate_clean_fcr_cache_region(HeapRegion* hr,
                                         const char** reason,

@@ -665,6 +665,11 @@
           "loads can resolve through LOCAL handles instead of re-entering "   \
           "the remote fetch path.")                                           \
                                                                             \
+  product(bool, G1RemoteFCRAsyncWriteback, true, DIAGNOSTIC,                 \
+          "Enable background writeback for segment-backed fetch-cache "       \
+          "regions. This lets STW reclaim only regions whose remote backing " \
+          "has already been refreshed.")                                      \
+                                                                            \
   product(uint, RDMACQDepth, 256, DIAGNOSTIC,                               \
           "Depth of RDMA completion queues.")                               \
                                                                             \

@@ -20,6 +20,8 @@
 #include "gc/g1/g1NUMA.hpp"
 #include "gc/g1/g1RemoteOop.hpp"
 #include "gc/shared/collectedHeap.hpp"
+#include "gc/shared/concurrentGCThread.hpp"
+#include "gc/shared/suspendibleThreadSet.hpp"
 #include "logging/log.hpp"
 #include "memory/metaspace.hpp"
 #include "oops/arrayOop.hpp"
@@ -42,6 +44,38 @@
 #include "gc/shared/referenceProcessor.hpp"
 
 static bool remote_handle_managed_local_oop(G1CollectedHeap* g1h, oop obj);
+
+class G1RemoteFCRWritebackThread : public ConcurrentGCThread {
+  G1RemoteMemoryManager* _rmm;
+
+public:
+  explicit G1RemoteFCRWritebackThread(G1RemoteMemoryManager* rmm) :
+      ConcurrentGCThread(), _rmm(rmm) {
+    set_name("G1 FCR Writeback");
+  }
+
+  void start() {
+    create_and_start();
+  }
+
+protected:
+  void run_service() override {
+    while (!should_terminate()) {
+      bool did_work = false;
+      for (uint i = 0; i < 4 && !should_terminate(); i++) {
+        if (!_rmm->drain_fcr_writeback_once()) {
+          break;
+        }
+        did_work = true;
+      }
+      if (!did_work && !should_terminate()) {
+        os::naked_short_sleep(10);
+      }
+    }
+  }
+
+  void stop_service() override {}
+};
 
 // TCP client for remote executor communication
 #include <sys/socket.h>
@@ -115,7 +149,11 @@ G1RemoteMemoryManager::G1RemoteMemoryManager(G1CollectedHeap* g1h)
     _fetch_batch_requests(0), _fetch_batch_returned(0), _fetch_batch_installed(0),
     _fetch_prefetch_installed(0), _fetch_prefetch_raced(0), _fetch_prefetch_failed(0),
     _fetch_prefetch_words(0), _fetch_batch_elapsed_counter(0),
-    _current_fcr(nullptr), _fcr_lock(0) {
+    _current_fcr(nullptr), _fcr_lock(0), _fcr_writeback_thread(nullptr),
+    _fcr_writeback_lock(0), _fcr_writeback_cursor(0),
+    _fcr_region_states(nullptr), _fcr_region_state_capacity(0),
+    _fcr_writeback_success(0), _fcr_writeback_failures(0),
+    _fcr_writeback_bytes(0), _fcr_writeback_segments(0) {
   _table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
   _eviction_table = NEW_C_HEAP_ARRAY(HandleEntry*, TABLE_SIZE, mtGC);
   memset(_table, 0, TABLE_SIZE * sizeof(HandleEntry*));
@@ -685,6 +723,119 @@ bool G1RemoteMemoryManager::make_handle_remote_from_retained_backing(RemoteHandl
   return true;
 }
 
+bool G1RemoteMemoryManager::ensure_fcr_region_states() {
+  if (_g1h == nullptr) {
+    return false;
+  }
+  uint cap = _g1h->max_regions();
+  if (cap == 0) {
+    return false;
+  }
+  if (_fcr_region_states != nullptr && _fcr_region_state_capacity >= cap) {
+    return true;
+  }
+
+  int* states = NEW_C_HEAP_ARRAY(int, cap, mtGC);
+  if (states == nullptr) {
+    return false;
+  }
+  memset(states, 0, sizeof(int) * cap);
+
+  if (_fcr_region_states != nullptr) {
+    uint copy = MIN2(_fcr_region_state_capacity, cap);
+    memcpy(states, _fcr_region_states, sizeof(int) * copy);
+    FREE_C_HEAP_ARRAY(int, _fcr_region_states);
+  }
+  _fcr_region_states = states;
+  _fcr_region_state_capacity = cap;
+  return true;
+}
+
+int G1RemoteMemoryManager::fcr_region_state(HeapRegion* hr) const {
+  if (hr == nullptr || _fcr_region_states == nullptr) {
+    return FCRRegionUntracked;
+  }
+  uint idx = hr->hrm_index();
+  if (idx >= _fcr_region_state_capacity) {
+    return FCRRegionUntracked;
+  }
+  return Atomic::load(&_fcr_region_states[idx]);
+}
+
+void G1RemoteMemoryManager::set_fcr_region_state(HeapRegion* hr, int state) {
+  if (hr == nullptr || _fcr_region_states == nullptr) {
+    return;
+  }
+  uint idx = hr->hrm_index();
+  if (idx >= _fcr_region_state_capacity) {
+    return;
+  }
+  Atomic::release_store(&_fcr_region_states[idx], state);
+}
+
+bool G1RemoteMemoryManager::cas_fcr_region_state(HeapRegion* hr,
+                                                 int old_state,
+                                                 int new_state) {
+  if (hr == nullptr || _fcr_region_states == nullptr) {
+    return false;
+  }
+  uint idx = hr->hrm_index();
+  if (idx >= _fcr_region_state_capacity) {
+    return false;
+  }
+  return Atomic::cmpxchg(&_fcr_region_states[idx], old_state, new_state) == old_state;
+}
+
+void G1RemoteMemoryManager::request_fcr_writeback_scan() {
+  // The writeback thread polls at a short interval.  This hook intentionally
+  // remains lock-free so it can be called from hot write-barrier paths.
+}
+
+void G1RemoteMemoryManager::mark_fcr_region_dirty(HeapRegion* hr) {
+  if (hr == nullptr || !hr->is_fetch_cache() || hr->is_free() ||
+      hr->is_empty() || hr->is_evict_guarded() ||
+      _fcr_region_states == nullptr) {
+    return;
+  }
+
+  int state = fcr_region_state(hr);
+  if (state == FCRRegionProtectedClean || state == FCRRegionWriteback) {
+    if (!os::protect_memory((char*)hr->bottom(), HeapRegion::GrainBytes,
+                            os::MEM_PROT_RW)) {
+      return;
+    }
+    set_fcr_region_state(hr, FCRRegionDirty);
+  } else if (state == FCRRegionUntracked) {
+    set_fcr_region_state(hr, FCRRegionDirty);
+  }
+  request_fcr_writeback_scan();
+}
+
+bool G1RemoteMemoryManager::handle_fcr_write_fault(void* addr) {
+  if (addr == nullptr || _g1h == nullptr || _fcr_region_states == nullptr ||
+      !_g1h->is_in_reserved(addr)) {
+    return false;
+  }
+  HeapRegion* hr = _g1h->heap_region_containing_or_null(addr);
+  if (hr == nullptr || !hr->is_fetch_cache() || hr->is_free() ||
+      hr->is_empty() || hr->is_evict_guarded()) {
+    return false;
+  }
+
+  int state = fcr_region_state(hr);
+  if (state != FCRRegionProtectedClean && state != FCRRegionWriteback) {
+    return false;
+  }
+
+  if (!os::protect_memory((char*)hr->bottom(), HeapRegion::GrainBytes,
+                          os::MEM_PROT_RW)) {
+    return false;
+  }
+  set_fcr_region_state(hr, FCRRegionDirty);
+  request_fcr_writeback_scan();
+  return true;
+}
+
 void G1RemoteMemoryManager::mark_backed_local_dirty_oop(oop obj) {
   void* addr = cast_from_oop<void*>(obj);
   if (addr == nullptr || _g1h == nullptr || !_g1h->is_in_reserved(addr)) {
@@ -697,6 +848,8 @@ void G1RemoteMemoryManager::mark_backed_local_dirty_oop(oop obj) {
     return;
   }
 
+  mark_fcr_region_dirty(hr);
+
   HeapWord* obj_addr = cast_from_oop<HeapWord*>(obj);
   if (obj_addr < hr->bottom() || obj_addr >= hr->top()) {
     return;
@@ -706,6 +859,341 @@ void G1RemoteMemoryManager::mark_backed_local_dirty_oop(oop obj) {
   if (h != nullptr && h->is_local() && h->is_backed_clean()) {
     h->set_backed_dirty();
   }
+}
+
+static const uint FCRWritebackSegmentHandleStackCap = 4096;
+
+static bool fcr_writeback_segment_seen(uint64_t* seen, uint seen_count, uint64_t id) {
+  for (uint i = 0; i < seen_count; i++) {
+    if (seen[i] == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void release_existing_edge_table_for_writeback(G1RemoteMemoryManager* rmm,
+                                                      RemoteHandle* h) {
+  G1RemoteMemoryManager::ObjectEdgeTable* old = rmm->take_edge_table(h);
+  if (old == nullptr) {
+    return;
+  }
+  for (uint32_t i = 0; i < old->_entry_count; i++) {
+    RemoteHandle* target =
+        G1RemoteMemoryManager::follow_forwarded_handle(old->_entries[i]._target_handle);
+    if (target != nullptr) {
+      target->decrement_remote_refcount();
+    }
+  }
+  G1RemoteMemoryManager::ObjectEdgeTable::free(old);
+}
+
+bool G1RemoteMemoryManager::writeback_fcr_segment_region(HeapRegion* hr,
+                                                         const char** reason,
+                                                         size_t* bytes,
+                                                         uint* segments) {
+  if (reason != nullptr) *reason = nullptr;
+  if (bytes != nullptr) *bytes = 0;
+  if (segments != nullptr) *segments = 0;
+  if (hr == nullptr || _backend == nullptr || !_backend->supports_segments()) {
+    if (reason != nullptr) *reason = "no-backend";
+    return false;
+  }
+  if (!hr->is_fetch_cache() || hr->is_free() || hr->is_empty() ||
+      hr->is_evict_guarded()) {
+    if (reason != nullptr) *reason = "bad-region";
+    return false;
+  }
+  if (!cas_fcr_region_state(hr, FCRRegionDirty, FCRRegionWriteback)) {
+    if (reason != nullptr) *reason = "not-dirty";
+    return false;
+  }
+  if (!os::protect_memory((char*)hr->bottom(), HeapRegion::GrainBytes,
+                          os::MEM_PROT_READ)) {
+    set_fcr_region_state(hr, FCRRegionDirty);
+    if (reason != nullptr) *reason = "protect-read-failed";
+    return false;
+  }
+
+  bool ok = true;
+  size_t total_bytes = 0;
+  uint total_segments = 0;
+  uint seen_count = 0;
+  uint seen_cap = 64;
+  uint64_t* seen = NEW_C_HEAP_ARRAY(uint64_t, seen_cap, mtGC);
+  if (seen == nullptr) {
+    ok = false;
+    if (reason != nullptr) *reason = "seen-alloc-failed";
+  }
+
+  RemoteHandleAllocBuffer hab;
+  HeapWord* p = hr->bottom();
+  while (ok && p < hr->top()) {
+    oop obj = cast_to_oop(p);
+    Klass* klass = obj->klass_or_null();
+    if (klass == nullptr) {
+      ok = false;
+      if (reason != nullptr) *reason = "null-klass";
+      break;
+    }
+    size_t obj_words = obj->size_given_klass(klass);
+    if (obj_words == 0 || obj_words > (size_t)(hr->end() - p)) {
+      ok = false;
+      if (reason != nullptr) *reason = "bad-size";
+      break;
+    }
+    if (G1CollectedHeap::is_obj_filler(obj)) {
+      p += obj_words;
+      continue;
+    }
+
+    RemoteHandle* h = handle_for(obj);
+    if (h == nullptr || !h->is_local() || h->is_forwarder()) {
+      p += obj_words;
+      continue;
+    }
+    uint32_t kind = h->_remote_location.kind_acquire();
+    if (kind != RemoteLocationArrayChunk &&
+        kind != RemoteLocationClusterObject) {
+      p += obj_words;
+      continue;
+    }
+    uint64_t segment_id = (uint64_t)h->_remote_location._secondary_id;
+    size_t segment_byte_size = h->_remote_location._segment_byte_size;
+    if (segment_id == 0 || segment_byte_size == 0 ||
+        fcr_writeback_segment_seen(seen, seen_count, segment_id)) {
+      p += obj_words;
+      continue;
+    }
+
+    if (seen_count == seen_cap) {
+      uint new_cap = seen_cap * 2;
+      uint64_t* new_seen = NEW_C_HEAP_ARRAY(uint64_t, new_cap, mtGC);
+      if (new_seen == nullptr) {
+        ok = false;
+        if (reason != nullptr) *reason = "seen-grow-failed";
+        break;
+      }
+      memcpy(new_seen, seen, sizeof(uint64_t) * seen_count);
+      FREE_C_HEAP_ARRAY(uint64_t, seen);
+      seen = new_seen;
+      seen_cap = new_cap;
+    }
+    seen[seen_count++] = segment_id;
+
+    uint total_handles = 0;
+    size_t registered_bytes = 0;
+    RemoteHandle* stack_handles[FCRWritebackSegmentHandleStackCap];
+    uint copied = copy_array_chunk_segment_handles(segment_id,
+                                                   stack_handles,
+                                                   FCRWritebackSegmentHandleStackCap,
+                                                   &registered_bytes,
+                                                   &total_handles);
+    RemoteHandle** handles = stack_handles;
+    if (total_handles > FCRWritebackSegmentHandleStackCap) {
+      handles = (RemoteHandle**)os::malloc(sizeof(RemoteHandle*) * total_handles, mtGC);
+      if (handles == nullptr) {
+        ok = false;
+        if (reason != nullptr) *reason = "handles-alloc-failed";
+        break;
+      }
+      copied = copy_array_chunk_segment_handles(segment_id, handles,
+                                                total_handles,
+                                                &registered_bytes,
+                                                &total_handles);
+    }
+    if (copied == 0 || registered_bytes != segment_byte_size) {
+      if (handles != stack_handles) {
+        os::free(handles);
+      }
+      ok = false;
+      if (reason != nullptr) *reason = "segment-registry-mismatch";
+      break;
+    }
+
+    uint8_t* segment_buf = (uint8_t*)os::malloc(segment_byte_size, mtGC);
+    if (segment_buf == nullptr) {
+      if (handles != stack_handles) {
+        os::free(handles);
+      }
+      ok = false;
+      if (reason != nullptr) *reason = "segment-buffer-alloc-failed";
+      break;
+    }
+
+    uintptr_t fetched_base = 0;
+    size_t fetched_bytes = 0;
+    uint32_t fetched_flags = 0;
+    bool fetched = _backend->fetch_segment(segment_id, &fetched_base,
+                                           segment_buf, segment_byte_size,
+                                           &fetched_bytes, &fetched_flags);
+    if (!fetched || fetched_bytes != segment_byte_size) {
+      os::free(segment_buf);
+      if (handles != stack_handles) {
+        os::free(handles);
+      }
+      ok = false;
+      if (reason != nullptr) *reason = "fetch-segment-failed";
+      break;
+    }
+
+    uintptr_t segment_base = 0;
+    uint32_t segment_flags = fetched_flags;
+    for (uint i = 0; i < copied; i++) {
+      RemoteHandle* member = handles[i];
+      if (member == nullptr || member->is_forwarder()) {
+        continue;
+      }
+      RemoteLocation* loc = &member->_remote_location;
+      uint32_t member_kind = loc->kind_acquire();
+      if ((member_kind != RemoteLocationArrayChunk &&
+           member_kind != RemoteLocationClusterObject) ||
+          (uint64_t)loc->_secondary_id != segment_id ||
+          loc->_segment_byte_size != segment_byte_size ||
+          loc->_byte_size == 0 ||
+          loc->_offset > segment_byte_size ||
+          loc->_byte_size > segment_byte_size - loc->_offset) {
+        continue;
+      }
+      uintptr_t sa = member->load_state_and_addr_acquire();
+      if ((sa & REMOTE_HANDLE_STATE_MASK) != REMOTE_HANDLE_LOCAL) {
+        continue;
+      }
+      HeapWord* member_addr = (HeapWord*)(sa & REMOTE_HANDLE_ADDR_MASK);
+      if (!_g1h->is_in_reserved(member_addr)) {
+        continue;
+      }
+      HeapRegion* member_hr = _g1h->heap_region_containing_or_null(member_addr);
+      if (member_hr == nullptr || member_hr->is_free() ||
+          member_hr->is_evict_guarded()) {
+        continue;
+      }
+
+      oop member_obj = cast_to_oop(member_addr);
+      Klass* member_klass = member_obj->klass_or_null();
+      if (member_klass == nullptr ||
+          G1CollectedHeap::is_obj_filler(member_obj)) {
+        continue;
+      }
+      size_t member_words = member_obj->size_given_klass(member_klass);
+      size_t member_bytes = member_words * HeapWordSize;
+      if (member_bytes != loc->_byte_size) {
+        continue;
+      }
+
+      uint8_t* dst = segment_buf + loc->_offset;
+      memcpy(dst, member_addr, member_bytes);
+      if (member_kind == RemoteLocationClusterObject &&
+          !member_klass->is_typeArray_klass()) {
+        release_existing_edge_table_for_writeback(this, member);
+        bool zero_edges = false;
+        ObjectEdgeTable* et = build_edge_table(member_obj, member, &hab,
+                                               &zero_edges);
+        if (et != nullptr) {
+          for (uint32_t edge = 0; edge < et->_entry_count; edge++) {
+            if (et->_entries[edge]._field_offset + sizeof(uintptr_t) <= member_bytes) {
+              uintptr_t* field = (uintptr_t*)(dst + et->_entries[edge]._field_offset);
+              *field = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT |
+                       (uintptr_t)et->_entries[edge]._target_handle;
+            }
+          }
+          store_edge_table(et);
+        }
+      }
+      member->set_backed_clean();
+      if (segment_base == 0) {
+        segment_base = loc->_primary_id;
+        segment_flags = loc->_flags;
+      }
+    }
+
+    if (segment_base == 0) {
+      segment_base = fetched_base;
+    }
+    bool evicted = _backend->evict_segment(segment_id, segment_base,
+                                           segment_buf, segment_byte_size,
+                                           segment_flags);
+    os::free(segment_buf);
+    if (handles != stack_handles) {
+      os::free(handles);
+    }
+    if (!evicted) {
+      ok = false;
+      if (reason != nullptr) *reason = "evict-segment-failed";
+      break;
+    }
+    total_segments++;
+    total_bytes += segment_byte_size;
+    p += obj_words;
+  }
+
+  if (seen != nullptr) {
+    FREE_C_HEAP_ARRAY(uint64_t, seen);
+  }
+
+  if (!ok || total_segments == 0) {
+    os::protect_memory((char*)hr->bottom(), HeapRegion::GrainBytes,
+                       os::MEM_PROT_RW);
+    set_fcr_region_state(hr, FCRRegionDirty);
+    Atomic::inc(&_fcr_writeback_failures);
+    if (reason != nullptr && *reason == nullptr) {
+      *reason = total_segments == 0 ? "no-segments" : "failed";
+    }
+    return false;
+  }
+
+  int state = fcr_region_state(hr);
+  if (state == FCRRegionWriteback) {
+    set_fcr_region_state(hr, FCRRegionProtectedClean);
+  } else {
+    // A mutator wrote the region while the remote writeback was in flight.
+    // The signal path has already made it writable and DIRTY; keep the newer
+    // local contents for a later writeback cycle.
+    ok = true;
+  }
+  Atomic::inc(&_fcr_writeback_success);
+  Atomic::add(&_fcr_writeback_bytes, (uint64_t)total_bytes);
+  Atomic::add(&_fcr_writeback_segments, (uint64_t)total_segments);
+  if (bytes != nullptr) *bytes = total_bytes;
+  if (segments != nullptr) *segments = total_segments;
+  return ok;
+}
+
+bool G1RemoteMemoryManager::drain_fcr_writeback_once() {
+  if (!G1RemoteFCRAsyncWriteback || _g1h == nullptr || _backend == nullptr ||
+      !_backend->supports_segments() || _fcr_region_states == nullptr ||
+      SafepointSynchronize::is_at_safepoint()) {
+    return false;
+  }
+  if (!try_fcr_writeback_lock()) {
+    return false;
+  }
+
+  bool did_work = false;
+  uint num_regions = _g1h->num_regions();
+  for (uint scanned = 0; scanned < num_regions && !did_work; scanned++) {
+    uint idx = (_fcr_writeback_cursor + scanned) % num_regions;
+    HeapRegion* hr = _g1h->region_at_or_null(idx);
+    if (hr == nullptr || fcr_region_state(hr) != FCRRegionDirty) {
+      continue;
+    }
+
+    const char* reason = nullptr;
+    size_t bytes = 0;
+    uint segments = 0;
+    did_work = writeback_fcr_segment_region(hr, &reason, &bytes, &segments);
+    if (did_work) {
+      log_debug(gc)("FCR async writeback: region=%u segments=%u bytes="
+                    SIZE_FORMAT "KB",
+                    idx, segments, bytes / K);
+    } else if (reason != nullptr) {
+      log_debug(gc)("FCR async writeback skipped region=%u: %s", idx, reason);
+    }
+  }
+  _fcr_writeback_cursor =
+      num_regions == 0 ? 0 : ((_fcr_writeback_cursor + 1) % num_regions);
+  fcr_writeback_unlock();
+  return did_work;
 }
 
 int G1RemoteMemoryManager::invalidate_clean_fcr_cache_region(HeapRegion* hr,
@@ -732,6 +1220,10 @@ int G1RemoteMemoryManager::invalidate_clean_fcr_cache_region(HeapRegion* hr,
   }
   if (hr->rem_set()->occupied() != 0) {
     if (reason != nullptr) *reason = "inbound-remset";
+    return -1;
+  }
+  if (fcr_region_state(hr) != FCRRegionProtectedClean) {
+    if (reason != nullptr) *reason = "not-writeback-clean";
     return -1;
   }
 
@@ -868,6 +1360,12 @@ void G1RemoteMemoryManager::initialize_backend() {
   for (int attempt = 1; attempt <= 5; attempt++) {
     if (_backend->initialize()) {
       log_info(gc)("Remote memory backend: %s", _backend->name());
+      if (G1RemoteFCRAsyncWriteback && _backend->supports_segments() &&
+          _fcr_writeback_thread == nullptr && ensure_fcr_region_states()) {
+        _fcr_writeback_thread = new G1RemoteFCRWritebackThread(this);
+        _fcr_writeback_thread->start();
+        log_info(gc)("FCR async writeback thread started");
+      }
       return;
     }
     log_warning(gc)("Remote backend (%s) initialization attempt %d/5 failed, retrying in 2s...",
@@ -881,6 +1379,12 @@ void G1RemoteMemoryManager::initialize_backend() {
   _backend = new SimLocalBackend();
   _backend->initialize();
   log_info(gc)("Remote memory backend: %s", _backend->name());
+  if (G1RemoteFCRAsyncWriteback && _backend->supports_segments() &&
+      _fcr_writeback_thread == nullptr && ensure_fcr_region_states()) {
+    _fcr_writeback_thread = new G1RemoteFCRWritebackThread(this);
+    _fcr_writeback_thread->start();
+    log_info(gc)("FCR async writeback thread started");
+  }
 }
 
 void G1RemoteMemoryManager::record_fetch_result(size_t word_size,
@@ -1103,6 +1607,11 @@ size_t G1RemoteMemoryManager::rebuild_handle_table_from_handles() {
 }
 
 G1RemoteMemoryManager::~G1RemoteMemoryManager() {
+  if (_fcr_writeback_thread != nullptr) {
+    _fcr_writeback_thread->stop();
+    _fcr_writeback_thread = nullptr;
+  }
+
   // Free HandleEntry chunks (entries are pool-managed, not individually freed)
   HandleEntryChunk* ec = _entry_chunks;
   while (ec != nullptr) {
@@ -1123,6 +1632,11 @@ G1RemoteMemoryManager::~G1RemoteMemoryManager() {
     _local_handle_region_heads = nullptr;
   }
   _local_handle_region_capacity = 0;
+  if (_fcr_region_states != nullptr) {
+    FREE_C_HEAP_ARRAY(int, _fcr_region_states);
+    _fcr_region_states = nullptr;
+    _fcr_region_state_capacity = 0;
+  }
 
   for (size_t i = 0; i < ARRAY_CHUNK_SEGMENT_BUCKETS; i++) {
     ArrayChunkSegmentEntry* e = _array_chunk_segments[i];
@@ -9232,6 +9746,7 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
     HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
     if (result != nullptr) {
       fcr->update_bot_for_obj(result, word_size);
+      mark_fcr_region_dirty(fcr);
       return result;
     }
   }
@@ -9263,6 +9778,7 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
       HeapWord* result = fcr->par_allocate(word_size, word_size, &actual);
       if (result != nullptr) {
         fcr->update_bot_for_obj(result, word_size);
+        mark_fcr_region_dirty(fcr);
         return result;
       }
     }
@@ -9287,6 +9803,7 @@ HeapWord* G1RemoteMemoryManager::allocate_in_fcr(size_t word_size) {
     HeapWord* result = new_fcr->par_allocate(word_size, word_size, &actual);
     if (result != nullptr) {
       new_fcr->update_bot_for_obj(result, word_size);
+      mark_fcr_region_dirty(new_fcr);
     }
     return result;
   }
