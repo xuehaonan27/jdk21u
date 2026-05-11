@@ -822,11 +822,11 @@ bool G1RemoteMemoryManager::handle_fcr_write_fault(void* addr) {
     return false;
   }
 
-  int state = fcr_region_state(hr);
-  if (state != FCRRegionProtectedClean && state != FCRRegionWriteback) {
-    return false;
-  }
-
+  // Treat page permissions as authoritative.  The writeback thread can
+  // protect a region while a mutator/GC worker is racing through allocation,
+  // fetch install, or card processing; the logical state may already have been
+  // reset by a later transition.  A SIGSEGV on a live non-guarded FCR page is
+  // therefore a cache dirtying event, not a VM fatal error.
   if (!os::protect_memory((char*)hr->bottom(), HeapRegion::GrainBytes,
                           os::MEM_PROT_RW)) {
     return false;
@@ -1455,6 +1455,10 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
   uint64_t dense_fetch_success = Atomic::load(&_dense_segment_fetch_success);
   uint64_t dense_fetch_failures = Atomic::load(&_dense_segment_fetch_failures);
   uint64_t dense_remote_bytes = Atomic::load(&_dense_segment_remote_bytes);
+  uint64_t fcr_writeback_success = Atomic::load(&_fcr_writeback_success);
+  uint64_t fcr_writeback_failures = Atomic::load(&_fcr_writeback_failures);
+  uint64_t fcr_writeback_bytes = Atomic::load(&_fcr_writeback_bytes);
+  uint64_t fcr_writeback_segments = Atomic::load(&_fcr_writeback_segments);
 
   if (resolve_fast_local == 0 && resolve_fast_remote == 0 &&
       resolve_fast_fetching == 0 && resolve_fast_dead == 0 &&
@@ -1466,7 +1470,8 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
       fetch_batch_installed == 0 && fetch_prefetch_installed == 0 &&
       fetch_prefetch_raced == 0 && fetch_prefetch_failed == 0 &&
       dense_evict_success == 0 && dense_evict_failures == 0 &&
-      dense_fetch_success == 0 && dense_fetch_failures == 0) {
+      dense_fetch_success == 0 && dense_fetch_failures == 0 &&
+      fcr_writeback_success == 0 && fcr_writeback_failures == 0) {
     return;
   }
 
@@ -1491,6 +1496,8 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                " dense_segment(evict_ok=" UINT64_FORMAT
                " evict_fail=" UINT64_FORMAT " fetch_ok=" UINT64_FORMAT
                " fetch_fail=" UINT64_FORMAT " remote_bytes=" UINT64_FORMAT ")"
+               " fcr_writeback(ok=" UINT64_FORMAT " fail=" UINT64_FORMAT
+               " segments=" UINT64_FORMAT " bytes=" UINT64_FORMAT ")"
                " waits(slow=" UINT64_FORMAT " no_safepoint=" UINT64_FORMAT
                " hard=" UINT64_FORMAT " loops=" UINT64_FORMAT ")",
                resolve_fast_local,
@@ -1518,6 +1525,10 @@ void G1RemoteMemoryManager::log_remote_access_stats() const {
                dense_fetch_success,
                dense_fetch_failures,
                dense_remote_bytes,
+               fcr_writeback_success,
+               fcr_writeback_failures,
+               fcr_writeback_segments,
+               fcr_writeback_bytes,
                fetch_wait_slow,
                fetch_wait_no_safepoint,
                fetch_wait_hard,
