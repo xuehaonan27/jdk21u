@@ -1839,7 +1839,23 @@ void G1RemoteMemoryManager::patch_dense_segment_boundary_edges(DenseSegmentEntry
     if (state == REMOTE_HANDLE_LOCAL) {
       int stale = 0;
       uintptr_t target_addr = sa & REMOTE_HANDLE_ADDR_MASK;
-      if (validate_local_handle_addr(target, "DENSE-SEGMENT-PATCH", &stale, 8)) {
+      uintptr_t dense_addr = 0;
+      if (local_handle_points_to_dense_segment(target, &dense_addr) &&
+          dense_addr == target_addr) {
+        *field = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)target;
+        if (!direct_entries_locked) {
+          tagged_field_lock();
+          direct_entries_locked = true;
+        }
+        TaggedFieldEntry tagged_entry;
+        tagged_entry._field_addr = (oop*)field;
+        tagged_entry._handle = target;
+        tagged_entry._tagged_raw = 0;
+        tagged_entry._kind = TaggedFieldDenseHandle;
+        add_tagged_field_entry_locked(tagged_entry);
+        shared++;
+        handle_tracked++;
+      } else if (validate_local_handle_addr(target, "DENSE-SEGMENT-PATCH", &stale, 8)) {
         *field = G1_OOP_MANAGED_BIT | G1_OOP_INDIRECT_BIT | (uintptr_t)target;
         if (!direct_entries_locked) {
           tagged_field_lock();
